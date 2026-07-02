@@ -1,0 +1,151 @@
+TEAMS MEETING TRANSCRIPT
+Meeting: FieldOps 2.0 — Conflict Resolution: Offline Mode + GDPR Timeline
+Date: 2026-06-24 | Duration: 1h 00m
+Attendees: Priya Nair (PM), James Whitfield (Delivery), Dev Kapoor (Eng Lead),
+           Ahmed Hassan (Mobile), Natasha Orlova (Legal/DPO), Daniel Frost (VP Field Ops)
+
+── TRANSCRIPT ────────────────────────────────────────────────────────────────
+
+JAMES WHITFIELD [00:01]:
+Two agenda items today. First: Ahmed's offline ping buffer spike results.
+Second: Natasha on GDPR DPA timeline. Priya, set the stage?
+
+PRIYA NAIR [00:02]:
+Sure. Ahmed, you did the spike. What did you find?
+
+AHMED HASSAN [00:03]:
+Good news — the offline ping buffer is genuinely lightweight. I built a proof of concept
+in 1.5 days. Here's what it does: when the device loses connectivity, the app stores
+GPS pings in AsyncStorage with timestamps. Max buffer size: 50 pings (25 minutes of
+Travelling pings, or 4+ hours of In Progress pings). When connectivity restores, the
+buffer flushes to POST /api/v2/location/ping with a "replayed: true" flag and the
+original clientTimestamp. The server processes them in chronological order.
+
+The server-side change is minimal: the ping endpoint needs to accept clientTimestamp
+as a separate field from server receipt time, and store it in technician_locations.
+Total estimate: 3 days mobile + 1 day backend. That's 4 days total.
+
+PRIYA NAIR [00:07]:
+That's really good. 4 days is totally absorb-able. Daniel, this directly responds to
+the Region East pilot feedback. What do you think?
+
+DANIEL FROST [00:08]:
+I think we have to do it. The pilot showed 23 of 40 technicians affected. If we go live
+without it, we'll have SLA alerts firing for technicians in tunnels or buildings — our
+dispatchers will lose trust in the dashboard within a week.
+
+PRIYA NAIR [00:10]:
+Agreed. I'm making a formal decision here: offline ping buffer is IN scope for v2.0.
+It was previously marked "out of scope — under evaluation." That status is now closed —
+it's committed. I'll update PRD Section 3.2 to move it from out-of-scope to in-scope.
+Dev, please add it to Sprint 2 planning.
+
+DEV KAPOOR [00:11]:
+Done. I'll also update the API spec to document the replay behaviour and the clientTimestamp field.
+
+JAMES WHITFIELD [00:12]:
+Good. Let's note this formally: the PRD conflict between Section 3.2 (offline out of scope)
+and the pilot data showing 57% technician impact is now resolved. Decision: in scope.
+
+[ITEM: GDPR DPA Amendment timeline]
+NATASHA ORLOVA [00:14]:
+Thank you for having me. I have an update that is better than my earlier email suggested.
+
+I spoke with three of our largest EU customers this week. All three confirmed they are willing
+to fast-track the DPA amendment review given the commercial benefit to their operations.
+Revised timeline: internal legal sign-off by 2026-07-15, customer amendments sent by 2026-07-22,
+30-day notice period ends 2026-08-21. This gives the team a clear green light from 2026-08-21 —
+well before the 2026-10-15 go-live.
+
+PRIYA NAIR [00:16]:
+That's excellent news. So the GDPR blocker from OQ-005 — is it now resolved or still a risk?
+
+NATASHA ORLOVA [00:17]:
+It's resolved for testing purposes from 2026-08-21. For go-live on 2026-10-15, it's fully
+resolved. I'll provide written confirmation to you by end of this week so you can update the PRD.
+
+However, I want to reiterate two items that must be in the go-live build:
+One — the mobile tracking banner. Have you scoped it?
+
+AHMED HASSAN [00:19]:
+Yes, it's in Sprint 1 as FR-MOB-001. Dev, Priya confirmed the approved Legal copy will
+come from Natasha by Friday.
+
+NATASHA ORLOVA [00:20]:
+I'll send the approved banner text today. Short version: "Your location is being shared with
+your dispatch team while this job is active. [Privacy Policy link]". The exact wording is in
+the document I'll send.
+
+Two — Kafka retention at 24h. Is this confirmed?
+
+DEV KAPOOR [00:21]:
+Confirmed. Added to infrastructure setup scripts last week. 24-hour retention on
+fieldops.technician-location topic. Done.
+
+NATASHA ORLOVA [00:22]:
+Good. And one more I want to add — I didn't raise it before but reviewing the architecture PDF,
+the GDPR Article 17 erasure endpoint (DELETE /api/v2/location/technician/{techId}/all-history)
+is mentioned as needing a "compliance audit table." Is that table designed?
+
+RAVI SHARMA — not present. DEV KAPOOR [00:24]:
+I'll own that. We need a gdpr_erasure_log table: id, technician_id, requested_by_user_id,
+requested_at, rows_deleted_count, completed_at. Ravi will design it, I'll review.
+Two days of work. I'll add to Sprint 2.
+
+NATASHA ORLOVA [00:25]:
+Perfect. In that case, from Legal's perspective, OQ-005 is closed — GDPR DPA timeline confirmed,
+all technical privacy requirements are being addressed. I'll send written confirmation today.
+
+PRIYA NAIR [00:26]:
+Natasha, thank you. This is a huge relief. James, can we officially close the GDPR blocker?
+
+JAMES WHITFIELD [00:27]:
+Yes. OQ-005: GDPR DPA amendment — CLOSED. DPA signed by customers expected 2026-08-21.
+Go-live 2026-10-15 is clear. This also means we can plan UAT with real technician data
+from 2026-08-21 onwards. Before that, Ahmed's GPS simulator is our UAT data source.
+
+[ITEM: remaining open items]
+PRIYA NAIR [00:30]:
+Two remaining open questions I want to close today.
+
+OQ-003 — dispatch_rules rule builder UI. Decision: not in v2.0. Rules will be managed by
+Engineering via a CLI tool (simple CRUD over the API). A proper UI is roadmapped for v2.1.
+I'm documenting this as a formal scope decision so it doesn't resurface.
+
+OQ-004 — customer notification when SLA preemption interrupts an in-progress job.
+Daniel, this is yours.
+
+DANIEL FROST [00:32]:
+We discussed this with Customer Success. Decision: we send an automated SMS to the
+affected customer, using our existing SMS notification service (Twilio). Message:
+"Your service appointment is still on track. Your technician is responding to an urgent
+nearby request and will arrive within [ETA] minutes. We apologise for any delay."
+The SMS should be sent within 60 seconds of the preemption event.
+
+PRIYA NAIR [00:34]:
+Good. So that's a new requirement: when a preemption event fires, trigger an SMS via
+Twilio to the customer of the interrupted job. Dev, is Twilio already integrated?
+
+DEV KAPOOR [00:35]:
+Yes, Twilio is used by the notifications service for appointment reminders. We just
+need to add a new event listener to the notifications service that listens to the
+fieldops.dispatch-events Kafka topic for PreemptionEvent messages, and sends the SMS.
+Estimate: 2 days.
+
+PRIYA NAIR [00:36]:
+Great. OQ-004 resolved. New requirement added to scope. I'll write up FR-NOTIF-001
+in the PRD.
+
+JAMES WHITFIELD [00:38]:
+To summarise today's decisions:
+1. Offline ping buffer — IN SCOPE, Sprint 2. PRD Section 3.2 updated.
+2. GDPR DPA amendment — resolved. UAT with real data from 2026-08-21.
+3. OQ-003 (rule builder UI) — not in v2.0, formal close.
+4. OQ-004 (customer preemption SMS) — resolved, new FR-NOTIF-001, Sprint 2.
+5. GDPR erasure log table — new, Sprint 2.
+
+Any objections? [None]
+
+Meeting closed.
+
+END OF TRANSCRIPT

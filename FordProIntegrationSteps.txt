@@ -1,0 +1,56 @@
+
+Ford Pro registers RepairLink as an application in their Azure B2c
+
+Ford Pro generates a Client ID and Client Secret and shares them with OEC
+
+Ford Pro shares their Authorization URL, Token URL, and User Profile API URL
+
+OEC stores these credentials securely in RepairLink's configuration
+
+Common Flow (Every Single Punchout, All Users)
+1	Fleet manager selects a vehicle VIN and clicks "Find Parts"	User (in Ford Pro portal)
+2	Ford Pro opens RepairLink in a new browser window, passing the VIN in the URL --> make VIN part of SSO from our side
+	in order to capture the same once SSO flow completes
+
+
+3	RepairLink sees no active session → redirects the browser to Azure B2c login page
+4	Azure Entra checks — user is already logged into Ford Pro, so no password is asked (silent SSO)	Azure Entra (Ford Pro's IdP)
+5	Azure Entra sends the browser back to RepairLink with a short-lived authorization code
+6	RepairLink takes that code and makes a direct server-to-server call (never via browser) to Azure B2c, 
+	sending the code + Client ID + Client Secret
+7	Azure Entra validates everything and returns an access token to RepairLink
+8	RepairLink uses that access token to call Ford Pro's user profile API to get the user's Ford Pro identity
+9	Ford Pro API returns: firstname, lastname and email
+10	RepairLink checks its own database: "Do we have this email address in our system?"
+
+
+
+
+OEC Handles All 3 Cases (Ford Pro does nothing here)
+Path A — Returning User (email already in OEC database)
+
+11	OEC database finds the email → gets the internal RepairLink user
+12	RepairLink creates a session and opens the parts catalog with the VIN already filled in
+
+
+Path B — Existing RepairLink User, Never Linked Before (one-time ceremony)
+
+11	OEC checks by email → finds an existing RepairLink account
+12	RepairLink shares the accounts by that email address and ask to link the existing account
+13	User clicks the link and Repairlink persist that information
+14	RepairLink creates a session and opens the parts catalog (all future logins skip this — silent from now on)
+
+Path C — Brand New User (no RepairLink account at all)
+
+11	email not found, email not found either	OEC Database
+12	RepairLink opens its registration page in the same new window
+13	User fills in the registration form: name, email, preferred dealer	User
+14	RepairLink creates a new account and permanently stores the email link
+15	RepairLink creates a session and opens the parts catalog
+
+
+Ford Pro only does Steps 1–2 — open a new window with the VIN. Everything else is OEC.
+The Client Secret never travels through the browser — it is only sent in a direct server-to-server call. Fully secure.
+The user never sees a login screen — Azure B2c SSO handles that silently since the user is already logged into Ford Pro.
+Account linking (Path B) is a one-time ceremony — after that, the user is on Path A forever.
+Ford Pro does not need to know which path was taken — OEC handles all three internally.

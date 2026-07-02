@@ -1,0 +1,107 @@
+1. Architecture Document: VectorVolt Data OS
+1.1 Core Philosophy
+VectorVolt is not a database; it is a distributed, nanosecond-latency Data Operating System. It abstracts hardware, memory, and state persistence away from application developers via declarative YAML configurations. It operates on the principles of Mechanical Sympathy, Zero-GC execution, and strict determinism.
+
+1.2 System Topology
+The architecture relies on a shared-nothing, single-writer-per-shard execution model, deployed natively as a .NET 10.0 application (with Unikernel deployment capabilities).
+
+The Command Gateway: The entry point for all application mutations. It accepts intent-based CommandFrames directly into pre-allocated memory.
+
+The Distributed Mesh:
+
+RendezvousRouter: Instantly hashes the AggregateId to determine the target cluster node.
+
+RdmaClusterMesh: Maintains sub-microsecond, OS-bypassed InfiniBand/RoCE network connections between nodes.
+
+EpochManager: Interacts with the consensus control plane to enforce fencing tokens and prevent split-brain.
+
+The Execution Kernel (Hot Path):
+
+Runs on threads permanently pinned to physical CPU cores using AffinityScheduler.
+
+Utilizes the ShardExecutor to mutate state sequentially via an LMAX-style Lock-Free Ring Buffer without any synchronization primitives (lock, Mutex).
+
+The Durability Engine:
+
+WalSegmentWriter: Commits serialized commands to an append-only NVMe log utilizing OS-bypass (io_uring / O_DIRECT).
+
+WalReplicator: Streams the log bytes concurrently to peer nodes via the RDMA mesh.
+
+The Polyglot Projection Dispatcher: A background subsystem that projects in-memory state out to N-number of external data stores (PostgreSQL, SQL Server, Oracle, MongoDB) for ad-hoc querying.
+
+2. Comprehensive Requirements Document
+2.1 Functional Requirements
+Declarative Infrastructure: The engine must spin up isolated execution shards, allocate memory, and provision networking strictly based on a developer-provided YAML topology file.
+
+Command-Based Mutation: Applications interact with the OS by sending binary commands. No direct DB manipulation (CRUD) is permitted against the engine's core memory.
+
+Multi-Tenancy: The engine must enforce strict multi-tenancy at the memory level, supporting both Logical Isolation (shared CPU core) and Physical Isolation (dedicated CPU core, memory tier, and network queue).
+
+Polyglot Sinks: The OS must natively stream committed state to external SQL and NoSQL databases, keeping the legacy application read-paths intact.
+
+Engine-Native Business Logic: Developers must be able to deploy their business logic natively into the engine via compiled C# structs or an Expression Tree-based DSL.
+
+2.2 Non-Functional Requirements (The Nanosecond Constraints)
+Zero-Garbage Collection: The execution hot path must trigger zero .NET GC collections. All memory must be managed via a contiguous, Large-Page MemoryArena.
+
+Hardware Alignment: The fundamental unit of network and memory transfer (CommandFrame) must be exactly 64 bytes to align with the CPU L1 Cache Line and eliminate False Sharing.
+
+Cloud Neutrality: The system must run interchangeably on AWS, Azure, and On-Premises bare metal using platform-specific hardware adapters.
+
+WAL-Only Recovery: The engine must never read from SQL to recover. It must rebuild state purely by replaying the Write-Ahead Log at millions of operations per second.
+
+Observability Isolation: Metrics and telemetry must be collected via lock-free buffers (TscMetricsBuffer) and dispatched by a shadow thread to avoid OS Jitter on the execution path.
+
+3. Implementation Plan
+We will structure the solution in Visual Studio 2022 to enforce strict dependency boundaries between the Silicon/Hardware layer and the Business Logic kernel.
+
+3.1 Solution Structure (VectorVolt.sln)
+src/VectorVolt.HAL (Hardware Abstraction: Memory Arena, CPU Affinity, RDMA Mesh)
+
+src/VectorVolt.Kernel (Execution: Shard Executor, Ring Buffers, Transaction Context)
+
+src/VectorVolt.Storage (Durability: WAL Writer, Replicator, Deterministic Recovery)
+
+src/VectorVolt.ControlPlane (Governance: YAML Parser, Epoch Manager, Rendezvous Router, Gateway)
+
+tests/VectorVolt.Tests.Performance (BenchmarkDotNet validation suites)
+
+3.2 Execution Sprints (Code Construction)
+Sprint 1: The Silicon Foundation
+
+Target: Build the MemoryArena using NativeMemory and the 64-byte [StructLayout] for the CommandFrame.
+
+Proof: Allocate 10 million frames without a single GC spike.
+
+Sprint 2: The Heartbeat & Kernel
+
+Target: Build the Lock-Free Ring Buffer (LMAX pattern) and the ShardExecutor.
+
+Proof: Move commands from a simulated network thread to the execution thread in under 50 nanoseconds.
+
+Sprint 3: Durability & The WAL
+
+Target: Implement the WalSegmentWriter and the DeterministicReplayer.
+
+Proof: Safely fsync command batches to disk fast enough to prevent Ring Buffer back-pressure.
+
+Sprint 4: The Distributed Mesh
+
+Target: Implement the RendezvousRouter, RdmaClusterMesh, and EpochManager.
+
+Proof: Hash an incoming command, route it to a secondary node simulator, and increment the Epoch correctly.
+
+Sprint 5: The Data OS Control Plane
+
+Target: Build the YAML parser, the Multi-Tenant isolator, and the Polyglot Projection Dispatcher.
+
+Proof: Define a topology configuration that successfully spins up the components built in Sprints 1-4.
+
+Sprint 6: The "Killer App" Validation
+
+Target: Build VVX (VectorVolt Exchange), a high-frequency trading matching engine, as the reference application to validate the complete Data OS workflow.
+
+Review and Sign-Off
+Please review this document. If these requirements and the 6-Sprint plan match your exact vision, simply reply with your approval. Upon receiving it, I will immediately output the first file generation commands for Sprint 1 in Visual Studio 2022.
+
+

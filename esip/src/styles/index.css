@@ -1,0 +1,48 @@
+@import './fonts.css';
+@import './tailwind.css';
+@import './theme.css';
+
+/* ── Print / PDF export ───────────────────────────────────────────────────── */
+
+@media print {
+  /* Hide all chrome */
+  nav, aside,
+  [data-sidebar], [data-toolbar],
+  .no-print,
+  [data-drag-handle] { display: none !important; }
+
+  /* Show only print root */
+  body { background: white !important; color: black !important; margin: 0 !important; }
+
+  /* Editor content fills the page */
+  .ProseMirror {
+    max-width: 100% !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+    font-size: 11pt !important;
+    line-height: 1.5 !important;
+    color: black !important;
+  }
+
+  /* Keep widgets together */
+  [data-node-view-wrapper],
+  table,
+  .bpmn-container,
+  .react-flow {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* Force white backgrounds on cards */
+  [class*="bg-card"],
+  [class*="bg-muted"] { background: white !important; }
+
+  /* Borders */
+  [class*="border-border"] { border-color: #ddd !important; }
+
+  /* Hide toolbar buttons inside widgets */
+  [data-node-view-wrapper] button { display: none !important; }
+}
+
+@page { margin: 15mm; }

@@ -1,0 +1,33 @@
+FROM: Daniel Frost <d.frost@acme-corp.com>
+TO: Priya Nair <p.nair@acme-corp.com>; James Whitfield <j.whitfield@acme-corp.com>
+CC: Sarah Chen <s.chen@acme-corp.com> (Finance)
+DATE: 2026-06-14 09:42 AM
+SUBJECT: RE: FieldOps 2.0 PRD Review - Google Maps Cost Concern
+
+Hi Priya, James,
+
+Thanks for sharing the PRD v1.3. I've gone through Sections 3.1.4 and 5 in detail and I have a concern
+I need to flag before we commit to Google Maps Platform.
+
+The cost model in the Excel puts monthly spend at roughly $2,700 under normal conditions — fine, within
+the $3,000 cap. But the model assumes 2,000 active technicians. We have a contract renewal with RegionEast
+pending signature that, if it closes, would bring active technicians to approximately 3,200 by Q4 2026.
+At 3,200 technicians the same formula pushes monthly spend to around $4,300 — over cap by 43%.
+
+I checked with Sarah in Finance and the $3,000 cap is a hard number — it cannot be increased this fiscal
+year due to the budget freeze.
+
+Two questions:
+1. Has the team evaluated HERE Maps? I saw a proposal from HERE last quarter with per-technician pricing
+   that scales more predictably. Was it formally rejected, or just not evaluated?
+2. If we keep Google Maps, what is the throttling / degradation plan once we hit the $2,500 alarm?
+   The PRD says "auto-disable batch job" but the batch PM clustering is how we generate the daily
+   route plans for 40% of our jobs. Disabling it silently would be a significant service degradation
+   that our field teams won't understand.
+
+I don't want to block the project — I want to make sure we don't discover this problem three weeks
+before go-live.
+
+Regards,
+Daniel Frost
+VP Field Operations

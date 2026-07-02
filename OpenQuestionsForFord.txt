@@ -1,0 +1,68 @@
+10. Open Questions for Ford Pro
+The following questions must be answered by Ford Pro before OEC can finalise the technical design and begin development.
+
+10.1 Identity & Users
+•	What is Ford Pro’s user identity model? Is a ‘Ford Pro user’ always a fleet manager, or can it be a driver or shop technician? This determines how much access control we apply at the RLS account level.
+•	Can a single Ford Pro user be associated with multiple fleet companies? If yes, which company/billing account applies when they order parts?
+•	What happens when a Ford Pro user’s account is deactivated or suspended? Should OEC automatically disable the linked RLS account? Is there a user lifecycle event API or webhook on Ford Pro’s side?
+•	Who owns the RLS account — Ford Pro or the end user? If a fleet manager leaves Ford Pro, can they retain their RLS account?
+
+10.2 Dealer & Inventory
+•	How does Ford Pro identify dealers today? What is the dealer ID format in Ford Pro’s system, and how do we map it to OEC’s VendorId? Will Ford Pro provide a dealer mapping table?
+•	Does Ford Pro have a preferred dealer relationship per fleet account? How is dealer preference stored, and should it be passed at punchout launch?
+•	Are there dealers in Ford Pro’s network that are not RepairLink participants? How should we handle the case where the fleet’s preferred dealer is not on OEC’s platform?
+
+10.3 Order Notification
+•	Which of the three notification options (A: Webhook, B: API Poll, C: AWS SQS) does Ford Pro prefer? This is the most critical architectural decision to agree on.
+•	If Option A (Webhook): What is the endpoint URL Ford Pro will expose? What authentication/signature verification method does Ford Pro prefer — HMAC-SHA256 or JWT?
+•	If Option C (SQS): Is Ford Pro already on AWS? Can they consume from an OEC-managed SQS queue, or do they need OEC to push to a Ford Pro-managed queue?
+•	Does Ford Pro want line-item level order data, or just the order header (total, VIN, dealer)?
+
+10.4 Punchout UI
+•	Should RepairLink open in an iframe inside Ford Pro, or as a full redirect to a new page? Iframe has limitations with third-party cookie policies in modern browsers — this must be tested.
+•	Will Ford Pro always pass a VIN, or are there cases where only Year/Make/Model is available? The punchout supports both, but we need to know the fallback scenario.
+•	What should happen if the user closes the punchout without placing an order? Should Ford Pro display any messaging, or is it a silent no-op?
+
+10.5 Metrics & Commercials
+•	Does Ford Pro have a formal mechanism to receive the daily metrics batch — SFTP, S3, or API pull? Which does their data team prefer?
+•	Is Ford Pro authorised to receive DNET (Dealer Net) pricing data? This requires a commercial agreement to be in place before OEC can include it in any data exports.
+•	What is Ford Pro’s agreed methodology for ‘cart abandoned’? OEC’s proposal: punchout sessions launched minus confirmed orders = abandoned. Does Ford Pro agree?
+
+
+
+11. Open Questions for OEC Internal IAM Team
+The following must be resolved internally with OEC’s IAM team before commitments can be made to Ford Pro.
+
+11.1 Okta Configuration
+•	Can Okta be configured to support a custom claim (fordProUserId) in the OAuth2 access token for the Ford Pro client application? Is this within the scope of a standard Okta configuration, or does it require a custom Okta policy?
+•	What is the current refresh token TTL on OEC’s Okta tenant? Can it be set to a minimum of 30 days for fleet use cases where users may be inactive for extended periods?
+•	Can Okta support multiple OAuth2 client registrations (one for Ford Pro, one for future partners) while sharing the same underlying user store? What is the process to register a new client application?
+•	Does OEC’s Okta tenant support SCIM for Just-in-Time (JIT) user provisioning? If yes, what is the effort to enable it and what attributes can be passed?
+
+11.2 Security & Compliance
+•	Can the user provisioning API (POST /rls/user/create) be secured with a separate OAuth2 client credential scope, independent from the user-facing SSO scope? This ensures server-to-server provisioning cannot be called from client-side code.
+•	What is OEC’s approved mechanism for webhook signature verification — HMAC-SHA256 or JWT? Is there an existing signing infrastructure we can leverage?
+•	Is there a rate limit on Okta token issuance that could become a bottleneck at Ford Pro fleet scale (potentially thousands of concurrent fleet managers)?
+•	Does sharing DNET pricing data with Ford Pro require a security or data privacy review? Who is the DLP owner for this data classification?
+
+11.3 AWS SQS (If Option C is Selected)
+•	Does OEC have an existing AWS account and SQS infrastructure, or would this need to be provisioned for this integration?
+•	Who owns the SQS queue — OEC or Ford Pro? OEC’s recommendation is OEC owns the queue and grants Ford Pro consume permissions via IAM policy.
+•	Is there an OEC data architecture or platform team who needs to be involved in the SQS setup? What is the provisioning lead time?
+
+11.4 Existing User Migration
+•	Can OEC’s IAM team provide a clean export of RLS user email addresses for the migration match process? What is the data handling protocol (PII)?
+•	Is there a process to bulk-update existing RLS accounts with a fordProUserId external identifier field? Or does each account need to be updated via API call?
+•	Who is the DBA or platform owner who needs to approve the migration script before it runs against the production user database?
+ 
+12. Decision Log
+The following decisions were made during the April 2026 Ford Pro / OEC design meeting.
+
+ID	Decision	Outcome	Owner
+D-001	Auth Protocol	OAuth2 only. SAML will not be supported.	OEC
+D-002	Order Ownership	Order is completed inside RepairLink. Ford Pro does not handle checkout or cart transfer.	Both
+D-003	Multi-VIN	Users can change VIN within a single RepairLink session. Multi-tab concurrent sessions are not required.	Both
+D-004	User Migration	Email match strategy for existing RLS users. No duplicate accounts.	OEC
+D-005	Notification Option	Ford Pro to select from Options A / B / C. Pending.	Ford Pro
+D-006	Provisioning Option	Ford Pro to select from Options A / B / C. OEC recommends Option B (API).	Ford Pro
+

@@ -1,0 +1,584 @@
+--- Page 220 ---
+Intel® Data Streaming Accelerator Architecture Specification
+IDPT
+Base: BAR0 Offset: Table-Offset + Index × IDPTE-Size Size: IDPTE-Size bytes
+Bytes Bits Attr Size Description
+31:24 63:12 RWL 52 bits Submitter Bitmap Address
+This field specifies the upper 52 address bits of a 4 KB aligned
+submitter bitmap region in memory. Bits 11:0 are not specified
+and are treated as 0.
+If Type is 1, a descriptor’s PASID must have a corresponding
+bit set to 1 in the bitmap.
+If Type is 0, this field is reserved.
+This field is read-only while Usable is 1.
+11:0 RSVD 12 bits Reserved.
+23:16 63:0 RWL 64 bits Window Size
+Size in bytes of the memory window.
+This field must be non-zero if Window Enable is 1.
+This field is read-only while Usable is 1 or Allow Update is 1.
+This field is reserved if Window Enable is 0.
+15:8 63:0 RWL 64 bits Window Base
+Base address of the memory window.
+This field is read-only while Usable is 1 or Allow Update is 1.
+This field is reserved if Window Enable is 0.
+7:4 31:12 RWL 20 bits Access PASID
+This PASID is used to access memory.
+This field must match the PASID of an Update Window
+descriptor.
+This field is read-only while Usable is 1 or Allow Update is 1.
+11:5 RSVD 7 bits Reserved.
+4 RWL 1 bit Window Mode
+0: Address Mode. Address field in the descriptor must be
+greater than or equal to the window base and must be less
+than the sum of window base and window size.
+1: Offset Mode. Address field in the descriptor is an offset and
+must be less than the window size. Descri
+--- Page 221 ---
+Intel® Data Streaming Accelerator Architecture Specification
+IDPT
+Base: BAR0 Offset: Table-Offset + Index × IDPTE-Size Size: IDPTE-Size bytes
+2 RWL 1 bit Access Privilege
+This controls the privilege used to access memory.
+0: Overrides the privilege of the descriptor. Memory access
+using this entry specifies user privilege (priv field equal to 0).
+1: Memory access using this entry uses the privilege of the
+descriptor.
+This field is read-only while Usable is 1 or Allow Update is 1.
+1 RWL 1 bit Write Permissions
+0: Memory writes are not allowed using this entry.
+1: Memory writes are allowed using this entry
+This field is read-only while Usable is 1 or Allow Update is 1.
+0 RWL 1 bit Read Permissions
+0: Memory reads are not allowed using this entry.
+1: Memory reads are allowed using this entry.
+This field is read-only while Usable is 1 or Allow Update is 1.
+3:0 31:12 RWL 20 bits Submitter PASID
+If Type is 0, this field must match the PASID of an inter-
+domain descriptor.
+If Type is 1, this field is reserved.
+This field is read-only while Usable is 1.
+11:4 RSVD 8 bits Reserved.
+3:2 RWL 2 bits Type
+0: Single-access, single-submitter entry (SASS)
+1: Single-access, multi-submitter entry (SAMS)
+2: Reserved
+3: Reserved
+This field is read-only while Usable is 1 or Allow Update is 1.
+See section 3.14.1 for details on the different types of entries.
+1 RW 1 bit Allow Update
+0: Window attributes cannot be modified using an Update
+Window descriptor. Window attributes may be modified by
+writin
+--- Page 222 ---
+Intel® Data Streaming Accelerator Architecture Specification
+9.2.30 DSA Capabilities (DSACAP0)
+DSACAP0
+Base: BAR0 Offset: 0x180 Size: 8 bytes (64 bits)
+Bits Attr Size Description
+63:55 RO 8 bits Unused
+55:48 RO 8 bits Maximum Scatter Gather Descriptors in Progress
+The maximum number of Scatter Gather descriptors that each engine
+is capable of concurrently processing at any time. This field is undefined
+if the Descriptors in Progress Limit Supported field is GRPCAP is 0 or if
+Scatter Gather operations are not supported in OPCAP.
+47:32 RO 16 bits SGL Formats Supported
+Bitmask indicating which of the SGL formats described in section 8.1.14
+are supported. Bit 0 is reserved. Bit 1 corresponds to SGL format 1, bit 2
+corresponds to SGL format 2 and so on.
+31:15 RO 17 bits Unused
+14:8 RO 7 bits Operations with Inter-Domain Support
+Bitmask indicating which operations support use of IDPT handles. If a
+bit is 0, the corresponding operation may not specify IDPT handles. If a
+bit is 1, the corresponding operation is allowed to specify IDPT handles.
+The operation corresponding to each bit position are shown below.
+Bit 8: Type Conversion
+Bit 9: Reduce
+Bit 10: Reduce with Dualcast
+Bit 1 1: Unused
+Bit 12: Gather Copy
+Bit 13: Scatter Copy
+Bit 14: Scatter Fill
+Use of IDPT Handles in operations for which the corresponding bit
+position is 0 is not supported. This field is undefined if the Inter-Domain
+Support field in GENCAP is 0.
+7:4 RO 4 bits Maximum Supported Gather Reduce Block Size
+The maxim
+--- Page 223 ---
+Intel® Data Streaming Accelerator Architecture Specification
+9.2.31 DSA Capabilities (DSACAP1)
+DSACAP1
+Base: BAR0 Offset: 0x188 Size: 8 bytes (64 bits)
+Bit Attr Size Description
+63:48 RO 16 bits Compute Operations Supported
+Bitmask indicating which compute operations are supported by the
+device. Each bit corresponds to the compute operation type with the
+same code as the bit position. See section 8.1.11 for the encoding of
+compute operations.
+47:32 RO 16 bits Floating-Point Data Type Down Conversion Support
+Bit 32: FP16 to FP8_E5M2
+Bit 33: BF16 to FP8_E5M2
+Bit 34: FP32 to FP8_E5M2
+Bit 35: FP16 to FP8_E4M3
+Bit 36: BF16 to FP8_E4M3
+Bit 37: FP32 to FP8_E4M3
+Bit 38: FP32 to FP16
+Bit 39: FP32 to BF16
+Bit 40: FP64 to FP32
+Bits 47:41: Reserved
+If a bit is 1, the corresponding conversion is supported; otherwise, it is
+not supported.
+31:16 RO 16 bits Floating-Point Data Type Up Conversion Support
+Bit 16: FP8_E5M2 to FP16
+Bit 17: FP8_E5M2 to BF16
+Bit 18: FP8_E5M2 to FP32
+Bit 19: FP8_E4M3 to FP16
+Bit 20: FP8_E4M3 to BF16
+Bit 21: FP8_E4M3 to FP32
+Bit 22: FP16 to FP32
+Bit 23: BF16 to FP32
+Bit 24: FP32 to FP64
+Bits 31:25: Reserved
+If a bit is 1, the corresponding conversion is supported; otherwise, it is
+not supported.
+15:0 RO 16 bits Data Types Supported
+Bitmask indicating which data types are supported by the device. Each
+bit corresponds to the data type with the same code as the bit position.
+See section 8.1.10 for the encoding of data types.
+Revision: 3.0 Page 223
+--- Page 224 ---
+Intel® Data Streaming Accelerator Architecture Specification
+9.2.32 DSA Capabilities (DSACAP2)
+DSACAP2
+Base: BAR0 Offset: 0x190 Size: 8 bytes (64 bits)
+Bit Attr Size Description
+63:20 RO 44 bits Unused
+19:12 RO 8 bits Rounding Type Support
+Bits 19:16: Unused
+Bit 15: Round toward Zero (RTZ)
+Bit 14: Round Up (RU)
+Bit 13: Round Down (RD)
+Bit 12: Round to Nearest Even (RNE)
+If a bit is 1, the corresponding rounding type is supported; otherwise, it is
+not supported.
+11:9 RO 3 bits Unused
+8 RO 1 bit Saturate Integer Result Support
+0: Integer output result saturation is not supported.
+1: Software can control integer output result saturation using the
+Saturate Integer Result flag in Compute Flags (described in section
+8.1.12).
+7 RO 1 bit Signed Integer Support
+0: Signed integer operands are not supported.
+1: Software can control whether integer operands are treated as signed
+or unsigned values using the Treat Integers as Signed Values flag in
+Compute Flags (described in section 8.1.12).
+6:4 RO 3 bits Unused
+3 RO 1 bit Denormal as Zero (DAZ) Support
+0: Treating a denormal operand as a zero value is not supported.
+1: Software can control the handling of denormal operands using the
+Denormal as Zero flag in Compute Flags (described in section 8.1.12).
+2 RO 1 bit Flush to Zero (FTZ) Support
+0: Conversion of a denormal result to a zero value is not supported.
+1: Software can control the handling of a denormal result using the
+Flush to Zero flag in Compute Flags (described in section 8.1.12
+--- Page 225 ---
+Intel® Data Streaming Accelerator Architecture Specification
+9.3 Portals (BAR2)
+Portals are used to submit descriptors to the device. Portals are located in the address space specified
+by BAR2. Each portal is 64 bytes in size and is located on a separate 4 KB page. This allows the portals
+to be independently mapped into different address spaces using CPU page tables and extended page
+tables.
+There are four portals per WQ, as shown in Figure 9-2. When submitting work to a portal, bits 5:0 of the
+portal address must be 0. Bits 11:6 are ignored; thus any 64-byte-aligned address on the page can be
+used with the same effect.
+Descriptor submissions to a portal for an SWQ must be performed using 64-byte Deferrable Memory
+Write transactions (DMWr). Any other write operation to an SWQ portal is ignored. Descriptor
+submissions to a DWQ must be performed using a 64-byte write operation. On Intel CPUs, software
+should use the MOVDIR64B instruction to generate a non-torn 64-byte write. A DMWr transaction to a
+disabled or dedicated WQ portal returns Retry. Any other write operation to a DWQ portal is ignored.
+Any read operation to the BAR2 address space returns 0x00 or 0xFF in all bytes. Reads to the BAR 2
+address space are not ordered with respect to any other transactions to the device and cannot be used
+to ensure that upstream write operations have completed. See section 5.3 for more information on error
+checking and reporting related to portal accesses.
+64-byte DMWr 64-byte posted Non-
+--- Page 226 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Revision: 3.0 Page 226
+P
+P
+P
+P
+N
+P
+o ff s e t
+0 0 0 0 h
+1 0 0 0 h
+2 0 0 0 h
+3 0 0 0 h
+4 0 0 0 h
+5 0 0 0 h
+6 0 0 0 h
+7 0 0 0 h
+8 0 0 0 h
+9 0 0 0 h
+A 0 0 0 h
+B 0 0 0 h
+C 0 0 0 h
+D 0 0 0 h
+E 0 0 0 h
+F 0 0 0 h
++ 0 0 0 0
++ 1 0 0 0
++ 2 0 0 0
++ 3 0 0 0
+= N u m b
+= (N –
+h
+h
+h
+h
+e
+×
+r o
+4
+f
+0
+W
+0
+U n
+L im
+U n
+L im
+U n
+L im
+U n
+L im
+U n
+L im
+U n
+L im
+U n
+L im
+U n
+L im
+U n
+L im
+U n
+L im
+Q s
+0 h
+lim
+ite
+lim
+ite
+lim
+ite
+lim
+it e
+lim
+ite
+lim
+it e
+lim
+ite
+lim
+it e
+lim
+ite
+lim
+it e
+ite d
+d M
+ite d
+d IM
+ite d
+d M
+it e d
+d IM
+ite d
+d M
+it e d
+d IM
+ite d
+d M
+it e d
+d IM
+... ...
+ite d
+d M
+it e d
+d IM
+M S I- X P o r t
+S I- X P o r t a l
+IM S P o r t a l
+S P o r t a l
+M S I- X P o r t
+S I- X P o r t a l
+IM S P o r t a l
+S P o r t a l
+M S I- X P o r t
+S I- X P o r t a l
+IM S P o r t a l
+S P o r t a l
+M S I- X P o r t
+S I- X P o r t a l
+IM S P o r t a l
+S P o r t a l
+M S I- X P o r t
+S I- X P o r t a l
+IM S P o r t a l
+S P o r t a l
+a
+a
+a
+a
+a
+l
+l
+l
+l
+l
+W
+W
+W
+W
+W
+Q
+Q
+Q
+Q
+Q
+0
+1
+2
+3
+N - 1
+Figure 9-2: Portals
+§
+--- Page 227 ---
+Intel® Data Streaming Accelerator Architecture Specification
+CRC Computation
+Intel DSA computes CRC using a method that produces results matching the following description.
+Intel DSA computes 32-bit CRC using the polynomial 0x11edc6f41 following the specification in the
+iSCSI Protocol (RFC 3720).
+For 64-bit CRC, Intel DSA uses the polynomial 0x1ad93d23594c93659, as defined in the NVM Express
+specification.
+The following description is adapted from RFC 3720. ‘w’ is the CRC Size, either 32 or 64. ‘n’ is the
+number of data bits. When the Transfer Size is not a multiple of w bits, the source data is padded on the
+end with zeros to a multiple of w bits.
+— The data bits are considered as the coefficients of a polynomial M(x) of degree n-1. The least
+significant bit (bit 0) of the first byte of the data is the coefficient of the most significant term (xn-1),
+followed by bit 1 of the first byte, and so on through bit 7 of the highest numbered byte (x0).
+— The most significant w bits of the data are complemented.
+— The polynomial is multiplied by xw, then divided by G(x). The generator polynomial produces a
+remainder R(x) of degree  w - 1.
+— The coefficients of R(x) are considered a w-bit sequence.
+— The bit sequence is complemented, and the result is the CRC value.
+— The bits of the CRC value are stored in the CRC Value field of the completion record as follows:
+The xw-1 coefficient is stored in the least significant bit (bit 0) of byte 0 of the field, followed by the xw-
+2 coeffici
+--- Page 228 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Revision: 3.0 Page 228
+--- Page 229 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Data Integrity Field (DIF)
+The Data Integrity Field (DIF) provides a system solution to protect the communication path between a
+host and storage device for end-to-end data integrity. Enterprise drives can be formatted with sector
+sizes that include an extra 8 bytes of information per sector which can be used to store integrity
+information. DIF was introduced as a way to use those extra bytes in an open standard.
+Intel DSA performs DIF computation on a block of source data organized in 512B, 520B, 4096B, or
+4104B blocks. It can check, strip, insert, or update the Guard Tag, Application Tag, and Reference Tag
+fields from source data and write the result to a destination buffer. The DIX generate operation may be
+used to generate the Guard Tag, Application Tag, and Reference Tag fields from source data, and write
+them to the destination address.
+The 8 bytes of DIF information are divided up as follows:
+• A 16-bit Guard Tag (CRC of the data, using the polynomial 0x18bb7).
+• A 16-bit Application Tag.
+• A 32-bit Reference Tag.
+The guard tag protects the data portion of the sector. The application tag is opaque storage information.
+The reference tag protects against out-of-order and misdirected writes. Standardizing the contents of
+the protection information enables all nodes in the I/O path, including the disk itself, to verify the integrity
+of the data block.
+Byte Byte
+0 N - 1 N N + 2 N + 4 N + 7
+Data block Guard Tag App
+--- Page 230 ---
+Intel® Data Streaming Accelerator Architecture Specification
+written to the destination. However, there is a flag in the descriptor to force the Reference Tag values
+read from the source to be written to the destination. In this case, the destination tag fields in the
+descriptor are ignored.
+Application Tag
+The Application Tag is initialized from the Application Tag Seed field in the descriptor. The tag may be
+fixed or incrementing, and the final value is written to the completion record, similar to the Reference
+Tag. The Application Tag Mask is applied to the application tag value before using it. Bits in the tag value
+corresponding to 0 bits in the mask are retained, while bits in the tag value corresponding to 1 bits in the
+mask are forced to 0. If the application tag is incrementing, the mask is applied after incrementing the
+tag value. Depending on the bits set in the mask, the effect of incrementing the tag value may be masked
+off, resulting in the same tag value being used for multiple blocks. To avoid this, the application tag mask
+should typically be set to mask only higher-order bits. The Source Application Tag Mask may be set to
+0xffff to disable application tag checking.
+For the DIF Update operation, there are separate fields in the descriptor to determine the source and
+destination Application Tag values, just as there are for the Reference Tag. There are also separate fields
+for the Source Application Tag Mask and Destination Application Tag Mask. As for the Ref
+--- Page 231 ---
+Intel® Data Streaming Accelerator Architecture Specification
+B.1 DIF Check
+The DIF Check operation is used to check the validity of the Data Integrity Fields in the source data.
+When performing a DIF Check operation, Intel DSA performs the following actions on each block of
+source data and the associated DIF:
+• Optionally calculate the Guard Tag and compare it to the Guard Tag field in the source DIF value.
+• Optionally verify the Application Tag and Reference Tag in the source DIF value.
+• Update the Application Tag and Reference Tag for the next block of data, based on the Source
+DIF Flags field of the descriptor.
+At least one of the Guard Tag, Application Tag, or Reference Tag should be checked; otherwise, this
+operation does nothing.
+B.2 DIF Insert
+The DIF Insert operation is used to add Data Integrity Fields when the source data does not contain
+them. When performing a DIF Insert operation, the device performs the following actions on each block
+of source data:
+• Calculate the Guard Tag.
+• Combine the Guard Tag, Application Tag and Reference Tag into a DIF value.
+• Write the source data to the destination, appending the DIF value.
+• Update the Application Tag and Reference Tag for the next block of data, based on the
+Destination DIF Flags field of the descriptor.
+For a DIF Insert operation, the destination buffer size is given by
+𝑇𝑆
+Destination Buffer Size=𝑇𝑆+( )×8
+𝐵𝑆
+where TS is the Transfer Size (source data size) and BS is the DIF Block Size.
+B.3 DIF Strip
+The DIF Str
+--- Page 232 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Update operation, the device performs the following actions on each block of source data and the
+associated DIF:
+• Calculate the Guard Tag value.
+• Optionally compare the computed Guard Tag value to the Guard Tag field in the source DIF value.
+• Optionally verify the Source Application Tag and Source Reference Tag in the source DIF value.
+• Combine the computed Guard Tag, the Destination Application Tag, and the Destination
+Reference Tag into a destination DIF value.
+• Write the source data to the destination, with the source DIF value replaced by the destination DIF
+value.
+• Update the Source Application Tag and Source Reference Tag for the next block of data, based
+on the Source DIF Flags field of the descriptor.
+• Update the Destination Application Tag and Destination Reference Tag for the next block of data,
+based on the Destination DIF Flags field of the descriptor.
+For a DIF Update operation, the destination buffer size is the same as the Transfer Size.
+The required destination buffer size for various DIF operations can be computed as shown in this table.
+If a DIF operation does not fully complete, the bytes written to the destination can be computed from
+the Bytes Completed field of the completion record.
+BS = DIF block size
+N = number of blocks to process
+M = number of blocks completed
+Transfer Size Destination Bytes Bytes Written to
+Buffer Size Completed Destination (Can be
+computed by SW)
+DIF-Check (BS+8) 
+--- Page 233 ---
+Intel® Data Streaming Accelerator Architecture Specification
+PCIe Configuration Registers
+This appendix provides details of PCIe configuration registers for Intel DSA.
+Vendor ID (VID)
+VENDOR ID (VID)
+Identifies the manufacturer of the device.
+Base: Rootbus CFG Offset: 0x0 Size: 2 bytes (16 bits)
+Default Value: 0x8086
+Bits Attr Size Default Val Description
+15:0 RO 16 0x8086 Vendor ID (VID)
+Indicates Intel (8086h).
+Device ID (DID)
+DEVICE ID (DID)
+Identifies the particular device.
+Base: Rootbus CFG Offset: 0x2 Size: 2 bytes (16 bits)
+Default Value: Implementation defined
+Bits Attr Size Default Val Description
+15:0 ROS 16 Implementation Device ID (DID)
+defined Allocated by the vendor.
+PCI Command (PCICMD)
+PCI COMMAND (PCICMD)
+The Command register provides coarse control over a device's ability to generate and respond to PCI
+cycles. When a 0 is written to this register, the device is logically disconnected from the PCI bus for all
+accesses except configuration accesses.
+Base: Rootbus CFG Offset: 0x4 Size: 2 bytes (16 bits)
+Default Value: 0x0000
+Bits Attr Size Default Val Description
+15:11 RSVD 5 0x00 Reserved.
+10 RO 1 0x0 Interrupt Disable (INTD)
+Controls the ability of the Function to generate
+INTx interrupts. This Function does not generate
+INTx interrupts, so this bit it hardwired to 0b.
+9 RO 1 0x0 Fast Back-to-Back Enable (FBE)
+Does not apply to PCI Express and is hardwired to
+0b.
+Revision: 3.0 Page 233
+--- Page 234 ---
+Intel® Data Streaming Accelerator Architecture Specification
+PCI COMMAND (PCICMD)
+The Command register provides coarse control over a device's ability to generate and respond to PCI
+cycles. When a 0 is written to this register, the device is logically disconnected from the PCI bus for all
+accesses except configuration accesses.
+Base: Rootbus CFG Offset: 0x4 Size: 2 bytes (16 bits)
+Default Value: 0x0000
+Bits Attr Size Default Val Description
+8 RW 1 0x0 SERR# Enable (SEE)
+When Set, this bit enables reporting of Non-Fatal
+and Fatal errors detected by the Function to the
+Root Complex. Note that errors are reported if
+enabled either through this bit or through the PCI
+Express specific bits in the Device Control register.
+7 RO 1 0x0 Wait Cycle Control (WCC)
+Does not apply to PCI Express and is hardwired to
+0b.
+6 RW 1 0x0 Parity Error Response Enable (PERE)
+This bit controls the logging of poisoned TLPs in the
+Master Data Parity Error bit in the Status register.
+5 RO 1 0x0 VGA Palette Snoop Enable (VGAPSE)
+Does not apply to PCI Express and is hardwired to
+0b.
+4 RO 1 0x0 Memory Write and Invalidate Enable (MWIE)
+Does not apply to PCI Express and is hardwired to
+0b.
+3 RO 1 0x0 Special Cycle Enable (SCE)
+Does not apply to PCI Express and is hardwired to
+0b.
+2 RW 1 0x0 Bus Master Enable (BME)
+Controls the ability of the endpoint to issue
+Memory Read/Write requests. When set, the
+Function is allowed to issue Memory Requests.
+When clear, the Function is not allowed to issue
+Memory Request
+--- Page 235 ---
+Intel® Data Streaming Accelerator Architecture Specification
+PCI COMMAND (PCICMD)
+The Command register provides coarse control over a device's ability to generate and respond to PCI
+cycles. When a 0 is written to this register, the device is logically disconnected from the PCI bus for all
+accesses except configuration accesses.
+Base: Rootbus CFG Offset: 0x4 Size: 2 bytes (16 bits)
+Default Value: 0x0000
+Bits Attr Size Default Val Description
+0 RO 1 0x0 I/O Space Enable (IOSE)
+Controls the Function's response to I/O Space
+accesses. A value of 0 disables the response.
+Hardwired to 0 as this Function does not support
+I/O Space accesses.
+PCI Status (PCISTS)
+PCI STATUS (PCISTS)
+The Status register is used to record status information for PCI bus related events.
+Base: Rootbus CFG Offset: 0x6 Size: 2 bytes (16 bits)
+Default Value: 0x0010
+Bits Attr Size Default Val Description
+15 RW1C 1 0x0 Detected Parity Error (DPE)
+This bit is Set by a Function whenever it receives a
+Poisoned TLP, regardless of the state the Parity
+Error Response bit in the Command register.
+14 RW1C 1 0x0 Signaled System Error (SSE)
+This bit is Set when a Function sends an
+ERR_FATAL or ERR_NONFATAL Message, and the
+SERR# Enable bit in the Command register is 1.
+13 RW1C 1 0x0 Received Master Abort (RMA)
+This bit is Set when a Requester receives a
+Completion with Unsupported Request Completion
+Status.
+12 RW1C 1 0x0 Received Target Abort (RTA)
+This bit is Set when a Requester receives a
+Completion with Completer Abort

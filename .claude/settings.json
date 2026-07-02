@@ -1,0 +1,36 @@
+{
+    "permissions": {
+        "allow": [
+            "mcp__Claude_Preview__preview_screenshot",
+            "mcp__Claude_Preview__preview_eval",
+            "mcp__Claude_Preview__preview_console_logs",
+            "mcp__Claude_Preview__preview_logs",
+            "mcp__Claude_Preview__preview_snapshot",
+            "mcp__Claude_Preview__preview_start",
+            "mcp__Claude_Preview__preview_list",
+            "mcp__Claude_Preview__preview_click",
+            "mcp__Claude_Preview__preview_fill",
+            "mcp__ccd_session__mark_chapter",
+            "mcp__ccd_session__spawn_task",
+            "mcp__b999df2a-cac6-4e51-830f-18bb5a1ad517__create_diagram",
+            "mcp__visualize__show_widget",
+            "mcp__visualize__read_me",
+            "PowerShell(Get-ChildItem *)",
+            "PowerShell(Test-Path *)",
+            "PowerShell(Select-String *)",
+            "PowerShell(Get-Content *)",
+            "PowerShell(Format-Table *)",
+            "PowerShell(Format-List *)",
+            "PowerShell(Select-Object *)",
+            "PowerShell(Sort-Object *)",
+            "PowerShell(Where-Object *)",
+            "PowerShell(Measure-Object *)",
+            "PowerShell(Write-Output *)",
+            "PowerShell(ConvertFrom-Json *)",
+            "PowerShell(ConvertTo-Json *)",
+            "PowerShell(Join-Path *)",
+            "PowerShell(Split-Path *)",
+            "PowerShell(Resolve-Path *)"
+        ]
+    }
+}

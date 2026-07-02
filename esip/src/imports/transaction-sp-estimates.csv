@@ -1,0 +1,54 @@
+Task	Optimistic (hrs)	MostLikely (hrs)	Pessimistic (hrs)	PERT Expected (hrs)	StdDev (hrs)	Variance (hrs^2)	Notes
+Transaction_pr_Transaction_Select (trx core row)	4	10	28	12	4	16	Translate joins and lookups to EF: projection DTO, concurrency token (RowVersionStamp), locale handling. Copilot will draft LINQ; manual review/opt required.
+Transaction_pr_PartPool_Select	2	7	15	7.5	2.167	4.6944	Translate temp-table/CTE-based filters to subqueries or in-memory HashSet filters. Ensure projection columns and localization.
+Transaction_pr_Document_Select_By_TrxNo	3	10	20	10.5	2.833	8.0278	CTE->LINQ translation, grouped adjustment joins. Maintain nullable semantics and ordering if required by callers.
+Transaction_pr_LineItem_Select	5	14	34	15.83	4.833	23.3611	Largest single SP: many joins, aggregated adjustment columns, CTEs -> LINQ GroupBy. Focus on projections to avoid huge tracked graphs.
+Transaction_pr_TransactionChain_Select	2	5	10	5.33	1.333	1.7778	Simple chain pointer selects, two resultsets. Convert to two LINQ queries or a composed DTO.
+Transaction_pr_DocumentChain_Select_By_TrxNo	2	5	10	5.33	1.333	1.7778	CTE-based source selection then two resultsets; preserve semantics.
+Transaction_pr_LineItemChain_Select	2	5	10	5.33	1.333	1.7778	Preceding/succeeding relations for line items; two resultsets.
+Transaction_pr_TransactionEventLog_Select	2	7	15	7.5	2.167	4.6944	ExternalOnly flag handling -> conditional filtering; project event type + reason.
+Transaction_pr_DocumentEventLog_Select	2	7	15	7.5	2.167	4.6944	Multilevel filtering (trx/doc); keep comment and created/updated metadata.
+Transaction_pr_LineItemEventLog_Select	2	7	15	7.5	2.167	4.6944	Temp table replaced by subquery/CTE logic; convert to LINQ with proper joins.
+Transaction_pr_Contact_Select	2	8	16	8.33	2.333	5.4444	Two recordsets (trx & doc). Map ContactType and locale fields; ensure caller contract preserved.
+Transaction_pr_Vehicle_Select	2	7	15	7.5	2.167	4.6944	Two recordsets (one is often dummy in current proc). Translate vehicle fields and type lookup.
+Transaction_pr_AdjustmentStack_Select_v02	6	19	48	21.67	7	49	Conditional SUMs by AdjustmentSubTypeKey -> LINQ GroupBy with conditional sums. Multi-resultset behavior for doc and line level; careful performance testing.
+Transaction_pr_Attachment_Select	6	19	48	21.67	7	49	Three resultsets (trx/doc/line), attachments metadata and binary storage decisions. Decide DB varbinary vs blob storage and implement streaming; include migration planning.
+Transaction_pr_TransactionAttributeValue_Select	2	5	10	5.33	1.333	1.7778	Simple attribute key/value mapping; translate attribute type and status filters.
+Transaction_pr_DocumentAttributeValue_Select	2	5	10	5.33	1.333	1.7778	Source table selection to map doc attributes; replace temp table with subquery/CTE.
+Transaction_pr_LineItemAttributeValue_Select_By_TrxNo	3	10	20	10.5	2.833	8.0278	LineItem attribute selections; ensure transaction/document status filters and joins preserved.
+Data model design & ER mapping (EF Core entities + relationships)	24	64	100	63.33	12.667	160.4444	Scaffold schema or hand-craft entities; refine relationships and navigation properties; handle RowVersionStamp concurrency tokens and lookups.
+DbContext & EF Core mappings (Fluent config, indexes, migrations)	14	38	72	39.67	9.667	93.4444	Context, DbSet declarations, Fluent API indexes/keys, initial migrations, careful control of tracking & query behavior.
+Repository / Query layer & LINQ translations (per SP mapping)	16	48	119	54.5	17.167	294.6944	Translate T-SQL (joins, CTEs, GroupBy, conditional SUMs) into efficient EF LINQ queries / compiled queries; prefer projections (.Select) and AsNoTracking where safe.
+Copilot prompt engineering & generation sessions	8	24	48	25.33	6.667	44.4444	Prepare high-quality prompts, iterate generation, capture known-good patterns; per-SP generation sessions aggregated here.
+Review & fix Copilot-generated code (security, correctness, hallucination fixes)	16	48	96	50.67	13.333	177.7778	Human review of generated code, fix logic errors, correct naming, ensure SQL parity and prevent Copilot hallucinations.
+Manual pattern improvements & LINQ optimization	20	60	120	63.33	16.667	277.7778	Replace naive generated LINQ with optimized patterns (split queries, compiled queries, efficient joins, projection tuning) and enforce domain-level patterns.
+DTO design + mapping (AutoMapper or manual mapping)	10	29	61	31.17	8.5	72.25	Design API contract DTOs to match or improve SP outputs; mapping strategies; preserve locale and null semantics.
+Web API endpoints & controllers (versioned)	6	19	41	20.5	5.833	34.0278	Aggregate endpoint to replace entry SP + per-resource endpoints; input validation, model binding, versioning and swagger.
+Parity automation tests (compare SP output vs EF output)	24	80	160	84	22.667	513.7778	Automated tests that execute existing stored procs and EF methods for identical inputs; assert column-by-column parity with tolerances; essential for correctness.
+Unit tests (query handlers, mappers)	12	36	66	37	9	81	Unit tests, mocking DbContext with in-memory providers or test doubles; test mapping and small business logic.
+Integration tests (DB + EF Core, multi-resultset)	12	36	66	37	9	81	Run against a test DB (LocalDB / test server) with production-ish datasets for multi-resultset and performance comparison.
+Performance profiling and query tuning (benchmarks, indexes, split queries)	10	29	70	32.67	10	100	Benchmark EF queries vs SPs; tune queries, add indexes, use AsNoTracking, projections and compiled queries; create perf regression tests.
+CI/CD and performance regression pipelines	8	16	32	17.33	4	16	Add pipelines for build/test/deploy and automated performance regression runs.
+Data migration scripts (attachments/attributes metadata)	3	10	27	11.67	4	16	Migration for attachments metadata if moving to blob storage, or adjustments to attribute tables; include verification scripts.
+Security review & hardening (auth, authz, secrets)	6	18	36	19	5	25	Ensure least privilege DB access, validate input sanitization, ensure secrets handled via KeyVault or similar; threat modelling.
+API testing & end-to-end tests	8	24	48	25.33	6.667	44.4444	Contract tests, e2e testing for the new API surface; test error conditions and edge cases across locales.
+Documentation, runbooks and rollback plan	5	14	26	14.5	3.5	12.25	Operational docs, API docs, maintenance/runbooks, migration/rollback steps.
+Code review cycles & refactor iteration (3 rounds)	6	18	33	18.5	4.5	20.25	Peer reviews and refactor cycles, address architectural feedback and performance rework.
+QA / UAT (manual testing, business validation, bug triage)	24	72	132	74	18	324	Business validation across locales and event filtering; ground-truth verification against existing system.
+Project management, sprint planning & meetings (wide-band Delphi sessions)	5	14	26	14.5	3.5	12.25	Coordination, status tracking, and stakeholder sessions to close parity gaps.
+							
+							
+Totals (hrs)	286	847	1718	898.65	50.912	2592.0553	StdDev derived from sum of task variances (sqrt(sum(variances)))
+							
+							
+Staffing projection							
+Team Dev Count	3						
+Allocation per dev	0.8						
+Total expected hours (PERT)	898.65						
+Total person-days (8h)	112.33						
+Estimated calendar days (parallel, 80% alloc)	47						
+							
+							
+Contingency (15%)	1033.45						
+Person-days with contingency	129.18						
+Calendar days with contingency (3 devs @80%)	54						

@@ -1,0 +1,896 @@
+--- Page 115 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Bits Description
+23:20 Reserved: Must be 0.
+19 Suppress TC-B Implicit Readback
+0: Hardware may perform implicit readback on TC-B.
+1: Hardware will not perform implicit readback on TC-B. Note that this flag does not affect
+readbacks to the explicit Readback Addresses.
+18 Suppress TC-A Implicit Readback
+0: Hardware may perform implicit readback on TC-A.
+1: Hardware will not perform implicit readback on TC-A. Note that this flag does not affect
+readbacks to the explicit Readback Addresses.
+17 Readback Address 2 Valid
+0: Readback Address 2 field is reserved.
+1: Readback Address 2 field is valid and hardware will perform a readback to this address on
+the TC specified by the Address 2 TC Selector flag. Note that the cache control flags are
+reserved for Drain descriptors.
+16 Readback Address 1 Valid
+0: Readback Address 1 field is reserved.
+1: Readback Address 1 field is valid and hardware will perform a readback to this address on
+the TC specified by the Address 1 TC Selector flag. Note that the cache control flags are
+reserved for Drain descriptors.
+Table 8-15: Drain Operation-Specific Flags
+Revision: 3.0 Page 115
+--- Page 116 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.4 Memory Move
+The Memory Move operation, 0x03, copies memory from the Source Address to the Destination
+Address. The number of bytes copied is given by Transfer Size. There are no alignment requirements
+for the memory addresses or the transfer size.
+If the source and destination regions overlap, the behavior depends on the value of the Overlapping
+Copy Support field in GENCAP. If Overlapping Copy Support is 1, the memory copy is done as if the
+entire source buffer is copied to temporary space and then copied to the destination buffer. (This may
+be implemented by reversing the direction of the copy when the beginning of the destination buffer
+overlaps the end of the source buffer.) If Overlapping Copy Support is 0, it is an error.
+If the operation is partially completed due to a page fault, the Result field of the completion record
+contains the direction of the copy. It is 0 if the copy was performed starting at the beginning of the source
+and destination buffers; it is 1 if the direction of the copy was reversed. If Overlapping Copy Support is 0,
+Result is always 0.
+To resume the operation after a partial completion, if Result is 0, the Source and Destination Address
+fields in the continuation descriptor should be increased by Bytes Completed, and the Transfer Size
+should be decreased by Bytes Completed. If Result is 1, the Transfer Size should be decreased by Bytes
+Completed, but the Source and Destination Addr
+--- Page 117 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.5 Fill
+The Memory Fill operation, 0x04, fills memory at the Destination Address with the value in the pattern
+field. The pattern size is specified by the Pattern Size flag. When the pattern size is 8 bytes, the pattern
+is specified in the Pattern Lower field. When the pattern size is 16 bytes, the first 8 bytes are in Pattern
+Lower and the next 8 bytes are in Pattern Upper. (To use a smaller pattern, software must replicate the
+pattern in the descriptor.) The number of bytes written is given by Transfer Size. The transfer size does
+not need to be a multiple of the pattern size. There are no alignment requirements for the destination
+address or the transfer size. If the operation is partially completed due to a page fault, the Bytes
+Completed field of the completion record contains the number of bytes written to the destination before
+the fault occurred.
+Revision: 3.0 Page 117
+O
+B
+p
+B
+y
+e
+y
+te
+ra
+te
+7
+tio
+7
+n
+B
+B
+y
+y
+te 6
+te 6
+B y te s C o m
+C
+p
+B y te 5
+F la g s
+o m p le tio
+B y te 5
+le te d
+n In te
+F ill D e s c r ip t o r
+B y te 4 B y te 3
+R e s P riv
+C o m p le tio n R e c o rd A d d re s
+P a tte rn L o w e r
+D e s tin a tio n A d d re s s
+rru p t H a n d le
+P a tte rn U p p e r
+R e s e rv e d
+F ill C o m p le t io n R e c o r d
+B y te 4 B y te 3
+U n u s e d
+F a u lt A d d re s s
+U n u s e d
+e
+s
+rv e d
+F
+B
+B
+a
+y te 2
+T ra
+y te 2
+u lt In fo
+n s fe r S
+B y
+iz e
+B y
+te 1
+P A
+te 1
+S ID
+B
+B
+S
+y te 0
+y te 0
+ta tu s
+--- Page 118 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.6 Compare
+The Compare operation, 0x05, compares memory at Source1 Address with memory at Source2
+Address. The number of bytes compared is given by Transfer Size. There are no alignment
+requirements for the memory addresses or the transfer size. The Completion Record Address Valid and
+Request Completion Record flags must be 1 and the Completion Record Address must be valid. The
+result of the comparison is written to the Result field of the completion record: a value of 0 indicates that
+the two memory regions match, and a value of 1 indicates that they do not match. If Result is 1, the Bytes
+Completed field of the completion record indicates the byte offset of the first difference. If the operation
+is partially completed due to a page fault, Result is 0. (If a difference had been detected, the difference
+would be reported instead of the page fault.)
+Revision: 3.0 Page 118
+O
+B
+p
+B
+y
+e
+y
+te
+ra
+te
+7
+tio
+7
+n
+B
+B
+y
+y
+te 6
+te 6
+B y te s C o m
+C
+p
+B y te 5
+F la g s
+o m p le tio
+B y te 5
+le te d
+n In te
+C
+C o m p a r e D e s c r ip t o r
+B y te 4 B y te 3
+R e P riv
+C o m p le tio n R e c o rd A d d re
+S o u rc e 1 A d d re s s
+S o u rc e 2 A d d re s s
+rru p t H a n d le
+R e s e rv e d
+o m p a r e C o m p le t io n R e c
+B y te 4 B y te 3
+U n u s e d
+F a u lt A d d re s s
+U n u s e d
+s e rv
+s s
+o r d
+e d
+F
+B
+B
+a
+y te 2
+T ra
+y te 2
+u lt In fo
+n s fe r S
+B y
+iz e
+B y
+R e
+te 1
+P A
+te 1
+s u lt
+S ID
+E x p
+B
+e c
+B
+S
+y te 0
+te d
+--- Page 119 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.7 Compare Pattern
+The Compare Pattern operation, 0x06, compares memory at Source Address with the value in the
+pattern field. The pattern size is always 8 bytes. (To use a smaller pattern, software must replicate the
+pattern in the descriptor.) The number of bytes compared is given by Transfer Size. The transfer size
+does not need to be a multiple of the pattern size. The Completion Record Address Valid and Request
+Completion Record flags must be 1 and the Completion Record Address must be valid. The result of the
+comparison is written to the Result field of the completion record; a value of 0 indicates that the memory
+region matches the pattern, and a value of 1 indicates that it does not match. If Result is 1, the Bytes
+Completed field of the completion record indicates the location of the first difference. (It may not be the
+exact byte location, but it is guaranteed to be no greater than the first difference.) If the operation is
+partially completed due to a page fault, Result is 0. (If a difference had been detected, the difference
+would be reported instead of the page fault.)
+The completion record format for Compare Pattern and the behavior of Check Result and Expected
+Result are identical to Compare.
+Revision: 3.0 Page 119
+O
+B
+p
+B
+y
+e
+y
+te
+ra
+te
+7
+tio
+7
+n
+B
+B
+y
+y
+te 6
+te 6
+B y te s C o m
+C
+p
+B y te 5
+F la g s
+o m p le tio
+B y te 5
+le te d
+n
+C
+In
+o m
+C o m p a r e P a t t e r n D e s c r ip
+B y te 4 B y te 
+--- Page 120 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.8 Create Delta Record
+The Create Delta Record operation, 0x07, compares memory at Source1 Address with memory at
+Source2 Address and generates a delta record that contains the information needed to update source1
+to match source2. The number of bytes compared is given by Transfer Size. The transfer size is limited
+by the maximum offset that can be stored in the delta record, as described below, in addition to the usual
+WQ-specific limit on transfer size. Source1 Address, Source2 Address, and Transfer Size must be
+aligned to a multiple of 8. The Completion Record Address Valid and Request Completion Record flags
+must be 1 and the Completion Record Address must be valid.
+The maximum size of the delta record is given by Maximum Delta Record Size. The maximum delta
+record size should be a multiple of the delta size (10 bytes), must not be less than the maximum number
+of deltas that can be generated from a single cache line (80 bytes), and must be no greater than the value
+allowed by the WQ Maximum Transfer Size in the WQ Configuration Table of the WQ that this descriptor
+was submitted to. If the maximum-size delta record overlaps either of the source buffers, it is an error.
+The actual size of the delta record that is generated depends on the number of differences detected
+between source1 and source2; this size is written to the Delta Record Size field of the completion record.
+If the space needed in the delta recor
+--- Page 121 ---
+Intel® Data Streaming Accelerator Architecture Specification
+If the operation is partially completed due to a page fault, Result is set to 0 if no deltas were written prior
+to the page fault, and Result is set to 1 if any deltas were written prior to the page fault. This behavior is
+the same whether the page fault is on one of the source buffers or on the delta record buffer. Bytes
+Completed contains the number of bytes compared before the page fault occurred, and Delta Record
+Size contains the space used in the delta record before the page fault occurred. If the operation fails due
+to any other error, these fields are undefined. To ensure that software can resume the operation without
+losing any deltas, if the fault occurred on the delta record, Bytes Completed does not include the bytes
+where the difference was found that was not written to the delta record.
+The format of the delta record is shown below. The delta record contains an array of deltas. Each delta
+contains a 2-byte offset and an 8-byte block of data from Source2 that is different from the
+corresponding 8 bytes in Source1. The 2-byte offset field is stored in memory with the low byte at the
+lower address (little-endian). The total size of the delta record is a multiple of 10. Since the offset is a 16-
+bit field representing a multiple of 8 bytes, the maximum offset that can be expressed is 0x7FFF8, so
+the maximum Transfer Size is 0x80000 bytes (512 KB).
+Byte Byte
+0 1 2 3 4 5 6 7 8 9
+Offset Data
+LSB MSB Byte 0 By
+--- Page 122 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.9 Apply Delta Record
+The Apply Delta Record operation, 0x08, applies a delta record to the contents of memory at
+Destination Address. Delta Record Address is the address of a delta record that was created by a Create
+Delta Record operation that completed with Result equal to 1. Delta Record Size is the size of the delta
+record, as reported in the completion record of the Create Delta Record operation. Destination Address
+is the address of a buffer that contains the same contents as the memory at the Source1 Address when
+the delta record was created. Transfer Size is the same as the Transfer Size used when the delta record
+was created. After the Apply Delta Record operation completes, the memory at Destination Address
+will match the contents that were in memory at the Source2 Address when the delta record was created.
+Destination Address and Transfer Size must be aligned to a multiple of 8. If the delta record overlaps the
+destination buffer, it is an error.
+If a page fault is encountered during the Apply Delta Record operation, the Bytes Completed field of the
+completion record contains the number of bytes of the delta record that were successfully applied to
+the destination. If software chooses to submit another descriptor to resume the operation, the
+continuation descriptor should contain the same Destination Address as the original. The Delta Record
+Address should be increased by Bytes Completed (so it points
+--- Page 123 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Figure 8-1 shows the usage of the Create Delta Record and Apply Delta Record operations. First, the
+Create Delta Record operation is performed. It reads the two source buffers and writes the delta record,
+recording the actual delta record size in its completion record. The Apply Delta Record operation takes
+the content of the delta record that was written by the Create Delta Record operation, along with its size
+and a copy of the Source1 data, and updates the destination buffer to be a duplicate of the original
+Source2 buffer.
+Create Delta Apply Delta
+Record Operation Completion Record Operation
+Record
+Maximum Delta Record Size Delta Record Size
+Delta Record Size
+Delta Copy of Source1
+Source1 Source2 Record
+Modified to match
+Source2
+Figure 8-1: Delta Record Usage
+Revision: 3.0 Page 123
+--- Page 124 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.10 Memory Copy with Dualcast
+The Memory Copy with Dualcast operation, 0x09, copies memory from the Source Address to both
+Destination1 Address and Destination2 Address. The number of bytes copied is given by Transfer Size.
+There are no alignment requirements for the source address or the transfer size. Bits 11:0 of the two
+destination addresses must be the same.
+If the source region overlaps with either of the destination regions or if the two destination regions
+overlap, it is an error. If the operation is partially completed due to a page fault, the copy operation stops
+after having written the same number of bytes to both destination regions.
+Revision: 3.0 Page 124
+O
+B
+p
+B
+y
+e
+y
+te
+ra
+te
+7
+tio n
+R
+7
+e s e rv e d
+B
+B
+y
+y
+te 6
+te 6
+B y te s C o m
+C
+p
+M
+B y te 5
+F la g s
+o m p le tio n
+M e m o
+B y te 5
+le te d
+e m o r y C o p y w it h D u a lc a s t D
+B y te 4 B y te 3
+R e P riv
+C o m p le tio n R e c o rd A d d re
+S o u rc e A d d re s s
+D e s tin a tio n 1 A d d re s s
+In te rru p t H a n d le
+D e s tin a tio n 2 A d d re s s
+R e s e rv e d
+r y C o p y w it h D u a lc a s t C o m p
+B y te 4 B y te 3
+F a u lt A d d re s s
+U n u s e d
+e s c r ip t o r
+B y te 2
+s e rv e d
+s s
+T ra
+le t io n R e c o r d
+B y te 2
+FUa nu ults Ien dfo
+n s fe r S
+B y
+iz e
+B y
+te 1
+P A
+te 1
+S ID
+B
+B
+S
+y te 0
+y te 0
+ta tu s
+b
+b
+y te
+0
+8
+1 6
+2 4
+3 2
+4 0
+4 8
+5 6
+y te
+0
+8
+1 6
+2 4
+s
+s
+--- Page 125 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.11 Translation Fetch
+The Translation Fetch operation, 0x0A, fetches address translations for the address range specified in
+the descriptor by issuing address translation (ATS) requests to the IOMMU. There is no data movement
+associated with this operation. The Region Size field specifies the size of the address range over which
+the translation requests may be issued. If the Use Stride flag is 1, the Region Stride field specifies the
+number of bytes to skip to compute the address for each subsequent ATS request. The Region Stride
+must be greater than or equal to 4096 and must be a power of 2. The descriptor execution terminates
+when the ATS request address is greater than or equal to the starting address plus region size. If Use
+Stride is 0, the device uses an implementation specific stride value. There are no alignment
+requirements for the address or the region size. However, the translation requests are always 4KB
+aligned and may be aligned to a multiple of the Region Stride. Alignment may result in a translation
+request outside the specified region.
+The Region Size must be non-zero, and the sum of Address and Region Size in the descriptor must be
+less than or equal to 264. In case a page fault is encountered, the Block on Fault flag controls whether the
+operation is partially completed, or a page request is issued to the IOMMU. In case of partial completion
+due to a page fault, the fault address is reported in
+--- Page 126 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Bits Description
+23:17 Reserved: Must be 0.
+16 Use Stride
+0: The Region Stride field is reserved. Hardware uses an implementation specific value.
+1: The Region Stride field specifies the number of bytes to skip to compute the address for
+each subsequent ATS request.
+This field is reserved if Translation Fetch Stride Support in GENCAP is 0.
+Table 8-18 : Translation Fetch Operation-Specific Flags
+Revision: 3.0 Page 126
+--- Page 127 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.12 CRC Generation
+The CRC Generation operation, 0x10, computes the CRC on memory at the Source Address. See
+Appendix A for details of CRC Generation. The number of bytes used for the CRC computation is given
+by Transfer Size. There are no alignment requirements for the memory addresses or the transfer size.
+The Completion Record Address Valid and Request Completion Record flags must be 1 and the
+Completion Record Address must be valid. The computed CRC value is written to the completion
+record.
+The CRC Generation operation-specific flags are shown in Table 8-19. The size of the CRC value
+computed, and the CRC seed used depends on the CRC Size flag. If CRC Size is 0, then a 32-bit CRC
+seed is used, and a 32-bit CRC value is computed. If CRC Size is 1, then a 64-bit CRC seed is used, and a
+64-bit CRC value is computed.
+If the Read CRC Seed flag is 1, the CRC seed is read from memory at the CRC Seed Address. The
+address must be naturally aligned to the size of the CRC value. If the Read CRC Seed flag is 0, the CRC
+Seed field in the descriptor is used for the seed. Unless this is a continuation of a partial CRC
+computation, the seed should be 0. If CRC Size is 0, bits 63:32 of CRC Seed are reserved.
+If the operation is partially completed due to a page fault, the partial CRC result is written to the
+completion record along with the page fault information. If software corrects the fault and resumes the
+operation, it 
+--- Page 128 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Bits Description
+23:20 Reserved: Must be 0.
+19 CRC Size
+0: 32-bit CRC value is computed. Upper 4 bytes of CRC Seed field in the descriptor and
+the CRC Value field in the completion record are reserved.
+1: 64-bit CRC value is computed.
+This flag must be 0 if CRC64 Support in GENCAP is 0.
+See Appendix A for details of CRC computation.
+18 Bypass Data Reflection
+0: Normal CRC operation: bit 0 of each data byte is the MSB in the CRC computation.
+1: Bit 7 of each data byte is the MSB in the CRC computation.
+See Appendix A for details of CRC computation.
+17 Bypass CRC Inversion and Reflection
+0: Normal CRC operation: CRC seed and result are inverted and use standard CRC bit order.
+1: Bypass inversion and use reverse bit order for CRC seed and result.
+See Appendix A for details of CRC computation.
+16 Read CRC Seed
+0: Use the CRC Seed field in the descriptor.
+1: Read the CRC seed from memory at the CRC Seed Address.
+Table 8-19: CRC Generation Operation-Specific Flags
+Revision: 3.0 Page 128
+--- Page 129 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.13 Copy with CRC Generation
+The Copy with CRC Generation operation, 0x11, copies memory from the Source Address to the
+Destination Address and computes the CRC on the data copied. See Appendix A for details of CRC
+Generation. The number of bytes copied is given by Transfer Size. There are no alignment requirements
+for the memory addresses or the transfer size. If the source and destination regions overlap, it is an error.
+The Completion Record Address Valid and Request Completion Record flags must be 1 and the
+Completion Record Address must be valid. The computed CRC value is written to the completion
+record.
+See the description of the CRC Generation operation and Table 8-19 in section 8.3.12 for a description
+of the CRC operation-specific flags, the CRC Seed field, and the CRC Seed Address field.
+The completion record format for Copy with CRC Generation is identical to the format for CRC
+Generation.
+Revision: 3.0 Page 129
+B y te 7
+O p e ra tio n
+R
+B y te 7
+e s e rv
+B y
+e d
+B y
+te 6
+te 6
+B y te s C o m
+C
+p
+C o p y w it h C R C G e n e ra tio n D e s c r ip
+B y te 5 B y te 4 B y te 3
+F la g s R e s e rv e Priv
+C o m p le tio n R e c o rd A d d re s s
+S o u rc e A d d re s s
+D e s tin a tio n A d d re s s
+o m p le tio n In te rru p t H a n d le
+C R C S e e d
+C R C S e e d A d d re s s
+R e s e rv e d
+C o p y w it h C R C G e n e ra tio n C o m p le tio n
+B y te 5 B y te 4 B y te 3
+le te d U n u s e d
+F a u lt A d d
+--- Page 130 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.14 DIF Check
+The DIF Check operation, 0x12, computes the Data Integrity Field (DIF) on the source data and
+compares the computed DIF to the DIF contained in the source data.
+The number of source bytes read is given by Transfer Size. DIF computation is performed on each block
+of source data that is 512, 520, 4096, or 4104 bytes. The transfer size should be a multiple of the source
+block size plus 8 bytes for each source block. There is no alignment requirement for the source address.
+If the operation completes successfully, the final Reference Tag and Application Tag are written to the
+completion record along with a Success completion status. If the operation is partially completed due to
+a page fault, updated values of Reference Tag and Application Tag are written to the completion record
+along with the page fault information. If software corrects the fault and resumes the operation, it may
+copy these fields into the continuation descriptor. If the operation fails due to any other error, these fields
+are undefined.
+If an error is detected in the DIF in the source data, the operation stops. The Status field in the completion
+record is set to DIF Error, the DIF Status field is set to indicate the type of error, and the Bytes Completed
+field is set to the number of source bytes successfully processed. Bytes Completed does not include the
+block in which the error was detected. The Completion Record Address Valid and
+--- Page 131 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.15 DIF Insert
+The DIF Insert operation, 0x13, copies memory from the Source Address to the Destination Address,
+while computing the Data Integrity Field (DIF) on the source data and inserting the DIF into the output
+data.
+The number of source bytes copied is given by Transfer Size. DIF computation is performed on each
+block of source data that is 512, 520, 4096, or 4104 bytes. The transfer size should be a multiple of the
+source block size. The number of bytes written to the destination is the transfer size plus 8 bytes for each
+source block. There is no alignment requirement for the memory addresses. If the source and
+destination regions overlap, it is an error.
+If the operation completes successfully, the final Reference Tag and Application Tag are written to the
+completion record along with a Success completion status. If the operation is partially completed due to
+a page fault, updated values of Reference Tag and Application Tag are written to the completion record
+along with the page fault information. If software corrects the fault and resumes the operation, it may
+copy these fields into the continuation descriptor. If the operation fails due to any other error, these fields
+are undefined.
+See section 8.3.17, DIF Update, for a description of DIF Flags, Destination DIF Flags, and the fields in the
+completion record. See Appendix B for details of DIF computation.
+DIF Insert Descriptor
+Byte 7 Byte 6 Byte 5 By
+--- Page 132 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.16 DIF Strip
+The DIF Strip operation, 0x14, copies memory from the Source Address to the Destination Address,
+removing the Data Integrity Field (DIF). It optionally computes the DIF on the source data and compares
+the computed DIF to the DIF contained in the source data.
+The number of source bytes read is given by Transfer Size. DIF computation is performed on each block
+of source data that is 512, 520, 4096, or 4104 bytes. The transfer size should be a multiple of the source
+block size plus 8 bytes for each source block. The number of bytes written to the destination is the
+transfer size minus 8 bytes for each source block. There is no alignment requirement for the memory
+addresses. If the source and destination regions overlap, it is an error.
+If the operation completes successfully, the final Reference Tag and Application Tag are written to the
+completion record along with a Success completion status. If the operation is partially completed due to
+a page fault, updated values of Reference Tag and Application Tag are written to the completion record
+along with the page fault information. If software corrects the fault and resumes the operation, it may
+copy these fields into the continuation descriptor. If the operation fails due to any other error, these fields
+are undefined.
+If an error is detected in the DIF in the source data, the operation stops. The Status field in the completion
+record is set to DIF Erro
+--- Page 133 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.17 DIF Update
+The DIF Update operation, 0x15, copies memory from the Source Address to the Destination Address.
+It optionally computes the Data Integrity Field (DIF) on the source data and compares the computed
+DIF to the DIF contained in the data. It simultaneously computes the DIF on the source data using
+Destination DIF Flags in the descriptor and inserts the computed DIF into the output data.
+The number of source bytes read is given by Transfer Size. DIF computation is performed on each block
+of source data that is 512, 520, 4096, or 4104 bytes. The transfer size should be a multiple of the source
+block size plus 8 bytes for each source block. The number of bytes written to the destination is the same
+as the transfer size. There is no alignment requirement for the memory addresses. If the source and
+destination regions overlap, it is an error.
+If the operation completes successfully, the final source and destination Reference Tags and Appli-
+cation Tags are written to the completion record along with a Success completion status. If the opera-
+tion is partially completed due to a page fault, updated values of the source and destination Reference
+Tags and Application Tags are written to the completion record along with the page fault information. If
+software corrects the fault and resumes the operation, it may copy these fields into the continuation
+descriptor. If the operation fails due to any other error, th
+--- Page 134 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.17.1 DIF Flags
+Bits Description
+7:4 Reserved.
+3 Invert CRC Result
+0: Do not invert CRC result.
+1: Invert CRC result. (That is, invert each bit of the final CRC value.)
+2 Invert CRC Seed
+0: The initial seed is 0.
+1: The initial seed is 0xffff.
+1:0 DIF Block Size
+00b: 512 bytes
+01b: 520 bytes
+10b: 4096 bytes
+11b: 4104 bytes
+8.3.17.2 Source DIF Flags
+Bits Description
+7 Source Reference Tag Type
+This field denotes the type of operation to perform on the source DIF Reference Tag.
+0: Incrementing
+1: Fixed
+6 Reference Tag Check Disable
+0: Enable Reference Tag field checking.
+1: Disable Reference Tag field checking.
+5 Guard Check Disable
+0: Enable Guard field checking.
+1: Disable Guard field checking.
+4 Source Application Tag Type
+This field denotes the type of operation to perform on the source DIF Application Tag.
+0: Fixed
+1: Incrementing
+Note that the meaning of the Application Tag Type is reversed compared to the Reference
+Tag Type. The default typically used in storage systems is for the Application Tag to be fixed
+and the Reference Tag to be incrementing.
+3 Application and Reference Tag F Detect
+0: Disable F Detect for Application Tag and Reference Tag fields.
+1: Enable F Detect for Application Tag and Reference Tag fields. When all bits of both the
+Application Tag and Reference Tag fields are equal to 1, the Application Tag and
+Reference Tag checks are not done and the Guard field is ignored.
+2 Application Tag F 
+--- Page 135 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Bits Description
+1 All F Detect
+0: Disable All F Detect.
+1: Enable All F Detect. When all bits of the Application Tag, Reference Tag, and Guard fields
+are equal to 1, no checks are performed on these fields. (The All F Detect Status is reported,
+if enabled.)
+0 Enable All F Detect Error
+0: Disable All F Detect Error.
+1: Enable All F Detect Error. When all bits of the Application Tag, Reference Tag, and Guard
+fields are equal to 1, All F Detect Error is reported in the DIF Status field of the Completion
+Record.
+If All F Detect flag is 0, this flag is ignored.
+8.3.17.3 Destination DIF Flags
+Bits Description
+7 Destination Reference Tag Type
+This field denotes the type of operation to perform on the destination DIF Reference Tag.
+0: Incrementing
+1: Fixed
+6 Reference Tag Pass-through
+0: The Reference Tag field written to the destination is determined based on the
+Destination Reference Tag Seed and Destination Reference Tag Type fields of the
+descriptor.
+1: The Reference Tag field from the source is copied to the destination. The Destination
+Reference Tag Seed and Destination Reference Tag Type fields of the descriptor are
+ignored.
+This field is ignored for the DIF Insert and DIX Generate operations.
+5 Guard Field Pass-through
+0: The Guard field written to the destination is computed from the source data.
+1: The Guard field from the source is copied to the destination.
+This field is ignored for the DIF Insert and DIX Gener
+--- Page 136 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.17.4 DIF Status
+Completion Record Offset: 1; Size: 1 byte
+This field reports the status of a DIF operation. This field is defined only for DIF Check, DIF Strip, and DIF
+Update operations and only if the Status field of the Completion Record is DIF Error. The values 0x01,
+0x02, and 0x04 may be combined when more than one error is detected for a single block.
+0x01 Guard mismatch. This value is reported under the following condition:
+- Guard Check Disable is 0;
+- F Detect condition is not detected; and
+- The guard value computed from the source data does not match the Guard field in the
+source Data Integrity Field.
+0x02 Application Tag mismatch. This value is reported under the following condition:
+- Source Application Tag Mask is not equal to 0xFFFF;
+- F Detect condition is not detected; and
+- The computed Application Tag value does not match the Application Tag field in the
+source Data Integrity Field.
+0x04 Reference Tag mismatch. This value is reported under the following condition:
+- Reference Tag Check Disable is 0.
+- F Detect condition is not detected; and
+- The computed Application Tag value does not match the Application Tag field in the
+source Data Integrity Field.
+0x08 All F Detect Error. This value is reported under the following condition:
+- All F Detect is 1;
+- Enable All F Detect Error is 1;
+- All bits of the Application Tag, Reference Tag, and Guard fields of the source Data
+Integrity Field are equal
+--- Page 137 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.18 DIX Generate
+The DIX Generate operation, 0x17, computes the Data Integrity Field (DIF) on the source data and writes
+only the computed DIF for each source block to the Destination Address. The source data is not copied
+to the destination region.
+The number of source bytes is given by Transfer Size. DIF computation is performed on each block of
+source data that is 512, 520, 4096, or 4104 bytes. The transfer size should be a multiple of the source
+block size. If the operation completes successfully, the number of bytes written to the destination is the
+number of source blocks multiplied by 8. There is no alignment requirement for the Source Address, but
+the Destination Address must be aligned to a multiple of 8. If the source and destination regions overlap,
+it is an error.
+If the operation completes successfully, the final Reference Tag and Application Tag are written to the
+completion record along with a Success completion status. If the operation is partially completed due to
+a page fault, updated values of Reference Tag and Application Tag are written to the completion record
+along with the page fault information. If software corrects the fault and resumes the operation, it may
+copy these fields into the continuation descriptor. The Completion Record Address Valid and Request
+Completion Record flags must be 1 and the Completion Record Address must be valid.
+See section 8.3.17, DIF Update, for a description 
+--- Page 138 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.19 Type Conversion
+The Type operation, 0x18, reads data elements of the type specified by IData Type from the Source
+Address, converts each element to the type specified by OData Type and writes the result to the
+Destination Address. The Element Count field specifies the number of input and output data elements
+of the specified data type. The element size in bytes is implied by the corresponding Data Type field in
+the descriptor (as described in section 8.1.10). The total number of bytes to read from the Source
+Address is the product of Element Count and element size specified by IData Type. The total number of
+bytes to write to the Destination Address is the product of Element Count and element size specified by
+OData Type. The total number of bytes to read or write must not exceed the value specified by the WQ
+Maximum Transfer Size in WQCFG.
+The Source and Destination Addresses must be naturally aligned to the size of the respective data type.
+If the source and destination regions overlap, then they must be identical (i.e. the source and destination
+addresses must be the same and IData Type and OData Type must be the same). IData Type and OData
+Type must be either both integer types or both floating point types. All combinations of integer types for
+IData Type and OData Type are supported. For FP types, the set of supported conversions is specified
+by DSACAP1 (described in 9.2.31). If IData Type and OData Type
+--- Page 139 ---
+Intel® Data Streaming Accelerator Architecture Specification
+overlapping buffers if they are not identical as described above. If an IDPT handle is specified, then buffer
+overlap checks are not done and the behavior is undefined if the buffers overlap in physical memory.
+The meaning of the Result field in the completion record is described in 8.2.2.
+Bits Description
+17 Use Alternate Destination PASID
+0: The Destination IDPT Handle field is not used.
+1: The Destination IDPT Handle field references an Inter-Domain Permissions Table entry
+which specifies the PASID used to access the Destination Address.
+This field is reserved if the Type Conversion bit in the Operations with Inter-Domain
+Support field in DSACAP0 is 0 (as described in section 9.2.30).
+16 Use Alternate Source PASID
+0: The Source IDPT Handle field is not used.
+1: The Source IDPT Handle field references an Inter-Domain Permissions Table entry
+which specifies the PASID used to access the Source Address.
+This field is reserved if the Type Conversion bit in the Operations with Inter-Domain
+Support field in DSACAP0 is 0 (as described in section 9.2.30).
+Table 8-20: Type Conversion Operation-Specific Flags
+Revision: 3.0 Page 139
+--- Page 140 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.20 Reduce
+The Reduce operation, 0x19, combines the data from Source1 Address and Source2 Address and writes
+the result to the Destination Address. The Compute Type and Compute Flags fields specify the com-
+pute operation used to combine the source data. Refer to sections 8.1.10 and 8.1.11 for a description of the
+data types and compute operations. DSACAP1 indicates the set of compute operations supported by
+the implementation.
+Compute operations are performed element-wise. The IData Type and OData Type fields specify the
+data type of each element in the source and destination buffers respectively. The Element Count field
+specifies the number of input and output data elements of the specified data type. The element size in
+bytes is implied by the Data Type field in the descriptor (as described in section 8.1.10).
+The total number of bytes to read from each of Source1 Address and Source2 Address is the product of
+Element Count and element size specified by IData Type. The total number of bytes to write to the
+Destination Address is the product of Element Count and element size specified by OData Type. The
+total number of bytes to read from each source region or write to the destination region must not exceed
+the value specified by the WQ Maximum Transfer Size in WQCFG.
+Source1 Address, Source2 Address, and Destination Address must be naturally aligned to the size of the
+respective data type. IData Type and OData T
+--- Page 141 ---
+Intel® Data Streaming Accelerator Architecture Specification
+the Inter-Domain Selector. If the selector specifies use of an IDPT handle, the handle must reference an
+Inter-Domain Permissions Table entry of one of the types described in section 3.14.1.
+If an IDPT Handle is specified and Window Enable and Window Mode are both 1 in the IDPT entry, the
+address in the descriptor and the Window Base in the IDPT entry must both be naturally aligned to the
+size of the corresponding data type. Buffer overlap checks are performed between each pair of source
+and destination addresses. If an IDPT handle is not specified for either address in a pair and the
+addresses overlap, then an error is reported unless they are identical as described earlier. If an IDPT
+handle is specified for either address in a pair, then buffer overlap checks are not performed, and the
+behavior is undefined if the buffers overlap in physical memory. Buffer overlap checks are not performed
+between source addresses.
+The meaning of the Result field in the completion record is described in 8.2.2.
+Bits Description
+23:17 Reserved: Must be 0.
+16 Use Inter-Domain Selector
+0: Inter-Domain Selector and IDPT Handle fields in the descriptor are reserved.
+1: Inter-Domain Selector identifies the IDPT Handle to use for each source and destination
+address (as described in 8.1.13). It must be non-zero.
+This field is reserved if the Reduce bit in the Operations with Inter-Domain Support field in
+DSACAP0 is 0 (as described in secti
+--- Page 142 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.21 Reduce with Dualcast
+The Reduce with Dualcast operation, 0x1A, behaves identically to the Reduce operation, except that the
+results are written to both Destination1 and Destination2. Source1, Source2, Destination1 and Desti-
+nation2 Address must be naturally aligned to the size of the respective data type. Additionally, bits 11:0
+of the two destination addresses must be the same. If either destination region overlaps with a source
+region, then they must be identical (i.e., the corresponding source and destination addresses must be
+the same and IData Type and OData Type must be the same).
+The Reduce with Dualcast bit in the Operations with Inter-Domain Support field in DSACAP0 indicates
+whether software is allowed to use the Inter-Domain Selector field (described in 8.1.13) to control the
+address space association for each source and destination address in the descriptor. Other details
+pertaining to inter-domain operation are similar to the Reduce operation in section 8.3.20. Buffer overlap
+checks are performed between each pair of source and destination addresses, and between destination
+addresses. If an IDPT handle is not specified for either address in a pair and the addresses overlap, then
+an error is reported unless they are identical as described earlier. If an IDPT handle is specified for either
+address in a pair, then buffer overlap checks are not performed, and the behavior is undefined if the
+buffers
+--- Page 143 ---
+Intel® Data Streaming Accelerator Architecture Specification
+Bits Description
+23:18 Reserved: Must be 0.
+17 Destination2 TC Selector
+For writes to Destination2 Address, this field selects one of the two Traffic Class values in
+the Group Configuration Register corresponding to the WQ that the descriptor was
+submitted to.
+0: Use TC-A in the Group Configuration Register.
+1: Use TC-B in the Group Configuration Register.
+16 Use Inter-Domain Selector
+0: Inter-Domain Selector and IDPT Handle fields in the descriptor are reserved.
+1: Inter-Domain Selector identifies the IDPT Handle to use for each source and destination
+address (as described in 8.1.13). It must be non-zero.
+This field is reserved if the Reduce with Dualcast bit in the Operations with Inter-Domain
+Support field in DSACAP0 is 0 (as described in section 9.2.30).
+Table 8-22: Reduce with Dualcast Operation-Specific Flags
+Revision: 3.0 Page 143
+--- Page 144 ---
+Intel® Data Streaming Accelerator Architecture Specification
+8.3.22 Gather Reduce
+The Gather Reduce operation, 0x1B, combines a set of input vectors of a specified size to produce a
+single output vector of the same size as shown in Figure 8-2. The list of source memory locations
+identifying the input vectors is specified by an SGL as described in section 8.1.14. The SGL format is
+specified by the SGL Format field. The output vector is written to the Destination Address. The
+Compute Type and Compute Flags fields specify the compute operation used to combine the input
+vectors element-wise. Refer to section 8.1.11 and 8.1.12 for details of the compute operations and flags.
+The IData Type and OData Type fields specify the data type of each element in the source and
+destination buffers respectively, as described in section 8.1.10. The Element Count field specifies the
+number of input and output data elements of the specified data type. The source addresses
+corresponding to each list entry, and the destination address must be naturally aligned to the size of the
+respective data type.
+IData Type and OData Type must conform to the rules specified for the Type Conversion operation in
+section 8.3.19. If IData Type and OData Type are different, then type conversion is performed.
+Figure 8-2: Illustration of Gather Reduce operation
+Gather Reduce
+Byte 7 Byte 6 Byte 5 Byte 4 Byte 3 Byte 2 Byte 1 Byte 0 bytes
+Operation Flags Priv Reserved PASID 0
+Completion Record Address 8
+Scatter-Gather Li
+--- Page 145 ---
+Intel® Data Streaming Accelerator Architecture Specification
+For the example in Figure 8-2, each element in the output vector may be expressed in terms of the
+following equation:
+o = a  b  c (where  represents the compute operation performed)
+n n n n
+The number of bytes to read from each source address is referred to as the input block size
+input block size = Element Count * element size (corresponding to IData Type)
+The number of bytes to write to the destination memory is referred to as the output block size
+output block size = Element Count * element size (corresponding to OData Type)
+The total number of bytes written to the destination address is equal to the output block size. Both the
+input block size and output block size must be less than Maximum Supported Gather Reduce Block Size
+in DSACAP0.
+If all the list entries were processed successfully, the Status field of the completion record indicates a
+success status. Bytes Completed is always 0 for this operation.1 If a page fault occurs, the operation
+must be restarted from the beginning. The value of the SGL Processed field in the completion record
+indicates the number of SGL entries processed.
+If the destination region overlaps with a source region, the data written is undefined.
+The meaning of the Result field in the completion record is described in 8.2.2.
+1 For compatibility with future implementations, software should ignore the value of Bytes Completed.
+Revision: 3.0 Page 145

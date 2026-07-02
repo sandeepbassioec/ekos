@@ -1,0 +1,10 @@
+export { CalloutExtension }       from './calloutWidget';
+export { RequirementExtension }   from './requirementWidget';
+export { AdrExtension }           from './adrWidget';
+export { MetricsExtension }       from './metricsWidget';
+export { ProcessStepsExtension }  from './processStepsWidget';
+export { DiagramExtension }       from './diagramWidget';
+export { StatusBadgeExtension }   from './statusBadgeWidget';
+export { DividerExtension }       from './dividerWidget';
+export { TradeoffExtension }      from './tradeoffWidget';
+export { NFRExtension }           from './nfrWidget';

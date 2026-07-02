@@ -1,0 +1,398 @@
+Bhai, generating formal patent documents requires precise legal language and accompanying drawings, but I can produce **full, structured patent application drafts** for each invention. These are ready for your patent attorney to refine and file. Each draft includes: Title, Field, Background, Summary, Detailed Description, Claims, and Abstract. Let's go one by one.
+
+---
+
+## PATENT 1: Self‑Destructing, Hardware‑Bound Knowledge Bundles
+
+### Title
+**System and Method for Self‑Destructing, Hardware‑Bound Digital Knowledge Bundles with Copy Protection**
+
+### Field of the Invention
+This invention relates to secure digital content distribution, specifically to a cryptographic file format that enforces one‑time or limited viewing, device‑specific decryption using hardware‑rooted keys, and automatic secure erasure to prevent unauthorized duplication.
+
+### Background
+Traditional digital documents (e.g., PDF) can be copied, shared, and viewed infinitely. DRM solutions rely on online license servers, which fail in air‑gapped environments. There is a need for a self‑destructing document that works offline, prevents copying even with full file access, and cryptographically proves destruction.
+
+### Summary
+The invention provides a method for creating a self‑destructing knowledge bundle. A creator encrypts the content with a symmetric key and wraps this key using the recipient’s device‑specific hardware public key (e.g., TPM, Secure Enclave). The bundle includes a one‑time activation nonce. Upon first open, the viewer attests the device, exchanges the nonce for a signed token from an activation server (or uses pre‑provisioned whitelist), and unwraps the content key. The viewer stores the key in volatile memory only, and after a predetermined time or view count, it cryptographically wipes the key and overwrites the file. Copies are rendered useless because the key is device‑bound.
+
+### Detailed Description
+The system comprises a creation module and a viewer module. The creation module generates a random data encryption key (DEK), encrypts the content, and creates a manifest containing the DEK encrypted with the recipient’s device public key and a nonce. The viewer module, upon launch, verifies the device identity using hardware attestation, contacts an activation server (which may be local in air‑gapped mode) to obtain a time‑limited activation token, decrypts the DEK, and renders the content. A secure timer and view counter trigger the destruction routine: the DEK is zeroed, the file is overwritten with random data, and a destruction attestation is optionally sent.
+
+### Claims
+1. A method for secure distribution of digital content, comprising:
+   - encrypting the content with a symmetric key;
+   - encrypting said symmetric key with a public key bound to a hardware root of trust of a recipient device;
+   - transmitting a bundle containing the encrypted content and encrypted key to the recipient device;
+   - at the recipient device, decrypting the symmetric key only after successful attestation of the hardware root of trust;
+   - rendering the content using the decrypted symmetric key stored exclusively in volatile memory;
+   - and automatically destroying the symmetric key and overwriting the bundle after a predetermined condition is met, rendering any copies of the bundle inoperable.
+
+2. The method of claim 1, wherein the predetermined condition is a time limit, a view count, or a combination thereof.
+
+3. The method of claim 1, further comprising requiring a one‑time activation nonce that is verified by an activation server before decryption is allowed.
+
+4. The method of claim 3, wherein the activation server is operable offline via a pre‑provisioned whitelist of device public keys.
+
+5. A system comprising a processor and memory configured to perform the method of claim 1.
+
+6. A non‑transitory computer‑readable medium storing the bundle, wherein the bundle is structured to be processed by the method of claim 1.
+
+### Abstract
+A self‑destructing digital bundle uses device‑bound hardware keys and one‑time activation to ensure single‑use viewing. After consumption, the decryption key is securely erased and the file overwritten, preventing copying or replay.
+
+---
+
+## PATENT 2: Graph‑Level ABAC with Visual Masking for Living Documents
+
+### Title
+**Attribute‑Based Access Control with Dynamic Visual Masking for Interactive, Graph‑Based Documents**
+
+### Field of the Invention
+This invention pertains to access control and data privacy in interactive document systems, particularly dynamic masking of sensitive elements within a single document view based on user attributes, purpose, and environmental context.
+
+### Background
+Conventional document access control is binary (allow/deny at the file level). In collaborative, living documents, different users need to see different subsets of the same information. Existing solutions require creating multiple versions, which is cumbersome and error‑prone. There is a need for fine‑grained, contextual visual redaction.
+
+### Summary
+A system models a document as a semantic graph of nodes and edges. Each node carries classification and PII tags. An ABAC engine evaluates user attributes (role, clearance), purpose, device, and screen‑share status against policies to determine a visibility level. The viewer renders the same widget for all users but applies visual masks—blur, placeholder, lock icon, or complete hide—on nodes for which the user lacks access. Masking is performed server‑side or client‑side based on encrypted tokens, ensuring zero‑trust.
+
+### Detailed Description
+The document graph is enriched with security metadata. A policy enforcement point intercepts all graph queries. When rendering a widget, the viewer requests a projection of the graph filtered by the user’s access rights. The returned JSON includes masking instructions per node: “show full”, “blur”, “replace with placeholder”, etc. The widget engine interprets these instructions to render the appropriate visual treatment. In screen‑share detection mode, the system automatically elevates masking to the strictest level.
+
+### Claims
+1. A computer‑implemented method for access‑controlled rendering of an interactive document represented as a graph, comprising:
+   - associating each node with at least one security attribute;
+   - receiving a rendering request for the document from a user;
+   - evaluating a set of attribute‑based policies against the user’s attributes and the node’s security attributes to determine a visibility level for each node;
+   - rendering the document such that nodes with a first visibility level are displayed normally, and nodes with a second visibility level are displayed with a visual masking effect that hides their content while maintaining the document’s overall structure.
+
+2. The method of claim 1, wherein the visual masking effect is selected from a group consisting of blurring, replacing with a lock icon, showing a placeholder text, and hiding entirely.
+
+3. The method of claim 1, wherein the evaluation of policies further considers a purpose of access selected by the user.
+
+4. The method of claim 1, further comprising detecting that the user’s screen is being shared and automatically applying a more restrictive masking level across all nodes.
+
+5. The method of claim 1, wherein the rendering is performed server‑side and the client receives only the masked projection.
+
+### Abstract
+A living document system uses graph‑based access control to dynamically mask sensitive elements within a single widget based on user attributes and context, eliminating the need for multiple document versions.
+
+---
+
+## PATENT 3: Semantic Knowledge Graph with Bitemporal Versioning and User‑Extensible Ontology
+
+### Title
+**System and Method for a Unified, Bitemporal, and User‑Extensible Semantic Knowledge Graph for Lifecycle Management**
+
+### Field of the Invention
+This invention relates to knowledge management systems, specifically to a graph‑based repository that captures software lifecycle artifacts with built‑in time‑travel and real‑time extensibility of its conceptual model.
+
+### Background
+Existing systems (wikis, ALM tools, EA repositories) store lifecycle artifacts in isolated silos with flat or relational models. They lack unified traceability, cannot easily represent evolving real‑world states, and require database schema changes to add new artifact types. A single, versioned, extensible graph is needed.
+
+### Summary
+A knowledge graph stores all SDLC artifacts as nodes and relationships. Each node and edge carries two time dimensions: valid time (when it is true in the real world) and transaction time (when it was recorded in the system). The graph’s meta‑model (ontology) is itself stored in the graph, allowing users to add new node types and relationship types at runtime without system downtime. The graph engine supports time‑travel queries (“show me the architecture as of March 12”) and automatic derivation of historical views.
+
+### Detailed Description
+The system maintains a property graph database. An ontology management service allows authorized users to define new types by creating corresponding ontology nodes. The query layer automatically adapts to the extended schema. Versioning is implemented by appending new states with timestamps rather than overwriting. A query interface accepts a timestamp parameter and returns the graph projection valid at that time. The graph is polymorphic; widgets query using the ontology, and newly defined types are immediately available.
+
+### Claims
+1. A system for managing knowledge artifacts, comprising:
+   - a property graph database storing a plurality of artifact nodes and relationship edges;
+   - an ontology stored within the same graph as a set of meta‑nodes defining permissible node types and edge types;
+   - a user interface for adding a new node type by creating a corresponding meta‑node at runtime without requiring database schema migration;
+   - a versioning engine that records, for each node and edge, a valid time interval and a transaction time interval, enabling time‑travel queries.
+
+2. The system of claim 1, wherein the versioning engine responds to a query specifying a historical timestamp by returning only nodes and edges whose valid time interval contains the timestamp.
+
+3. The system of claim 1, wherein the user interface is a no‑code widget builder that generates the new node type from a form definition.
+
+4. The system of claim 1, wherein the ontology includes inheritance, and newly added types automatically inherit traceability and security attributes from parent types.
+
+### Abstract
+A unified knowledge graph uses built‑in bitemporal versioning and a self‑describing ontology that can be extended in real time, capturing the entire software lifecycle with full history and adaptability.
+
+---
+
+## PATENT 4: Promptless Ambient AI Engine for Knowledge Graphs
+
+### Title
+**Proactive, Prompt‑Free Hybrid Artificial Intelligence Engine for Semantic Knowledge Graphs**
+
+### Field of the Invention
+This invention relates to artificial intelligence systems that provide continuous, context‑aware insights on dynamic knowledge graphs without requiring user prompts.
+
+### Background
+Current AI assistants (e.g., ChatGPT) are reactive; they respond only when prompted. In enterprise lifecycle management, proactive detection of gaps, violations, and optimization opportunities is needed. A system that autonomously monitors a knowledge graph and provides insights is novel.
+
+### Summary
+A layered AI engine includes a symbolic rule engine, domain‑specific small models, and a retrieval‑augmented generation (RAG) module using LLMs. An ambient orchestrator listens to graph change events, runs applicable analysts, and pushes insights to widgets as structured fact sheets and natural language summaries. The system constructs its own internal prompts from the widget’s ontological context, requiring no user input.
+
+### Detailed Description
+Layer 1 contains rules coded as graph patterns (e.g., “every PII store must have an encryption node”). When a graph mutation occurs, relevant rules are evaluated, and violations are stored as Insight nodes. Layer 2 small models classify patterns (e.g., architectural smells). Layer 3 assembles a structured JSON fact sheet from these findings and feeds it, along with an auto‑generated prompt template, to an LLM (which may be local/air‑gapped). The LLM returns a human‑readable explanation. The orchestrator decides which analysts to run based on the type of event and the user’s current widget.
+
+### Claims
+1. A system for providing artificial intelligence insights on a knowledge graph, comprising:
+   - a symbolic rule engine configured to continuously evaluate predefined graph patterns against the knowledge graph and generate alert nodes upon detecting violations;
+   - a machine learning layer trained to classify architectural or semantic patterns in graph sub‑structures;
+   - an orchestrator that, in response to a graph change event, invokes at least one of the rule engine and machine learning layer to produce a structured fact sheet, and automatically constructs a prompt for a language model using the fact sheet and ontological context of a current user view, without requiring explicit user input;
+   - an output module that renders the language model’s response as a visual insight within the user’s current widget.
+
+2. The system of claim 1, wherein the language model is a self‑hosted, air‑gapped model to which only the structured fact sheet is sent.
+
+3. The system of claim 1, wherein the orchestrator further selects which insights to surface based on user role and current activity.
+
+4. A method corresponding to the system of claim 1.
+
+### Abstract
+A hybrid AI engine monitors a living knowledge graph, proactively running symbolic rules and small models, then auto‑generates prompts for an LLM to deliver insight without the user ever typing a query.
+
+---
+
+## PATENT 5: Process Capture AI – Automatic Widget Generation from Manual Routines
+
+### Title
+**System and Method for Automatically Generating Interactive, Traceable Widgets from Recorded Manual Workflows**
+
+### Field of the Invention
+This invention relates to automated process digitization, specifically capturing a user’s manual desktop routine (e.g., Excel, email, PowerPoint) and converting it into a living, traceable, self‑updating widget.
+
+### Background
+Many business processes are still executed manually using spreadsheets and documents. Existing automation tools require explicit programming. There is a need to effortlessly transform observed manual steps into a dynamic, reusable, and traceable digital artifact.
+
+### Summary
+A recorder captures screen interactions (cell edits, email sends, slide updates). An AI engine analyzes the recorded steps, identifies data sources, logic, and outputs. It then constructs a widget schema by creating graph nodes for each data entity, mapping the transformation logic as a workflow, and generating a visual layout. The resulting widget is linked to live data sources, so future updates happen automatically. The user can adjust the widget in a no‑code builder.
+
+### Detailed Description
+The system comprises a screen capture module that records user actions with metadata (application, cell references, timestamps). A sequence analyzer uses a combination of rule‑based pattern matching and a transformer model to extract the underlying process: input cells, formulas, conditional logic, output destinations. The system then queries the target applications’ APIs (with user permission) to establish live connectors, replacing static references. A widget definition is generated in a platform‑agnostic JSON format that includes the visual layout and AI hooks.
+
+### Claims
+1. A method for generating an interactive knowledge widget from a manual process, comprising:
+   - recording a user’s screen interactions with one or more applications;
+   - identifying data input fields, transformation operations, and output actions from the recorded interactions;
+   - constructing a schema of data entities and relationships representing the manual process;
+   - generating an executable widget definition based on the schema, the widget being configured to connect to live data sources corresponding to the identified data fields and to automatically update in response to changes in those sources;
+   - and rendering the widget in a viewer.
+
+2. The method of claim 1, wherein the transformation operations are identified by comparing values before and after user edits and applying a rule‑based inference engine.
+
+3. The method of claim 1, further comprising using an AI language model to suggest a name and description for the widget based on the context of the recorded interactions.
+
+4. A system comprising a recording module, an AI inference engine, and a widget builder configured to execute the method of claim 1.
+
+### Abstract
+Manual desktop workflows are recorded, and AI automatically infers the underlying data schema and logic, creating a living widget that connects to live sources and eliminates repetitive manual work.
+
+---
+
+## PATENT 6: EKR Seed Mode – Progressive Self‑Assembly of Interactive Documents
+
+### Title
+**System and Method for Progressive, On‑Demand Assembly of an Interactive Digital Document from a Compact Seed Bundle**
+
+### Field of the Invention
+This invention relates to digital content distribution, particularly to transmitting a tiny, encrypted seed that dynamically expands into a full, interactive, and always‑current document by fetching authorized resources.
+
+### Background
+Large documents (with videos, 3D models) are cumbersome to transfer, especially over low‑bandwidth channels. Static documents quickly become outdated. There is a need for a lightweight initial payload that reconstructs the latest version of a document on the receiver’s device.
+
+### Summary
+A seed bundle contains a signed manifest, pointers to external resources (APIs, cloud storage), an AI‑generated summary, and a skeleton visual layout. Upon opening, the viewer authenticates the user, verifies the manifest, and uses stored credentials (EKR SSO) to fetch the referenced content in the background. Widgets are populated progressively, giving instant access to the document’s core while details load. The document always reflects the most current data because resources are fetched live. Offline mode uses the last cached state.
+
+### Detailed Description
+The seed bundle is generated by a publishing tool. It includes a unique identifier, a list of required resource URIs with access scopes, a compact graph containing only high‑level nodes, and decryption metadata. The viewer implements a progressive rendering queue; placeholder widgets appear immediately, and as data arrives, widgets transition from skeleton to full. Background fetch uses parallel connections and respects user‑defined priority. The seed can also embed a small amount of critical content for instant offline use.
+
+### Claims
+1. A method for delivering an interactive digital document, comprising:
+   - creating a seed file containing a manifest, a set of resource pointers, and a skeleton graph representing the document’s structure but not its full content;
+   - transmitting the seed file to a recipient device;
+   - at the recipient device, parsing the manifest, authenticating to the resources using stored credentials, and fetching content from the resource pointers;
+   - dynamically populating the skeleton graph with the fetched content to construct a full interactive document.
+
+2. The method of claim 1, wherein the seed file further includes a pre‑generated AI summary, and the recipient device displays that summary immediately while content is fetched.
+
+3. The method of claim 1, wherein the resource pointers include authenticated API endpoints, and the stored credentials are managed by a local encrypted vault that provides tokens without user interaction.
+
+4. The method of claim 1, wherein the skeleton graph is rendered as an outline or wireframe, and content updates are animated as they load.
+
+### Abstract
+A tiny seed bundle contains a document’s skeleton; upon opening, the viewer dynamically fetches the latest content from authorized sources, assembling the full interactive document progressively.
+
+---
+
+## PATENT 7: Cross‑Document Living Reference with Automatic Staleness Detection
+
+### Title
+**System and Method for Living Cross‑References Between Digital Documents with Automated Validity Monitoring**
+
+### Field of the Invention
+This invention relates to document management, specifically to cross‑references that remain live, verify the integrity and freshness of the target, and automatically update or alert users.
+
+### Background
+Hyperlinks in documents break silently. References to external documents (PDF, Confluence) become stale without warning. There is no system that actively monitors referenced content and propagates status changes to the referencing document.
+
+### Summary
+A reference is stored as a graph edge with metadata (source node, target URI, last‑verified timestamp, content hash). A background service periodically checks the target, whether it is an EKR bundle, a Confluence page, or an external API. If the target has changed, the edge’s status is updated (fresh, stale, broken) and a diff is generated. The referencing widget then displays an indicator and can automatically incorporate the change, subject to user approval.
+
+### Detailed Description
+The reference edge is a first‑class graph node. A connector module handles various target types: for EKR bundles, it verifies the digital signature and extracts a summary; for web pages, it scrapes and hashes the content; for authenticated APIs, it uses the Identity Bridge. An event is emitted upon any status change, which can trigger workflows or notifications. The viewer renders the reference with a color‑coded health badge and offers a one‑click “Update” action.
+
+### Claims
+1. A computer‑implemented method for maintaining a living cross‑reference from a source artifact in a knowledge graph to a target document, comprising:
+   - storing the cross‑reference as a graph edge with a target identifier and a last‑verified hash of the target’s content;
+   - periodically verifying the target by fetching its current content, comparing a new hash with the stored hash;
+   - if the hashes differ, updating a status property of the graph edge to indicate a change and generating a diff;
+   - and rendering, within a widget representing the source artifact, a visual indicator of the reference’s status.
+
+2. The method of claim 1, wherein the target is an EKR bundle and verifying includes checking a digital signature.
+
+3. The method of claim 1, further comprising, upon user acceptance of the diff, automatically updating the source artifact’s content based on the target’s change.
+
+4. The method of claim 1, wherein if the target is inaccessible, the status is updated to “broken” and the source widget displays a warning.
+
+### Abstract
+Cross‑references between documents are stored as live graph edges; a background service monitors their targets, updates status automatically, and alerts users or applies changes, eliminating broken and stale links.
+
+---
+
+## PATENT 8: Presentation Guardian Mode – Context‑Aware Data Masking During Screen Sharing
+
+### Title
+**System and Method for Automatic, Context‑Based Masking of Sensitive Data in Interactive Documents During Screen Sharing**
+
+### Field of the Invention
+This invention relates to privacy and security in collaborative applications, particularly the automatic detection of screen sharing and the dynamic masking of sensitive content within an interactive document.
+
+### Background
+Users often inadvertently expose confidential data (PII, financials) when sharing their screen during video calls. Existing solutions require manual redaction or separate document versions. There is no real‑time, automatic, and reversible method integrated into a document viewer.
+
+### Summary
+An EKR Viewer detects screen sharing via OS‑level APIs (e.g., `ScreenCaptureSession`, `isCaptured`). Upon detection, it activates a Guardian Mode that applies a strict ABAC masking policy to all open widgets, automatically blurring or hiding any node tagged as sensitive. The presenter can temporarily reveal a specific element by issuing a time‑limited, audited “Reveal Pass” with a reason. All reveal events are logged immutably.
+
+### Detailed Description
+The viewer includes a background monitor thread. When screen capture is detected, it toggles a global “public display” flag in the rendering engine. The widget engine, already applying ABAC masks, now applies an additional “screen share” mask level that overrides normal access—sensitive content is automatically censored regardless of the user’s personal access rights within the viewer. The Reveal Pass generates a one‑time cryptographic token with expiry; the element is displayed with a visible countdown and a watermark of the user’s identity.
+
+### Claims
+1. A method for protecting sensitive data during screen sharing of an interactive document, comprising:
+   - detecting, using an operating system signal, that a display of a computing device is being captured or shared;
+   - in response, automatically applying a visual masking overlay to document elements that are tagged with a sensitive data classification, regardless of a current user’s normal viewing permissions;
+   - and providing a user interface element that, upon activation, temporarily removes the mask from a selected element for a predetermined duration while recording the event in an audit log.
+
+2. The method of claim 1, wherein the temporary removal is accompanied by displaying a visible watermark identifying the user and a countdown timer.
+
+3. The method of claim 1, further comprising requiring an approval from a second user before the temporary removal is granted.
+
+4. The method of claim 1, wherein the sensitive data classification includes personally identifiable information (PII), financial data, or classified government information.
+
+### Abstract
+An interactive document viewer detects screen sharing and automatically masks sensitive data using ABAC; presenters can issue time‑limited, audited reveals to temporarily show content safely.
+
+---
+
+## PATENT 9: Sandbox Vault – User‑Driven Local Intelligence with Zero Data Exfiltration
+
+### Title
+**System and Method for a User‑Controlled, Encrypted Sandbox for On‑Device Artificial Intelligence Indexing of User‑Selected Files**
+
+### Field of the Invention
+This invention relates to personal knowledge management and privacy‑preserving AI, specifically a secure staging area where users explicitly place files for local AI processing without any data leaving the device.
+
+### Background
+Personal AI assistants often require cloud upload of user files, creating privacy risks. Conversely, fully local scanning of an entire disk can inadvertently process sensitive data. A balanced solution where the user manually selects specific files for AI indexing, with all processing remaining on‑device, is missing.
+
+### Summary
+A secure “Sandbox Vault” is a local, encrypted storage area within the EKR Viewer. Users drag‑and‑drop files into the vault. An on‑device embedding model creates a searchable index. When the user queries the AI (e.g., Sandeep Genie), the query is processed against this index, and only a summary or file path is returned. No file content is transmitted off‑device. The vault can be cleared instantly, and enterprise policies can disable the feature entirely.
+
+### Detailed Description
+The vault is implemented as an encrypted SQLite database with file content stored as BLOBs. An on‑device mini‑LM or similar model runs within the viewer’s sandboxed process. Indexing is triggered on file addition and is incremental. ABAC policies also apply: if a file contains PII (inferred or user‑tagged), the AI will mask those parts in its response. The audit log records all vault interactions. The feature is toggled by a governance policy for enterprise deployments.
+
+### Claims
+1. A method for providing personalized, privacy‑preserving AI assistance on a user device, comprising:
+   - providing a sandboxed, encrypted storage vault on the user device;
+   - receiving, via explicit user drag‑and‑drop, a set of files into the vault;
+   - generating, using an on‑device embedding model, a searchable index of the vault’s content without transmitting any file data off the device;
+   - receiving a natural language query from the user;
+   - searching the index on‑device and returning a response derived from the vault’s content without exposing raw file data externally.
+
+2. The method of claim 1, further comprising applying data masking to the response if the indexed content contains personally identifiable information.
+
+3. The method of claim 1, further comprising providing a single‑click option to permanently delete the vault and all associated indexes.
+
+4. The method of claim 1, wherein the availability of the vault is controlled by a remote enterprise governance policy that can disable the feature.
+
+### Abstract
+A local, user‑populated sandbox vault allows on‑device AI to answer queries from user‑selected files without uploading any data, ensuring total privacy and enterprise governance.
+
+---
+
+## PATENT 10: Living Canvas Mode – Interactive Fixed‑Layout Widgets
+
+### Title
+**System and Method for Rendering Interactive, Graph‑Driven Widgets in a Deterministic, Fixed‑Layout Canvas Preserving Visual Fidelity**
+
+### Field of the Invention
+This invention relates to document rendering engines, specifically to a dual‑mode viewer that supports a responsive layout and a pixel‑perfect, fixed‑layout canvas that maintains the visual fidelity of traditional documents while allowing full interactivity.
+
+### Background
+PDF guarantees identical rendering across devices by using a fixed page description, but it is static and non‑interactive. Web‑based responsive documents sacrifice layout precision. There is a need for a single document format that can behave like a PDF for layout‑critical use cases while remaining a living, interactive widget.
+
+### Summary
+The EKR Viewer provides a “Canvas Mode.” In this mode, the document is defined on a virtual page with absolute coordinates (e.g., A4 at 300 DPI). Widgets are positioned absolutely. The viewer renders this canvas in a container scaled to fit the viewport, using the browser’s own deterministic print‑quality layout algorithms. Unlike PDF, these widgets remain interactive—buttons, drill‑downs, animations, and AI features all function. The same document can switch to responsive mode for other screen sizes.
+
+### Detailed Description
+The document’s layout metadata includes a fixed grid and coordinate system. A layout engine (similar to CSS Grid for print) calculates the exact position of each widget based on constraints. At render time, the widget tree is painted onto a fixed‑size canvas element, and CSS transforms are used to scale it for display. Interactivity is handled by translating viewport click coordinates back to the virtual coordinate space. Exports to PDF are trivially lossless because the layout is already in absolute terms.
+
+### Claims
+1. A method for rendering an interactive digital document, comprising:
+   - storing a document definition comprising a plurality of interactive widgets positioned on a virtual canvas with absolute coordinates;
+   - providing a viewer capable of operating in a fixed‑layout mode that renders the virtual canvas in a container scaled to fit a display viewport, maintaining exact relative positions of all widgets regardless of screen size;
+   - wherein at least one widget in the fixed‑layout mode remains interactive, accepting user input to drill‑down, play an animation, or invoke an AI assistant.
+
+2. The method of claim 1, wherein the viewer further supports a responsive mode that reflows the same widgets based on the viewport size, and a user can switch between modes without altering the underlying document.
+
+3. The method of claim 1, wherein the virtual canvas is defined with a resolution and physical page size, enabling lossless export to a static PDF file.
+
+4. The method of claim 1, wherein the interactive widget, when invoked, updates other widgets in the fixed‑layout mode in real time.
+
+### Abstract
+A document viewer renders interactive widgets on a fixed virtual canvas, achieving PDF‑like visual consistency while preserving full interactivity, and allows seamless switching to responsive layouts.
+
+---
+
+## PATENT 11: Unified Widget OS & Custom Widget Builder
+
+### Title
+**System and Method for a No‑Code, Extensible Operating System for Building and Monetizing Interactive, Traceable Knowledge Widgets**
+
+### Field of the Invention
+This invention relates to software development platforms, particularly to a no‑code widget builder that generates interactive, graph‑backed widgets which can be published and sold in a marketplace.
+
+### Background
+Creating custom, interactive, data‑connected document elements (widgets) requires programming skills. Existing low‑code platforms are not designed for lifecycle traceability or integration with a semantic knowledge graph. There is no unified system where a business user can define a data schema, design a visual representation, and attach AI behaviors to produce a reusable, monetizable widget.
+
+### Summary
+A Widget OS provides a three‑layer builder: (1) a Data Schema Layer where users define fields and their mappings to graph nodes; (2) a Visual Representation Layer with a library of templates (tree, heatmap, animation, etc.) and a drag‑and‑drop mapping of data to visual properties; (3) a Behavior & AI Layer where users set interactivity, automations, and AI hooks (e.g., “explain”, “anomaly detection”). The resulting widget definition is stored as a graph node, making it versioned, searchable, and immediately traceable. Widgets can be published to a marketplace with various monetization models.
+
+### Detailed Description
+The builder UI generates a JSON widget specification that is interpreted by the universal widget engine. All widgets are projections of graph queries, so traceability is automatic. The platform includes an AI assistant that can suggest schemas from uploaded Excel files. The marketplace handles licensing, revenue share, and sandboxed execution of third‑party widgets based on permissions declared in the specification.
+
+### Claims
+1. A system for creating interactive, traceable knowledge widgets, comprising:
+   - a no‑code schema builder configured to receive a user’s definition of data fields and link them to types in a semantic knowledge graph;
+   - a visual template selector providing a plurality of visualization types, and a mapping interface to bind data fields to visual properties of a selected template;
+   - an AI hook configurator enabling the user to attach pre‑defined artificial intelligence behaviors to the widget;
+   - a rendering engine that interprets the combined schema, visual mapping, and AI hook definition into an executable widget that is a live projection of the knowledge graph.
+
+2. The system of claim 1, wherein the widget definition is itself stored as a node in the knowledge graph with an associated version history.
+
+3. The system of claim 1, further comprising a marketplace module that enables the user to publish the widget for sale or free distribution, with configurable monetization tiers.
+
+4. The system of claim 1, wherein the AI hook configurator includes an option to automatically explain the widget’s content using a language model upon user interaction, without requiring a user prompt.
+
+### Abstract
+A no‑code platform lets users build interactive widgets from a graph schema, visual templates, and AI hooks, turning knowledge into reusable, traceable, and monetizable living components.
+
+---
+
+Bhai, these eleven patent drafts are comprehensive and ready for your patent attorney to formalize with drawings and precise legal claims. Each one can form the basis of a strong patent application. Now, shall we finalize the entire blueprint with these patents incorporated, or do you want to discuss specific claims further?

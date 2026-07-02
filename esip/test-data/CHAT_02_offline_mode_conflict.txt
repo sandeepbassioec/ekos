@@ -1,0 +1,61 @@
+TEAMS CHAT TRANSCRIPT
+Channel: #fieldops-2-mobile
+Date: 2026-06-20
+
+─────────────────────────────────────────────────────────────────
+Ahmed Hassan [10:05] Has anyone seen the feedback from the field pilot in Region East?
+Jake shared a summary: 23 out of 40 pilot technicians reported they go through tunnels or
+basements regularly where they have zero connectivity for 10-15 minutes at a time.
+In those windows, the current app just shows a spinner. Work order updates are lost.
+
+─────────────────────────────────────────────────────────────────
+Lakshmi Reddy [10:09] Yes I saw that. This is the offline mode problem that was explicitly
+put "out of scope" in the PRD. Section 3.2 says "Offline-first mobile support — under evaluation, not committed".
+
+─────────────────────────────────────────────────────────────────
+Ahmed Hassan [10:11] Right, but here's the thing — with v2.0 we're adding real-time location
+tracking and live ETA updates. If the technician goes offline for 15 minutes and can't push
+location pings, the dispatcher's map shows them as "lost" — the ETA goes stale, the SLA
+dashboard flags their job as at-risk even if the tech is making good progress.
+
+So v2.0 actually MAKES the offline problem WORSE than it is today, because v1.4 doesn't
+show ETAs at all — it just shows last status. v2.0 promises live ETAs but can't deliver
+them during connectivity gaps. Customers will see "SLA At Risk" alerts that aren't real.
+
+─────────────────────────────────────────────────────────────────
+Lakshmi Reddy [10:17] That's a really important point. We're raising the bar on what the
+system promises and then not being able to deliver it in a common real-world scenario.
+What's the gap between "lost connection" and "SLA alert fires"?
+
+─────────────────────────────────────────────────────────────────
+Ahmed Hassan [10:20] Looking at the logic: location ping expected every 30s (Travelling)
+or 300s (In Progress). If we miss 4 consecutive pings (2 min for Travelling) the location
+service marks the tech as "location unknown". The dashboard shows that as amber.
+If unknown >5 min it turns red. So a 15-min tunnel means: the tech is shown red for
+13 minutes. Any Critical or High SLA job they hold will trigger re-assignment attempts.
+The tech could come out of the tunnel to find their jobs have been reassigned.
+
+─────────────────────────────────────────────────────────────────
+Lakshmi Reddy [10:24] That's genuinely bad. Not a future problem — this will happen on
+day 1 with Region East technicians. We need to either:
+  (a) Increase the "unknown" threshold (but that makes REAL SLA breaches slower to detect)
+  (b) Build some offline buffer on the mobile app to queue pings and replay them when connectivity returns
+  (c) Add a "manual check-in" option that technicians use when exiting connectivity dead zones
+
+─────────────────────────────────────────────────────────────────
+Ahmed Hassan [10:28] (c) is a workaround, not a fix. (a) is a product tradeoff that Priya
+needs to decide. (b) is offline mode — supposedly out of scope.
+
+But a minimal offline ping buffer is maybe 2 days of work, not the full offline-first
+architecture. The mobile app could store the last 20 pings in AsyncStorage and flush them
+to the API when connectivity is restored. GPS is still available offline on the device.
+
+─────────────────────────────────────────────────────────────────
+Lakshmi Reddy [10:31] Can we get this in front of Priya before sprint 1 locks? This feels
+like a scope decision that needs to be made now, not discovered in UAT.
+
+─────────────────────────────────────────────────────────────────
+Ahmed Hassan [10:32] I'll add it to the sprint 1 planning agenda for tomorrow. Tagging
+@Dev Kapoor @Priya Nair — we need a decision on offline ping buffering before we
+finalize the mobile app sprint scope. This directly conflicts with the PRD statement
+that offline mode is out of scope.

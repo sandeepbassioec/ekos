@@ -1,0 +1,45 @@
+FROM: Natasha Orlova <n.orlova@acme-corp.com> (Legal / DPO)
+TO: Priya Nair <p.nair@acme-corp.com>
+CC: Dev Kapoor <d.kapoor@acme-corp.com>; James Whitfield <j.whitfield@acme-corp.com>
+DATE: 2026-06-18 16:05 PM
+SUBJECT: URGENT — FieldOps 2.0 GDPR DPA Amendment — Timeline Confirmation
+
+Priya,
+
+I've completed the initial GDPR impact assessment for the FieldOps 2.0 location tracking feature.
+I want to share my findings and be clear about what needs to happen before go-live.
+
+Summary of findings:
+
+1. DPA Amendment: The current Data Processing Agreement with our EU customers does NOT cover
+   continuous GPS location tracking of employees. The amendment I've drafted covers:
+   - Article 5(1)(e) compliance (30-day retention, explicitly stated)
+   - Article 13 transparency obligations (technicians must be notified — mobile app must display
+     a clear "Location tracking active" indicator and allow technicians to understand when tracking starts/stops)
+   - Cross-border data transfer: location data will transit through AWS eu-west-1 only — must be
+     stated explicitly in the DPA amendment
+
+2. Timeline: I need 4 weeks for internal legal review, then the amendment must be sent to customers
+   with a 30-day notice period. Realistically, DPA amendment signed by all affected customers = 2026-09-01
+   at the earliest. If go-live is 2026-10-15 that is workable — barely.
+
+3. BLOCKER for earlier testing: We cannot run location tracking in UAT with real technician data
+   until the amendment is signed. You may use anonymised/synthetic data for QA.
+
+4. ADDITIONAL REQUIREMENT I do not see in the PRD:
+   The mobile app MUST display a persistent banner when location tracking is active (per Article 13).
+   It cannot be a one-time pop-up that technicians dismiss and forget. The banner must:
+   - Be visible on the home screen while location is being tracked
+   - State clearly: "Your location is being shared with your dispatcher" (or equivalent)
+   - Link to the privacy policy
+   This is a new functional requirement, not optional.
+
+5. Kafka topic retention: Your PRD (and technical spec PDF) mentions 7-day default retention for the
+   fieldops.technician-location Kafka topic. This must be reduced to 24 hours maximum, per GDPR
+   data minimisation principles. Please update TQ-004 to a decision.
+
+Please confirm in writing that the above requirements will be incorporated into the PRD
+and that testing will not use real technician location data before DPA amendment is signed.
+
+Natasha Orlova
+Data Protection Officer

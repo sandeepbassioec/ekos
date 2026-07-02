@@ -1,0 +1,33 @@
+FROM: Priya Nair <p.nair@acme-corp.com>
+TO: Daniel Frost <d.frost@acme-corp.com>; James Whitfield <j.whitfield@acme-corp.com>
+CC: Sarah Chen <s.chen@acme-corp.com>; Dev Kapoor <d.kapoor@acme-corp.com> (Engineering Lead)
+DATE: 2026-06-15 11:15 AM
+SUBJECT: RE: FieldOps 2.0 PRD Review - Google Maps Cost Concern
+
+Daniel,
+
+Really appreciate you flagging this — you're right, the cost model needs to be updated for the
+RegionEast scenario.
+
+To answer your questions directly:
+
+1. HERE Maps WAS evaluated (Q1 2026, eval doc attached to Confluence: PROJ-FOPS-EVAL-001).
+   It was rejected primarily on two grounds:
+   - Legal/Procurement flagged HERE Maps' data residency terms as incompatible with our EU customer data policy
+   - The HERE Routes API does not support the "optimise_waypoints" parameter we need for PM route clustering
+   We cannot reopen this without a new Legal review, which would add 6 weeks minimum to the timeline.
+
+2. Good challenge on the batch job disable. Dev — can you propose a smarter degradation strategy?
+   My initial thinking: instead of disabling batch clustering entirely, we reduce the frequency
+   (daily → every 3 days) and reduce the region coverage (prioritise Critical SLA regions first).
+   This keeps the feature alive but reduces Google Maps calls by roughly 65%.
+
+I'm also going to action two things immediately:
+- Update the PRD to add a "fleet size scaling" note to NFR-COST-001 with thresholds for 2k, 3k, 5k technicians
+- Ask Dev to add a runtime configuration for max technicians tracked concurrently (so we can cap
+  tracking at 2,500 even if 3,200 are provisioned, with a queue for the rest — FIFO by SLA tier)
+
+Daniel, does this address your concern enough to proceed, or do we need to schedule a deeper review?
+
+Priya
+Head of Product, FieldOps

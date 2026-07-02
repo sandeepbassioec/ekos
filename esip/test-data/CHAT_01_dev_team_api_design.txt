@@ -1,0 +1,92 @@
+TEAMS CHAT TRANSCRIPT
+Channel: #fieldops-2-engineering
+Date: 2026-06-16
+
+─────────────────────────────────────────────────────────────────
+Dev Kapoor [09:12] @everyone — I've been going through the API spec in the PDF and I have a few
+design questions before we start Sprint 1 planning tomorrow. Tagging Ravi and Mei since they'll
+own the Location Service.
+
+─────────────────────────────────────────────────────────────────
+Ravi Sharma [09:18] sure, what's up?
+
+─────────────────────────────────────────────────────────────────
+Dev Kapoor [09:20] First one: the PRD says location pings go every 30 seconds when a job is
+"In Progress or Travelling". But those are two different job statuses. Travelling is when the
+tech is en-route to the job, In Progress is when they're on-site. The ping frequency probably
+should be different — every 30s while Travelling makes sense (moving), but every 30s while
+stationary on-site is wasteful and will drain battery faster.
+
+My suggestion: 30s while Travelling, 5-minute interval while In Progress (on-site).
+This also reduces location pings by ~65% for on-site time.
+
+─────────────────────────────────────────────────────────────────
+Mei Lin [09:24] +1. I was going to raise the same thing. The nextPingIntervalSecs field in
+the response body is already there for exactly this — the server can tell the client what
+interval to use next. So technically we can implement adaptive ping intervals without any
+client-side logic change beyond "respect the interval the server returns".
+
+─────────────────────────────────────────────────────────────────
+Ravi Sharma [09:25] agreed. Can we make this a decision now? If we document adaptive intervals
+as the intended behaviour in the spec, I'll code it that way from day 1 instead of doing it
+as a change later.
+
+─────────────────────────────────────────────────────────────────
+Dev Kapoor [09:27] Let me ping Priya — @Priya Nair can you weigh in? This affects battery life
+and API cost (fewer pings = fewer location records = lower storage cost too).
+
+─────────────────────────────────────────────────────────────────
+Priya Nair [09:41] Makes total sense. Please document it in the spec — 30s Travelling, 300s
+In Progress. I'll update the PRD FR-LS-001 language to say "adaptive interval, minimum 30s,
+maximum 300s, server-directed". Good catch.
+
+─────────────────────────────────────────────────────────────────
+Dev Kapoor [09:42] 👍 updating spec. Second question — bigger one.
+
+The auto-assign endpoint: POST /api/v2/fieldops/dispatch/auto-assign — the PRD says it's
+synchronous with a 5-second timeout. But consider this scenario: 200 concurrent dispatch
+requests arrive simultaneously (big storm event, lots of jobs created at once). Each one
+needs to call Google Maps for ETA computation. Google Maps Routes API is external. If Google
+has a 1-second response time under load, 200 concurrent → 200 parallel Google Maps calls.
+We'll hit our rate limit immediately.
+
+I think we need to rethink this. Options:
+A) Async dispatch: POST returns a jobDispatchId immediately, client polls GET /dispatch/{id}/status
+B) Synchronous but with in-memory ETA cache (TTL 90s) so we don't always hit Google Maps
+C) Synchronous but use Haversine for the sync response and update with real ETA async
+
+─────────────────────────────────────────────────────────────────
+Ravi Sharma [09:55] Option B is my preference. We already have a location cache for
+technician positions (we update it every 30s from pings). We can pre-compute ETAs for all
+active jobs every 90s as a background task and cache the results. The sync endpoint just
+reads from cache. Cache miss → Haversine fallback, async update queued.
+
+─────────────────────────────────────────────────────────────────
+Mei Lin [09:57] Option B works but we need to be careful about cache staleness. If a tech
+just diverted around traffic and their ETA jumped from 12min to 35min, the cached value
+could be stale for up to 90s. For SLA-critical assignments that 90s window matters.
+
+─────────────────────────────────────────────────────────────────
+Dev Kapoor [10:02] Good point. Compromise: cache TTL 90s for Normal/High SLA jobs, 20s
+TTL for Critical SLA jobs. Critical jobs always trigger a fresh Google Maps call if cache
+is stale. Thoughts?
+
+─────────────────────────────────────────────────────────────────
+Ravi Sharma [10:05] that works for me. Let's document this as a design decision and bring
+it to the PRD review. Priya will need to update the API spec.
+
+─────────────────────────────────────────────────────────────────
+Dev Kapoor [10:06] Agreed. Third thing — smaller but worth flagging.
+The dispatch_rules table uses JSONB with JSONLogic expressions. We need a validation layer.
+PRD mentions a "PL/pgSQL validator function" — who is writing this? It's not in any ticket yet.
+If the validator is not solid, an admin could write a malformed rule that crashes the scoring
+engine at runtime. This needs to be in Sprint 1 scope.
+
+─────────────────────────────────────────────────────────────────
+Ravi Sharma [10:09] I can pick that up. Give me until EOD Friday to write a spec for the validator.
+Key behaviours: (1) reject on JSON parse error, (2) validate against JSONLogic schema, (3) test
+evaluation against a dummy technician/job object, (4) return line-by-line errors.
+
+─────────────────────────────────────────────────────────────────
+Dev Kapoor [10:10] Perfect. Adding to Sprint 1 backlog. Let's discuss all of this in tomorrow's
+planning session. I'll share this chat thread with Priya so she can update the PRD.

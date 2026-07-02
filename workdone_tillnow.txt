@@ -1,0 +1,100 @@
+
+
+1.	RL-TOS Re-design -> converted our stored procedure to entity framework code.  [Started October - Released by Jan 2026]
+
+
+Servicemix -> noisy neighbout -> re-architected this part to AWS. 
+
+API -> Sending a message to AWS -> On-Prem Listener  listens to these message -> Processes -> Overview Tables
+
+SP -> 40 ms to process a single transaction
+processing multiple transaction in a single execution 
+
+1 transaction -> 9 SQL Statements
+10 transaction -> 81 -> 9 SQL statements  20 ms
+
+
+2.	AWS Transform Vijay sir									[Started December - still going on]
+	Repairlink and CollisionLink -> modernized 100% code
+
+
+
+3.	RL-PT integration 										[Started December - March 2026]
+
+	pushed event to AWS -> PT team
+	pushed event to AWS from shop -> PT Team
+	
+	
+4.	Thoughworks code reviews, design review, cache suggestions		[continous activity, no fixed timelines]
+
+
+5.	Token DMS -> 15 days Tekion -> they are not having the API which we want. Q3 2026
+
+
+5.	Solera DMS Integration   								[24-December-2025 till Feb 2026]
+	*	Generic document delivery on how to add a new integration	
+	*	Solera specific design document
+	
+6.	Pinewood DMS integration  [In Progress] [starting April 2026]
+
+
+7.	Dealer DMS Customer Number mandatory -> Design
+	
+8.	Dealer Promotion Enhancement
+	- Rules based
+	- Give immediate value to the customer by enhancing the existing UI in existing 
+	- Modernizing the entire Dealer promotion into React + Typescript + OUI -> modernize the backend
+	
+	Clarify whether this is OE sponsored or purely Dealer sponsored, Talk to Amala and Megan about this....
+	
+9.	Dealer right to win
+		Design from frontend is ready, we need a lot of work to do for backend
+
+10. InApp chat - Discovery phase
+		introduce AI capabilities 
+		
+11.	Door Dash - Requirement phase, 
+
+12.	MFE framework and design around that
+	- loading remote application into mfe host.
+
+13.  Manheim SSO - In Progress, we have taken an intermediate solution -> Auth0
+	 - Accessing the Repairlink app from their okta
+	 - Federating with us, we do not have Idp, APIGEE, SAML, greg petros, 
+	 - IAM (Candace and Kenya) - Federation scenario with Auth0
+		-	4 - 6 weeks before they even ready - 1-2 week for integraiton
+		- Joe 1st May, we need to introduce custom 
+
+After office hours:
+1.	micro level or nano level latency for CRUD operation - framework i am working on - 3 months required to complete.
+
+2.	Requirement wizard
+	- Take the product owner BRD, extract the requirements -> generate the WBS -> team - estimate -> estimation technique 15 estimation techniques -> complexity - security -
+	-  Resource requirements, sprint desired,
+	-  Hardware sizing rackspace or AWS
+	-  Capture the non-functional from the architected
+	-  Architecture including HLD and LLD
+	
+	
+	
+
+	Dealer promotion
+	-	How many promotions are getting created on daily basis
+	-	Current stats in production about how many dealers are offering promotion to shops
+	-	What is the intended future state we are looking at, if more dealers are not going to attempt it then what is the ROI for this re-architecture or modernization?
+	-	capture metrics and build a dashboard about total promotions, applications, qualification scenarios, how many promotions are getting created on daily basis, weekly, and even monthly
+		-	This needs change in design and need to discuss in detail with the product owner
+	
+	-	Just ask product about the usability and acceptability of change in the UI/UX.
+	
+	-	Check how we are protecting DDoS attacks on web application which are publicly available
+		-	Check which Firewall we have, is it F5 or something else
+		-	Share this information back.
+		
+		
+	-	Setup a meeting with operations about AWS, 
+	modernizated page need to be an iframe our Repairlink
+	
+	
+	POC on the PSX api and put the analytics
+	

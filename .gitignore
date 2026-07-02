@@ -1,0 +1,71 @@
+# ---------- .NET Core ----------
+bin/
+obj/
+out/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.dll
+*.pdb
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Rider / VS
+.vs/
+.idea/
+*.csproj.user
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Bb]uild/
+[Bb]in/
+[Oo]bj/
+
+# Test / coverage
+[Tt]est[Rr]esult*/
+coverage*.json
+coverage*.xml
+*.coverage
+*.trx
+
+# ---------- Node.js ----------
+node_modules/
+jspm_packages/
+.npm
+.eslintcache
+.node_repl_history
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build output
+dist/
+build/
+.next/
+.nuxt/
+.cache/
+.parcel-cache/
+coverage/
+
+# ---------- Environment / secrets ----------
+.env
+.env.local
+.env.*.local
+*.pfx
+appsettings.*.local.json
+
+# ---------- OS / editor ----------
+.DS_Store
+Thumbs.db
+*.swp

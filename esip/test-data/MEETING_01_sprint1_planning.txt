@@ -1,0 +1,174 @@
+TEAMS MEETING TRANSCRIPT
+Meeting: FieldOps 2.0 — Sprint 1 Planning + PRD Review
+Date: 2026-06-17 | Duration: 1h 45m
+Attendees: Priya Nair (PM), Dev Kapoor (Eng Lead), Ravi Sharma (Backend), Mei Lin (Backend),
+           Ahmed Hassan (Mobile), Lakshmi Reddy (Mobile), James Whitfield (Delivery Manager),
+           Daniel Frost (VP Field Ops — first 30 min only)
+
+── TRANSCRIPT ────────────────────────────────────────────────────────────────
+
+JAMES WHITFIELD [00:01]:
+Good morning everyone. Agenda today: PRD walkthrough decisions, Sprint 1 scope lock,
+and any blockers. Priya, do you want to kick off?
+
+PRIYA NAIR [00:02]:
+Sure. I want to address Daniel's email first while he's on the call.
+Daniel — on the HERE Maps question: I confirmed with procurement this morning.
+The HERE evaluation from Q1 is binding. Legal has a data residency concern that cannot
+be waived. We're sticking with Google Maps. For cost scaling, Dev is going to implement
+a configurable max-technician tracking cap. Dev, can you summarise?
+
+DEV KAPOOR [00:03]:
+Yes. We'll add a runtime config: MAX_TRACKED_TECHNICIANS (default 2000, max 3000).
+When active technicians exceed this, we queue by SLA tier — Critical SLA technicians
+always tracked, then High, then Normal. This gives us a knob to stay within cost budget
+regardless of fleet size. At 3,200 technicians, if we cap at 2,500, we cut overage risk significantly.
+Monthly cost at 2,500 with our formula comes to about $3,350 — still over budget.
+We'd need to cap at roughly 2,200 to stay safely under $3,000.
+
+DANIEL FROST [00:05]:
+So some Normal SLA technicians may not have their location tracked at all?
+
+DEV KAPOOR [00:06]:
+Correct, when fleet exceeds cap. Their jobs still dispatch normally — they just won't appear
+on the live map. The dispatcher can still manually assign them.
+
+DANIEL FROST [00:07]:
+I can live with that for now. I want it documented that this is a known limitation.
+Make sure the dashboard clearly shows when a technician is "untracked" rather than
+just being invisible on the map.
+
+PRIYA NAIR [00:08]:
+Agreed, I'll add that as a functional requirement — untracked technicians should show as
+greyed-out pins on the map, not be invisible.
+
+DANIEL FROST [00:10]:
+Good. I have to drop to another meeting. I'm satisfied with the direction. Let me know
+if you need me for the GDPR discussion — Natasha copied me on her email.
+
+[Daniel Frost leaves the meeting]
+
+PRIYA NAIR [00:12]:
+Okay, moving to the Natasha's email from Legal. The four action items she raised:
+One: mobile location tracking banner — active indicator during tracking. This is a new
+functional requirement. Ahmed, Lakshmi — how complex?
+
+AHMED HASSAN [00:13]:
+Not complex at all. A persistent banner component we show whenever tracking is active.
+Two to three hours of work. The bigger question is exactly what the text should say —
+that needs Legal sign-off.
+
+PRIYA NAIR [00:15]:
+I'll get Legal to provide approved copy by end of this week. Ahmed, assume it's a banner
+at the top of the home screen: icon, text, and a "Learn more" link. I'll add this to the PRD
+as FR-MOB-001 — it's a mandatory compliance requirement.
+
+Two: Kafka topic retention reduced to 24h. Dev?
+
+DEV KAPOOR [00:16]:
+Easy config change. I'll add it to the Kafka setup script. Ravi, note this — TQ-004 is now
+a decision: 24h retention on fieldops.technician-location. Done.
+
+RAVI SHARMA [00:17]:
+Noted. I'll update the architecture doc.
+
+PRIYA NAIR [00:18]:
+Three: no real technician data in UAT before DPA amendment. This is a constraint we
+need to plan around. Dev, do we have a synthetic data generator for technician locations?
+
+DEV KAPOOR [00:20]:
+We have a basic simulator from the v1.4 load testing. I'll extend it to produce GPS traces
+along real road networks — I can use the Google Maps Roads API to snap random coordinates
+to roads. Should take a week. The QA team can use simulated technicians for all UAT.
+
+PRIYA NAIR [00:21]:
+Perfect. That's our UAT data strategy. I'll confirm this with Natasha.
+
+Four: remaining_time_estimate for in-progress jobs — Natasha's email didn't mention this
+but I want to resolve TQ-005 now while engineering is here. The SLA pre-emption logic
+needs to know how much time is left on a current job.
+
+MEI LIN [00:23]:
+We looked at this. Two options. Option A: manual estimate — the technician sets an
+estimated completion time when they start the job. Dispatchers see it. It's subjective.
+Option B: we compute average job duration by job type from historical data, subtract
+elapsed time. More objective but ignores job-specific complexity.
+
+RAVI SHARMA [00:25]:
+Option B is better for the automated pre-emption decision because it doesn't rely on
+technician input. Technicians rushing through jobs to avoid pre-emption would be a bad incentive.
+
+DEV KAPOOR [00:26]:
+Agreed. Let's go Option B: computed remaining_time_estimate = avg_duration_for_job_type - elapsed_time_since_start.
+I'll add this to the WorkOrderService. We need a job_type_durations reference table.
+That's a new table — I'll add it to the schema delta. Should take about three days.
+
+PRIYA NAIR [00:27]:
+Great, TQ-005 resolved. Option B, with a new job_type_durations reference table.
+I'll update the PRD and PDF.
+
+[ITEM: Adaptive ping intervals — resolves gap from Dev's chat message]
+PRIYA NAIR [00:29]:
+Also from Dev's Teams chat yesterday — adaptive ping intervals. We're officially changing
+FR-LS-001 to: 30-second interval during Travelling status, 300-second interval during
+In Progress status, server-directed via nextPingIntervalSecs in the response.
+Everyone okay with this?
+
+[No objections]
+
+[ITEM: ETA cache design]
+DEV KAPOOR [00:31]:
+Next: the ETA cache design. My proposal from the chat: 90-second TTL for Normal and High SLA,
+20-second TTL for Critical SLA. Cache populated by a background service that calls Google Maps
+every 90 seconds for all active technicians. Synchronous auto-assign endpoint reads from cache.
+Cache miss → Haversine fallback, async refresh queued.
+
+RAVI SHARMA [00:33]:
+One concern: what if the cache service crashes? The auto-assign endpoint falls back to Haversine
+permanently until the cache recovers. Haversine accuracy is ±25% on congested urban routes.
+We should have a health check on the cache service that the auto-assign endpoint can use to
+decide whether to return a stale ETA or flag it as estimated.
+
+DEV KAPOOR [00:35]:
+Fair. We add a field to the auto-assign response: etaSource: "google_maps_cached" | "haversine_fallback" | "google_maps_live".
+The Dashboard can show a small indicator when the ETA is an estimate.
+
+PRIYA NAIR [00:36]:
+I like that. It's honest to the dispatcher about data quality. I'll add etaSource to the
+API spec and the Dashboard UI design.
+
+[ITEM: Sprint 1 scope lock]
+JAMES WHITFIELD [00:40]:
+We need to wrap up sprint 1 scope in the next 20 minutes. Dev, what's on the candidate list?
+
+DEV KAPOOR [00:41]:
+From priority: (1) Set up TLS microservice skeleton + DB schema migrations, (2) POST /api/v2/location/ping
+endpoint + basic auth, (3) Kafka producer setup in TLS, (4) dispatch_rules table + JSONLogic validator
+(Ravi), (5) job_type_durations reference table (new — from TQ-005 resolution), (6) Location simulator
+for UAT (needs to start early for QA team).
+
+JAMES WHITFIELD [00:43]:
+That's a full sprint. I'd suggest (6) starts in Sprint 1 but doesn't need to be done by sprint end.
+Ahmed, what's on the mobile side?
+
+AHMED HASSAN [00:44]:
+Mobile Sprint 1: GPS ping logic (30s / 300s adaptive), location permission flow, and the
+compliance banner (FR-MOB-001). I also want to start the offline ping buffer — I know it's
+out of scope but after that pilot feedback I'm worried.
+
+PRIYA NAIR [00:46]:
+Ahmed, I hear you on the offline concern. I can't officially put it in scope today — I need
+to run it through the steering committee because it will affect timeline. What I can say is:
+you can do a spike in Sprint 1 — no more than 2 days — to prototype the offline ping buffer
+and report back on effort. If it's truly 2 days, I'll fight for it. If it's 2 weeks, we
+have to defer it.
+
+AHMED HASSAN [00:47]:
+Fair enough. I'll do the spike.
+
+JAMES WHITFIELD [00:50]:
+Sprint 1 is locked. Dev, please update Jira by EOD today.
+
+[Meeting continues with team logistics discussion — not material to requirements]
+
+END OF TRANSCRIPT

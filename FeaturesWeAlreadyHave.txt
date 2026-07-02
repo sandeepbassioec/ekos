@@ -1,0 +1,80 @@
+Features We ALREADY Have (Covered)
+✅ Single-writer per shard (LMAX, VoltDB, TigerBeetle)
+✅ Lock-free ring buffers with batch consumption (LMAX Disruptor)
+✅ Cache-line padding / false sharing prevention (LMAX, ScyllaDB)
+✅ Zero-GC / pre-allocated memory (LMAX, TigerBeetle, ScyllaDB)
+✅ DPDK kernel bypass networking (ScyllaDB Seastar)
+✅ io_uring for disk I/O (ScyllaDB, TigerBeetle)
+✅ eBPF/XDP pre-filtering (ScyllaDB)
+✅ RDMA replication (custom, beyond what most have)
+✅ WAL with hash chain integrity (TigerBeetle)
+✅ Deterministic replay / recovery (LMAX, TigerBeetle)
+✅ Snapshots + WAL replay (LMAX, VoltDB, SAP HANA)
+✅ SIMD/AVX2 scanning (custom, ScyllaDB uses SIMD internally)
+✅ Columnar + Document dual-mode reads (SingleStore Universal Storage, SAP HANA)
+✅ Compiled query filters via Expression Trees (VoltDB stored procedures concept)
+✅ Multi-tenancy with resource isolation (SAP HANA MDC, ScyllaDB service levels)
+✅ Projection Dispatcher to external DBs (VoltDB export connectors, TigerBeetle CDC)
+✅ Epoch fencing / split-brain prevention (FoundationDB generations)
+✅ Consistent hashing for shard placement (Aerospike, ScyllaDB)
+✅ Thread-to-core pinning / NUMA awareness (ScyllaDB, LMAX)
+✅ Live shard migration (Aerospike, ScyllaDB)
+✅ Auto-scaling / shard splitting (Aerospike, ScyllaDB)
+✅ Polyglot client SDKs (TigerBeetle, VoltDB, Redis, Aerospike)
+✅ CDC / change data capture (TigerBeetle, ScyllaDB, VoltDB)
+✅ DST simulation testing (FoundationDB, TigerBeetle)
+✅ CLI + dashboard tooling (VoltDB VMC, Aerospike asadm, ScyllaDB Manager)
+✅ Legacy migration strategy (unique to us — most systems don't even address this)
+✅ YAML-driven config (unique — most require code/SQL)
+
+Features We're MISSING — Gap Analysis
+Here are features found across these systems that are NOT in our current REQUIREMENTS.md or IMPLEMENTATION_PLAN.md:
+
+1. Configurable Wait Strategies (from LMAX)
+LMAX offers 7 different wait strategies per ring buffer consumer: BusySpin, Yielding, Sleeping, Blocking, Timeout, Lite. VectorVolt's ring buffer currently assumes one strategy. Different consumers need different trade-offs (hot-path = busy spin, projection dispatcher = sleeping).
+
+2. Consumer Dependency DAGs (from LMAX)
+LMAX lets you arrange consumers in a directed acyclic graph: "A and B run in parallel, then C runs after both complete." Our ring buffer assumes simple single-consumer-per-shard. For complex pipelines (journal + replicate in parallel, then execute), we need DAG gating.
+
+3. Back-Pressure with Configurable Policy (from LMAX, Aerospike)
+When the ring buffer is full, what happens? LMAX blocks the producer. We should make this configurable: block, drop-newest, drop-oldest, reject-with-error. Different tenants may need different policies.
+
+4. Exactly-Once / Idempotency Keys (from TigerBeetle)
+TigerBeetle enforces client-generated 128-bit IDs as idempotency keys. Duplicate submissions return exists instead of creating duplicates. Our CommandFrame has CorrelationId but no explicit idempotency enforcement at the engine level.
+
+5. Two-Phase Transactions / Pending State (from TigerBeetle)
+TigerBeetle supports pending → post/void/timeout flows (reserve funds, then confirm or cancel). Critical for payments, escrow, reservations. Our system handles single-phase mutations only. Two-phase is a real-world requirement for any financial/booking system.
+
+6. Materialized Views / Continuous Aggregations (from VoltDB, SingleStore)
+VoltDB automatically maintains materialized views as transactions execute — incrementally updated, not batch-recomputed. Our Read Fabric handles scans but has no concept of pre-computed aggregates (COUNT, SUM, AVG per group) that update in real-time.
+
+7. TTL / Automatic Record Expiration (from Redis, Aerospike, ScyllaDB)
+Per-record or per-entity time-to-live with automatic eviction. We have time-tiered storage (hot→warm→cold) but no automatic record expiration/deletion. For session stores, caches, temporary holds — TTL is essential.
+
+8. Atomic Multi-Operation on Single Entity (from Redis, Aerospike)
+Redis MULTI/EXEC and Aerospike's operations API allow multiple mutations on a single record in one atomic call (increment field A, append to list B, set field C — all or nothing). Our CommandFrame handles one mutation per command. Batching multiple field-level operations in a single atomic command reduces round-trips.
+
+9. Probabilistic Data Structures (from Redis)
+Bloom Filters (membership test), HyperLogLog (cardinality estimation), Count-Min Sketch (frequency estimation), Top-K. These are ~1KB structures that answer "have I seen this before?" in O(1) with configurable false-positive rates. Useful for deduplication, analytics, rate limiting.
+
+10. Workload Prioritization / QoS Tiers (from ScyllaDB)
+ScyllaDB assigns service levels with shares (1-1000) per role. Interactive (OLTP) workloads get priority over batch (OLAP) queries. Our system treats all commands equally. When a heavy scan query runs alongside real-time transactions, we need priority scheduling.
+
+11. Versionstamps / Global Ordering Tokens (from FoundationDB)
+FoundationDB embeds monotonic 10-byte versionstamps into keys/values, providing total ordering of all mutations cluster-wide. Our SequenceNumber is per-shard. For cross-shard ordering (event sourcing, audit trails), we need a cluster-wide monotonic stamp.
+
+12. Transactional Watches / Key Change Notifications (from FoundationDB, Redis)
+FoundationDB lets clients set a watch on a key — fire when it changes. Redis has keyspace notifications. Our system has no push-based change notification to clients. Currently clients must poll or use the Projection Dispatcher. Real-time UI updates need push.
+
+13. Write-Verify (Read-After-Write Verification) (from TigerBeetle)
+TigerBeetle reads data back from disk after WAL writes to confirm durability. Catches silent disk corruption, firmware bugs, and misdirected I/O. Our WAL trusts fsync. Adding read-verify for critical writes is a safety enhancement.
+
+14. Built-in Benchmarking Tool (from Aerospike, our vvctl bench partially covers this)
+Aerospike ships asbenchmark as a first-class tool. Our vvctl bench covers hardware microbenchmarks but we should also include a built-in load generator that simulates real entity CRUD at scale — not just hardware tests.
+
+15. Warm Restart / Fast Restart (from Aerospike)
+On process restart, Aerospike's index survives in shared memory — node rejoins in seconds without rebuilding from disk. Our recovery is snapshot + WAL replay. If we keep the MemoryArena in shared memory (Linux shm_open), we could restart without any replay.
+
+My recommendation: Items 1-6 and 10-11 are architecturally significant and should go into the requirements. Items 7-9 and 12-15 are valuable but could be Phase 7/8 additions. Want me to add them all, or do you want to prioritize which ones matter most to you?
+
+
