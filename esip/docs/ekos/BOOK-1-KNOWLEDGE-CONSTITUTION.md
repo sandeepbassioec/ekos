@@ -184,7 +184,187 @@ the truth?" problem at its root.
 
 ---
 
-## Part III — How This Book Governs
+## Part III — Constitutional Compliance Protocol (How Laws Are Enforced at Runtime)
+
+> **Added 2026-07-03.** The Constitution is not a document to be read — it is a runtime
+> contract to be enforced. Every caller (UI, SDK, EKR Viewer, KWR Worker, third-party
+> extension, autonomous AI agent) reaches EKOS through the syscall layer (Vol 22), and
+> every syscall passes through the **Constitutional Compliance Runtime (CCR)** — a
+> cross-cutting enforcement layer that makes the Laws binding at execution time, not just
+> at design time. **ADR-051** governs this decision.
+
+### 1. The Enforcement Principle
+
+Callers do not "call the Constitution." Callers call syscalls. The CCR **intercepts every
+syscall** and enforces the applicable Laws on behalf of all callers — without opt-in,
+without escape hatch, without trusted-caller bypass. The Constitution is enforced by the
+runtime, not trusted to callers.
+
+This mirrors how operating systems work: no user-space process can bypass the kernel's
+memory protection, scheduling, or capability model regardless of how trusted it is.
+EKOS's Constitution is the kernel's protection model for knowledge.
+
+### 2. Law Enforcement Tiers
+
+Not all Laws are enforced the same way. Laws are tiered by where and how they are checked:
+
+| Tier | Laws | Enforcement mechanism | When checked |
+|---|---|---|---|
+| **Tier 1 — Structural invariants** | Law 2, 3, 13 | Architecture enforces them. The ports literally do not expose a path that bypasses the graph or the projection layer. No runtime check needed — the wrong path doesn't exist. | At design time; port boundaries |
+| **Tier 2 — Behavioral laws** | Law 4, 6, 11, 16 | CCR checks on every qualifying syscall. `Commit()` checks Law 11 (bitemporal). `Project()` checks Law 3/16 (projection, no representation persistence). `Query()` checks Law 6 (AI-scoped). | At every syscall invocation |
+| **Tier 3 — Policy laws** | Law 5, 7, 8, 9, 10, 12, 14, 15 | OPA/Rego policy engine (CCR delegates to the policy evaluation plane). Policies are themselves knowledge objects (Law 12). | At qualifying syscall; async for audit |
+| **Tier 4 — Capability laws** | Law 1 | Design Methodology gate; ADR; architecture review. Not a runtime check — a decision-time gate. | At decision / ADR time |
+
+### 3. The ConstitutionalViolation Error Hierarchy
+
+Every CCR violation produces a typed error. The hierarchy is stable — callers may catch
+specific law violations for structured handling:
+
+```
+ConstitutionalViolation (base)
+├── Law2Violation       — caller attempted to write knowledge outside the graph
+│                          (e.g., persisting to a shadow datastore via a bypassed port)
+├── Law3Violation       — caller attempted to persist a representation as canonical knowledge
+│                          (Law 16 subtype — representation persistence without evidence exception)
+│   └── RepresentationPersistenceViolation (Law 16)
+├── Law4Violation       — caller provided credentials / configuration that weakens
+│                          the cryptographic model (e.g., null-key, test bypass)
+├── Law6Violation       — AI syscall attempted to originate a fact without graph-sourced grounding;
+│                          or AI operation executed outside the calling principal's PDP scope
+├── Law7Violation       — caller attempted to trigger a training pipeline on customer content
+├── Law11Violation      — caller attempted a destructive (non-bitemporal) write;
+│                          valid-time or transaction-time missing from Commit()
+├── Law13Violation      — app-layer code attempted to call a kernel primitive directly,
+│                          bypassing the syscall layer
+└── PolicyViolation     — OPA/Rego evaluation returned deny
+    ├── GovernanceViolation    (Law 12)
+    ├── VendorLockInViolation  (Law 9 — export path blocked)
+    └── AirGapViolation        (Law 8 — feature deployed with no air-gap equivalent)
+```
+
+**Rules for all callers:**
+- All `ConstitutionalViolation` subtypes are **never suppressible** by user-space callers.
+- A violation **never leaks unauthorized information** about the rejected knowledge object
+  (consistent with Vol 04 §7 and EKOS-22-028).
+- Every violation **emits a constitutional telemetry event** (§4 below) before returning
+  the error to the caller.
+
+### 4. Constitutional Telemetry — The Unified Observability Pipeline
+
+Every CCR evaluation — pass or violation — emits a structured event to the **Constitutional
+Telemetry Stream** (CTS). This is the single, unified observability plane for all
+constitutional enforcement activity across all callers and all deployment tiers (SaaS,
+air-gap, EKR Viewer, SDK, KWR).
+
+**ConstitutionalEvent schema (illustrative):**
+
+```json
+{
+  "eventId": "<uuid>",
+  "timestamp": "<ISO8601>",
+  "lawsEvaluated": ["Law11", "Law3"],
+  "outcome": "PASS | VIOLATION | POLICY_DENY",
+  "violatedLaw": "Law11",
+  "violationType": "Law11Violation",
+  "syscall": "Knowledge.Commit",
+  "callerType": "SDK | UI | EKR_Viewer | KWR_Worker | Extension | AI_Agent",
+  "callerId": "<principal-id>",
+  "tenantId": "<tenant-id>",
+  "knowledgeObjectRef": "<KO-id>",
+  "policyRef": "<OPA-package-path>",
+  "correlationId": "<trace-id>",
+  "deploymentTier": "SaaS | AirGap | EKR | Edge"
+}
+```
+
+**CTS properties:**
+- **Immutable** — events are appended, never modified (Law 11 applies to itself).
+- **Caller-agnostic** — one stream regardless of whether the caller is a browser, SDK,
+  EKR Viewer, autonomous AI, or third-party extension.
+- **Platform-internal** — not filtered by tenant PDP scope (compliance officers can see
+  all constitutional events for their tenant; the platform team sees across tenants).
+- **Standard transport** — emitted as CloudEvents over the kernel's Kafka journal (Vol 18
+  §8); consumed by the Governance Service (Vol 05), SIEM integrations (Vol 04 §19),
+  and the Constitutional Compliance Dashboard.
+
+**Mandatory CTS metrics (per tenant, per deployment tier):**
+
+| Metric | Description |
+|---|---|
+| `ekos.ccr.evaluations.total` | Total CCR evaluations (all syscalls, all callers) |
+| `ekos.ccr.evaluations.by_law` | Evaluation count broken down by law |
+| `ekos.ccr.violations.total` | Total constitutional violations |
+| `ekos.ccr.violations.by_law` | Violations broken down by violated law |
+| `ekos.ccr.violations.by_caller_type` | Violations broken down by caller type (SDK/UI/Extension/AI) |
+| `ekos.ccr.policy_denies.total` | OPA policy denials |
+| `ekos.ccr.latency_p99_ms` | CCR enforcement latency at P99 (target: < 1ms in-process) |
+
+These metrics are first-class platform health indicators — visible on the Constitutional
+Compliance Dashboard alongside SLOs, and exported via `Observe()` to any monitoring tool
+(Law 10 — pluggable).
+
+### 5. Extension Compliance Manifest
+
+Any party extending EKOS (third-party widget, connector, app, SDK client, AI agent
+integration) MUST declare a **Constitutional Compliance Manifest (CCM)** — a signed
+knowledge object submitted at extension registration time. This is the mechanism by which
+the Constitution extends to every extension.
+
+**CCM minimum required fields:**
+
+```yaml
+ekos_ccm_version: "1.0"
+extension_id: "<globally-unique-id>"
+extension_type: "App | Widget | Connector | AI_Agent | SDK_Client"
+author_tenant: "<tenant-id>"
+constitution_version: "Book1-v1"   # pins to a Constitution version
+
+# Which laws the extension explicitly engages with (not opts out of —
+# all laws are binding; this declares which ones the extension
+# consciously interacts with and how)
+law_engagements:
+  - law: "Law16"
+    engagement: "Produces projections on demand; no representation persistence"
+    evidence_artifact_types: ["signed-contract", "filed-pdf"]  # if any
+  - law: "Law6"
+    engagement: "AI features are grounded via Knowledge.Query; no LLM-originated facts"
+  - law: "Law8"
+    engagement: "All AI model calls route through AI Engine port; local model available"
+
+# Syscalls this extension uses (CCR uses this for pre-registration validation)
+syscalls_used: ["Knowledge.Open", "Knowledge.Query", "Knowledge.Project"]
+
+# Extension's own error mapping (how it surfaces ConstitutionalViolations to users)
+violation_surface: "SDK-exception | UI-error-boundary | gRPC-status"
+
+# Signed by the extension author's tenant key (KMS)
+signature: "<Ed25519-signature-over-manifest-hash>"
+```
+
+**CCM enforcement rules:**
+- An extension that uses a syscall not declared in `syscalls_used` receives a
+  `ConstitutionalViolation` (Law 13 — unexpected kernel access).
+- A CCM signed with an invalid or revoked key is rejected at registration time.
+- CCM versions are pinned — when the Constitution is amended, extensions must declare
+  re-compliance before their manifests are accepted against the new version.
+- Platform operators may audit all CCMs via `Knowledge.Query` (they are knowledge objects
+  in the graph — Law 15 / self-hosting).
+
+### 6. Caller-Specific Enforcement Notes
+
+| Caller type | CCR entry point | Notes |
+|---|---|---|
+| **Browser UI** (ESIP, EKOS apps) | App SDK → syscall layer | SDK wraps CCR; UI never touches kernel directly. `ConstitutionalViolation` surfaces as a typed error boundary. |
+| **SDK clients** (.NET, Rust, TS, Python) | Syscall layer directly | SDK is a thin ergonomic wrapper; every call enters CCR. Language-idiomatic exception type wraps `ConstitutionalViolation`. |
+| **EKR Viewer** (free viewer, offline) | Syscall layer (local kernel instance) | Viewer ships with a bundled CCR; air-gap enforcement identical to cloud. Law 4, Law 11, Law 16 enforced locally. |
+| **KWR Worker** (human/AI/automation) | Worker SDK → syscall layer | Worker SDK routes every `IKnowledgeAccess` call through the syscall layer. Capability-scoped sandbox + CCR enforce together. |
+| **Third-party extension** | Syscall layer (CCM required) | Must have a valid, signed CCM. `syscalls_used` checked on every call. |
+| **AI Agent** (autonomous) | Syscall layer via Worker SDK | Law 6 enforced: every AI invocation is checked for grounding source. AI cannot invoke `Commit()` for facts not sourced from `Query()` results. |
+| **Another EKOS service** (internal) | Syscall layer | No privileged internal bypass. Internal EKOS services are principals with their own capability grants — not trusted by default. |
+
+---
+
+## Part IV — How This Book Governs
 
 - **Precedence:** Book 1 > any volume. On conflict, Book 1 wins; the volume is corrected.
 - **Citation:** volumes cite laws as "Law N" (replacing the older "Constitution §N"

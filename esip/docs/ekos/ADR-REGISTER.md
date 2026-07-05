@@ -233,8 +233,289 @@
 > (2026-07-01)** — 49 ADRs logged. **ADR-050** enacted 2026-07-01 (post-architecture
 > insight: Law 16 + KRR). Total: **50 ADRs**.
 
+## ADR-051 — Constitutional Compliance Runtime (CCR)
+- **Context:** Book 1 declares 16 Laws that are binding on every caller — UI, SDK, EKR
+  Viewer, KWR Worker, third-party extension, autonomous AI agent. Until 2026-07-03, these
+  Laws existed as a *document* (design-time intent) but had no runtime enforcement layer.
+  No architecture document specified *where* the Laws are checked, *who* checks them,
+  *what error type* a violation produces, *how* violations are observed, or *how*
+  third-party extensions declare and prove constitutional adherence. The Constitution was
+  philosophy without a court. This gap was identified by the user: "whosoever calls it —
+  whether UI or SDK or EKR reader or EKOS or anybody extending it — should follow the same
+  Constitution and it should give the centralized observability, logging and metrics and
+  error mechanism."
+- **Decision:** Introduce the **Constitutional Compliance Runtime (CCR)** as a
+  cross-cutting enforcement layer at the syscall boundary (Vol 22). The CCR:
+  (1) Intercepts every `Knowledge.*` syscall on every caller path — no opt-out,
+  no trusted-caller bypass, no internal escape hatch.
+  (2) Enforces Laws in three tiers: Structural (architecture-enforced), Behavioral
+  (CCR runtime check per syscall), Policy (OPA/Rego delegation).
+  (3) Produces a typed `ConstitutionalViolation` error hierarchy — callers handle
+  specific law violations; violations are never suppressible.
+  (4) Emits every evaluation (pass or violation) to a **Constitutional Telemetry Stream
+  (CTS)** — a single, immutable, caller-agnostic observability pipeline covering all
+  callers across all deployment tiers (SaaS, air-gap, EKR Viewer, Edge).
+  (5) Requires a signed **Constitutional Compliance Manifest (CCM)** from every
+  third-party extension — declaring syscalls used, law engagements, and evidence-artifact
+  types — checked at registration and on every syscall.
+  The Constitution is enforced by the runtime, not trusted to callers.
+- **Alternatives considered:**
+  (a) *Trust internal callers; only check third-party extensions* — rejected. Internal
+  callers are principals with grants, not trusted actors. A compromised internal service
+  should be governed identically to any other caller. "Trusted internal" is the most
+  common source of compliance failures in real systems.
+  (b) *Enforce laws in each subsystem independently* — rejected. This produces N
+  independent enforcement implementations, N independent observability streams, and
+  inevitable gaps where a subsystem forgets to enforce a law. Centralization at the
+  syscall boundary is the only model that guarantees uniformity.
+  (c) *Enforcement via code review / architecture linting only* — rejected. Design-time
+  gates catch known violations in first-party code; they do not cover third-party
+  extensions, AI agents, or runtime edge cases. Both are needed; neither replaces the other.
+  (d) *Separate CCR service (sidecar)* — rejected for the in-process fast path. CCR must
+  be < 1ms P99; a network hop to a sidecar adds unjustifiable latency for every syscall.
+  The enforcement logic runs in-process; the *telemetry* is emitted to Kafka (asynchronous,
+  non-blocking).
+- **Consequences:**
+  Positive: The Constitution becomes a runtime contract, not just a document. Every
+  caller sees identical enforcement. A single CTS stream provides audit, compliance
+  reporting, anomaly detection, and constitutional health metrics for the entire platform.
+  Extension ecosystem is safe by default (CCM required). `ConstitutionalViolation` type
+  hierarchy makes law enforcement introspectable in code.
+  Negative: CCR adds in-process overhead to every syscall (target: < 1ms P99 for
+  behavioral-tier checks; OPA policy checks are async where possible). CCM registration
+  adds friction for extension authors (mitigated by SDK tooling that generates CCMs).
+  The typed violation hierarchy must be kept stable across ABI versions (breaking a
+  violation type is a breaking change — governs by the same deprecation policy as the
+  syscall ABI, ADR-019 / EKOS-22-019).
+- **Status:** ✅ Accepted. **Links:** Book 1 Part III (CCR specification); Vol 22 §§14–16
+  (CCR requirements, constitutional telemetry, extension manifest); ADR-050 (Law 16 /
+  KRR — the law CCR enforces); Vol 04 §7 (no-existence-leak rule, honored by
+  ConstitutionalViolation responses); Vol 05 (governance / OPA — Tier 3 enforcement);
+  A06 (security architecture — CCR is a security-critical path).
+
+---
+
+### ADR-052 — Storage Provider Abstraction Model (Multi-Database Portability)
+
+- **Date:** 2026-07-03
+- **Status:** ✅ Accepted
+- **Deciders:** Sandeep Bassi (architect), Claude (design partner)
+- **Context:**
+  A03 ADR-020 declared that the graph store is "behind the Storage Abstraction port (Vol 18 §9) —
+  swappable," and A02 established hexagonal ports everywhere. However, neither document formalizes the
+  *adapter contract* — what a storage driver must implement to plug into EKOS. Without a formal
+  interface specification, "swappable" is an intention, not a deployable capability.
+  The user identified the critical risk during pre-ADR review: *"We would like to support multiple
+  graph databases, if it needs relational database then multiple and same way for NoSQL databases.
+  Tomorrow if we distribute it for on-prem, client's cloud infrastructure (they may want cheaper
+  services) then this will be another factor which goes against us."* This surfaces four concrete
+  failure modes: (1) an enterprise client who already has SQL Server or MongoDB refuses to provision
+  a new database just to run EKOS; (2) a government/air-gap client cannot use any managed cloud DB;
+  (3) a cost-sensitive SME rejects PostgreSQL-specific operational overhead when they already run
+  MySQL; (4) a client on AWS with Amazon Neptune or Azure with Cosmos DB cannot bring their existing
+  investment. Any hard dependency on a specific database loses those deals or forces unwanted
+  infrastructure. EKOS must be database-agnostic from the first production deployment.
+- **Decision:**
+  Adopt a formal **Storage Provider Model** with four interface families, each independently
+  pluggable at deploy time. EKOS core code calls only interfaces — never database drivers directly.
+  Clients configure which providers to use via Helm values / environment configuration.
+  VectorVolt (per `VECTORVOLT-EKOS-INTEGRATION-PLAN.md`) is the long-term unified provider that
+  eventually implements all four interfaces; until VectorVolt matures to each gate, the below
+  reference implementations are used.
+
+  **Interface 1 — `IGraphStoreProvider`** (knowledge graph: nodes, edges, traversal, Cypher/GQL)
+  | Provider | License | When to Use |
+  |---|---|---|
+  | `PostgreSQLAGEProvider` | Apache 2.0 | Default — lowest operational overhead, same Postgres instance as relational |
+  | `Neo4jProvider` | GPL/Commercial | Clients with existing Neo4j enterprise license |
+  | `JanusGraphProvider` | Apache 2.0 | Very-large-scale graph (>10B edges) on HBase/Cassandra backend |
+  | `AmazonNeptuneProvider` | Proprietary (AWS) | AWS-native clients; behind port so no lock-in |
+  | `VectorVoltGraphProvider` | Open-source | Phase 3 gate — VectorVolt graph extension complete |
+
+  **Interface 2 — `IRelationalStoreProvider`** (structured data, EF Core projections, governance tables)
+  | Provider | License | When to Use |
+  |---|---|---|
+  | `PostgreSQLProvider` | PostgreSQL License | Default |
+  | `SQLServerProvider` | Commercial | Enterprise on-prem clients with existing SQL Server licenses |
+  | `MySQLProvider` | GPL / Commercial | Cost-sensitive deployments; MySQL-native cloud offerings |
+  | `SQLiteProvider` | Public Domain | Embedded / developer / air-gap single-node deployments |
+
+  **Interface 3 — `IDocumentStoreProvider`** (hot cache, KO identity reads, CCR capability cache)
+  | Provider | License | When to Use |
+  |---|---|---|
+  | `RedisProvider` | SSPL / Redis Source | Default hot cache |
+  | `MongoDBProvider` | SSPL / Commercial | Clients on MongoDB Atlas |
+  | `CosmosDBProvider` | Proprietary (Azure) | Azure-native clients (Mongo API) |
+  | `CassandraProvider` | Apache 2.0 | Large-scale write-heavy NoSQL tenants |
+  | `VectorVoltDocumentProvider` | Open-source | Phase 2 gate — VectorVolt Phase 5 DocumentStore |
+
+  **Interface 4 — `IColumnarStoreProvider`** (analytics, aggregates, widget dashboards, reporting)
+  | Provider | License | When to Use |
+  |---|---|---|
+  | `ClickHouseProvider` | Apache 2.0 | Default analytics |
+  | `TimescaleProvider` | Timescale License | PostgreSQL-embedded option (same instance as relational) |
+  | `VectorVoltColumnarProvider` | Open-source | Phase 2 gate — VectorVolt Phase 5 ColumnarStore + VectorScanner |
+
+  **Adapter Contract Requirements** (all four interfaces must satisfy):
+  (a) Implements the EKOS storage interface (defined in `EKOS.Storage.Abstractions` package).
+  (b) Respects the bitemporal data model — valid-time and transaction-time columns are mandatory
+  schema requirements; the adapter translates them to native constructs (temporal tables, timestamp
+  columns, etc.).
+  (c) Is configured entirely via the EKOS Helm values / environment config — no code changes needed
+  to switch providers.
+  (d) Supports the EKOS tenancy model — tenant isolation is enforced at the provider level (row-level
+  security, namespace separation, or separate schema per tenant depending on provider capability).
+  (e) Emits health metrics to the Constitutional Telemetry Stream (CTS) — provider health is
+  observable alongside constitutional compliance, not via a separate channel.
+
+- **Rejected Alternatives:**
+  (a) *Single-provider mandate (PostgreSQL + AGE only)* — rejected. Law 10 requires providers to be
+  pluggable; mandating a single provider violates it. Enterprise on-prem and client-cloud deployments
+  make this commercially untenable.
+  (b) *Thin abstraction layer with hard-coded Postgres fallback* — rejected. A thin wrapper that
+  falls back to Postgres for all unhandled cases means third-party providers can never fully replace
+  the default. The interface must be fully abstract.
+  (c) *ORM-only abstraction (EF Core providers)* — rejected for graph and columnar tiers. EF Core
+  covers the relational interface adequately, but has no first-class graph query or columnar SIMD
+  model. The four-interface model extends beyond what any single ORM provides.
+  (d) *Wait for VectorVolt to implement all four interfaces before launching EKOS* — rejected.
+  VectorVolt Phases 1–3 are prerequisites for EKOS Phase 1, but VectorVolt Phase 5 (read fabric) and
+  the graph extension are years away. EKOS cannot wait. The provider model lets EKOS launch with
+  reference providers, then transparently upgrade to VectorVolt as each phase completes.
+
+- **Consequences:**
+  Positive: EKOS is database-agnostic from first deployment — any client infrastructure is
+  compatible. VectorVolt is positioned as the performance upgrade path, not a hard dependency.
+  Enterprise, SME, government, and air-gap deployments all supported without custom builds.
+  Provider switching (e.g., AGE → VectorVolt graph) requires only configuration changes.
+  Negative: Four interfaces multiply integration test surface (each reference provider needs its own
+  test suite). Community-contributed providers may be lower quality than reference implementations
+  (mitigated by conformance test kit — see below). Bitemporal requirement adds schema complexity for
+  providers that don't natively support temporal tables (they must implement it in application code).
+  Provider health diversity means ops teams need familiarity with whichever providers they deploy.
+  
+- **Implementation Note:**
+  Ship a **Storage Provider Conformance Test Kit** (EKOS.Storage.ConformanceTests) — a shared test
+  suite that any provider implementation must pass before being considered EKOS-compatible. Community
+  providers run this kit as CI. This is analogous to the TCK (Technology Compatibility Kit) used by
+  Jakarta EE. Makes "EKOS-compatible" a verifiable claim, not a self-declaration.
+
+- **Links:** ADR-020 (graph store port origin); ADR-003 (hexagonal architecture); ADR-009
+  (benchmark gates for final picks); Book 1 Law 10 (provider pluggability); Vol 18 §9 (Storage
+  Abstraction port); `architecture/VECTORVOLT-EKOS-INTEGRATION-PLAN.md` (phase-by-phase provider
+  fulfillment schedule); `00-MASTER-INDEX.md` OQ-A03-A (graph-store benchmark gate).
+
+> **ADR-052** enacted 2026-07-03. Total: **52 ADRs**.
+
+---
+
+### ADR-053 — VectorVolt as EKOS Storage Engine (Phased Integration)
+
+- **Date:** 2026-07-03
+- **Status:** ✅ Accepted
+- **Deciders:** Sandeep Bassi (architect), Claude (design partner)
+- **Context:**
+  ADR-052 established four pluggable storage provider interfaces (`IGraphStoreProvider`,
+  `IRelationalStoreProvider`, `IDocumentStoreProvider`, `IColumnarStoreProvider`) with
+  reference implementations (PostgreSQL+AGE, Redis, ClickHouse) as the launch defaults.
+  ADR-052 explicitly reserved VectorVolt as the long-term unified provider across all four
+  interfaces, referencing `VECTORVOLT-EKOS-INTEGRATION-PLAN.md` for the phased schedule.
+  This ADR formally records that decision: VectorVolt — the zero-GC, kernel-bypass,
+  sub-microsecond OLTP engine being built by the same team — is the designated long-term
+  storage engine for EKOS. This is an unusual architectural choice (first-party storage
+  engine rather than adopting an existing database) that requires explicit justification.
+  The motivation is performance: EKOS's constitutional constraints demand sub-microsecond
+  CCR capability lookups (EKOS-22-041: CCR < 1ms P99 per syscall), immutable append-only
+  CTS writes at high throughput (metering + telemetry), and SIMD-accelerated Knowledge
+  Object scans with ABAC filters. No existing open-source database simultaneously provides
+  zero-GC memory management, kernel-bypass networking, SIMD columnar reads, hardware-clock
+  bitemporal timestamps (PTP IEEE 1588), and a WAL that serves as the constitutional
+  audit spine. VectorVolt is being built to provide all of these, engineered specifically
+  for the EKOS workload profile.
+- **Decision:**
+  VectorVolt is the designated long-term EKOS storage engine, integrated in three
+  phases across six gates (full specification in `VECTORVOLT-EKOS-INTEGRATION-PLAN.md`):
+
+  **Integration Phase 1 — Gate 1 (VectorVolt Phase 1+2+3 complete)**
+  VectorVolt provides: (a) WAL for the Constitutional Telemetry Stream — immutable,
+  hash-chained, tamper-evident (satisfies EKOS-22-046); (b) GroupCommitBatcher for
+  high-throughput metering events (Knowledge Economy, Vol 13); (c) ProjectionDispatcher
+  syncing WAL → PostgreSQL+AGE (keeping graph store current); (d) InterceptorPipeline
+  as the CCR enforcement hook before events reach storage. All other storage (graph,
+  document, columnar) remains with reference providers until Gate 3.
+
+  **Integration Phase 2 — Gate 3 (VectorVolt Phase 5 complete)**
+  VectorVolt's Read Fabric replaces Redis (`IDocumentStoreProvider`) and ClickHouse
+  (`IColumnarStoreProvider`): DocumentStore for sub-10ns CCR capability cache reads;
+  VectorScanner (AVX2/AVX-512) for ABAC-filtered Knowledge Object scans;
+  MaterializedViewEngine for widget dashboard aggregates. PostgreSQL+AGE continues as
+  `IGraphStoreProvider` for all graph traversals until Gate 6.
+
+  **Integration Phase 3 — Gate 6 (VectorVolt Graph Extension complete)**
+  VectorVolt's graph extension (property graph model + Cypher/GQL + bitemporal edges)
+  replaces PostgreSQL+AGE as `IGraphStoreProvider`. VectorVolt becomes the single engine
+  for graph, document, and columnar tiers. PostgreSQL remains permanently for relational
+  projections (EF Core). Full specification of graph requirements: Vol 01 (ontology),
+  A04 (bitemporal), `VECTORVOLT-EKOS-INTEGRATION-PLAN.md` §6.
+
+  **What VectorVolt never replaces:** `IRelationalStoreProvider` (PostgreSQL) — EKOS uses
+  PostgreSQL for EF Core–based projection targets, control-plane tables, and governance
+  data. VectorVolt is not a relational database and makes no claim to be one.
+
+- **Rejected Alternatives:**
+  (a) *Use an existing database (TigerBeetle / FoundationDB / ScyllaDB)* — rejected.
+  TigerBeetle covers financial double-entry accounting (not a general OLTP engine);
+  FoundationDB has strong consistency but no SIMD read fabric or graph model; ScyllaDB
+  is C++ and provides no bitemporal semantics. None provide the specific combination of
+  zero-GC + kernel-bypass + SIMD columnar + bitemporal edges + WAL-as-CTS-spine that
+  EKOS requires. Building VectorVolt also yields a standalone PhD research artifact and
+  industry recognition (user goal), which purchasing an existing database does not.
+  (b) *Use PostgreSQL+AGE permanently (never build VectorVolt for EKOS)* — rejected.
+  PostgreSQL round-trips are ~1–3ms; CCR must be <1ms P99 per syscall (EKOS-22-041).
+  Columnar ABAC scans over millions of KOs in PostgreSQL require full row deserialization;
+  VectorVolt VectorScanner processes 8–16 values per CPU cycle. At EKOS scale (10⁹
+  events/day, per A08-017), PostgreSQL-only architecture fails the performance contract.
+  (c) *Build EKOS's storage layer as a separate internal library (not VectorVolt)* —
+  rejected. VectorVolt and EKOS share the same development team. Splitting into two
+  separate storage projects doubles maintenance burden with no architectural benefit.
+  VectorVolt's phased gate model means EKOS is never blocked waiting for VectorVolt
+  capabilities that don't exist yet — reference providers bridge every gap.
+  (d) *Use Redis for all hot-path reads permanently* — rejected. Redis is single-threaded,
+  GC-adjacent (Lua garbage collection), and has no SIMD scan capability. Redis serves as
+  the `IDocumentStoreProvider` until Gate 3 precisely because it is adequate for the
+  interim — not because it meets EKOS's long-term performance contract.
+
+- **Consequences:**
+  Positive: EKOS's performance contract (sub-microsecond CCR, SIMD KO scans, WAL-backed
+  CTS) is achievable without compromising on existing database limitations. VectorVolt and
+  EKOS co-evolve — each VectorVolt phase immediately maps to an EKOS capability. The gate
+  model means EKOS is never blocked: reference providers run until VectorVolt is ready,
+  then swap transparently via ADR-052 configuration. VectorVolt becomes a standalone
+  research + commercial product in parallel with EKOS.
+  Negative: EKOS has a strategic dependency on VectorVolt completing its phases on
+  schedule. If VectorVolt development stalls, EKOS remains on reference providers
+  indefinitely (which is functional but not optimal). The graph extension (Gate 6) is
+  unscoped in VectorVolt's current 8-phase plan — it requires additional phase planning
+  before Gate 6 can open. First-party storage engines carry higher operational risk than
+  battle-tested databases; mitigated by VectorVolt's Phase 7 deterministic simulation
+  testing (10M failure scenarios) and chaos testing before any Gate promotion.
+
+- **Invariant:** VectorVolt provider promotion at each gate is a **configuration-only
+  change** (Helm values swap) — no EKOS application code changes, no data migration, no
+  downtime. The ADR-052 provider interface guarantees this. Any gate promotion that
+  requires application code changes is a defect in the provider interface, not a planned
+  migration step.
+
+- **Status:** ✅ Accepted. **Links:** ADR-052 (provider interfaces); ADR-020 (graph store
+  original decision); `architecture/VECTORVOLT-EKOS-INTEGRATION-PLAN.md` (6-gate schedule,
+  gate status tracker); `C:\VectorVolt\IMPLEMENTATION_PLAN.md` (VectorVolt 8-phase plan);
+  EKOS-22-041 (CCR <1ms P99 requirement); Vol 01 (graph ontology — Gate 6 requirements);
+  A04 (bitemporal — Gate 6 edge model); A16 (VectorVolt node pool in distributed topology).
+
+> **ADR-053** enacted 2026-07-03. Total: **53 ADRs**.
+
 ## Reserved / Pending decisions (to become ADRs when decided)
-- Bitemporal storage strategy (OQ-01-B) · Query language openCypher/GQL (leaning yes, OQ-01-C) · K-IR representation (OQ-19-A) · IDL/binding toolchain (OQ-22-A) · ABI deprecation window length (OQ-18-D/22-B) · fintech licensing per region (OQ-13-A) · concrete small-model family (OQ-03-D).
+- Bitemporal storage strategy (OQ-01-B) · Query language openCypher/GQL (leaning yes, OQ-01-C) · K-IR representation (OQ-19-A) · IDL/binding toolchain (OQ-22-A) · ABI deprecation window length (OQ-18-D/22-B) · fintech licensing per region (OQ-13-A) · concrete small-model family (OQ-03-D) · VectorVolt graph extension scope (OQ-A21-A relates; formal ADR when Phase 8 graph extension is scoped).
 
 > **Next decisions to register:** A02 (logical boundaries), A03 (the full technology-
 > selection ADR set, scored via the Trade-off methodology), A04–A11.
