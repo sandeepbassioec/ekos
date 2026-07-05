@@ -363,7 +363,17 @@
       "PowerShell(ls \"C:\\\\VectorVolt\\\\esip\\\\node_modules\\\\\" | Where-Object { $_.Name -eq \".pnpm\" -or $_.Name -eq \"react\" -or $_.Name -eq \"@tiptap\" } | Select-Object Name, LinkType)",
       "PowerShell(ls \"C:\\\\VectorVolt\\\\esip\\\\node_modules\\\\\" | Where-Object { $_.Name -eq 'react' })",
       "Bash(mkdir -p \"/c/RepairLink/DealerPromotions/docs\")",
-      "Read(//c/RepairLink/DealerPromotions/**)"
+      "Read(//c/RepairLink/DealerPromotions/**)",
+      "Bash(Get-ChildItem -Path \"C:\\\\VectorVolt\\\\esip\\\\src\" -Recurse -Directory)",
+      "Bash(gh pr create --title 'EKOS Architecture Suite: A12–A21, ADR-052/053, VectorVolt Integration Plan' --body ' *)",
+      "PowerShell(rustc --version)",
+      "PowerShell(rustup toolchain list)",
+      "PowerShell(rustup target list --installed)",
+      "PowerShell(rustup toolchain install stable-x86_64-pc-windows-gnu)",
+      "PowerShell(rustup default stable-x86_64-pc-windows-gnu 2>&1)",
+      "PowerShell(rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal 2>&1)",
+      "Bash(ls ~/.claude/projects/ | head -20)",
+      "Bash(xargs '-I{}' sh -c ' *)"
     ]
   }
 }
