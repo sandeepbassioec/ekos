@@ -666,7 +666,7 @@
 
 - id: VV-PKG-002
   title: Debian .deb package built for amd64 and arm64
-  status: implemented
+  status: in_progress
   phase: vectorvolt-packaging
   arch:
     doc: vectorvolt/packaging/PUBLISH-SETUP.md
@@ -679,7 +679,7 @@
 
 - id: VV-PKG-003
   title: RPM package built for x86_64 and aarch64
-  status: implemented
+  status: in_progress
   phase: vectorvolt-packaging
   arch:
     doc: vectorvolt/packaging/PUBLISH-SETUP.md
@@ -692,7 +692,7 @@
 
 - id: VV-PKG-004
   title: Homebrew formula updated automatically on GitHub Release
-  status: implemented
+  status: in_progress
   phase: vectorvolt-packaging
   arch:
     doc: vectorvolt/packaging/PUBLISH-SETUP.md
@@ -705,7 +705,7 @@
 
 - id: VV-PKG-005
   title: Scoop manifest updated automatically on GitHub Release
-  status: implemented
+  status: in_progress
   phase: vectorvolt-packaging
   arch:
     doc: vectorvolt/packaging/PUBLISH-SETUP.md
@@ -718,7 +718,7 @@
 
 - id: VV-PKG-006
   title: Chocolatey .nupkg built and pushed on GitHub Release
-  status: implemented
+  status: in_progress
   phase: vectorvolt-packaging
   arch:
     doc: vectorvolt/packaging/PUBLISH-SETUP.md
@@ -731,7 +731,7 @@
 
 - id: VV-PKG-007
   title: winget manifest PR opened to microsoft/winget-pkgs on GitHub Release
-  status: implemented
+  status: in_progress
   phase: vectorvolt-packaging
   arch:
     doc: vectorvolt/packaging/PUBLISH-SETUP.md

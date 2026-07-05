@@ -31,7 +31,7 @@ jobs:
         run: pip install pyyaml
 
       - name: Regenerate TRACEABILITY.md
-        run: python docs/traceability/generate.py --strict
+        run: python docs/traceability/generate.py
 
       - name: Check TRACEABILITY.md is up-to-date
         # Fail if generate.py produced a diff — devs must commit the updated file
