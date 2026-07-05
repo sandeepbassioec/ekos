@@ -58,7 +58,14 @@ def load_catalog(path: Path) -> list[dict]:
 
 
 def check_files(root: Path, req: dict) -> list[str]:
-    """Return list of missing code-file paths for this requirement."""
+    """Return missing code-file paths, but only for implemented/verified requirements.
+
+    draft and in_progress requirements are expected to have missing files —
+    flagging them would produce environment-dependent output (different branches
+    have different files checked out) and break the up-to-date diff check in CI.
+    """
+    if req.get("status") not in ("implemented", "verified"):
+        return []
     missing = []
     for rel in req.get("code") or []:
         if not (root / rel).exists():
