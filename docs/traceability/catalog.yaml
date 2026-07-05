@@ -1,0 +1,1017 @@
+# VectorVolt / EKOS Requirements Traceability Catalog
+#
+# Every requirement in this file must link to:
+#   - At least one architecture document section  (arch)
+#   - Zero or more ADRs                           (adrs)
+#   - One or more source files                    (code)
+#   - One or more test identifiers                (tests)
+#
+# Status values:
+#   draft        — captured, not yet started
+#   in_progress  — implementation underway
+#   implemented  — code written, tests passing
+#   verified     — independently verified / reviewed
+#
+# ID scheme:
+#   VV-WAL-nnn   VectorVolt WAL
+#   VV-GCB-nnn   VectorVolt GroupCommitBatcher
+#   VV-STR-nnn   VectorVolt Storage Engine
+#   VV-PRJ-nnn   VectorVolt Projection / Scan
+#   VV-PKG-nnn   VectorVolt Packaging / CI
+#   EKOS-KNL-nnn EKOS Knowledge Kernel
+#   EKOS-API-nnn EKOS Syscall / API layer
+#   EKOS-CCR-nnn EKOS CCR enforcement
+#   EKOS-FED-nnn EKOS Federation / Edge
+#   ESIP-UI-nnn  ESIP React application
+
+# ────────────────────────────────────────────────────────────────────────────
+# VectorVolt — WAL (Phase 1)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: VV-WAL-001
+  title: Frame magic constant identifies VWAL frames
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/frame.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/frame.rs::tests::roundtrip
+    - vectorvolt/crates/vectorvolt-wal/src/frame.rs::tests::detects_bit_flip
+
+- id: VV-WAL-002
+  title: Each frame carries SHA3-256 hash of its own content chained to prev_hash
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/frame.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/tests/wal_integration.rs::write_read_verify
+    - vectorvolt/crates/vectorvolt-wal/tests/wal_integration.rs::multi_segment_verify
+
+- id: VV-WAL-003
+  title: Each frame is protected by a CRC32C checksum
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/frame.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/frame.rs::tests::detects_bit_flip
+
+- id: VV-WAL-004
+  title: Frame overhead is exactly 97 bytes (magic+len+seq+ts+prev_hash+type+hash+crc)
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/frame.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/frame.rs::tests::roundtrip
+
+- id: VV-WAL-005
+  title: Segment header uses VWALSEG0 magic and 64-byte layout
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/segment.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/segment.rs::tests::create_and_read_segment
+
+- id: VV-WAL-006
+  title: Segments auto-rotate when they would exceed max_bytes (default 64 MiB)
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/writer.rs
+    - vectorvolt/crates/vectorvolt-wal/src/segment.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/writer.rs::tests::segment_rotation
+    - vectorvolt/crates/vectorvolt-wal/tests/wal_integration.rs::multi_segment_verify
+
+- id: VV-WAL-007
+  title: Segment files are named {id:020}.vwal for lexicographic ordering
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/segment.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/writer.rs::tests::segment_rotation
+
+- id: VV-WAL-008
+  title: list_segment_ids filters strictly by .vwal extension to avoid collisions
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/segment.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/store_integration.rs::crash_recovery
+
+- id: VV-WAL-009
+  title: WalWriter recovers chain_hash and next_seq from last segment on reopen
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/writer.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/writer.rs::tests::append_and_recover
+    - vectorvolt/crates/vectorvolt-wal/tests/wal_integration.rs::crash_recovery
+
+- id: VV-WAL-010
+  title: GENESIS_HASH is all-zero 32 bytes — well-known chain anchor
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/frame.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/tests/wal_integration.rs::write_read_verify
+
+- id: VV-WAL-011
+  title: WalWriter is cheaply cloneable (Arc<Mutex>) for shared ownership
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/writer.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/tests/wal_integration.rs::group_commit_throughput
+
+- id: VV-WAL-012
+  title: WalReader::verify() validates entire hash chain and returns frame count
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: WAL Frame Format
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/reader.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/reader.rs::tests::verify_chain
+    - vectorvolt/crates/vectorvolt-wal/tests/wal_integration.rs::write_read_verify
+
+# ────────────────────────────────────────────────────────────────────────────
+# VectorVolt — GroupCommitBatcher (Phase 1 + Phase 3)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: VV-GCB-001
+  title: N concurrent writes are batched into a single fsync call
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: GroupCommit
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs::tests::concurrent_commits
+    - vectorvolt/crates/vectorvolt-wal/tests/wal_integration.rs::group_commit_throughput
+
+- id: VV-GCB-002
+  title: submit() returns CommitFuture immediately; caller awaits durability asynchronously
+  status: implemented
+  phase: vectorvolt-1
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: GroupCommit
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs::tests::concurrent_commits
+
+- id: VV-GCB-003
+  title: Channel is bounded; submit() returns Err(Backpressure) when full
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: GroupCommit
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs
+    - vectorvolt/crates/vectorvolt-wal/src/error.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs::tests::backpressure_when_channel_full
+
+- id: VV-GCB-004
+  title: BatcherMetrics tracks fsync_count, frames_committed, bytes_committed, batch_count
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: GroupCommit
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/metrics.rs
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs::tests::metrics_recorded
+
+- id: VV-GCB-005
+  title: BatcherMetrics uses EMA (α=0.1) for avg_batch_size and avg_latency_us
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: GroupCommit
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/metrics.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs::tests::metrics_recorded
+
+- id: VV-GCB-006
+  title: BatcherMetrics tracks peak_batch_size via atomic CAS
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: GroupCommit
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/metrics.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs::tests::metrics_recorded
+
+- id: VV-GCB-007
+  title: BatcherMetrics tracks frames_dropped when backpressure is applied
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: GroupCommit
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/metrics.rs
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs::tests::backpressure_when_channel_full
+
+- id: VV-GCB-008
+  title: Graceful shutdown drains all queued submissions before stopping the task
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: GroupCommit
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/tests/wal_integration.rs::group_commit_throughput
+
+- id: VV-GCB-009
+  title: flush_interval and max_batch_bytes are configurable via BatcherConfig
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: GroupCommit
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-wal/src/group_commit.rs::tests::concurrent_commits
+
+# ────────────────────────────────────────────────────────────────────────────
+# VectorVolt — Storage Engine (Phase 2)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: VV-STR-001
+  title: LogRecord encodes Put/Delete as op_tag(u8) + key_len(u32) + key + val_len(u32) + val
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/record.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/record.rs::tests::roundtrip_put
+    - vectorvolt/crates/vectorvolt-store/src/record.rs::tests::roundtrip_delete
+
+- id: VV-STR-002
+  title: MemTable uses BTreeMap<Bytes, Option<Bytes>> where None represents a tombstone
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/memtable.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/memtable.rs::tests::put_get_delete
+
+- id: VV-STR-003
+  title: MemTable tracks approximate size_bytes for flush threshold decisions
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/memtable.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/memtable.rs::tests::size_tracking
+
+- id: VV-STR-004
+  title: MemTable::iter() returns entries in lexicographic key order
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/memtable.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/memtable.rs::tests::ordered_iteration
+
+- id: VV-STR-005
+  title: SSTable header uses VVST0001 magic and footer uses VVSTFOOT magic
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/sstable.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/sstable.rs::tests::write_read_point_lookup
+
+- id: VV-STR-006
+  title: SSTable index is loaded into memory on open for O(log n) point lookups
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/sstable.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/sstable.rs::tests::write_read_point_lookup
+
+- id: VV-STR-007
+  title: SSTable val_type byte distinguishes value (0) from tombstone (1)
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/sstable.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/sstable.rs::tests::write_read_point_lookup
+
+- id: VV-STR-008
+  title: Compaction merge iterator returns newest version for duplicate keys
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/compaction.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/compaction.rs::tests::merge_dedup_newest_wins
+
+- id: VV-STR-009
+  title: Tombstones are GC'd only at the bottom-most compaction level
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/compaction.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/compaction.rs::tests::tombstone_drop_at_bottom_level
+
+- id: VV-STR-010
+  title: "KvStore read path: active memtable -> SSTables newest-first"
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/store.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/store_integration.rs::overwrite
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::memtable_overwrite_beats_sstable
+
+- id: VV-STR-011
+  title: KvStore appends to WAL before writing to memtable
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/store.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/store_integration.rs::wal_replay_without_flush
+
+- id: VV-STR-012
+  title: KvStore auto-flushes memtable to SSTable when size_bytes >= threshold
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/store.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/store_integration.rs::flush_to_sstable_and_read_back
+
+- id: VV-STR-013
+  title: KvStore triggers compaction when SSTable count >= compaction_trigger
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/store.rs
+    - vectorvolt/crates/vectorvolt-store/src/compaction.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/store_integration.rs::compaction_reduces_sstable_count
+
+- id: VV-STR-014
+  title: KvStore replays WAL into a fresh memtable on open for crash recovery
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/store.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/store_integration.rs::wal_replay_without_flush
+    - vectorvolt/crates/vectorvolt-store/tests/store_integration.rs::crash_recovery
+
+- id: VV-STR-015
+  title: Manifest scans directory for .vvsst files on open to discover existing SSTables
+  status: implemented
+  phase: vectorvolt-2
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Engine
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/store.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/store_integration.rs::crash_recovery
+
+# ────────────────────────────────────────────────────────────────────────────
+# VectorVolt — Projection / Scan (Phase 3)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: VV-PRJ-001
+  title: KeyRange supports full, prefix, and inclusive range variants
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Projection Dispatcher
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/scan.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/scan.rs::tests::prefix_range
+    - vectorvolt/crates/vectorvolt-store/src/scan.rs::tests::inclusive_range
+
+- id: VV-PRJ-002
+  title: Prefix scan computes exclusive upper bound by incrementing last byte
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Projection Dispatcher
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/scan.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/scan.rs::tests::prefix_range
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::prefix_scan
+
+- id: VV-PRJ-003
+  title: Tombstones are never returned in scan results
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Projection Dispatcher
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/store.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::tombstone_excluded_from_scan
+
+- id: VV-PRJ-004
+  title: "Projection trait apply(ScanEntry) -> Option<ScanEntry> allows transform and filter"
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Projection Dispatcher
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/projection.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/projection.rs::tests::identity_passes_through
+    - vectorvolt/crates/vectorvolt-store/src/projection.rs::tests::filter_projection
+
+- id: VV-PRJ-005
+  title: "Built-in projections: IdentityProjection, KeyOnlyProjection, FilterProjection"
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Projection Dispatcher
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/projection.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::key_only_projection
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::filter_projection
+
+- id: VV-PRJ-006
+  title: PipelineProjection composes a chain of projections short-circuiting on None
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Projection Dispatcher
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/projection.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/src/projection.rs::tests::pipeline_short_circuits
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::pipeline_projection
+
+- id: VV-PRJ-007
+  title: ProjectionDispatcher merges memtable and SSTables with memtable winning on key conflict
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Projection Dispatcher
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/store.rs
+    - vectorvolt/crates/vectorvolt-store/src/projection.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::scan_across_memtable_and_sstables
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::memtable_overwrite_beats_sstable
+
+- id: VV-PRJ-008
+  title: ProjectionDispatcher provides count() and keys() convenience methods
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Projection Dispatcher
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/projection.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::count
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::keys_only
+
+- id: VV-PRJ-009
+  title: Scan results are returned in lexicographic key order
+  status: implemented
+  phase: vectorvolt-3
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Projection Dispatcher
+  adrs: []
+  code:
+    - vectorvolt/crates/vectorvolt-store/src/store.rs
+  tests:
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::full_scan_returns_all_live_entries
+    - vectorvolt/crates/vectorvolt-store/tests/projection_integration.rs::scan_across_memtable_and_sstables
+
+# ────────────────────────────────────────────────────────────────────────────
+# VectorVolt — Packaging & CI (Phase 1-3)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: VV-PKG-001
+  title: Universal install.sh detects platform and downloads correct binary
+  status: implemented
+  phase: vectorvolt-packaging
+  arch:
+    doc: vectorvolt/packaging/PUBLISH-SETUP.md
+    section: User install commands
+  adrs: []
+  code:
+    - vectorvolt/packaging/install.sh
+  tests: []
+
+- id: VV-PKG-002
+  title: Debian .deb package built for amd64 and arm64
+  status: implemented
+  phase: vectorvolt-packaging
+  arch:
+    doc: vectorvolt/packaging/PUBLISH-SETUP.md
+    section: apt
+  adrs: []
+  code:
+    - vectorvolt/packaging/debian/control
+    - vectorvolt/.github/workflows/publish-apt.yml
+  tests: []
+
+- id: VV-PKG-003
+  title: RPM package built for x86_64 and aarch64
+  status: implemented
+  phase: vectorvolt-packaging
+  arch:
+    doc: vectorvolt/packaging/PUBLISH-SETUP.md
+    section: yum/dnf
+  adrs: []
+  code:
+    - vectorvolt/packaging/rpm/vectorvolt.spec
+    - vectorvolt/.github/workflows/publish-rpm.yml
+  tests: []
+
+- id: VV-PKG-004
+  title: Homebrew formula updated automatically on GitHub Release
+  status: implemented
+  phase: vectorvolt-packaging
+  arch:
+    doc: vectorvolt/packaging/PUBLISH-SETUP.md
+    section: Homebrew
+  adrs: []
+  code:
+    - vectorvolt/packaging/brew/vectorvolt.rb
+    - vectorvolt/.github/workflows/publish-homebrew.yml
+  tests: []
+
+- id: VV-PKG-005
+  title: Scoop manifest updated automatically on GitHub Release
+  status: implemented
+  phase: vectorvolt-packaging
+  arch:
+    doc: vectorvolt/packaging/PUBLISH-SETUP.md
+    section: Scoop
+  adrs: []
+  code:
+    - vectorvolt/packaging/windows/scoop/vectorvolt.json
+    - vectorvolt/.github/workflows/publish-scoop.yml
+  tests: []
+
+- id: VV-PKG-006
+  title: Chocolatey .nupkg built and pushed on GitHub Release
+  status: implemented
+  phase: vectorvolt-packaging
+  arch:
+    doc: vectorvolt/packaging/PUBLISH-SETUP.md
+    section: Chocolatey
+  adrs: []
+  code:
+    - vectorvolt/packaging/windows/chocolatey/vectorvolt.nuspec
+    - vectorvolt/.github/workflows/publish-chocolatey.yml
+  tests: []
+
+- id: VV-PKG-007
+  title: winget manifest PR opened to microsoft/winget-pkgs on GitHub Release
+  status: implemented
+  phase: vectorvolt-packaging
+  arch:
+    doc: vectorvolt/packaging/PUBLISH-SETUP.md
+    section: winget
+  adrs: []
+  code:
+    - vectorvolt/.github/workflows/publish-winget.yml
+  tests: []
+
+- id: VV-PKG-008
+  title: CI runs clippy, fmt, and tests on ubuntu/macos/windows for every PR
+  status: implemented
+  phase: vectorvolt-packaging
+  arch:
+    doc: vectorvolt/packaging/PUBLISH-SETUP.md
+    section: CI
+  adrs: []
+  code:
+    - vectorvolt/.github/workflows/ci.yml
+  tests: []
+
+- id: VV-PKG-009
+  title: Release CI builds 5 targets (Linux musl x86/arm, macOS arm/x86, Windows MSVC)
+  status: implemented
+  phase: vectorvolt-packaging
+  arch:
+    doc: vectorvolt/packaging/PUBLISH-SETUP.md
+    section: CI
+  adrs: []
+  code:
+    - vectorvolt/.github/workflows/release.yml
+  tests: []
+
+# ────────────────────────────────────────────────────────────────────────────
+# EKOS — Knowledge Kernel (Phase 4 — draft)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: EKOS-KNL-001
+  title: Knowledge Object (KO) is the atomic unit of data in EKOS
+  status: draft
+  phase: ekos-4
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: KO Anatomy
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-KNL-002
+  title: Every KO carries valid-time and transaction-time (bitemporal)
+  status: draft
+  phase: ekos-4
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: KO Anatomy
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-KNL-003
+  title: "Mutation lifecycle follows CCR -> PDP -> KOM -> Ontology Runtime -> TVE -> Mutation Journal -> Scheduler -> CTS"
+  status: draft
+  phase: ekos-4
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Mutation Lifecycle
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-KNL-004
+  title: EKOS runtime is a single binary (ekosd) with no external runtime dependency
+  status: draft
+  phase: ekos-4
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Runtime Architecture
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-KNL-005
+  title: EKOS kernel stores KOs as KV entries in VectorVolt
+  status: draft
+  phase: ekos-4
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Storage Integration
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-KNL-006
+  title: KO edges are stored as indexed entries for graph traversal
+  status: draft
+  phase: ekos-4
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: KO Graph Engine
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-KNL-007
+  title: EKOS Kernel exposes exactly 14 syscalls as the stable API surface
+  status: draft
+  phase: ekos-4
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Syscall Catalogue
+  adrs: []
+  code: []
+  tests: []
+
+# ────────────────────────────────────────────────────────────────────────────
+# EKOS — CCR Enforcement (Phase 5 — draft)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: EKOS-CCR-001
+  title: CCR Tier 1 Structural enforcement has zero runtime cost (compile-time / schema validation)
+  status: draft
+  phase: ekos-5
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: CCR Enforcement
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-CCR-002
+  title: CCR Tier 2 Behavioral enforcement completes in <1ms P99 in-process
+  status: draft
+  phase: ekos-5
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: CCR Enforcement
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-CCR-003
+  title: CCR Tier 3 Policy enforcement uses OPA asynchronously (does not block mutations)
+  status: draft
+  phase: ekos-5
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: CCR Enforcement
+  adrs: []
+  code: []
+  tests: []
+
+# ────────────────────────────────────────────────────────────────────────────
+# EKOS — API / gRPC Layer (Phase 5 — draft)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: EKOS-API-001
+  title: EKOS external API is defined as gRPC + Protocol Buffers
+  status: draft
+  phase: ekos-5
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: API Surface
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-API-002
+  title: HTTP/REST gateway (Axum) wraps gRPC for browser and developer use
+  status: draft
+  phase: ekos-5
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: API Surface
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-API-003
+  title: TypeScript client SDK is generated from Protobuf definitions
+  status: draft
+  phase: ekos-5
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Client SDKs
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-API-004
+  title: C# client SDK is generated from Protobuf definitions
+  status: draft
+  phase: ekos-5
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: Client SDKs
+  adrs: []
+  code: []
+  tests: []
+
+# ────────────────────────────────────────────────────────────────────────────
+# EKOS — Federation / Edge (Phase 6 — draft, see A15)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: EKOS-FED-001
+  title: Knowledge Domain Boundary (KDB) defines the scope of a single EKOS kernel
+  status: draft
+  phase: ekos-6
+  arch:
+    doc: esip/docs/ekos/architecture/A15-runtime-distribution-architecture.md
+    section: KDB Federation Protocol
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-FED-002
+  title: FederationFrame carries WAL delta plus CTS chain proof for inter-kernel sync
+  status: draft
+  phase: ekos-6
+  arch:
+    doc: esip/docs/ekos/architecture/A15-runtime-distribution-architecture.md
+    section: KDB Federation Protocol
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-FED-003
+  title: Edge kernel is the same binary with offline-first feature flags enabled
+  status: draft
+  phase: ekos-6
+  arch:
+    doc: esip/docs/ekos/architecture/A15-runtime-distribution-architecture.md
+    section: Edge Kernel
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-FED-004
+  title: Unsynced edge mutations carry PENDING_UPSTREAM tag until confirmed by parent kernel
+  status: draft
+  phase: ekos-6
+  arch:
+    doc: esip/docs/ekos/architecture/A15-runtime-distribution-architecture.md
+    section: Edge Kernel
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-FED-005
+  title: Conflict resolution policy is configurable per Knowledge Domain Boundary
+  status: draft
+  phase: ekos-6
+  arch:
+    doc: esip/docs/ekos/architecture/A15-runtime-distribution-architecture.md
+    section: Conflict Resolution
+  adrs: []
+  code: []
+  tests: []
+
+# ────────────────────────────────────────────────────────────────────────────
+# EKOS — WASM Sandbox (Phase 6 — draft)
+# ────────────────────────────────────────────────────────────────────────────
+
+- id: EKOS-WAS-001
+  title: App code runs in EKRA WASM sandbox via Wasmtime
+  status: draft
+  phase: ekos-6
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: EKRA WASM Sandbox
+  adrs: []
+  code: []
+  tests: []
+
+- id: EKOS-WAS-002
+  title: First-party and third-party apps have identical syscall-only kernel access
+  status: draft
+  phase: ekos-6
+  arch:
+    doc: esip/docs/ekos/architecture/A13-knowledge-runtime-architecture.md
+    section: EKRA WASM Sandbox
+  adrs: []
+  code: []
+  tests: []

@@ -1,0 +1,58 @@
+name: Requirements Traceability
+
+on:
+  push:
+    paths:
+      - 'docs/traceability/catalog.yaml'
+      - 'docs/traceability/generate.py'
+      - 'vectorvolt/crates/**/*.rs'
+      - '.github/workflows/traceability.yml'
+  pull_request:
+    paths:
+      - 'docs/traceability/catalog.yaml'
+      - 'docs/traceability/generate.py'
+      - 'vectorvolt/crates/**/*.rs'
+      - '.github/workflows/traceability.yml'
+
+jobs:
+  traceability:
+    name: Verify & Regenerate RTM
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pyyaml
+        run: pip install pyyaml
+
+      - name: Regenerate TRACEABILITY.md
+        run: python docs/traceability/generate.py --strict
+
+      - name: Check TRACEABILITY.md is up-to-date
+        # Fail if generate.py produced a diff — devs must commit the updated file
+        run: |
+          if ! git diff --exit-code docs/traceability/TRACEABILITY.md; then
+            echo "❌  TRACEABILITY.md is out of date."
+            echo "    Run: python docs/traceability/generate.py"
+            echo "    Then commit the updated file."
+            exit 1
+          fi
+
+      - name: Report coverage
+        run: |
+          python - <<'EOF'
+          import yaml, sys
+          from pathlib import Path
+          reqs = yaml.safe_load(Path("docs/traceability/catalog.yaml").read_text())
+          total = len(reqs)
+          done  = sum(1 for r in reqs if r.get("status") in ("implemented","verified"))
+          pct   = (done/total*100) if total else 0
+          print(f"Coverage: {done}/{total} ({pct:.1f}%)")
+          if pct < 50:
+              print("WARNING: implementation coverage below 50% — expected during early phases")
+          EOF
