@@ -1,0 +1,55 @@
+//! # vectorvolt-wal
+//!
+//! The VectorVolt Write-Ahead Log — immutable, append-only, SHA3-256 hash-chained.
+//!
+//! ## Quick start
+//!
+//! ```rust,no_run
+//! use vectorvolt_wal::{WalConfig, WalWriter, WalReader, WalCursor};
+//!
+//! // Write
+//! let cfg = WalConfig::default().with_dir("/var/lib/vectorvolt/wal");
+//! let writer = WalWriter::open(cfg.clone()).unwrap();
+//! let tip = writer.append(b"hello".to_vec()).unwrap();
+//! writer.flush().unwrap();
+//! println!("committed sequence {}", tip.sequence);
+//!
+//! // Read
+//! let reader = WalReader::open(cfg);
+//! let frames = reader.read_all().unwrap();
+//! ```
+//!
+//! ## GroupCommit (high-throughput)
+//!
+//! ```rust,no_run
+//! use vectorvolt_wal::{WalConfig, WalWriter, GroupCommitBatcher};
+//! use tokio::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let cfg = WalConfig::default().with_dir("/var/lib/vectorvolt/wal");
+//!     let writer = WalWriter::open(cfg).unwrap();
+//!     let batcher = GroupCommitBatcher::start(
+//!         writer, Duration::from_micros(500), 4 * 1024 * 1024, 8192
+//!     );
+//!     let fut = batcher.submit(b"payload".to_vec()).unwrap();
+//!     let tip = fut.wait().await.unwrap();
+//! }
+//! ```
+
+pub mod config;
+pub mod error;
+pub mod frame;
+pub mod group_commit;
+pub mod reader;
+pub mod segment;
+pub mod writer;
+
+// Convenience re-exports.
+pub use config::WalConfig;
+pub use error::{WalError, WalResult};
+pub use frame::{Frame, PayloadType, GENESIS_HASH};
+pub use group_commit::{CommitFuture, GroupCommitBatcher};
+pub use reader::{WalCursor, WalReader, WalStats};
+pub use segment::{list_segment_ids, segment_path, SegmentReader};
+pub use writer::{WalTip, WalWriter};

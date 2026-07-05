@@ -1,0 +1,12 @@
+Package: vectorvolt
+Version: 0.1.0
+Architecture: amd64
+Maintainer: WorkerRuntime <hello@workerruntime.com>
+Homepage: https://workerruntime.com
+Description: VectorVolt — ultra-low-latency kernel-bypass data engine
+ VectorVolt is a zero-GC, kernel-bypass Write-Ahead Log and storage
+ engine designed for sub-microsecond latency workloads. Includes
+ vvctl, the VectorVolt control plane CLI.
+Section: database
+Priority: optional
+Depends: libc6 (>= 2.17)

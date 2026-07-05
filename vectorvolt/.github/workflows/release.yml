@@ -1,0 +1,209 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Run tests on all platforms before releasing ────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+  # ── Build release binaries ────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          # Linux x86_64 (musl — fully static, runs on any Linux)
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+          # Linux aarch64 (musl — Raspberry Pi, ARM servers)
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+          # macOS Apple Silicon
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          # macOS Intel
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl cross-compilation needs musl-tools
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools
+
+      # aarch64 musl needs cross
+      - name: Install cross (aarch64 musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }} -p vvctl
+
+      - name: Build (cargo)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }} -p vvctl
+
+      # ── Package ────────────────────────────────────────────────────────────
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          TARGET=${{ matrix.target }}
+          BINARY=target/${TARGET}/release/vvctl
+          ARCHIVE=vvctl-${VERSION}-${TARGET}.tar.gz
+          tar -czf "${ARCHIVE}" -C "$(dirname $BINARY)" "$(basename $BINARY)"
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $VERSION = $env:GITHUB_REF_NAME
+          $TARGET  = "${{ matrix.target }}"
+          $BINARY  = "target\$TARGET\release\vvctl.exe"
+          $ARCHIVE = "vvctl-$VERSION-$TARGET.zip"
+          Compress-Archive -Path $BINARY -DestinationPath $ARCHIVE
+          $hash = (Get-FileHash $ARCHIVE -Algorithm SHA256).Hash.ToLower()
+          "$hash  $ARCHIVE" | Out-File -Encoding utf8 "$ARCHIVE.sha256"
+          echo "ARCHIVE=$ARCHIVE" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vvctl-${{ matrix.target }}
+          path: |
+            vvctl-*.tar.gz
+            vvctl-*.zip
+            vvctl-*.sha256
+
+  # ── Build .deb package ────────────────────────────────────────────────────
+  deb:
+    name: Package .deb (amd64)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: vvctl-x86_64-unknown-linux-musl
+          path: dist/
+
+      - name: Build .deb
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          PKG=vectorvolt_${VERSION}_amd64
+
+          mkdir -p ${PKG}/DEBIAN ${PKG}/usr/bin
+          tar -xzf dist/vvctl-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz -C ${PKG}/usr/bin/
+
+          # Patch version in control file
+          sed "s/Version: .*/Version: ${VERSION}/" packaging/debian/control > ${PKG}/DEBIAN/control
+          cp packaging/debian/changelog ${PKG}/DEBIAN/changelog
+
+          dpkg-deb --build ${PKG}
+          mv ${PKG}.deb vectorvolt_${VERSION}_amd64.deb
+          sha256sum vectorvolt_${VERSION}_amd64.deb > vectorvolt_${VERSION}_amd64.deb.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vvctl-deb
+          path: "*.deb*"
+
+  # ── Build .rpm package ────────────────────────────────────────────────────
+  rpm:
+    name: Package .rpm (x86_64)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: vvctl-x86_64-unknown-linux-musl
+          path: dist/
+
+      - name: Install rpm tools
+        run: sudo apt-get install -y rpm
+
+      - name: Build .rpm
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp dist/vvctl-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz \
+             rpmbuild/SOURCES/
+          sed "s/Version:.*/Version:    ${VERSION}/" packaging/rpm/vectorvolt.spec \
+            > rpmbuild/SPECS/vectorvolt.spec
+          rpmbuild --define "_topdir $(pwd)/rpmbuild" -bb rpmbuild/SPECS/vectorvolt.spec
+          find rpmbuild/RPMS -name "*.rpm" -exec mv {} . \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vvctl-rpm
+          path: "*.rpm"
+
+  # ── Create GitHub Release ─────────────────────────────────────────────────
+  release:
+    name: Create Release
+    needs: [build, deb, rpm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets/
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "VectorVolt ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: release-assets/**

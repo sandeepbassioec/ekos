@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>vectorvolt</id>
+    <version>0.1.0</version>
+    <title>VectorVolt (vvctl)</title>
+    <authors>WorkerRuntime</authors>
+    <projectUrl>https://workerruntime.com</projectUrl>
+    <licenseUrl>https://github.com/workerruntime/vectorvolt/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>VectorVolt — ultra-low-latency kernel-bypass data engine.
+Installs vvctl, the VectorVolt control plane CLI.
+    </description>
+    <tags>database wal storage performance low-latency rust cli</tags>
+    <releaseNotes>https://github.com/workerruntime/vectorvolt/releases/tag/v0.1.0</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

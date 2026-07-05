@@ -1,0 +1,8 @@
+vectorvolt (0.1.0) stable; urgency=low
+
+  * Phase 1: WAL foundation — append-only, SHA3-256 hash-chained segments.
+  * GroupCommitBatcher for high-throughput write batching.
+  * vvctl CLI: wal status, wal verify, wal inspect.
+  * Crash recovery via WAL replay.
+
+ -- WorkerRuntime <hello@workerruntime.com>  Sat, 05 Jul 2026 00:00:00 +0000
