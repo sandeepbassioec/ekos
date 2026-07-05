@@ -265,6 +265,48 @@ impl KvStore {
         g.maybe_compact()
     }
 
+    /// Ordered, tombstone-free scan over memtable + SSTables.
+    /// Used by ProjectionDispatcher — not intended for direct use.
+    pub fn scan_raw(&self, req: &crate::scan::ScanRequest) -> StoreResult<Vec<crate::scan::ScanEntry>> {
+        use std::collections::BTreeMap;
+        use crate::scan::ScanEntry;
+
+        let g = self.inner.read();
+
+        // Merge all sources into a single BTreeMap keyed by Bytes.
+        // Sources are applied newest → oldest so newer values overwrite older ones.
+        // None = tombstone (will be filtered out at the end).
+        let mut merged: BTreeMap<Bytes, Option<Bytes>> = BTreeMap::new();
+
+        // 1. SSTables oldest → newest (so newer overwrites older in the map)
+        for (sst, _) in &g.manifest.tables {
+            for entry in sst.iter()? {
+                if req.range.contains(&entry.key) {
+                    merged.insert(entry.key, entry.value);
+                }
+            }
+        }
+
+        // 2. Active memtable (newest — overwrites everything)
+        for entry in g.active.iter() {
+            if req.range.contains(&entry.key) {
+                merged.insert(entry.key, entry.value);
+            }
+        }
+
+        // Collect live entries (tombstones removed), respect limit
+        let limit = req.limit.unwrap_or(usize::MAX);
+        let mut results = Vec::new();
+        for (key, value) in merged {
+            if results.len() >= limit { break; }
+            if req.range.past_end(&key) { break; }
+            if let Some(v) = value {
+                results.push(ScanEntry { key, value: v });
+            }
+        }
+        Ok(results)
+    }
+
     /// Snapshot of store statistics.
     pub fn stats(&self) -> StoreStats {
         let g = self.inner.read();

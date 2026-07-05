@@ -34,6 +34,9 @@ pub enum WalError {
 
     #[error("GroupCommit channel closed")]
     ChannelClosed,
+
+    #[error("GroupCommit channel full — backpressure")]
+    Backpressure,
 }
 
 pub type WalResult<T> = Result<T, WalError>;
