@@ -1,0 +1,21 @@
+now can i request you to do the actual changes in the project, these demo pages are good, now i wanna see how it look likes on the actual pages, following are the pages which i am looking to automate, but beware, the existing set of pages should not be changed and there are other designs as well, which i want to try as well on the real project pages, so i want you to copy the existing tsx pages and and create a design specific folders, like this is axiom theme, so create a folder axiom and create a copy of the original pages, in the routing area, the regular application should render as http://localhost:{port}/{theme}/login and so on. So the current application will get open as default theme, in this way i can test the other themes and then i can take a decision which theme i have to finally adapt. so my request is to create a copy for the following pages into Axiom theme which you just generated, the list is given below.
+
+/login
+/home
+/register
+/unauthorized
+/projects/list
+/projects/create
+/projects/:projectId
+/projects/:projectId/requirements
+/projects/:projectId/requirements/add
+/projects/:projectId/requirements/:id/edit
+/projects/:projectId/requirements/comprehensive
+/teams
+/admin/metamodel
+/admin/metamodel/create
+/projects/:projectId/roadmap
+/roadmap-items/:roadmapItemId/knowledge-hub
+
+remember you have to really consume less tokens as you have already wasted a lot of my tokens, and this is a request to you
+

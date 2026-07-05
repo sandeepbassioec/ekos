@@ -1,0 +1,23 @@
+{
+  "version": "0.1.0",
+  "description": "VectorVolt — ultra-low-latency kernel-bypass data engine (vvctl CLI)",
+  "homepage": "https://workerruntime.com",
+  "license": "Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/workerruntime/vectorvolt/releases/download/v0.1.0/vvctl-v0.1.0-x86_64-pc-windows-msvc.zip",
+      "hash": "PLACEHOLDER_SHA256"
+    }
+  },
+  "bin": "vvctl.exe",
+  "checkver": {
+    "github": "https://github.com/workerruntime/vectorvolt"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/workerruntime/vectorvolt/releases/download/v$version/vvctl-v$version-x86_64-pc-windows-msvc.zip"
+      }
+    }
+  }
+}
