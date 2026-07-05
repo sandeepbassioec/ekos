@@ -1,0 +1,132 @@
+name: Publish — yum/dnf (RPM)
+
+on:
+  release:
+    types: [published]
+
+# Hosts a signed RPM repository on the gh-pages branch of
+# workerruntime/rpm-vectorvolt.  Users add it with:
+#
+#   curl -fsSL https://workerruntime.github.io/rpm-vectorvolt/KEY.gpg | sudo rpm --import -
+#   sudo tee /etc/yum.repos.d/vectorvolt.repo <<EOF
+#   [vectorvolt]
+#   name=VectorVolt
+#   baseurl=https://workerruntime.github.io/rpm-vectorvolt/
+#   enabled=1
+#   gpgcheck=1
+#   gpgkey=https://workerruntime.github.io/rpm-vectorvolt/KEY.gpg
+#   EOF
+#   sudo dnf install vectorvolt   # or: sudo yum install vectorvolt
+
+jobs:
+  publish-rpm:
+    name: Build and publish .rpm
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build createrepo_c gnupg2 gh
+
+      - name: Download Linux assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "vectorvolt-*-x86_64-unknown-linux-musl.tar.gz" \
+            --pattern "vectorvolt-*-aarch64-unknown-linux-musl.tar.gz" \
+            --dir /tmp/assets
+
+      - name: Extract binaries
+        run: |
+          mkdir -p /tmp/bin-x86_64 /tmp/bin-aarch64
+          tar -xzf /tmp/assets/vectorvolt-*-x86_64-unknown-linux-musl.tar.gz   -C /tmp/bin-x86_64  --strip-components=1
+          tar -xzf /tmp/assets/vectorvolt-*-aarch64-unknown-linux-musl.tar.gz  -C /tmp/bin-aarch64 --strip-components=1
+
+      - name: Build RPM packages
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+
+          build_rpm() {
+            GOARCH=$1; BIN_DIR=$2; RPM_ARCH=$3
+            mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+            cp "${BIN_DIR}/vvctl" ~/rpmbuild/SOURCES/vvctl-${RPM_ARCH}
+
+            cat > ~/rpmbuild/SPECS/vectorvolt-${RPM_ARCH}.spec <<SPEC
+          Name:           vectorvolt
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        Ultra-low-latency kernel-bypass data engine
+          License:        Apache-2.0
+          URL:            https://workerruntime.com
+          ExclusiveArch:  ${RPM_ARCH}
+
+          %description
+          VectorVolt is a zero-GC, WAL-backed KV storage engine with
+          sub-microsecond target latency. Ships as a single binary (vvctl).
+
+          %install
+          mkdir -p %{buildroot}%{_bindir}
+          install -m 755 %{_sourcedir}/vvctl-${RPM_ARCH} %{buildroot}%{_bindir}/vvctl
+
+          %files
+          %{_bindir}/vvctl
+
+          %changelog
+          * $(date +'%a %b %d %Y') WorkerRuntime <hello@workerruntime.com> - ${VERSION}-1
+          - Release ${VERSION}
+          SPEC
+
+            rpmbuild -bb ~/rpmbuild/SPECS/vectorvolt-${RPM_ARCH}.spec
+          }
+
+          mkdir -p /tmp/rpms
+          build_rpm x86_64  /tmp/bin-x86_64  x86_64
+          build_rpm aarch64 /tmp/bin-aarch64 aarch64
+          find ~/rpmbuild/RPMS -name "*.rpm" -exec cp {} /tmp/rpms/ \;
+
+      - name: Import GPG signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Sign RPM packages
+        env:
+          GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
+        run: |
+          FINGERPRINT=$(gpg --list-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')
+          echo "%_gpg_name ${FINGERPRINT}" >> ~/.rpmmacros
+          echo "%_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase ${GPG_PASSPHRASE}" >> ~/.rpmmacros
+          for rpm in /tmp/rpms/*.rpm; do
+            rpmsign --addsign "$rpm"
+          done
+
+      - name: Checkout RPM repo
+        uses: actions/checkout@v4
+        with:
+          repository: workerruntime/rpm-vectorvolt
+          token: ${{ secrets.TAP_DEPLOY_TOKEN }}
+          path: rpm-repo
+
+      - name: Build yum/dnf repository
+        run: |
+          cp /tmp/rpms/*.rpm rpm-repo/
+          createrepo_c rpm-repo/
+          gpg --armor --export > rpm-repo/KEY.gpg
+
+      - name: Commit and push
+        working-directory: rpm-repo
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "vectorvolt ${TAG}"
+          git push

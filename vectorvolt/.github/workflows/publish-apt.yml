@@ -1,0 +1,120 @@
+name: Publish — apt (Debian/Ubuntu)
+
+on:
+  release:
+    types: [published]
+
+# Hosts a signed apt repository on the gh-pages branch of
+# workerruntime/apt-vectorvolt.  Users add it with:
+#
+#   curl -fsSL https://workerruntime.github.io/apt-vectorvolt/KEY.gpg | sudo gpg --dearmor -o /usr/share/keyrings/vectorvolt.gpg
+#   echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/vectorvolt.gpg] https://workerruntime.github.io/apt-vectorvolt stable main" | sudo tee /etc/apt/sources.list.d/vectorvolt.list
+#   sudo apt update && sudo apt install vectorvolt
+
+jobs:
+  publish-deb:
+    name: Build and publish .deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux amd64 asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "vectorvolt-*-x86_64-unknown-linux-musl.tar.gz" \
+            --pattern "vectorvolt-*-aarch64-unknown-linux-musl.tar.gz" \
+            --dir /tmp/assets
+
+      - name: Extract binaries
+        run: |
+          mkdir -p /tmp/bin-amd64 /tmp/bin-arm64
+          tar -xzf /tmp/assets/vectorvolt-*-x86_64-unknown-linux-musl.tar.gz   -C /tmp/bin-amd64 --strip-components=1
+          tar -xzf /tmp/assets/vectorvolt-*-aarch64-unknown-linux-musl.tar.gz  -C /tmp/bin-arm64 --strip-components=1
+
+      - name: Build .deb packages
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+
+          build_deb() {
+            ARCH=$1; BIN_DIR=$2; DEB_ARCH=$3
+            PKG="vectorvolt_${VERSION}_${DEB_ARCH}"
+            mkdir -p "/tmp/${PKG}/DEBIAN" "/tmp/${PKG}/usr/bin"
+            cp "${BIN_DIR}/vvctl" "/tmp/${PKG}/usr/bin/vvctl"
+            chmod 755 "/tmp/${PKG}/usr/bin/vvctl"
+            cat > "/tmp/${PKG}/DEBIAN/control" <<CTRL
+          Package: vectorvolt
+          Version: ${VERSION}
+          Architecture: ${DEB_ARCH}
+          Maintainer: WorkerRuntime <hello@workerruntime.com>
+          Homepage: https://workerruntime.com
+          Description: Ultra-low-latency kernel-bypass data engine
+           VectorVolt is a zero-GC, WAL-backed KV storage engine with
+           sub-microsecond target latency. Ships as a single binary (vvctl).
+          CTRL
+            dpkg-deb --build "/tmp/${PKG}" "/tmp/debs/${PKG}.deb"
+          }
+
+          mkdir -p /tmp/debs
+          build_deb amd64 /tmp/bin-amd64 amd64
+          build_deb arm64 /tmp/bin-arm64 arm64
+
+      - name: Import GPG signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE:  ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "$GPG_PASSPHRASE" | gpg --batch --passphrase-fd 0 --pinentry-mode loopback \
+            --export-secret-keys --armor > /dev/null  # validate import
+
+      - name: Checkout apt repo
+        uses: actions/checkout@v4
+        with:
+          repository: workerruntime/apt-vectorvolt
+          token: ${{ secrets.TAP_DEPLOY_TOKEN }}
+          path: apt-repo
+
+      - name: Build apt repository with reprepro
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          sudo apt-get install -y reprepro
+
+          mkdir -p apt-repo/conf
+          FINGERPRINT=$(gpg --list-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')
+
+          cat > apt-repo/conf/distributions <<DIST
+          Codename: stable
+          Components: main
+          Architectures: amd64 arm64
+          SignWith: ${FINGERPRINT}
+          DIST
+
+          export GNUPGHOME=$(mktemp -d)
+          gpg --batch --export-secret-keys --armor | gpg --homedir "$GNUPGHOME" --batch --import
+
+          for deb in /tmp/debs/*.deb; do
+            echo "$GPG_PASSPHRASE" | reprepro --ask-passphrase \
+              -b apt-repo includedeb stable "$deb"
+          done
+
+          # Export public key for users
+          gpg --armor --export > apt-repo/KEY.gpg
+
+      - name: Commit and push
+        working-directory: apt-repo
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "vectorvolt ${TAG}"
+          git push

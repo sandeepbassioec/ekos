@@ -1,0 +1,67 @@
+name: Publish — Chocolatey
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    name: Push to chocolatey.org
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$env:TAG" `
+            --repo ${{ github.repository }} `
+            --pattern "vectorvolt-*-x86_64-pc-windows-msvc.zip" `
+            --dir C:\assets
+        shell: pwsh
+
+      - name: Compute SHA256
+        id: sha
+        shell: pwsh
+        run: |
+          $zip  = Get-ChildItem C:\assets\*.zip | Select-Object -First 1
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          echo "win_x86=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Rewrite NuSpec with real version and checksum
+        shell: pwsh
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          WIN_X86: ${{ steps.sha.outputs.win_x86 }}
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          $repo    = "${{ github.repository }}"
+          $base    = "https://github.com/$repo/releases/download/$env:TAG"
+          $url     = "$base/vectorvolt-$version-x86_64-pc-windows-msvc.zip"
+
+          # Write install script
+          New-Item -ItemType Directory -Force vectorvolt\packaging\windows\chocolatey\tools
+          @"
+          `$ErrorActionPreference = 'Stop'
+          Install-ChocolateyZipPackage ``
+            -PackageName   'vectorvolt' ``
+            -Url64bit      '$url' ``
+            -Checksum64    '$($env:WIN_X86)' ``
+            -ChecksumType64 'sha256' ``
+            -UnzipLocation (Split-Path (Get-Command choco).Source)
+          "@ | Set-Content vectorvolt\packaging\windows\chocolatey\tools\chocolateyInstall.ps1
+
+          # Patch version in nuspec
+          (Get-Content vectorvolt\packaging\windows\chocolatey\vectorvolt.nuspec) `
+            -replace '<version>.*</version>', "<version>$version</version>" |
+            Set-Content vectorvolt\packaging\windows\chocolatey\vectorvolt.nuspec
+
+      - name: Pack and push
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          choco pack vectorvolt\packaging\windows\chocolatey\vectorvolt.nuspec
+          choco push vectorvolt.*.nupkg --source https://push.chocolatey.org --api-key $env:CHOCO_API_KEY

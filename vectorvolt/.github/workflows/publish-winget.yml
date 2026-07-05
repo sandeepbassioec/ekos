@@ -1,0 +1,126 @@
+name: Publish — winget
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  submit-manifest:
+    name: Open PR to microsoft/winget-pkgs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "vectorvolt-*-x86_64-pc-windows-msvc.zip" \
+            --dir /tmp/assets
+
+      - name: Compute SHA256
+        id: sha
+        run: |
+          HASH=$(sha256sum /tmp/assets/vectorvolt-*-x86_64-pc-windows-msvc.zip | awk '{print $1}')
+          echo "win_x86=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Write winget manifest files
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          WIN_X86: ${{ steps.sha.outputs.win_x86 }}
+          REPO: ${{ github.repository }}
+        run: |
+          VERSION="${TAG#v}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          MANIFEST_DIR="manifests/w/WorkerRuntime/VectorVolt/${VERSION}"
+          mkdir -p "$MANIFEST_DIR"
+
+          # Version manifest
+          cat > "${MANIFEST_DIR}/WorkerRuntime.VectorVolt.yaml" <<YAML
+          PackageIdentifier: WorkerRuntime.VectorVolt
+          PackageVersion: ${VERSION}
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.6.0
+          YAML
+
+          # Installer manifest
+          cat > "${MANIFEST_DIR}/WorkerRuntime.VectorVolt.installer.yaml" <<YAML
+          PackageIdentifier: WorkerRuntime.VectorVolt
+          PackageVersion: ${VERSION}
+          MinimumOSVersion: "10.0.0.0"
+          InstallerType: zip
+          Installers:
+            - Architecture: x64
+              InstallerUrl: ${BASE}/vectorvolt-${VERSION}-x86_64-pc-windows-msvc.zip
+              InstallerSha256: ${WIN_X86}
+              NestedInstallerType: portable
+              NestedInstallerFiles:
+                - RelativeFilePath: vvctl.exe
+                  PortableCommandAlias: vvctl
+          ManifestType: installer
+          ManifestVersion: 1.6.0
+          YAML
+
+          # Locale manifest
+          cat > "${MANIFEST_DIR}/WorkerRuntime.VectorVolt.locale.en-US.yaml" <<YAML
+          PackageIdentifier: WorkerRuntime.VectorVolt
+          PackageVersion: ${VERSION}
+          PackageLocale: en-US
+          Publisher: WorkerRuntime
+          PublisherUrl: https://workerruntime.com
+          PackageName: VectorVolt
+          PackageUrl: https://workerruntime.com
+          License: Apache-2.0
+          LicenseUrl: https://github.com/${REPO}/blob/main/LICENSE
+          ShortDescription: Ultra-low-latency kernel-bypass data engine
+          Description: >
+            VectorVolt is an ultra-low-latency OLTP storage engine with
+            zero-GC design, WAL-backed durability, and sub-microsecond
+            target latency. Ships as a single binary (vvctl).
+          Tags:
+            - database
+            - storage
+            - cli
+            - rust
+          ManifestType: defaultLocale
+          ManifestVersion: 1.6.0
+          YAML
+
+          tar -czf /tmp/winget-manifests.tar.gz "$MANIFEST_DIR"
+          echo "MANIFEST_DIR=$MANIFEST_DIR" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Checkout winget-pkgs fork
+        uses: actions/checkout@v4
+        with:
+          # Fork microsoft/winget-pkgs under the workerruntime org
+          repository: workerruntime/winget-pkgs
+          token: ${{ secrets.WINGET_TOKEN }}
+          path: winget-pkgs
+
+      - name: Copy manifests into fork
+        run: |
+          cp -r "${{ env.MANIFEST_DIR }}" "winget-pkgs/${{ env.MANIFEST_DIR }}"
+
+      - name: Push branch and open PR
+        working-directory: winget-pkgs
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          VERSION: ${{ env.VERSION }}
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH="vectorvolt-${VERSION}"
+          git checkout -b "$BRANCH"
+          git add .
+          git commit -m "Add WorkerRuntime.VectorVolt version ${VERSION}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --repo microsoft/winget-pkgs \
+            --title "Add WorkerRuntime.VectorVolt ${VERSION}" \
+            --body "New version ${VERSION} of VectorVolt by WorkerRuntime." \
+            --base master \
+            --head "workerruntime:${BRANCH}"

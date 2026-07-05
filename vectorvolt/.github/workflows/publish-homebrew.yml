@@ -1,0 +1,100 @@
+name: Publish — Homebrew
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-tap:
+    name: Update homebrew-vectorvolt tap
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "vectorvolt-*-apple-darwin.tar.gz" \
+            --pattern "vectorvolt-*-linux-musl*.tar.gz" \
+            --dir /tmp/assets
+
+      - name: Compute SHA256 checksums
+        id: sha
+        run: |
+          MAC_ARM=$(sha256sum /tmp/assets/vectorvolt-*-aarch64-apple-darwin.tar.gz | awk '{print $1}')
+          MAC_X86=$(sha256sum /tmp/assets/vectorvolt-*-x86_64-apple-darwin.tar.gz   | awk '{print $1}')
+          LIN_X86=$(sha256sum /tmp/assets/vectorvolt-*-x86_64-unknown-linux-musl.tar.gz    | awk '{print $1}')
+          LIN_ARM=$(sha256sum /tmp/assets/vectorvolt-*-aarch64-unknown-linux-musl.tar.gz   | awk '{print $1}')
+          echo "mac_arm=$MAC_ARM" >> "$GITHUB_OUTPUT"
+          echo "mac_x86=$MAC_X86" >> "$GITHUB_OUTPUT"
+          echo "lin_x86=$LIN_X86" >> "$GITHUB_OUTPUT"
+          echo "lin_arm=$LIN_ARM" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: workerruntime/homebrew-vectorvolt
+          token: ${{ secrets.TAP_DEPLOY_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          MAC_ARM: ${{ steps.sha.outputs.mac_arm }}
+          MAC_X86: ${{ steps.sha.outputs.mac_x86 }}
+          LIN_X86: ${{ steps.sha.outputs.lin_x86 }}
+          LIN_ARM: ${{ steps.sha.outputs.lin_arm }}
+          REPO: ${{ github.repository }}
+        run: |
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          cat > tap/Formula/vectorvolt.rb <<FORMULA
+          class Vectorvolt < Formula
+            desc "VectorVolt — ultra-low-latency kernel-bypass data engine"
+            homepage "https://workerruntime.com"
+            version "${TAG#v}"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/vectorvolt-${TAG#v}-aarch64-apple-darwin.tar.gz"
+                sha256 "${MAC_ARM}"
+              end
+              on_intel do
+                url "${BASE}/vectorvolt-${TAG#v}-x86_64-apple-darwin.tar.gz"
+                sha256 "${MAC_X86}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${BASE}/vectorvolt-${TAG#v}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${LIN_ARM}"
+              end
+              on_intel do
+                url "${BASE}/vectorvolt-${TAG#v}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${LIN_X86}"
+              end
+            end
+
+            def install
+              bin.install "vvctl"
+            end
+
+            test do
+              assert_match "vvctl", shell_output("#{bin}/vvctl version")
+            end
+          end
+          FORMULA
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/vectorvolt.rb
+          git commit -m "vectorvolt ${TAG}"
+          git push
