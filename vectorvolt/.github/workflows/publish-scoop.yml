@@ -1,0 +1,78 @@
+name: Publish — Scoop
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-bucket:
+    name: Update scoop-vectorvolt bucket
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "vectorvolt-*-x86_64-pc-windows-msvc.zip" \
+            --dir /tmp/assets
+
+      - name: Compute SHA256
+        id: sha
+        run: |
+          HASH=$(sha256sum /tmp/assets/vectorvolt-*-x86_64-pc-windows-msvc.zip | awk '{print $1}')
+          echo "win_x86=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout bucket repo
+        uses: actions/checkout@v4
+        with:
+          repository: workerruntime/scoop-vectorvolt
+          token: ${{ secrets.TAP_DEPLOY_TOKEN }}
+          path: bucket
+
+      - name: Update manifest
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          WIN_X86: ${{ steps.sha.outputs.win_x86 }}
+          REPO: ${{ github.repository }}
+        run: |
+          VERSION="${TAG#v}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          cat > bucket/vectorvolt.json <<JSON
+          {
+            "version": "${VERSION}",
+            "description": "VectorVolt — ultra-low-latency kernel-bypass data engine",
+            "homepage": "https://workerruntime.com",
+            "license": "Apache-2.0",
+            "architecture": {
+              "64bit": {
+                "url": "${BASE}/vectorvolt-${VERSION}-x86_64-pc-windows-msvc.zip",
+                "hash": "${WIN_X86}"
+              }
+            },
+            "bin": "vvctl.exe",
+            "checkver": {
+              "github": "https://github.com/${REPO}"
+            },
+            "autoupdate": {
+              "architecture": {
+                "64bit": {
+                  "url": "https://github.com/${REPO}/releases/download/v\$version/vectorvolt-\$version-x86_64-pc-windows-msvc.zip"
+                }
+              }
+            }
+          }
+          JSON
+
+      - name: Commit and push
+        working-directory: bucket
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add vectorvolt.json
+          git commit -m "vectorvolt ${TAG}"
+          git push
