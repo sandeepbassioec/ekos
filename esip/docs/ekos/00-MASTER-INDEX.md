@@ -130,7 +130,7 @@ requirements. Closing them BEFORE the Architecture Phase (A01).
 | 19 | **Knowledge Compiler** (Knowledge Objects → compiled artifacts; ≠ widget engine) | ✅ (58 reqs) | #2 |
 | 20 | **Knowledge Representation Runtime (KRR)** — fka "Projection Engine"; scope expanded 2026-07-01: KRF/KRR split, Law 16 (Representation Independence), Intent-Based Representation, evidence-artifact exception | ✅ (~72 reqs) | #3 + Law 16 |
 | 21 | **Knowledge Acquisition Framework** (all knowledge inflow — meetings/ERP/IoT/voice/sensors/AI/humans) | ✅ (60 reqs) | #4 |
-| 22 | **Knowledge OS APIs / Syscall Layer** (`Knowledge.Open/Query/Project/Publish…` = Win32/POSIX equiv) | ✅ (58 reqs) | #5 |
+| 22 | **Knowledge OS APIs / Syscall Layer** (`Knowledge.Open/Query/Project/Publish…` = Win32/POSIX equiv) + CCR amendment 2026-07-03: Constitutional Compliance Runtime gate, Constitutional Telemetry Stream, Extension Compliance Manifest (ADR-051) | ✅ (74 reqs) | #5 |
 | 23 | **EKOS Application Runtime & SDK** (apps-not-widgets, App Bundles, App Store, sandbox) | ✅ (58 reqs) | #6 |
 | 24 | **Living Knowledge Publication Framework** (Living Books — first-class) | ✅ (52 reqs) | #7 |
 | 25 | **EKOS as Self-Hosting Reference Knowledge Base** (EKOS imports EKOS; the spec is the first reference impl) | ✅ (44 reqs) | #8 |

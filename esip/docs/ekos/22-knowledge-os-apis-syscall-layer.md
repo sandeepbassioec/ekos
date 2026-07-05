@@ -244,7 +244,148 @@ enforcement**, and the relationship to the SDK and public API.
 
 ---
 
-## 12. Open Questions (parked)
+## 12. Constitutional Compliance Runtime (CCR) Gate
+
+> **Added 2026-07-03 (ADR-051).** The CCR is the cross-cutting enforcement layer that
+> makes Book 1 Laws binding at runtime. It intercepts every syscall on every caller path.
+> Specification: Book 1 Part III. This section states the syscall-layer requirements.
+
+- **EKOS-22-040 (Must, MVP)** — A **Constitutional Compliance Runtime (CCR)** gate SHALL
+  be executed as part of every syscall invocation, in-process, before the syscall body
+  executes. No caller type, no principal level, and no deployment tier bypasses the gate.
+  *Source:* Book 1 Part III §1; ADR-051.
+
+- **EKOS-22-041 (Must, MVP)** — The CCR SHALL enforce Laws in three tiers:
+  **Tier 1 — Structural** (architecture port boundaries; no runtime check needed);
+  **Tier 2 — Behavioral** (CCR runtime check per qualifying syscall — Law 4, 6, 11, 16);
+  **Tier 3 — Policy** (CCR delegates to the OPA/Rego policy engine — Law 5, 7, 8, 9, 10,
+  12, 14, 15). Tier 2 checks SHALL complete in < 1ms P99 (in-process). Tier 3 policy
+  evaluation SHALL be asynchronous where the calling syscall permits; synchronous where the
+  result gates the commit (e.g., `Commit()` with a governance-required approval).
+  *Source:* Book 1 Part III §2; ADR-051.
+
+- **EKOS-22-042 (Must, P2)** — When the CCR detects a violation, it SHALL:
+  (a) halt the syscall before any mutation or data access occurs,
+  (b) return a typed `ConstitutionalViolation` subtype to the caller (matching the
+  violated law — see Book 1 Part III §3 hierarchy),
+  (c) emit a `ConstitutionalEvent` to the Constitutional Telemetry Stream before
+  returning the error (see EKOS-22-045),
+  (d) never reveal the existence of unauthorized knowledge objects in the violation
+  message (consistent with EKOS-22-028 / Vol 04 §7).
+  *Source:* Book 1 Part III §3; ADR-051.
+
+- **EKOS-22-043 (Must, P2)** — The `ConstitutionalViolation` type hierarchy SHALL be
+  **stable across ABI versions** — adding a new subtype is additive (not breaking);
+  removing or renaming a subtype is breaking and follows the deprecation policy
+  (EKOS-22-019). *Source:* ADR-051; Book 1 Law 14.
+
+- **EKOS-22-044 (Must, P2)** — The CCR SHALL enforce the following behavioral-tier laws
+  at the named syscalls:
+  - `Knowledge.Commit()` → Law 11: reject if bitemporal fields (valid-time, transaction-
+    time) are absent or if the write attempts a destructive overwrite.
+  - `Knowledge.Project()` → Law 16: reject if the caller attempts to persist a
+    projected representation to canonical knowledge without a declared evidence-artifact
+    exception type.
+  - `Knowledge.Query()` with an AI-bound context → Law 6: reject if the AI invocation
+    lacks a `groundingSourceRef` pointing to a `Query()` result; reject if the AI
+    operation executes outside the calling principal's PDP scope.
+  - `Knowledge.Commit()` with a training flag → Law 7: reject if the commit would
+    enqueue customer knowledge for model training without a verified opt-in record.
+  - Any syscall using a cryptographic parameter → Law 4: reject null-key, test-bypass,
+    or weakened-algorithm configurations in non-development deployment tiers.
+  *Source:* Book 1 Part III §2; ADR-051.
+
+---
+
+## 13. Constitutional Telemetry Stream (CTS)
+
+- **EKOS-22-045 (Must, P2)** — Every CCR evaluation — pass or violation — SHALL emit a
+  **ConstitutionalEvent** to the **Constitutional Telemetry Stream (CTS)**. The event
+  SHALL be emitted asynchronously (non-blocking to the caller) via an in-process buffer
+  flushed to the Kafka journal (Vol 18 §8, topic `ekos.ccr.constitutional`). If the
+  buffer is full, events are written to a local WAL before the Kafka flush completes.
+  *Source:* Book 1 Part III §4; ADR-051.
+
+- **EKOS-22-046 (Must, P2)** — The CTS SHALL be **immutable and append-only** — Law 11
+  applies to the telemetry stream itself. No caller, tenant, or platform operator may
+  delete or modify CTS events. *Source:* Book 1 Law 11; ADR-051.
+
+- **EKOS-22-047 (Must, P2)** — The CTS SHALL be **caller-agnostic and
+  deployment-tier-agnostic** — identical events are emitted whether the caller is a
+  browser, SDK, EKR Viewer (local kernel instance), KWR Worker, third-party extension,
+  or autonomous AI agent, and whether the deployment is SaaS, air-gap, or Edge.
+  Air-gap deployments SHALL buffer CTS events locally and replicate to the central CTS
+  upon connectivity. *Source:* Book 1 Part III §4; ADR-051; Book 1 Law 8.
+
+- **EKOS-22-048 (Must, P2)** — The CTS SHALL emit the following mandatory fields per
+  event (schema stable across ABI versions): `eventId`, `timestamp`, `lawsEvaluated[]`,
+  `outcome` (PASS | VIOLATION | POLICY_DENY), `violatedLaw` (if outcome ≠ PASS),
+  `violationType`, `syscall`, `callerType`, `callerId`, `tenantId`,
+  `knowledgeObjectRef` (masked if PDP denies existence), `policyRef` (if Tier 3),
+  `correlationId` (OpenTelemetry trace ID), `deploymentTier`.
+  *Source:* Book 1 Part III §4; ADR-051.
+
+- **EKOS-22-049 (Must, P2)** — The following **mandatory CTS metrics** SHALL be computed
+  in real-time and exposed via `Observe()` within the calling tenant's PDP scope:
+  `ekos.ccr.evaluations.total`, `ekos.ccr.evaluations.by_law`,
+  `ekos.ccr.violations.total`, `ekos.ccr.violations.by_law`,
+  `ekos.ccr.violations.by_caller_type`, `ekos.ccr.policy_denies.total`,
+  `ekos.ccr.latency_p99_ms`.
+  Platform operators (cross-tenant) MAY access aggregate metrics via their governance
+  plane. *Source:* Book 1 Part III §4; ADR-051.
+
+- **EKOS-22-050 (Should, P2)** — A **Constitutional Compliance Dashboard** SHALL be
+  provided as a first-class platform governance view (a widget projection of the CTS —
+  Law 3), showing per-tenant constitutional health, violation trends by law, caller-type
+  breakdown, and SLO compliance for CCR latency. *Source:* Book 1 Part III §4; Vol 02
+  (widget projection); ADR-051.
+
+---
+
+## 14. Extension Compliance Manifest (CCM)
+
+- **EKOS-22-051 (Must, P2)** — Every third-party extension (widget, connector, app, SDK
+  client, AI agent integration) MUST submit a signed **Constitutional Compliance Manifest
+  (CCM)** at registration time. A CCM-less or CCM-invalid extension SHALL be rejected at
+  registration; the syscall layer SHALL reject calls from an unregistered extension.
+  *Source:* Book 1 Part III §5; ADR-051.
+
+- **EKOS-22-052 (Must, P2)** — The CCM SHALL declare at minimum:
+  (a) `extension_id` (globally unique),
+  (b) `extension_type` (App | Widget | Connector | AI_Agent | SDK_Client),
+  (c) `constitution_version` (pinned to the Book 1 version at registration),
+  (d) `law_engagements[]` (which Laws the extension consciously interacts with and how),
+  (e) `syscalls_used[]` (complete list; CCR checks against this list at every call),
+  (f) `violation_surface` (how the extension surfaces ConstitutionalViolations to its
+  own users — SDK-exception | UI-error-boundary | gRPC-status),
+  (g) a cryptographic signature (Ed25519, signed with the author's tenant KMS key).
+  *Source:* Book 1 Part III §5; ADR-051.
+
+- **EKOS-22-053 (Must, P2)** — If a caller's `extension_id` invokes a syscall not
+  declared in `syscalls_used`, the CCR SHALL reject the call with a
+  `Law13Violation` (unexpected kernel access) and emit a CTS event.
+  *Source:* Book 1 Part III §5; ADR-051.
+
+- **EKOS-22-054 (Must, P2)** — When the Constitution is amended (new Law or Law update),
+  all active CCMs are flagged as **pending re-compliance**. An extension that has not
+  submitted an updated CCM against the new Constitution version within the declared
+  re-compliance window SHALL have its syscall access suspended.
+  *Source:* Book 1 Part III §5; ADR-051; Book 1 Law 14.
+
+- **EKOS-22-055 (Should, P2)** — The **EKOS SDK** (Vol 23) SHALL include a CCM generator
+  tool that scaffolds a valid CCM from the extension's declared syscall usage, reducing
+  the compliance burden on extension authors to a review-and-sign step rather than manual
+  authoring. *Source:* Vol 23; ADR-051.
+
+- **EKOS-22-056 (Should, P3)** — CCMs SHALL be knowledge objects in the graph
+  (introspectable via `Knowledge.Query()` — Law 15 self-hosting), allowing platform
+  operators and compliance officers to audit the full extension landscape, search for
+  extensions engaging with a specific law, or query the set of extensions with pending
+  re-compliance obligations. *Source:* Book 1 Law 15; Vol 25; ADR-051.
+
+---
+
+## 16. Open Questions (parked)
 
 - **OQ-22-A** — Concrete IDL & binding-generation toolchain (illustrative candidates;
   decide in Vol 15/A03) — must satisfy language-agnostic + transport-pluggable.
@@ -261,10 +402,13 @@ enforcement**, and the relationship to the SDK and public API.
 
 ## 13. Requirement Index (this volume)
 
-EKOS-22-001 … EKOS-22-039 (stable numbering; the OS-contract principle, the full syscall
+EKOS-22-001 … EKOS-22-039 — original 58 requirements (OS-contract principle, full syscall
 catalog, stable ABI/versioning, language-agnostic binding, sync/async/streaming, error
-model, per-call enforcement, SDK/public-API relationship, observability, self-hosting
-expand to 58 distinct stated rules).
+model, per-call enforcement, SDK/public-API relationship, observability, self-hosting).
+
+EKOS-22-040 … EKOS-22-056 — **CCR amendment (2026-07-03, ADR-051)**: Constitutional
+Compliance Runtime gate (040–044), Constitutional Telemetry Stream (045–050), Extension
+Compliance Manifest (051–056). **Total: 74 requirements.**
 
 > **Next gap:** `23 — EKOS Application Runtime & SDK`.
 > Per protocol: STOP here. Await user "proceed".
