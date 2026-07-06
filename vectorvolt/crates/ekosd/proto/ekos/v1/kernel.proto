@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package ekos.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EKOS Kernel — Phase 1 syscall surface
+//
+// Six RPCs covering the complete read/write/history lifecycle for
+// Knowledge Objects.  Cluster-aware RPCs (federation, WASM invoke,
+// CCR enforcement) are deferred to Phase 2+.
+// ─────────────────────────────────────────────────────────────────────────────
+
+service KernelService {
+  // Syscall 1 — create or update a Knowledge Object (WAL-durable)
+  rpc KoPut      (KoPutRequest)      returns (KoPutResponse);
+
+  // Syscall 2 — fetch latest active version by id
+  rpc KoGet      (KoGetRequest)      returns (KoGetResponse);
+
+  // Syscall 3 — soft-delete (writes a tombstone version)
+  rpc KoDelete   (KoDeleteRequest)   returns (KoDeleteResponse);
+
+  // Syscall 4 — scan active KOs in a namespace, optionally by kind
+  rpc KoScan     (KoScanRequest)     returns (KoScanResponse);
+
+  // Syscall 5 — full version history for a KO (bitemporal log)
+  rpc KoHistory  (KoHistoryRequest)  returns (KoHistoryResponse);
+
+  // Syscall 6 — find all active KOs carrying a specific tag
+  rpc KoQueryTag (KoQueryTagRequest) returns (KoQueryTagResponse);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared message types
+// ─────────────────────────────────────────────────────────────────────────────
+
+message KnowledgeObject {
+  string id          = 1;
+  string namespace   = 2;
+  string kind        = 3;
+  bytes  payload     = 4;   // opaque — caller owns the schema
+
+  google.protobuf.Timestamp valid_from  = 5;
+  google.protobuf.Timestamp valid_until = 6;   // absent = still valid
+  google.protobuf.Timestamp tx_time     = 7;   // set by kernel, immutable
+
+  repeated string tags = 8;
+  uint64          version = 9;
+  KoStatus        status  = 10;
+}
+
+enum KoStatus {
+  KO_STATUS_UNSPECIFIED = 0;
+  KO_STATUS_ACTIVE      = 1;
+  KO_STATUS_DELETED     = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Syscall 1 — KoPut
+// ─────────────────────────────────────────────────────────────────────────────
+
+message KoPutRequest {
+  string namespace = 1;
+  string kind      = 2;
+  bytes  payload   = 3;
+
+  // Optional — supply an existing id to update; omit to create a new KO
+  string id        = 4;
+
+  google.protobuf.Timestamp valid_from  = 5;
+  google.protobuf.Timestamp valid_until = 6;
+  repeated string tags = 7;
+}
+
+message KoPutResponse {
+  KnowledgeObject ko = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Syscall 2 — KoGet
+// ─────────────────────────────────────────────────────────────────────────────
+
+message KoGetRequest {
+  string namespace = 1;
+  string id        = 2;
+}
+
+message KoGetResponse {
+  KnowledgeObject ko = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Syscall 3 — KoDelete
+// ─────────────────────────────────────────────────────────────────────────────
+
+message KoDeleteRequest {
+  string namespace = 1;
+  string id        = 2;
+}
+
+message KoDeleteResponse {
+  bool ok = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Syscall 4 — KoScan
+// ─────────────────────────────────────────────────────────────────────────────
+
+message KoScanRequest {
+  string namespace = 1;
+  string kind      = 2;   // empty = all kinds
+  uint32 limit     = 3;   // 0 = no limit
+}
+
+message KoScanResponse {
+  repeated KnowledgeObject kos   = 1;
+  uint32                   total = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Syscall 5 — KoHistory
+// ─────────────────────────────────────────────────────────────────────────────
+
+message KoHistoryRequest {
+  string namespace = 1;
+  string id        = 2;
+}
+
+message KoHistoryResponse {
+  repeated KnowledgeObject versions = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Syscall 6 — KoQueryTag
+// ─────────────────────────────────────────────────────────────────────────────
+
+message KoQueryTagRequest {
+  string namespace = 1;
+  string tag       = 2;
+  uint32 limit     = 3;
+}
+
+message KoQueryTagResponse {
+  repeated KnowledgeObject kos   = 1;
+  uint32                   total = 2;
+}

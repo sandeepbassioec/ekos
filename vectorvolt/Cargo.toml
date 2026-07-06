@@ -3,6 +3,8 @@ members = [
     "crates/vectorvolt-wal",
     "crates/vectorvolt-store",
     "crates/vvctl",
+    "crates/ekos-kernel",
+    "crates/ekosd",
 ]
 resolver = "2"
 
@@ -40,6 +42,15 @@ chrono         = { version = "0.4", features = ["serde"] }
 # serialization
 serde          = { version = "1.0", features = ["derive"] }
 serde_json     = "1.0"
+rmp-serde      = "1.3"
+serde_bytes    = "0.11"
+uuid           = { version = "1.11", features = ["v7", "serde"] }
+tonic          = { version = "0.12", features = ["transport"] }
+tonic-build    = { version = "0.12", features = ["prost"] }
+protoc-bin-vendored = "3.0"
+prost          = "0.13"
+prost-types    = "0.13"
+toml           = "0.8"
 # testing
 tempfile       = "3.14"
 
