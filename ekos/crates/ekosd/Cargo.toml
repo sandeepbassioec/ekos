@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 ekos-kernel      = { path = "../ekos-kernel" }
-vectorvolt-store = { path = "../vectorvolt-store" }
+vectorvolt-store = { workspace = true }
 bytes          = { workspace = true }
 anyhow         = { workspace = true }
 thiserror      = { workspace = true }

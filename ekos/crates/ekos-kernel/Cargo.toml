@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace   = true
 
 [dependencies]
-vectorvolt-store = { path = "../vectorvolt-store" }
+vectorvolt-store = { workspace = true }
 bytes          = { workspace = true }
 anyhow         = { workspace = true }
 thiserror      = { workspace = true }
