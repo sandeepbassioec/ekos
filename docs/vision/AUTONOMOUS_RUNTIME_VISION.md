@@ -325,7 +325,116 @@ pub enum PromotionPolicy {
 
 ---
 
-## 6. Reflexive Encrypted Runtime (Phase 6+)
+## 6. Simulation Capabilities
+
+**Goal:** Because EKOS's data model is bitemporal (every KO has `tx_time`) and Shadowbox already mirrors production state, the system is naturally simulation-capable. The following must be first-class features of the Shadowbox design — not retrofitted later.
+
+### 6.1 Policy Replay
+
+*"If I had used a different trust policy over the last N months, what would have happened?"*
+
+EKOS retains full history of every ARP patch and its confidence score. Policy Replay runs a simulation:
+
+```
+Input:  historical patch log (last N months) + proposed new TrustPolicy
+Output: which patches would have auto-promoted, which would have been held,
+        any patch that would have incorrectly auto-promoted (false confidence)
+```
+
+This is how admins safely tune confidence thresholds before enabling `AutoIfConfident` or `FullAuto`. No production risk — runs on historical data.
+
+### 6.2 ARP Training Simulation
+
+*"Can I trust ARP enough to enable FullAuto?"*
+
+A `BugLibrary` — KOs containing known past bugs (already fixed) with their ground-truth patches:
+
+```
+KO { kind: "known_bug", payload: { symptom_metrics, root_cause, correct_patch } }
+```
+
+Simulation workflow:
+1. Inject known bug into Shadowbox("dev")
+2. Let ARP detect, diagnose, and synthesize a patch
+3. Compare ARP's patch against ground-truth patch
+4. Score: correct / partially correct / wrong
+
+Run against the full BugLibrary. If ARP scores > threshold → FullAuto is safe to enable. This is ARP's own test suite — not written by developers, grown from production history.
+
+### 6.3 Time-Shifted Traffic Replay (Digital Twin)
+
+*"How does the new patch behave against real production traffic — not synthetic load?"*
+
+Current Shadowbox runs new code against live traffic as it arrives. Time-shifted replay instead:
+
+```
+Record: last 24h of production gRPC requests (anonymized, stored as KOs)
+Replay: feed that exact traffic sequence into Shadowbox with new code
+Compare: responses from new code vs recorded production responses
+```
+
+This gives patch validation against real traffic patterns without waiting for live traffic to exercise the changed code path. A patch that fixes a 2am batch job can be validated immediately, not at 2am.
+
+### 6.4 Bitemporal Forward Projection
+
+*"What does the system look like in 6 months?"*
+
+EKOS knows current write rate, KO size distribution, and compaction behavior. Projection simulation:
+
+```
+Input:  current metrics + growth rate (fitted from last 90 days)
+Output: predicted KoStore size, query latency p99, compaction frequency at T+30/60/90/180 days
+```
+
+Used for capacity planning — predict hardware upgrade trigger before it becomes an emergency. Stored as a `KO { kind: "capacity_projection" }` — updated weekly, visible in admin panel.
+
+### 6.5 What-If Indexing
+
+*"Is a new index worth the rebuild cost?"*
+
+Before committing to a new index (e.g., adding a secondary tag index), simulate:
+
+1. Build the new index in Shadowbox on historical data
+2. Replay last N days of scan queries against old index vs new index
+3. Compare: query latency delta, storage overhead, compaction impact
+
+Decision is data-driven, not guesswork.
+
+### 6.6 Chaos Confidence
+
+*"Does ARP correctly classify failure types before I trust it in production?"*
+
+Deliberately inject failure scenarios into Shadowbox and verify ARP's classification:
+
+| Injected Failure | Expected Classification | Pass If |
+|---|---|---|
+| Slow disk I/O | Infra Error | ARP does NOT attempt code patch |
+| Buggy ko_history() | System Error | ARP synthesizes WASM patch |
+| Malformed gRPC payload | Network Error | ARP triggers retry/circuit-break |
+| Invalid KO payload | Business Error | ARP alerts owner, no self-patch |
+
+If ARP misclassifies → it is not safe to enable autonomous remediation.  
+Chaos runs in Shadowbox on a schedule before any FullAuto trust policy is activated.
+
+### 6.7 Design Constraint for Shadowbox (Phase 4)
+
+All simulation capabilities above require Shadowbox to support:
+
+```rust
+pub enum ShadowboxMode {
+    LiveMirror,                          // current: mirrors live traffic
+    TimeShiftedReplay { recorded_at: DateTime<Utc> },  // 6.3
+    PolicyReplay { policy: TrustPolicy, from: DateTime<Utc> }, // 6.1
+    ChaosInjection { scenario: ChaosScenario },        // 6.6
+    ForwardProjection { horizon_days: u32 },            // 6.4
+}
+```
+
+Phase 4 must build Shadowbox with this enum — not just `LiveMirror`. Retrofitting later breaks the interface.
+
+---
+
+## 7. Reflexive Encrypted Runtime (Phase 6+)
 
 **Goal:** After first production deployment, GitHub is retired. Source code lives inside EKOS as encrypted KnowledgeObjects. The runtime is its own development environment.
 
