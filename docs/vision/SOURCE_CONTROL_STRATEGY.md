@@ -7,6 +7,41 @@
 
 ---
 
+## 0. Scope — Both Products, Same System
+
+This strategy applies to **both** VectorVolt and EKOS equally.  
+Same SCM engine, same ekosctl tooling, same encryption model, same bootstrap ceremony.
+
+The key difference is that they are **separate products with separate DevOps nodes**:
+
+```
+┌─────────────────────────────────┐      artifact dep      ┌─────────────────────────────────┐
+│   VectorVolt DevOps Node        │ ──────────────────────► │   EKOS DevOps Node              │
+│   (workerruntime.com)           │                         │   (garvionlabs.com)             │
+│                                 │                         │                                 │
+│  Source KOs:                    │                         │  Source KOs:                    │
+│    vectorvolt-wal               │                         │    ekos-kernel                  │
+│    vectorvolt-store             │                         │    ekosd                        │
+│    vvctl                        │                         │    ekos-scm                     │
+│                                 │                         │    ekosctl                      │
+│  Publishes:                     │                         │                                 │
+│    vectorvolt-store artifact    │                         │  Consumes:                      │
+│    (internal registry)          │                         │    vectorvolt-store artifact    │
+└─────────────────────────────────┘                         └─────────────────────────────────┘
+```
+
+VectorVolt node publishes `vectorvolt-store` to an **internal artifact registry** (not crates.io — that was Phase A).  
+EKOS node consumes it as a versioned dependency.  
+This mirrors the current path-dep relationship but inside the encrypted runtime.
+
+**Why separate nodes, not one?**
+- Different release cadences (VectorVolt is slower-moving, foundational)
+- Different teams/access controls (WorkerRuntime vs Garvion Labs)
+- EKOS node going down must not affect VectorVolt source
+- Clean IP boundary between the two brands
+
+---
+
 ## 1. The Problem With External Source Control
 
 GitHub is a general-purpose collaboration platform. For a self-healing, self-patching runtime like EKOS, using GitHub creates a fundamental contradiction:
@@ -308,7 +343,47 @@ Phase 7+:    Multi-node federation — DevOps cluster, not single node
 
 ---
 
-## 10. Embedded SCM Engine — Build vs Buy Decision
+## 10. Internal Artifact Registry (crates.io Replacement)
+
+Once GitHub is retired, crates.io publishing also stops.  
+VectorVolt publishes artifacts internally so EKOS can consume them.
+
+### What It Is
+
+A lightweight gRPC service — `ekos-registry` — that:
+- Accepts a compiled `.rlib` / `.crate` package from VectorVolt DevOps node
+- Stores it as a KO: `kind="crate_artifact"`, namespace=`"registry/vectorvolt-store/0.2.1"`
+- EKOS DevOps node fetches it via Cargo's `--registry` mechanism or a custom resolver
+
+### Cargo Integration
+
+```toml
+# ekos/Cargo.toml — Phase 6+
+[workspace.dependencies]
+vectorvolt-store = { version = "0.2", registry = "garvion-internal" }
+```
+
+```toml
+# ~/.cargo/config.toml on DevOps nodes
+[registries.garvion-internal]
+index = "sparse+https://registry.garvionlabs.internal/index/"
+```
+
+The registry index itself is served by `ekosd` — a new `RegistryService` alongside `EkosScm` and `EkosKernel`.
+
+### Publish Flow
+
+```
+VectorVolt ARP promotes new vectorvolt-store version
+  → BuildWorkflow produces .crate artifact
+  → EkosRegistry.Publish(artifact) → stored as KO
+  → EKOS DevOps node's next build resolves new version automatically
+  → No manual crates.io publish step
+```
+
+---
+
+## 11. Embedded SCM Engine — Build vs Buy Decision
 
 ### What Gets Embedded
 
