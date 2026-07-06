@@ -1,0 +1,59 @@
+[workspace]
+members = [
+    "crates/ekos-kernel",
+    "crates/ekosd",
+]
+resolver = "2"
+
+[workspace.package]
+version     = "0.1.0"
+authors     = ["Garvion Labs <hello@garvionlabs.com>"]
+edition     = "2024"
+license     = "Apache-2.0"
+repository  = "https://github.com/garvionlabs/ekos"
+homepage    = "https://garvionlabs.com"
+description = "EKOS — Knowledge Operating System Runtime"
+
+[workspace.dependencies]
+# VectorVolt storage engine — path dep until published to crates.io
+# When VectorVolt is published, replace with: vectorvolt-store = "0.1"
+vectorvolt-store = { path = "../vectorvolt/crates/vectorvolt-store" }
+
+# async
+tokio          = { version = "1.45", features = ["full"] }
+# error handling
+anyhow         = "1.0"
+thiserror      = "2.0"
+# bytes / encoding
+bytes          = "1.10"
+# serialization
+serde          = { version = "1.0", features = ["derive"] }
+serde_json     = "1.0"
+serde_bytes    = "0.11"
+rmp-serde      = "1.3"
+# identity
+uuid           = { version = "1.11", features = ["v7", "serde"] }
+# time
+chrono         = { version = "0.4", features = ["serde"] }
+# gRPC
+tonic          = { version = "0.12", features = ["transport"] }
+tonic-build    = { version = "0.12", features = ["prost"] }
+prost          = "0.13"
+prost-types    = "0.13"
+protoc-bin-vendored = "3.0"
+# config
+toml           = "0.8"
+# CLI
+clap           = { version = "4.5", features = ["derive", "color"] }
+# logging
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# testing
+tempfile       = "3.14"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"

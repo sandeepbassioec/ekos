@@ -1,0 +1,26 @@
+[package]
+name        = "ekos-kernel"
+description = "EKOS knowledge object model and storage layer"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+
+[dependencies]
+vectorvolt-store = { workspace = true }
+bytes          = { workspace = true }
+anyhow         = { workspace = true }
+thiserror      = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+rmp-serde      = { workspace = true }
+serde_bytes    = { workspace = true }
+uuid           = { workspace = true }
+chrono         = { workspace = true }
+tracing        = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true }
