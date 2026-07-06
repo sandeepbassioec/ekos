@@ -1,0 +1,312 @@
+# Internal Source Control Strategy
+## VectorVolt + EKOS — Private SCM Built on EKOS Itself
+
+**Status:** Architecture Capture (not scheduled for development)  
+**Captured:** 2026-07-07  
+**Depends on:** AUTONOMOUS_RUNTIME_VISION.md — Section 6 (Reflexive Encrypted Runtime)
+
+---
+
+## 1. The Problem With External Source Control
+
+GitHub is a general-purpose collaboration platform. For a self-healing, self-patching runtime like EKOS, using GitHub creates a fundamental contradiction:
+
+```
+EKOS needs to read its own source to synthesize patches
+  → Source lives on GitHub (external)
+  → ARP must call out to GitHub at patch time
+  → GitHub outage = ARP blind
+  → Source is readable by anyone with repo access
+  → IP not protected at storage layer
+```
+
+The goal is to eliminate this contradiction: **source must live where the runtime lives.**
+
+---
+
+## 2. Three-Phase Transition Strategy
+
+### Phase A — External (Current, Phase 1–5)
+
+```
+Source: GitHub (private repo)
+CI/CD:  GitHub Actions → crates.io
+SCM:    Standard git — branches, PRs, tags
+```
+
+Nothing changes during active development phases.  
+GitHub is the source of truth. This is intentional — do not rush the transition.
+
+**Exit condition:** Phase 5 complete (ARP working), system proven stable for 90 days in production.
+
+---
+
+### Phase B — Hybrid Mirror (Bridge, ~Phase 5–6)
+
+```
+Source: GitHub (still primary) + EKOS mirror (read-only KOs)
+```
+
+EKOS begins mirroring its own source as encrypted KOs — but GitHub remains authoritative.  
+This gives ARP access to source without requiring the full transition.
+
+```
+GitHub push → CI triggers mirror workflow → 
+  source files encrypted and upserted into EKOS as KOs →
+  ARP can now read source internally during patch synthesis
+```
+
+**What this enables:**
+- ARP can diagnose and synthesize patches against mirrored source
+- Full transition can be tested without risk — GitHub is still the fallback
+- Team gets comfortable with source-as-KO workflow
+
+**Exit condition:** Mirror has been accurate for 60 days, bootstrap ceremony rehearsed successfully.
+
+---
+
+### Phase C — EKOS Primary (Full Transition, Phase 6+)
+
+```
+Source: EKOS (primary, encrypted KOs)
+GitHub: Archived — private, read-only, emergency fallback only
+SCM:    EKOS internal SCM (described below)
+```
+
+One-time bootstrap ceremony performed (see Section 5).  
+All development flows through the EKOS DevOps node from this point.
+
+---
+
+## 3. Internal SCM Architecture
+
+### 3.1 The Single DevOps Node
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  EKOS DevOps Node                   │
+│                                                     │
+│  ┌─────────────┐  ┌──────────┐  ┌───────────────┐  │
+│  │ Source KOs  │  │  Build   │  │  Shadowboxes  │  │
+│  │ (encrypted) │  │ Workflow │  │ dev/qa/uat    │  │
+│  └─────────────┘  └──────────┘  └───────────────┘  │
+│                                                     │
+│  Admin gRPC channel (privileged, mTLS)              │
+└─────────────────────────────────────────────────────┘
+         ▲                    ▲
+    Dev workstation      Dev workstation
+    (submits changes)    (reviews, approves)
+```
+
+One node holds the authoritative encrypted source.  
+Developers do not push to a central server — they submit **change proposals** via the admin gRPC channel.  
+The node decides when to accept, build, test, and promote.
+
+---
+
+### 3.2 Branching Model
+
+Git branches do not exist in this model. Instead:
+
+```
+Namespace = Branch
+
+main source:    namespace = "ekos/crates/ekos-kernel/main"
+feature work:   namespace = "ekos/crates/ekos-kernel/feature-cip"
+hotfix:         namespace = "ekos/crates/ekos-kernel/hotfix-20260707"
+```
+
+Each namespace is a full copy of the relevant source KOs.  
+"Branching" = fork a namespace.  
+"Merging" = a MergeWorkflow that reconciles two namespaces into a target.
+
+**Merge workflow behavior:**
+- Compares KO versions across source and target namespaces
+- Identical files: fast-forward
+- Diverged files: LLM-assisted merge (not auto-merge for non-trivial conflicts)
+- Conflicts requiring human judgment: flagged, routed to human approval gate
+
+---
+
+### 3.3 Change Proposal (Replaces Pull Request)
+
+```protobuf
+message ChangeProposal {
+  string id            = 1;  // UUID v7
+  string author        = 2;
+  string source_ns     = 3;  // "feature-cip"
+  string target_ns     = 4;  // "main"
+  string description   = 5;  // what and why
+  repeated SourceDiff diffs = 6;
+  bytes  signature     = 7;  // author's key
+}
+
+message SourceDiff {
+  string file_path   = 1;
+  bytes  old_content = 2;  // encrypted
+  bytes  new_content = 3;  // encrypted
+}
+```
+
+Submitted via admin gRPC → stored as a KO → routed through PromotionEngine.
+
+**ChangeProposal lifecycle:**
+```
+Submitted → Shadowbox("dev") build triggered
+         → Shadowbox("qa") test suite runs
+         → Shadowbox("uat") human review
+         → PromotionEngine decision
+         → Merge into target namespace or reject
+```
+
+This is exactly the GitHub PR flow — but internal, encrypted, and with automated confidence scoring.
+
+---
+
+### 3.4 Code Review Model
+
+Reviews are KOs:
+
+```
+KO {
+  kind:      "code_review"
+  namespace: "reviews/<change_proposal_id>"
+  payload:   { reviewer, file_path, line_range, comment, verdict }
+  tags:      ["proposal:<id>", "file:<path>", "verdict:approved|changes_requested"]
+}
+```
+
+Reviews are immutable (new version for each edit).  
+Approval = PromotionEngine receives minimum N approved review KOs before allowing merge.
+
+---
+
+### 3.5 Audit Trail
+
+Because source files are KOs with full bitemporal history:
+
+```
+ko_history("ekos/crates/ekos-kernel/main", "src/store.rs")
+  → returns every version of this file ever committed
+  → with tx_time (when it was stored) and valid_from (logical commit time)
+  → with author tag on each version
+  → cannot be deleted or rewritten (EKOS immutability guarantee)
+```
+
+This is stronger than `git log` — the history is cryptographically ordered by tx_time and cannot be rebased away.
+
+---
+
+## 4. Access Control Model
+
+```
+Namespace-level permissions (EKOS native):
+
+  "ekos/crates/ekos-kernel/main"    → write: [devops-node-key]
+                                       read:  [all-dev-keys]
+
+  "ekos/crates/ekos-kernel/feature-*" → write: [author-key]
+                                         read:  [all-dev-keys]
+
+  "reviews/*"                          → write: [any-dev-key]
+                                         read:  [all-dev-keys]
+```
+
+Main namespace: only the DevOps node can write (via PromotionEngine).  
+Feature namespaces: author has write, others have read.  
+No anonymous read — all access requires a registered dev key.
+
+---
+
+## 5. Bootstrap Ceremony
+
+One-time process, performed once before retiring GitHub:
+
+```
+Step 1: Final GitHub build
+  → Run full test suite on GitHub
+  → Tag as "last-github-release"
+  → This is the emergency fallback forever
+
+Step 2: Import source into EKOS
+  → For each file in each crate:
+       Encrypt with HSM key
+       ko_put into "ekos/crates/<crate>/main" namespace
+       Tag with: author, git_sha, import_timestamp
+  → Verify: ko_history count == git log --follow count per file
+
+Step 3: Verify build workflow
+  → Trigger build workflow against freshly imported source KOs
+  → Output binary must be byte-for-byte identical to Step 1 binary
+  → If not identical: ABORT ceremony, debug, retry
+
+Step 4: Retire GitHub
+  → Set GitHub repo to private + archived
+  → Remove all contributor write access
+  → Document archived URL in EKOS as a config KO (emergency fallback)
+
+Step 5: Key ceremony
+  → HSM key shards distributed to N key holders (e.g. 3-of-5 threshold)
+  → No single person holds full decryption key
+  → Key recovery process documented and tested
+```
+
+---
+
+## 6. Emergency Fallback
+
+GitHub archive is never deleted. In catastrophic failure:
+
+```
+Scenario: EKOS DevOps node unrecoverable (hardware failure, data corruption)
+
+Recovery:
+  1. Spin up new EKOS node from last binary release (GitHub release artifact)
+  2. Restore HSM key from shards (key holders convene)
+  3. Re-import source from GitHub archive OR restore from EKOS backup KOs
+  4. Resume from last known good state
+```
+
+RTO (Recovery Time Objective): < 4 hours with documented runbook.
+
+---
+
+## 7. What This Replaces
+
+| GitHub Concept | EKOS Internal SCM Equivalent |
+|---|---|
+| Repository | EKOS namespace |
+| Branch | Namespace fork |
+| Commit | KO version (immutable, bitemporal) |
+| Pull Request | ChangeProposal KO |
+| Code Review | Review KO set |
+| Merge | MergeWorkflow |
+| git log | ko_history() |
+| GitHub Actions | Build Workflow (EKOS-native) |
+| GitHub Secrets | HSM-protected config KOs |
+| git blame | KO author tag per version |
+| Force push | Not possible — EKOS history is append-only |
+
+---
+
+## 8. What This Does Not Replace (Intentionally)
+
+- **Public-facing documentation** — still on GitHub Pages or equivalent
+- **Issue tracking** — until EKOS has a purpose-built issue KO schema (future)
+- **External contributor workflow** — EKOS SCM is for the core team only; external contributions come in via a separate intake process
+
+---
+
+## 9. Phase Placement
+
+```
+Phase 1–5:   GitHub (do not touch this strategy)
+Phase 5:     Begin Phase B — hybrid mirror, ARP reads from EKOS source KOs
+Phase 6:     Bootstrap ceremony + Phase C transition
+Phase 7+:    Multi-node federation — DevOps cluster, not single node
+```
+
+---
+
+*Do not implement any part of this document until Phase 5 is stable in production.*  
+*Update this document when bootstrap ceremony is rehearsed or key management approach changes.*
