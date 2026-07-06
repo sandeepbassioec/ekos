@@ -308,5 +308,70 @@ Phase 7+:    Multi-node federation — DevOps cluster, not single node
 
 ---
 
+## 10. Embedded SCM Engine — Build vs Buy Decision
+
+### What Gets Embedded
+
+The SCM is NOT a separate embedded binary (no libgit2, no gitoxide). It is:
+
+```
+ekos-scm crate  ←  thin SCM logic layer
+    │
+    ├── KoStore          (object store — already built)
+    ├── imara-diff       (diff engine — pure Rust, borrowed)
+    └── diffy            (three-way merge — pure Rust, borrowed)
+
+ekosctl binary  ←  developer-facing CLI (like git, but gRPC-backed)
+```
+
+Total new code: ~1500 lines. Everything else reused or borrowed.
+
+### Why Not Embed Git
+
+- git object model (blobs/trees/commits) duplicates KO model — two parallel histories
+- libgit2 is a C dependency — breaks EKOS's pure Rust constraint
+- gitoxide (pure Rust git) has incomplete merge operations as of 2026
+- We only need diff + merge from gitoxide; borrowing `imara-diff` + `diffy` is cleaner
+
+### Control Plane
+
+New gRPC service added to ekosd (same binary, not a separate server):
+
+```protobuf
+service EkosScm {
+  rpc ForkNamespace(ForkRequest)        returns (ForkResult);
+  rpc SubmitProposal(ChangeProposal)    returns (ProposalHandle);
+  rpc GetProposalStatus(ProposalHandle) returns (ProposalStatus);
+  rpc ApproveProposal(ApprovalRequest)  returns (ApproveResult);
+  rpc FileDiff(DiffRequest)            returns (DiffResult);
+  rpc FileLog(LogRequest)              returns (stream KoVersion);
+  rpc CheckoutFile(CheckoutRequest)    returns (EncryptedFileContent);
+}
+```
+
+### Developer Encryption Flow
+
+```
+ekosctl push (developer machine, plaintext local)
+  → encrypt files with DevOps node's public key (session key exchange)
+  → ChangeProposal{encrypted_diffs} over gRPC
+
+DevOps node (ekosd + HSM)
+  → unwrap session key with HSM private key
+  → decrypt → store as KO (re-encrypt with HSM master key)
+  → plaintext never on disk outside HSM boundary
+```
+
+Developer never holds master key. Master key never leaves HSM.
+
+### crates in Phase 6
+
+```
+ekos/crates/ekos-scm/    ←  SCM engine (ForkNamespace, propose, diff, merge, file_log)
+ekos/bin/ekosctl/        ←  developer CLI (checkout, push, status, log, review)
+```
+
+---
+
 *Do not implement any part of this document until Phase 5 is stable in production.*  
 *Update this document when bootstrap ceremony is rehearsed or key management approach changes.*
