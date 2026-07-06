@@ -16,7 +16,7 @@
 //! ```
 
 use crate::error::{WalError, WalResult};
-use crate::frame::{Frame, FRAME_OVERHEAD};
+use crate::frame::Frame;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};

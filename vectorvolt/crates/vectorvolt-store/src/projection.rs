@@ -28,7 +28,6 @@
 //! - Vector similarity projection for EKOS Knowledge Object queries
 //! - WASM-sandboxed user projections
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;

@@ -98,6 +98,22 @@ impl ScanRequest {
         ScanRequest { range: KeyRange::prefix(prefix), limit: None }
     }
 
+    /// Inclusive on both ends.
+    pub fn inclusive(start: impl Into<Bytes>, end: impl Into<Bytes>) -> Self {
+        ScanRequest { range: KeyRange::inclusive(start, end), limit: None }
+    }
+
+    /// From a start key to the end of the table (unbounded upper end).
+    pub fn from_start(start: impl Into<Bytes>) -> Self {
+        ScanRequest {
+            range: KeyRange {
+                start: Bound::Included(start.into()),
+                end:   Bound::Unbounded,
+            },
+            limit: None,
+        }
+    }
+
     pub fn with_limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self
