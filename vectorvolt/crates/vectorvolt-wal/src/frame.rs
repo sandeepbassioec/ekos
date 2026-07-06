@@ -22,7 +22,7 @@
 use crate::error::{WalError, WalResult};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use sha3::{Digest, Sha3_256};
-use std::io::{Read, Write};
+use std::io::Read;
 
 pub const FRAME_MAGIC: u32 = 0x5657_414C; // "VWAL"
 pub const FRAME_HEADER_SIZE: usize = 4 + 4 + 8 + 8 + 32 + 1 + 4; // 61 bytes
