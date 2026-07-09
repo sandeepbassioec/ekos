@@ -779,7 +779,108 @@ Phase 7       Cluster-aware (Raft + FederationFrame)
 
 ---
 
-## 9. What This Is Not
+## 9. Evidence Correlation Engine (Pre-ARP Layer)
+
+ARP receives a classified error and synthesizes a patch. But *before* ARP is invoked, we
+need a layer that answers: **"Is this actually a single root cause, or are 50 correlated
+symptoms being treated as 50 separate bugs?"**
+
+### 9.1 The Problem
+
+Under a bad deployment or cascading failure, observability systems emit hundreds of alerts:
+- CPU spike
+- API latency increase
+- Orders table throughput drop
+- 3 different exception types
+- Prefetch cache miss rate increase
+- WAL write latency spike
+
+Without correlation, ARP would attempt to synthesize 7 separate patches — all pointing at
+the same root cause (the deployment 5 minutes ago).
+
+### 9.2 Evidence Types
+
+Every input to the correlation engine is typed as `Evidence`:
+
+```rust
+pub enum EvidenceKind {
+    Infrastructure,  // CPU, memory, disk, network hardware
+    Runtime,         // CLR/process metrics, thread pool, GC, DRAM pressure
+    Application,     // VectorVolt OLTP metrics, KoStore ops, WAL throughput
+    Business,        // order completion rate, invoice generation, SLA metrics
+    Evolution,       // code churn, recent deployments, recent index changes
+}
+
+pub struct Evidence {
+    pub kind:        EvidenceKind,
+    pub source:      String,          // component or sensor name
+    pub payload:     ObservabilityEvent,
+    pub confidence:  f32,             // 0.0–1.0, how reliable this source is
+    pub timestamp:   DateTime<Utc>,
+}
+```
+
+### 9.3 Correlation Algorithm
+
+The correlation engine runs over a sliding 10-minute window of Evidence:
+
+```
+Input: stream of Evidence objects
+
+Step 1 — Temporal Clustering:
+  Group Evidence that occurred within the same 30-second window
+  Events that co-occur are candidates for sharing a root cause
+
+Step 2 — Causal Graph Walk:
+  For each cluster: does any single event causally precede the others?
+  (Deployment → latency spike → throughput drop → business SLA miss)
+  Use the KO audit trail and Evolution evidence to find triggering event
+
+Step 3 — Hypothesis Scoring:
+  Generate candidate root causes with confidence weights
+  Example output:
+    "Deployment ekos-kernel v0.3.1 (14 min ago)  — confidence 94%"
+    "Connection pool exhaustion                   — confidence 72%"
+    "Redis cache cold start                       — confidence 18%"
+
+Step 4 — Route to handler:
+  If top hypothesis is Evolution evidence (recent deployment):
+    → Route to human review panel (not ARP — don't patch code for a bad deploy)
+    → Recommend rollback, not patch
+  If top hypothesis is Infrastructure:
+    → Route to infra self-heal (restart, scale, migrate)
+    → Do NOT invoke ARP
+  If top hypothesis is Application/System code bug:
+    → Invoke ARP with correlated evidence bundle (not just the raw error)
+```
+
+### 9.4 Why This Matters for ARP Quality
+
+When ARP receives a correlated evidence bundle instead of a raw error, its diagnosis
+is dramatically better:
+
+```
+Without correlation:
+  ARP sees: "WAL write latency exceeded 10ms p99"
+  ARP synthesizes: a patch to optimize the WAL write path
+
+With correlation:
+  ARP sees: "WAL write latency, DRAM pressure, compaction latency —
+             all started 14 minutes after deployment v0.3.1"
+  ARP concludes: "This is likely a regression from the deployment,
+                  not a pre-existing code bug"
+  ARP recommends: rollback review, not code synthesis
+```
+
+False-positive patches (where ARP fixes symptoms rather than causes) are the primary
+failure mode. Evidence correlation is the primary defense against it.
+
+**Phase placement:** Phase 5 (implement alongside full ARP — correlation is required for
+ARP to have acceptable false-positive rate in production).
+
+---
+
+## 10. What This Is Not
 
 - **Not a plugin system.** CIP goes further: capabilities are synthesized from intent, not compiled by a developer in advance.
 - **Not Kubernetes self-healing.** K8s restarts crashed pods (infra level). ARP patches logic bugs in running code (system level).
