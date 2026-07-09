@@ -159,17 +159,47 @@ pub trait KoPlugin {
 }
 ```
 
-**D. Dynamic Routing**
-Capabilities are addressable by name:
-```protobuf
-rpc ScanByCapability(CapabilityScanRequest) returns (stream KnowledgeObject);
+**D. Dynamic gRPC Method Registration (The Core Innovation)**
 
-message CapabilityScanRequest {
-  string capability_name = 1;
+Standard gRPC: all methods are fixed at compile time in the `.proto` file.  
+CIP breaks this constraint: new methods appear at runtime as capabilities are injected.
+
+The mechanism uses a **capability router** inside ekosd — a single generic gRPC method that dispatches to any registered capability by name:
+
+```protobuf
+// Generic dispatch — the only compile-time method needed
+rpc InvokeCapability(CapabilityRequest) returns (stream CapabilityResponse);
+
+message CapabilityRequest {
+  string capability_name = 1;   // "stale_contract_scanner"
   string namespace       = 2;
-  bytes  params          = 3;  // capability-specific (MessagePack)
+  bytes  params          = 3;   // capability-specific input (MessagePack)
+}
+
+message CapabilityResponse {
+  bytes  payload = 1;           // capability-specific output (MessagePack)
+  bool   is_last = 2;
 }
 ```
+
+Inside ekosd, the `CapabilityRegistry` maps names to loaded WASM instances:
+
+```rust
+pub struct CapabilityRegistry {
+    // name → (wasm instance, input/output schema, metadata)
+    capabilities: DashMap<String, Arc<LoadedCapability>>,
+}
+
+impl CapabilityRegistry {
+    // Called by InjectCapability — new capability immediately addressable
+    pub fn register(&self, name: String, cap: LoadedCapability) { .. }
+
+    // Called by InvokeCapability gRPC handler
+    pub fn invoke(&self, name: &str, params: &[u8]) -> impl Stream<Item=Vec<u8>> { .. }
+}
+```
+
+**What this achieves:** From the caller's perspective, every injected capability feels like a first-class gRPC method. The TypeScript SDK discovers available capabilities at runtime via `ListCapabilities()` and can call any of them through `InvokeCapability`. No SDK recompilation, no proto changes, no server restart. The API surface grows dynamically.
 
 ### 3.3 Security Model
 - Admin channel requires a signed token (separate from regular gRPC auth)
@@ -499,14 +529,123 @@ Attack signatures:
   - Backdating:        valid_from set years in the past
 ```
 
-### 7.2 Behavioral Model
+### 7.2 Behavioral Model Architecture
 
-Trained on normal operation telemetry.  
-Input: a sequence of KO operations.  
-Output: anomaly score per operation.  
-Model type: lightweight time-series anomaly detection (not a large LLM — needs to be fast).
+Model type: **online statistical model + sliding window** — not a large LLM.  
+Must be fast (sub-millisecond per KO write), deterministic, and updateable without restart.
 
-Attacker changes binary/encoding → behavioral signature unchanged → still flagged.
+```rust
+pub struct BehavioralModel {
+    // Per-namespace, per-kind statistics (rolling window, last 30 days)
+    pub baselines: DashMap<(Namespace, KoKind), KoOperationBaseline>,
+}
+
+pub struct KoOperationBaseline {
+    pub payload_size_mean:   f64,
+    pub payload_size_stddev: f64,
+    pub version_delta_mode:  u64,      // almost always 1
+    pub tag_change_rate:     f64,      // tags per N puts
+    pub backdating_p99_secs: f64,      // how far valid_from lags tx_time normally
+    pub inter_arrival_ms:    f64,      // time between puts for this KO
+    pub sample_count:        u64,
+}
+```
+
+**Training:** Online — model updates itself after every KO write using exponential moving average. No batch training job, no separate training pipeline.
+
+**Model stored as a KO:**
+```
+KO { kind: "behavioral_model", namespace: "ekos/security/fingerprint",
+     payload: serialized(BehavioralModel), version: <updates continuously> }
+```
+Model is versioned, backed-up with KoStore, recoverable after crash.
+
+### 7.3 Write Path Integration
+
+Fingerprint check runs **synchronously in the ko_put hot path** — must be sub-millisecond:
+
+```rust
+// Inside KoStore::ko_put()
+pub async fn ko_put(&self, ko: KnowledgeObject) -> Result<KoId> {
+    let score = self.fingerprint.score(&ko);   // ← sub-ms check
+    match score {
+        AnomalyScore::Normal       => {},
+        AnomalyScore::Suspicious(s) => self.emit_alert(ko.id, s),
+        AnomalyScore::Critical(s)  => return Err(KoError::FingerprintBlocked(s)),
+    }
+    // normal write path continues...
+}
+```
+
+Three response levels:
+- **Normal** — write proceeds, model updates
+- **Suspicious** — write proceeds but alert KO emitted for admin review
+- **Critical** — write blocked, full audit KO written, admin notified immediately
+
+### 7.4 Model Update Cycle
+
+```
+Every ko_put (normal):
+  → score against baseline
+  → update baseline with new sample (EMA, α=0.01 — slow drift allowed)
+  → persist updated model as new KO version (async, not on hot path)
+
+Weekly:
+  → BackupVerifyWorkflow includes model KO in snapshot
+  → Chaos simulation runs known attack scenarios against model (Section 6.6)
+  → If model fails chaos → alert admin, do not auto-update thresholds
+```
+
+### 7.5 Self-Upgrading Core Binary
+
+**Goal:** EKOS upgrades its own core binary (ekosd itself) through the same sandbox → confidence → promotion pipeline used for patches, but with stricter gates.
+
+This is the highest-risk operation in the system. Architecture reflects that:
+
+```
+Trigger: ARP determines WASM plugin cannot fix the issue
+         (core data structure change, WAL format change, etc.)
+         OR: scheduled major version upgrade
+      │
+      ▼
+Build new ekosd binary in Shadowbox("dev")
+  using source KOs + BuildWorkflow
+      │
+      ▼
+Shadowbox("qa"): full test suite (18+ tests)
+      │
+      ▼
+Shadowbox("uat"): 72-hour shadow soak
+  real traffic replayed (time-shifted replay, Section 6.3)
+  metrics compared continuously
+      │
+      ▼
+PromotionEngine: binary upgrade always RequireHumanApproval
+  (cannot be set to FullAuto — architectural constraint)
+      │
+      ▼ Human approves
+QuiesceKernel() → drain all in-flight requests
+      │
+kexec-style handoff (Linux):
+  new ekosd process starts, binds same ports
+  old ekosd sends FIN to new ekosd when drain complete
+  old process exits cleanly
+      │
+Old binary archived as KO artifact (rollback: start old binary, same handoff in reverse)
+```
+
+**kexec-style handoff in Rust:**
+```rust
+// Old ekosd, after drain complete:
+let new_binary_path = artifact_store.fetch("ekosd", new_version)?;
+std::process::Command::new(&new_binary_path)
+    .env("EKOS_HANDOFF_FROM", old_pid.to_string())
+    .env("EKOS_INHERIT_LISTENERS", serialized_socket_fds)
+    .spawn()?;
+// New process inherits listening sockets via fd passing — zero port rebind
+```
+
+Socket file descriptors passed via environment — new binary inherits open ports. Zero downtime. No load balancer change needed.
 
 ---
 
