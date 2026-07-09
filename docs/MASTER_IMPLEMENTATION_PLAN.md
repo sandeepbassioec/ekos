@@ -557,14 +557,16 @@ Every spec doc and what it covers:
 
 | Document | Phase Coverage |
 |---|---|
+| **[VECTORVOLT_CORE_ARCHITECTURE.md](vision/VECTORVOLT_CORE_ARCHITECTURE.md)** | **All phases: Standalone VectorVolt overview — 8-phase architecture, DPDK, RDMA, clustering, SDKs, observability** |
+| **[CPU_CACHE_NUMA_ISOLATION.md](vision/CPU_CACHE_NUMA_ISOLATION.md)** | **Phase 1–6: L1/L2/L3 cache strategy, NUMA arenas, core isolation, AVX2/AVX-512, Huge Pages, false sharing** |
 | [READ_PATH_ARCHITECTURE.md](vision/READ_PATH_ARCHITECTURE.md) | Phase 2–5: Nanosecond read algorithms |
-| [PREDICTIVE_PREFETCH_ENGINE.md](vision/PREDICTIVE_PREFETCH_ENGINE.md) | Phase 2–5: Markov chain pre-fetch |
-| [IN_PROCESS_LLM_EMBEDDING.md](vision/IN_PROCESS_LLM_EMBEDDING.md) | Phase 2–5: VECTOR type, LoRA fine-tuning |
+| [PREDICTIVE_PREFETCH_ENGINE.md](vision/PREDICTIVE_PREFETCH_ENGINE.md) | Phase 2–5: Markov chain pre-fetch, 3-tier memory hierarchy |
+| [IN_PROCESS_LLM_EMBEDDING.md](vision/IN_PROCESS_LLM_EMBEDDING.md) | Phase 2–5: VECTOR type, core pinning for LLM, LoRA fine-tuning |
 | [STORAGE_ENGINE_ADVANCED.md](vision/STORAGE_ENGINE_ADVANCED.md) | Phase 2–5: QoS, fingerprints, checksums |
 | [GRAPH_RELATIONAL_BRIDGE.md](vision/GRAPH_RELATIONAL_BRIDGE.md) | Phase 3–5: Property Graph over relational |
 | [AUTONOMOUS_RUNTIME_VISION.md](vision/AUTONOMOUS_RUNTIME_VISION.md) | Phase 2–7: CIP, ARP, Shadowbox, simulation |
 | [BUILD_SANDBOX_ADMIN.md](vision/BUILD_SANDBOX_ADMIN.md) | Phase 3–6: Sandbox, admin UI, build system |
-| [DEPENDENCY_SELF_UPGRADE.md](vision/DEPENDENCY_SELF_UPGRADE.md) | Phase 4–7+: Class A/B/C dependency upgrade |
+| [DEPENDENCY_SELF_UPGRADE.md](vision/DEPENDENCY_SELF_UPGRADE.md) | Phase 4–7+: Class A/B/C dependency upgrade, eBPF |
 | [SOURCE_CONTROL_STRATEGY.md](vision/SOURCE_CONTROL_STRATEGY.md) | Phase 5–6: Internal SCM on KoStore |
 | [EVOLUTION_ENGINE_AS_A_SERVICE.md](vision/EVOLUTION_ENGINE_AS_A_SERVICE.md) | Phase 7+: Commercial external offering |
 | [HARDWARE_FRONTIER.md](vision/HARDWARE_FRONTIER.md) | Phase 3–7+: QAT/DSA/RDMA/CXL/FPGA |
