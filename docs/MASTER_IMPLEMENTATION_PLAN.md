@@ -1,5 +1,5 @@
 # Master Implementation Plan
-## VectorVolt + EKOS — Every Item, Every Phase, Every Status
+## VectorVolt + EKOS Engine — Every Item, Every Phase, Every Status
 
 **Last updated:** 2026-07-09  
 **Branch:** feature-ekos-phase1  
@@ -9,6 +9,30 @@
 - ⬜ Pending (scheduled for this phase)
 - 🔵 Future (later phase, not yet scheduled)
 - 📄 Architecture doc = the spec for that item
+
+---
+
+## Scope Boundary — Two Trackers, One System
+
+**This document tracks the Rust engine layer:**
+
+| Scope | What it covers |
+|---|---|
+| **VectorVolt** | Nanosecond OLTP + graph + vector query engine, WAL, MVCC, Micro-Partitions, Cuckoo indexes, SIMD joins, HNSW, gRPC server, client SDKs, vvctl CLI |
+| **EKOS engine** | Operational intelligence running on top of VectorVolt: ARP self-healing, CIP capability injection, Shadowbox sandboxing, behavioral fingerprinting, in-process LLM, predictive pre-fetch, dependency self-upgrade, admin panel, 6 simulation modes |
+
+**The EKOS Knowledge OS layer is tracked separately:**
+
+> `esip/docs/ekos/BUILD-PLAN-AND-OQ-TRIAGE.md` — EKOS Knowledge OS build plan  
+> `esip/docs/ekos/00-MASTER-INDEX.md` — 27-volume requirements catalog (~1,560 requirements)  
+> `esip/docs/ekos/architecture/` — 12 architecture docs (A00–A11)
+>
+> That layer covers: `.ekr` Knowledge Runtime Package, EKR Viewer family, Ambient AI engine,
+> semantic knowledge graph, Widget OS, Personal Knowledge Space / Digital Twin, Knowledge Economy,
+> Knowledge Networks, Knowledge Session Runtime (P2P), Knowledge Workforce Runtime,
+> Knowledge Kernel + Compiler + Projection Engine, patents (22+ families), ESIP→EKOS migration.
+
+**The two layers connect at the storage port:** EKOS Knowledge OS uses VectorVolt as its storage backend via the VectorVolt client SDK (Phase 3+). VectorVolt does not depend on EKOS Knowledge OS.
 
 ---
 
@@ -71,6 +95,24 @@ MFA security mandate, observability instrumentation foundation.
 | ⬜ | `cosine_similarity()` SQL function | [IN_PROCESS_LLM_EMBEDDING](vision/IN_PROCESS_LLM_EMBEDDING.md) §6 |
 | ⬜ | VECTOR column storage layout in Micro-Partition | [IN_PROCESS_LLM_EMBEDDING](vision/IN_PROCESS_LLM_EMBEDDING.md) §4 |
 
+### vectorvolt-server (new crate) — gRPC + network layer
+| Status | Item | Spec Doc |
+|---|---|---|
+| ⬜ | gRPC server (tonic) — execute, query, txn begin/commit/abort endpoints | — (Phase 2 arch TBD) |
+| ⬜ | Connection pool + per-core shard routing | — |
+| ⬜ | `x-vv-txn` fingerprint injection into response metadata | [STORAGE_ENGINE_ADVANCED](vision/STORAGE_ENGINE_ADVANCED.md) §4 |
+| ⬜ | TLS + mTLS support (server cert, optional client cert) | — |
+| ⬜ | gRPC health probe (`grpc.health.v1.Health`) | — |
+
+### vvctl (new binary crate) — operator CLI
+| Status | Item | Spec Doc |
+|---|---|---|
+| ⬜ | `vvctl debug txn <fingerprint>` — decode transaction context | [STORAGE_ENGINE_ADVANCED](vision/STORAGE_ENGINE_ADVANCED.md) §4 |
+| ⬜ | `vvctl synthetic generate` — schema-aware fake data generation | [STORAGE_ENGINE_ADVANCED](vision/STORAGE_ENGINE_ADVANCED.md) §3 |
+| ⬜ | `vvctl index list` / `vvctl index rebuild` — index management | [READ_PATH_ARCHITECTURE](vision/READ_PATH_ARCHITECTURE.md) |
+| ⬜ | `vvctl backup status` — backup health check | [BACKUP_STRATEGY](security/BACKUP_STRATEGY.md) |
+| ⬜ | `vvctl qos override` — runtime QoS rule injection | [STORAGE_ENGINE_ADVANCED](vision/STORAGE_ENGINE_ADVANCED.md) §1 |
+
 ### Transaction Fingerprint
 | Status | Item | Spec Doc |
 |---|---|---|
@@ -105,6 +147,33 @@ MFA security mandate, observability instrumentation foundation.
 
 **Goal:** CSR graph traversal, in-process LLM, graph-relational bridge, Capability Injection Protocol,
 transaction prioritization, synthetic data generator, cross-partition checksum.
+
+### vectorvolt-sdk-rust (new crate) — Rust client SDK
+| Status | Item | Spec Doc |
+|---|---|---|
+| 🔵 | Async gRPC client wrapper (tonic-based, connection pooling) | — |
+| 🔵 | Typed query builder API (`client.query().from("table").where_eq(...)`) | — |
+| 🔵 | `client.graph().from().traverse()` graph traversal API | [GRAPH_RELATIONAL_BRIDGE](vision/GRAPH_RELATIONAL_BRIDGE.md) §3 |
+| 🔵 | Transaction builder (`client.txn().begin().execute().commit()`) | — |
+| 🔵 | Published to crates.io as `vectorvolt-client` | — |
+
+### vectorvolt-sdk-dotnet — C# / .NET client SDK
+| Status | Item | Spec Doc |
+|---|---|---|
+| 🔵 | NuGet package `VectorVolt.Client` (.NET 8+) | — |
+| 🔵 | Grpc.Net.Client wrapper with async/await | — |
+| 🔵 | LINQ query provider surface (`context.Table<T>().Where(...)`) | — |
+| 🔵 | C# was the original VectorVolt prototype — SDK is the blueprint of that work reborn | — |
+
+### vectorvolt-sdk-go, sdk-java, sdk-python — polyglot SDKs
+| Status | Item | Spec Doc |
+|---|---|---|
+| 🔵 | Go SDK (`vectorvolt-go`) — gRPC + idiomatic Go client | — |
+| 🔵 | Java/Kotlin SDK — gRPC + reactive streams | — |
+| 🔵 | Python SDK — gRPC + pandas DataFrame integration | — |
+| 🔵 | All SDKs generated from the same protobuf definitions | — |
+
+---
 
 ### vectorvolt-graph (new crate)
 | Status | Item | Spec Doc |
@@ -458,7 +527,14 @@ Every crate mentioned, its phase, and its status:
 | `vectorvolt-storage` | vectorvolt | 2 | ⬜ Pending |
 | `vectorvolt-query` | vectorvolt | 2 | ⬜ Pending |
 | `vectorvolt-vector` | vectorvolt | 2 | ⬜ Pending |
+| `vectorvolt-server` | vectorvolt | 2 | ⬜ Pending |
+| `vvctl` (binary) | vectorvolt | 2 | ⬜ Pending |
 | `vectorvolt-graph` | vectorvolt | 3 | 🔵 Future |
+| `vectorvolt-sdk-rust` | vectorvolt | 3 | 🔵 Future |
+| `vectorvolt-sdk-dotnet` | vectorvolt | 3 | 🔵 Future |
+| `vectorvolt-sdk-go` | vectorvolt | 4 | 🔵 Future |
+| `vectorvolt-sdk-java` | vectorvolt | 4 | 🔵 Future |
+| `vectorvolt-sdk-python` | vectorvolt | 4 | 🔵 Future |
 | `ekos-kernel` | ekos | 1 | ✅ Done |
 | `ekosd` | ekos | 1 | ✅ Done |
 | `ekos-security` | ekos | 2 | ⬜ Pending |
