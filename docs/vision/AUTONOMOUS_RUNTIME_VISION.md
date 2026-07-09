@@ -218,10 +218,18 @@ impl CapabilityRegistry {
 SYSTEM ERROR detected (from ObservabilityAgent)
         │
         ▼
+  Capture Phase  ← THIS IS THE FOUNDATION — metrics alone are not enough
+  ├── Capture: exact input payload that triggered the anomaly (gRPC bytes)
+  ├── Capture: KoStore state snapshot at time of failure
+  ├── Capture: execution context (thread, syscall, stack trace)
+  ├── Capture: last N inputs before failure (sliding window corpus)
+  └── Store all as: KO { kind: "error_capture", ... }  (see Section 4.4)
+        │
+        ▼
   Diagnosis Phase
-  ├── Collect: metric history, recent traces, error context
+  ├── Collect: metric history, error captures, recent traces
   ├── Identify: which code path is implicated
-  └── LLM prompt: "Given this symptom and this source, what is wrong?"
+  └── LLM prompt: source code + captured payload + symptom → root cause
         │
         ▼
   Synthesis Phase
@@ -230,10 +238,11 @@ SYSTEM ERROR detected (from ObservabilityAgent)
   └── If core level → compile new binary in shadow environment
         │
         ▼
-  Validation Phase
-  ├── Run patch against shadow traffic (real data, shadowed writes)
-  ├── Compare metrics: patched vs unpatched
-  └── Score confidence (see Section 5.3)
+  Validation Phase  ← patch must pass ALL THREE, not just metrics
+  ├── (a) Original payload: replay exact captured input → must not error
+  ├── (b) Generated variants: auto-fuzz the input → must handle gracefully
+  ├── (c) Existing test suite: full regression → zero new failures
+  └── Score confidence only after all three pass
         │
         ▼
   PromotionEngine decision
@@ -246,7 +255,8 @@ SYSTEM ERROR detected (from ObservabilityAgent)
   ├── QuiesceKernel()
   ├── Hot-swap capability or binary
   ├── ResumeKernel()
-  └── Archive old version (rollback available for 30 days)
+  ├── Archive old version (rollback available for 30 days)
+  └── Captured payload promoted to permanent regression corpus
 ```
 
 ### 4.2 Kernel Coordination (Quiesce/Resume)
@@ -276,7 +286,100 @@ Quiesce behavior:
 This maps to the "file backup" use case directly:
 a workflow acquires the quiesce guard, takes a snapshot, releases the guard — kernel resumes normal operation automatically.
 
-### 4.3 ARP Constraints (What ARP Will NOT Do)
+### 4.3 Error Capture — Full Input Preservation
+
+Metrics tell you *that* something broke. Captured payloads tell you *what* broke it.  
+Without the actual input, a patch is synthesized blind — it may fix the symptom, not the cause.
+
+**What gets captured at the moment of anomaly:**
+
+```rust
+pub struct ErrorCapture {
+    pub id:           Uuid,
+    pub timestamp:    DateTime<Utc>,
+    pub syscall:      String,              // "ko_put", "ko_scan", etc.
+    pub input_payload: Vec<u8>,            // exact gRPC request bytes (MessagePack)
+    pub store_state:   StoreStateSnapshot, // KoStore metadata at time of failure
+    pub stack_trace:   String,
+    pub metric_context: MetricSnapshot,   // latency, memory, error rate at t=failure
+    pub preceding_inputs: Vec<Vec<u8>>,   // last 50 inputs (sliding window)
+                                           // ← sequence context for ordering bugs
+}
+```
+
+Stored immediately as:
+```
+KO { kind:      "error_capture"
+     namespace: "ekos/arp/captures"
+     payload:   encrypted(ErrorCapture)
+     tags:      ["syscall:ko_put", "severity:critical", "arp_id:<uuid>"] }
+```
+
+**Preceding inputs matter** — some bugs are sequence-dependent (e.g., ko_put of type A followed by ko_scan triggers a bug, but ko_put alone does not). The sliding window preserves ordering context for the LLM to analyze.
+
+### 4.4 Automatic Payload Generation (Fuzzing)
+
+Once a patch is synthesized, it is tested against three layers:
+
+**Layer 1 — Original Capture (must pass)**  
+Replay the exact `input_payload` that caused the failure.  
+If the patch does not fix this exact input → discard immediately.
+
+**Layer 2 — Generated Variants (must handle gracefully)**  
+A lightweight fuzzer generates variants of the captured input:
+
+```rust
+pub struct PayloadFuzzer;
+
+impl PayloadFuzzer {
+    pub fn generate_variants(original: &[u8]) -> Vec<FuzzVariant> {
+        vec![
+            // Boundary conditions
+            Self::empty_payload(),
+            Self::max_size_payload(64 * 1024 * 1024),   // 64MB
+            Self::single_byte(),
+
+            // Field mutations (MessagePack-aware)
+            Self::null_required_fields(original),
+            Self::wrong_field_types(original),
+            Self::extra_unknown_fields(original),
+
+            // Sequence attacks
+            Self::duplicate_send(original),              // same payload twice
+            Self::interleave_with_deletes(original),     // concurrent delete
+
+            // Encoding attacks
+            Self::truncated(original, original.len() / 2),
+            Self::random_bit_flip(original, 3),          // 3 random bit flips
+
+            // Semantic attacks (KO-specific)
+            Self::backdated_valid_from(original),        // valid_from = 1970
+            Self::future_valid_from(original),           // valid_from = year 2099
+            Self::version_jump(original, 9999),          // version = 9999
+            Self::strip_all_tags(original),
+        ]
+    }
+}
+```
+
+For each variant, expected outcome is one of:
+- **Clean error** (graceful rejection, correct error code) ✅
+- **Panic / crash** ❌ → patch fails, variant added to regression corpus permanently
+- **Silent data corruption** ❌ → worst case, caught by output diff
+
+**Layer 3 — Existing Test Suite + Growing Regression Corpus**  
+Every previously-captured `error_capture` that was fixed becomes a permanent regression test.  
+The corpus grows with every ARP cycle. Over time ARP becomes harder to fool.
+
+```
+Corpus after Phase 5 launch:       18 tests
+Corpus after 6 months in production: 18 + N captured regressions
+Corpus after 2 years:               18 + M regressions  (M >> N)
+```
+
+The system gets smarter about its own failure modes the longer it runs.
+
+### 4.5 ARP Constraints (What ARP Will NOT Do)
 
 - **Never self-patch for BUSINESS, INFRA, or NETWORK errors** — classification gates this
 - **Never patch without at least N shadow runs** (configurable minimum)
