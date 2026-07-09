@@ -382,7 +382,7 @@ quorum checksum witnesses, RDMA WAL shipping, MVCC isolation, vectorized joins.
 | 🔵 | ARP integration: classify Tier 3 misses as resource issue, not code bug | [PREDICTIVE_PREFETCH_ENGINE](vision/PREDICTIVE_PREFETCH_ENGINE.md) §8 |
 | 🔵 | Decay rate auto-tuning based on workload variability | [PREDICTIVE_PREFETCH_ENGINE](vision/PREDICTIVE_PREFETCH_ENGINE.md) §10 |
 
-### Storage + Durability
+### Storage + Durability + PITR
 | Status | Item | Spec Doc |
 |---|---|---|
 | 🔵 | Full MVCC snapshot isolation on all read paths | [READ_PATH_ARCHITECTURE](vision/READ_PATH_ARCHITECTURE.md) §13 |
@@ -390,6 +390,16 @@ quorum checksum witnesses, RDMA WAL shipping, MVCC isolation, vectorized joins.
 | 🔵 | Graph + relational hybrid query planner | [GRAPH_RELATIONAL_BRIDGE](vision/GRAPH_RELATIONAL_BRIDGE.md) §7 |
 | 🔵 | Graph analytics (path counting, connectivity, basic centrality) | [GRAPH_RELATIONAL_BRIDGE](vision/GRAPH_RELATIONAL_BRIDGE.md) §7 |
 | 🔵 | Quorum witness checksum (cross-node partition verification) | [STORAGE_ENGINE_ADVANCED](vision/STORAGE_ENGINE_ADVANCED.md) §5 |
+| 🔵 | PITR (Point-In-Time Recovery) — restore to any millisecond | [VECTORVOLT_STORAGE_TIERING](vision/VECTORVOLT_STORAGE_TIERING.md) Part 2 |
+| 🔵 | PITR Catalog — tracks every snapshot + WAL segment with time range | [VECTORVOLT_STORAGE_TIERING](vision/VECTORVOLT_STORAGE_TIERING.md) Part 2 |
+| 🔵 | Configurable retention policies (time-based / size-based / compliance) | [VECTORVOLT_STORAGE_TIERING](vision/VECTORVOLT_STORAGE_TIERING.md) Part 1 |
+| 🔵 | L0–L4 five-level storage hierarchy with auto tier promotion/demotion | [VECTORVOLT_STORAGE_TIERING](vision/VECTORVOLT_STORAGE_TIERING.md) Part 1 |
+| 🔵 | Compliance WORM lock on L4 object storage (S3/Blob/GCS) | [VECTORVOLT_STORAGE_TIERING](vision/VECTORVOLT_STORAGE_TIERING.md) Part 6 |
+| 🔵 | Projection workers — Kafka-inspired event log with consumer offsets + lag metric | [VECTORVOLT_STORAGE_TIERING](vision/VECTORVOLT_STORAGE_TIERING.md) Part 4 |
+| 🔵 | Projection Dead Letter Queue (DLQ) — failed events, worker pause + alert | [VECTORVOLT_STORAGE_TIERING](vision/VECTORVOLT_STORAGE_TIERING.md) Part 5 |
+| 🔵 | Reference domain: Financial Ledger (RD-1 — ACID + sub-ms write validation) | [VECTORVOLT_LOCKED_DECISIONS](vision/VECTORVOLT_LOCKED_DECISIONS.md) RD-1 |
+| 🔵 | Reference domain: Workflow Engine (RD-2 — event sourcing + projection) | [VECTORVOLT_LOCKED_DECISIONS](vision/VECTORVOLT_LOCKED_DECISIONS.md) RD-2 |
+| 🔵 | Reference domain: Order Management (RD-3 — FK constraints + cross-shard saga) | [VECTORVOLT_LOCKED_DECISIONS](vision/VECTORVOLT_LOCKED_DECISIONS.md) RD-3 |
 
 ### Dependency Self-Upgrade — Class B
 | Status | Item | Spec Doc |
@@ -462,9 +472,25 @@ quorum checksum witnesses, RDMA WAL shipping, MVCC isolation, vectorized joins.
 ### Cluster Mode
 | Status | Item | Spec Doc |
 |---|---|---|
-| 🔵 | Raft consensus for distributed KoStore | [AUTONOMOUS_RUNTIME_VISION](vision/AUTONOMOUS_RUNTIME_VISION.md) §8 |
+| 🔵 | Raft consensus (raft-rs) for shard leader election + WAL log replication | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 3 |
+| 🔵 | SWIM gossip protocol for cluster membership (NOT Raft for membership) | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 1 |
+| 🔵 | 4096 virtual nodes in consistent hash ring (1–65,536 physical shards) | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 2 |
+| 🔵 | ShardCatalog — authoritative routing table, cached per node | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 2 |
+| 🔵 | Epoch fencing for split-brain prevention (epoch in every AppendEntries) | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 4 |
+| 🔵 | < 2 second failover (500ms heartbeat timeout → election → client refresh) | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 5 |
+| 🔵 | Multi-tenant shard groups (each tenant gets dedicated shard groups, LD-MT-01) | [VECTORVOLT_LOCKED_DECISIONS](vision/VECTORVOLT_LOCKED_DECISIONS.md) LD-MT-01 |
 | 🔵 | `FederationFrame` — multi-node EKOS coordination | [AUTONOMOUS_RUNTIME_VISION](vision/AUTONOMOUS_RUNTIME_VISION.md) §8 |
 | 🔵 | All ARP/CIP/Shadowbox operations cluster-aware | [AUTONOMOUS_RUNTIME_VISION](vision/AUTONOMOUS_RUNTIME_VISION.md) §8 |
+
+### Read Fabric + SQL Layer (separate binary — LD-READ-01)
+| Status | Item | Spec Doc |
+|---|---|---|
+| 🔵 | `vectorvolt-reader` binary — separate process from `vectorvolt-server` | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 5 |
+| 🔵 | PostgreSQL wire protocol (libpq-compatible, port 5432) for SQL SELECT queries | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 7 |
+| 🔵 | Stale reads by default (followers, configurable tolerance ≤50ms) | [VECTORVOLT_LOCKED_DECISIONS](vision/VECTORVOLT_LOCKED_DECISIONS.md) LD-READ-02 |
+| 🔵 | Consistent reads opt-in (`SELECT /*+ consistent */` routes to leader) | [VECTORVOLT_LOCKED_DECISIONS](vision/VECTORVOLT_LOCKED_DECISIONS.md) LD-READ-02 |
+| 🔵 | Read replica load balancer (healthy + lag filter → lowest RTT) | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 6 |
+| 🔵 | SQL parser: `sqlparser-rs` → internal query plan → Read Fabric execution | [VECTORVOLT_DISTRIBUTED_REPLICATION](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) Part 7 |
 
 ### Simulation Capabilities (all 6 modes)
 | Status | Item | Spec Doc |
@@ -560,6 +586,9 @@ Every spec doc and what it covers:
 | **[VECTORVOLT_CORE_ARCHITECTURE.md](vision/VECTORVOLT_CORE_ARCHITECTURE.md)** | **All phases: Standalone VectorVolt overview — 8-phase architecture, DPDK, RDMA, clustering, SDKs, observability** |
 | **[CPU_CACHE_NUMA_ISOLATION.md](vision/CPU_CACHE_NUMA_ISOLATION.md)** | **Phase 1–6: L1/L2/L3 cache strategy, NUMA arenas, core isolation, AVX2/AVX-512, Huge Pages, false sharing** |
 | **[QUERY_EXECUTION_MODEL.md](vision/QUERY_EXECUTION_MODEL.md)** | **Phase 2–5: Deterministic algorithm selection (no cost-model planner), all 7 access patterns, join algorithms** |
+| **[VECTORVOLT_LOCKED_DECISIONS.md](vision/VECTORVOLT_LOCKED_DECISIONS.md)** | **All phases: 48+ locked architecture decisions — ACID, PITR, SWIM, VNodes, epoch fencing, zero-GC, DLQ, multi-tenancy, perf gates** |
+| **[VECTORVOLT_DISTRIBUTED_REPLICATION.md](vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md)** | **Phase 6–7: SWIM gossip, 4096 VNodes, Raft per shard, failover sequence, PostgreSQL wire protocol** |
+| **[VECTORVOLT_STORAGE_TIERING.md](vision/VECTORVOLT_STORAGE_TIERING.md)** | **Phase 5–6: L0–L4 5-level storage, PITR, CoW snapshots, Kafka-inspired projection workers, DLQ, WORM compliance** |
 | [READ_PATH_ARCHITECTURE.md](vision/READ_PATH_ARCHITECTURE.md) | Phase 2–5: Nanosecond read algorithms |
 | [PREDICTIVE_PREFETCH_ENGINE.md](vision/PREDICTIVE_PREFETCH_ENGINE.md) | Phase 2–5: Markov chain pre-fetch, 3-tier memory hierarchy |
 | [IN_PROCESS_LLM_EMBEDDING.md](vision/IN_PROCESS_LLM_EMBEDDING.md) | Phase 2–5: VECTOR type, core pinning for LLM, LoRA fine-tuning |
