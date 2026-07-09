@@ -559,6 +559,7 @@ Every spec doc and what it covers:
 |---|---|
 | **[VECTORVOLT_CORE_ARCHITECTURE.md](vision/VECTORVOLT_CORE_ARCHITECTURE.md)** | **All phases: Standalone VectorVolt overview — 8-phase architecture, DPDK, RDMA, clustering, SDKs, observability** |
 | **[CPU_CACHE_NUMA_ISOLATION.md](vision/CPU_CACHE_NUMA_ISOLATION.md)** | **Phase 1–6: L1/L2/L3 cache strategy, NUMA arenas, core isolation, AVX2/AVX-512, Huge Pages, false sharing** |
+| **[QUERY_EXECUTION_MODEL.md](vision/QUERY_EXECUTION_MODEL.md)** | **Phase 2–5: Deterministic algorithm selection (no cost-model planner), all 7 access patterns, join algorithms** |
 | [READ_PATH_ARCHITECTURE.md](vision/READ_PATH_ARCHITECTURE.md) | Phase 2–5: Nanosecond read algorithms |
 | [PREDICTIVE_PREFETCH_ENGINE.md](vision/PREDICTIVE_PREFETCH_ENGINE.md) | Phase 2–5: Markov chain pre-fetch, 3-tier memory hierarchy |
 | [IN_PROCESS_LLM_EMBEDDING.md](vision/IN_PROCESS_LLM_EMBEDDING.md) | Phase 2–5: VECTOR type, core pinning for LLM, LoRA fine-tuning |
