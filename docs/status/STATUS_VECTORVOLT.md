@@ -262,6 +262,9 @@ Full architecture: [`VECTORVOLT_CORE_ARCHITECTURE.md`](../vision/VECTORVOLT_CORE
 | [RESEARCH_FRONTIER.md](../vision/RESEARCH_FRONTIER.md) | ✅ | Double-write, retroactive rollback, Knowledge Compiler |
 | [MFA_SESSION_MANDATE.md](../security/MFA_SESSION_MANDATE.md) | ✅ | SSH MFA enforcement |
 | [BACKUP_STRATEGY.md](../security/BACKUP_STRATEGY.md) | ✅ | 3-2-1 backup, 4-layer strategy |
+| [VECTORVOLT_LOCKED_DECISIONS.md](../vision/VECTORVOLT_LOCKED_DECISIONS.md) | ✅ | 48+ LD codes — locked architecture decisions |
+| [VECTORVOLT_DISTRIBUTED_REPLICATION.md](../vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md) | ✅ | SWIM gossip, 4096 VNodes, Raft, failover, PostgreSQL wire |
+| [VECTORVOLT_STORAGE_TIERING.md](../vision/VECTORVOLT_STORAGE_TIERING.md) | ✅ | L0–L4 5-level stack, PITR, CoW snapshots, projection workers |
 
 ---
 
@@ -296,6 +299,32 @@ Full architecture: [`VECTORVOLT_CORE_ARCHITECTURE.md`](../vision/VECTORVOLT_CORE
 | `ekos-arp` | 5 (EKOS) | 🔵 Future |
 | `ekos-scm` | 5 (EKOS) | 🔵 Future |
 | `ekos-build` | 6 (EKOS) | 🔵 Future |
+
+---
+
+---
+
+## Locked Performance Targets
+
+| Metric | Target | Source |
+|---|---|---|
+| p99 command latency (memory path) | < 10 µs | `vega_requirements.md` |
+| p99.9 command latency (memory path) | < 10 µs | `vega_requirements.md` |
+| p99 command latency (with WAL fsync) | < 1 ms | `state-continuation.md` |
+| Single-shard throughput | 500K+ commands/sec | `state-continuation.md` |
+| Cluster throughput | 10M+ commands/sec | `state-continuation.md` |
+| Max shards per cluster | 65,536 | `vega_requirements.md` |
+| Max cluster nodes | 800+ | `vega_requirements.md` |
+| Availability target | 99.999% (five nines) | `state-continuation.md` |
+| Failover time | < 2 seconds | `state-continuation.md` |
+| Shard recovery (100GB) | < 60 seconds | `state-continuation.md` |
+| Virtual nodes in hash ring | 4096 (fixed) | `vega_lld_standards.md` |
+| Membership protocol | SWIM (gossip) | `vega_lld_standards.md` |
+| Leader election protocol | Raft (per shard group) | `state-continuation.md` |
+| PITR granularity | Any millisecond | `vega_requirements.md` |
+| Read fabric | Separate binary (CQRS at process level) | LD-READ-01 |
+| SQL compatibility | PostgreSQL wire protocol | LD-PG-WIRE |
+| Reference domains | Financial Ledger, Workflow Engine, Order Management | RD-1/2/3 |
 
 ---
 
