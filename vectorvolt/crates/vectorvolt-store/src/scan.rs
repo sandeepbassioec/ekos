@@ -1,19 +1,22 @@
 //! Scan primitives — range requests and result types used by ProjectionDispatcher.
 
-use std::ops::Bound;
 use bytes::Bytes;
+use std::ops::Bound;
 
 /// A key range for a scan.  Uses `std::ops::Bound` semantics.
 #[derive(Debug, Clone)]
 pub struct KeyRange {
     pub start: Bound<Bytes>,
-    pub end:   Bound<Bytes>,
+    pub end: Bound<Bytes>,
 }
 
 impl KeyRange {
     /// Unbounded on both ends — full table scan.
     pub fn full() -> Self {
-        KeyRange { start: Bound::Unbounded, end: Bound::Unbounded }
+        KeyRange {
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+        }
     }
 
     /// Keys with a given prefix (inclusive start, exclusive end computed by
@@ -23,29 +26,32 @@ impl KeyRange {
         let end = next_prefix(&p);
         KeyRange {
             start: Bound::Included(p),
-            end:   match end {
+            end: match end {
                 Some(e) => Bound::Excluded(e),
-                None    => Bound::Unbounded,
+                None => Bound::Unbounded,
             },
         }
     }
 
     /// Inclusive on both ends.
     pub fn inclusive(start: impl Into<Bytes>, end: impl Into<Bytes>) -> Self {
-        KeyRange { start: Bound::Included(start.into()), end: Bound::Included(end.into()) }
+        KeyRange {
+            start: Bound::Included(start.into()),
+            end: Bound::Included(end.into()),
+        }
     }
 
     /// Check whether a key falls within this range.
     pub fn contains(&self, key: &Bytes) -> bool {
         let after_start = match &self.start {
-            Bound::Unbounded        => true,
-            Bound::Included(lo)     => key >= lo,
-            Bound::Excluded(lo)     => key > lo,
+            Bound::Unbounded => true,
+            Bound::Included(lo) => key >= lo,
+            Bound::Excluded(lo) => key > lo,
         };
         let before_end = match &self.end {
-            Bound::Unbounded        => true,
-            Bound::Included(hi)     => key <= hi,
-            Bound::Excluded(hi)     => key < hi,
+            Bound::Unbounded => true,
+            Bound::Included(hi) => key <= hi,
+            Bound::Excluded(hi) => key < hi,
         };
         after_start && before_end
     }
@@ -53,7 +59,7 @@ impl KeyRange {
     /// True if a key is already past the end of this range (no point scanning further).
     pub fn past_end(&self, key: &Bytes) -> bool {
         match &self.end {
-            Bound::Unbounded    => false,
+            Bound::Unbounded => false,
             Bound::Included(hi) => key > hi,
             Bound::Excluded(hi) => key >= hi,
         }
@@ -77,7 +83,7 @@ fn next_prefix(prefix: &Bytes) -> Option<Bytes> {
 /// A single result entry from a scan.  Tombstones are never returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanEntry {
-    pub key:   Bytes,
+    pub key: Bytes,
     pub value: Bytes,
 }
 
@@ -91,16 +97,25 @@ pub struct ScanRequest {
 
 impl ScanRequest {
     pub fn full() -> Self {
-        ScanRequest { range: KeyRange::full(), limit: None }
+        ScanRequest {
+            range: KeyRange::full(),
+            limit: None,
+        }
     }
 
     pub fn prefix(prefix: impl Into<Bytes>) -> Self {
-        ScanRequest { range: KeyRange::prefix(prefix), limit: None }
+        ScanRequest {
+            range: KeyRange::prefix(prefix),
+            limit: None,
+        }
     }
 
     /// Inclusive on both ends.
     pub fn inclusive(start: impl Into<Bytes>, end: impl Into<Bytes>) -> Self {
-        ScanRequest { range: KeyRange::inclusive(start, end), limit: None }
+        ScanRequest {
+            range: KeyRange::inclusive(start, end),
+            limit: None,
+        }
     }
 
     /// From a start key to the end of the table (unbounded upper end).
@@ -108,7 +123,7 @@ impl ScanRequest {
         ScanRequest {
             range: KeyRange {
                 start: Bound::Included(start.into()),
-                end:   Bound::Unbounded,
+                end: Bound::Unbounded,
             },
             limit: None,
         }

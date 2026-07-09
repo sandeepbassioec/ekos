@@ -6,10 +6,18 @@ pub enum WalError {
     Io(#[from] std::io::Error),
 
     #[error("Corrupt frame at segment {segment} offset {offset}: {reason}")]
-    CorruptFrame { segment: u64, offset: u64, reason: &'static str },
+    CorruptFrame {
+        segment: u64,
+        offset: u64,
+        reason: &'static str,
+    },
 
     #[error("Hash chain broken at sequence {sequence}: expected {expected}, got {actual}")]
-    ChainBroken { sequence: u64, expected: String, actual: String },
+    ChainBroken {
+        sequence: u64,
+        expected: String,
+        actual: String,
+    },
 
     #[error("CRC32 mismatch at sequence {sequence}")]
     Crc32Mismatch { sequence: u64 },

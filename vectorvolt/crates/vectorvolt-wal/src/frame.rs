@@ -34,8 +34,8 @@ pub const GENESIS_HASH: [u8; 32] = [0u8; 32];
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadType {
-    Data         = 0,
-    Checkpoint   = 1,
+    Data = 0,
+    Checkpoint = 1,
     EndOfSegment = 2,
 }
 
@@ -47,7 +47,9 @@ impl TryFrom<u8> for PayloadType {
             1 => Ok(Self::Checkpoint),
             2 => Ok(Self::EndOfSegment),
             _ => Err(WalError::CorruptFrame {
-                segment: 0, offset: 0, reason: "unknown payload type",
+                segment: 0,
+                offset: 0,
+                reason: "unknown payload type",
             }),
         }
     }
@@ -55,13 +57,13 @@ impl TryFrom<u8> for PayloadType {
 
 #[derive(Debug, Clone)]
 pub struct Frame {
-    pub sequence:     u64,
+    pub sequence: u64,
     pub timestamp_ns: u64,
-    pub prev_hash:    [u8; 32],
+    pub prev_hash: [u8; 32],
     pub payload_type: PayloadType,
-    pub payload:      Vec<u8>,
+    pub payload: Vec<u8>,
     /// SHA3-256 of everything before the tail; computed on write, verified on read.
-    pub frame_hash:   [u8; 32],
+    pub frame_hash: [u8; 32],
 }
 
 impl Frame {
@@ -91,7 +93,8 @@ impl Frame {
         buf.write_u64::<LittleEndian>(self.timestamp_ns).unwrap();
         buf.extend_from_slice(&self.prev_hash);
         buf.write_u8(self.payload_type as u8).unwrap();
-        buf.write_u32::<LittleEndian>(self.payload.len() as u32).unwrap();
+        buf.write_u32::<LittleEndian>(self.payload.len() as u32)
+            .unwrap();
         buf.extend_from_slice(&self.payload);
 
         // compute hash over everything written so far
@@ -113,22 +116,34 @@ impl Frame {
     pub fn decode<R: Read>(r: &mut R, segment_id: u64, offset: u64) -> WalResult<Self> {
         let magic = r.read_u32::<LittleEndian>()?;
         if magic != FRAME_MAGIC {
-            return Err(WalError::CorruptFrame { segment: segment_id, offset, reason: "bad magic" });
+            return Err(WalError::CorruptFrame {
+                segment: segment_id,
+                offset,
+                reason: "bad magic",
+            });
         }
         let frame_len = r.read_u32::<LittleEndian>()? as usize;
         if frame_len < FRAME_OVERHEAD {
-            return Err(WalError::CorruptFrame { segment: segment_id, offset, reason: "frame_len too small" });
+            return Err(WalError::CorruptFrame {
+                segment: segment_id,
+                offset,
+                reason: "frame_len too small",
+            });
         }
         let payload_len = frame_len - FRAME_OVERHEAD;
 
-        let sequence     = r.read_u64::<LittleEndian>()?;
+        let sequence = r.read_u64::<LittleEndian>()?;
         let timestamp_ns = r.read_u64::<LittleEndian>()?;
         let mut prev_hash = [0u8; 32];
         r.read_exact(&mut prev_hash)?;
         let payload_type = PayloadType::try_from(r.read_u8()?)?;
         let declared_payload_len = r.read_u32::<LittleEndian>()? as usize;
         if declared_payload_len != payload_len {
-            return Err(WalError::CorruptFrame { segment: segment_id, offset, reason: "payload_len mismatch" });
+            return Err(WalError::CorruptFrame {
+                segment: segment_id,
+                offset,
+                reason: "payload_len mismatch",
+            });
         }
         let mut payload = vec![0u8; payload_len];
         r.read_exact(&mut payload)?;
@@ -139,12 +154,16 @@ impl Frame {
         // re-encode header + payload + hash to verify CRC
         let mut check_buf = Vec::with_capacity(frame_len);
         check_buf.write_u32::<LittleEndian>(FRAME_MAGIC).unwrap();
-        check_buf.write_u32::<LittleEndian>(frame_len as u32).unwrap();
+        check_buf
+            .write_u32::<LittleEndian>(frame_len as u32)
+            .unwrap();
         check_buf.write_u64::<LittleEndian>(sequence).unwrap();
         check_buf.write_u64::<LittleEndian>(timestamp_ns).unwrap();
         check_buf.extend_from_slice(&prev_hash);
         check_buf.write_u8(payload_type as u8).unwrap();
-        check_buf.write_u32::<LittleEndian>(payload_len as u32).unwrap();
+        check_buf
+            .write_u32::<LittleEndian>(payload_len as u32)
+            .unwrap();
         check_buf.extend_from_slice(&payload);
         check_buf.extend_from_slice(&frame_hash);
 
@@ -161,10 +180,21 @@ impl Frame {
             h.finalize().into()
         };
         if expected_hash != frame_hash {
-            return Err(WalError::CorruptFrame { segment: segment_id, offset, reason: "frame_hash mismatch" });
+            return Err(WalError::CorruptFrame {
+                segment: segment_id,
+                offset,
+                reason: "frame_hash mismatch",
+            });
         }
 
-        Ok(Frame { sequence, timestamp_ns, prev_hash, payload_type, payload, frame_hash })
+        Ok(Frame {
+            sequence,
+            timestamp_ns,
+            prev_hash,
+            payload_type,
+            payload,
+            frame_hash,
+        })
     }
 }
 
@@ -176,12 +206,12 @@ mod tests {
     #[test]
     fn roundtrip() {
         let mut f = Frame {
-            sequence:     42,
+            sequence: 42,
             timestamp_ns: 123_456_789,
-            prev_hash:    GENESIS_HASH,
+            prev_hash: GENESIS_HASH,
             payload_type: PayloadType::Data,
-            payload:      b"hello vectorvolt".to_vec(),
-            frame_hash:   [0u8; 32],
+            payload: b"hello vectorvolt".to_vec(),
+            frame_hash: [0u8; 32],
         };
         let encoded = f.encode();
         let mut cur = Cursor::new(&encoded);
@@ -194,8 +224,12 @@ mod tests {
     #[test]
     fn detects_bit_flip() {
         let mut f = Frame {
-            sequence: 1, timestamp_ns: 0, prev_hash: GENESIS_HASH,
-            payload_type: PayloadType::Data, payload: vec![0u8; 64], frame_hash: [0u8; 32],
+            sequence: 1,
+            timestamp_ns: 0,
+            prev_hash: GENESIS_HASH,
+            payload_type: PayloadType::Data,
+            payload: vec![0u8; 64],
+            frame_hash: [0u8; 32],
         };
         let mut encoded = f.encode();
         // flip a bit in the payload area

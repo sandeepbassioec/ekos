@@ -127,18 +127,19 @@ fn main() -> Result<()> {
         Commands::Wal(cmd) => wal::run(cmd)?,
 
         Commands::Store(cmd) => match cmd {
-            StoreCommand::Put { key, value, dir } =>
-                store::cmd_put(dir, key, value, fmt)?,
-            StoreCommand::Get { key, dir } =>
-                store::cmd_get(dir, key, fmt)?,
-            StoreCommand::Delete { key, dir } =>
-                store::cmd_delete(dir, key, fmt)?,
-            StoreCommand::Scan { dir, prefix, start, end, limit, keys_only } =>
-                store::cmd_scan(dir, prefix, start, end, limit, keys_only, fmt)?,
-            StoreCommand::Stats { dir } =>
-                store::cmd_stats(dir, fmt)?,
-            StoreCommand::Compact { dir } =>
-                store::cmd_compact(dir, fmt)?,
+            StoreCommand::Put { key, value, dir } => store::cmd_put(dir, key, value, fmt)?,
+            StoreCommand::Get { key, dir } => store::cmd_get(dir, key, fmt)?,
+            StoreCommand::Delete { key, dir } => store::cmd_delete(dir, key, fmt)?,
+            StoreCommand::Scan {
+                dir,
+                prefix,
+                start,
+                end,
+                limit,
+                keys_only,
+            } => store::cmd_scan(dir, prefix, start, end, limit, keys_only, fmt)?,
+            StoreCommand::Stats { dir } => store::cmd_stats(dir, fmt)?,
+            StoreCommand::Compact { dir } => store::cmd_compact(dir, fmt)?,
         },
 
         Commands::Version => print_version(),

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Subcommand;
-use vectorvolt_wal::{WalConfig, WalReader, list_segment_ids, segment_path, SegmentReader};
+use vectorvolt_wal::{SegmentReader, WalConfig, WalReader, list_segment_ids, segment_path};
 
 #[derive(Subcommand)]
 pub enum WalCommand {
@@ -35,7 +35,11 @@ pub fn run(cmd: WalCommand) -> Result<()> {
     match cmd {
         WalCommand::Status { dir } => cmd_status(&dir),
         WalCommand::Verify { dir } => cmd_verify(&dir),
-        WalCommand::Inspect { dir, segment, payload } => cmd_inspect(&dir, segment, payload),
+        WalCommand::Inspect {
+            dir,
+            segment,
+            payload,
+        } => cmd_inspect(&dir, segment, payload),
     }
 }
 
@@ -48,7 +52,11 @@ fn cmd_status(dir: &str) -> Result<()> {
     println!("  Directory    : {}", dir);
     println!("  Segments     : {}", stats.segments);
     println!("  Total frames : {}", stats.total_frames);
-    println!("  Total bytes  : {} ({:.2} MiB)", stats.total_bytes, stats.total_bytes as f64 / (1024.0 * 1024.0));
+    println!(
+        "  Total bytes  : {} ({:.2} MiB)",
+        stats.total_bytes,
+        stats.total_bytes as f64 / (1024.0 * 1024.0)
+    );
     println!("  First seq    : {}", stats.first_sequence);
     println!("  Last seq     : {}", stats.last_sequence);
     println!("  Chain tip    : {}", hex(&stats.chain_tip));
@@ -87,9 +95,15 @@ fn cmd_inspect(dir: &str, seg: Option<u64>, print_payload: bool) -> Result<()> {
     }
 
     let mut reader = SegmentReader::open(&path)?;
-    println!("─── Segment {:020} ─────────────────────────────────", target_id);
+    println!(
+        "─── Segment {:020} ─────────────────────────────────",
+        target_id
+    );
     println!("  File         : {}", path.display());
-    println!("  Created      : {}", chrono::DateTime::from_timestamp_nanos(reader.header.created_ns as i64));
+    println!(
+        "  Created      : {}",
+        chrono::DateTime::from_timestamp_nanos(reader.header.created_ns as i64)
+    );
     println!("  Base seq     : {}", reader.header.base_seq);
     println!();
 
@@ -100,7 +114,7 @@ fn cmd_inspect(dir: &str, seg: Option<u64>, print_payload: bool) -> Result<()> {
     for f in &frames {
         let payload_display = if print_payload {
             match std::str::from_utf8(&f.payload) {
-                Ok(s)  => format!("\"{}\"", s.chars().take(80).collect::<String>()),
+                Ok(s) => format!("\"{}\"", s.chars().take(80).collect::<String>()),
                 Err(_) => format!("<{} bytes binary>", f.payload.len()),
             }
         } else {

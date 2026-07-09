@@ -6,8 +6,8 @@
 //!   - Immutable snapshot via `freeze()` returns an Arc<MemTable> for background flush
 //!   - Thread-safe via external RwLock in KvStore; MemTable itself is not Sync
 
-use std::collections::BTreeMap;
 use bytes::Bytes;
+use std::collections::BTreeMap;
 
 /// A single in-memory KV entry.
 #[derive(Debug, Clone)]
@@ -24,7 +24,10 @@ pub struct MemTable {
 
 impl MemTable {
     pub fn new() -> Self {
-        MemTable { data: BTreeMap::new(), size_bytes: 0 }
+        MemTable {
+            data: BTreeMap::new(),
+            size_bytes: 0,
+        }
     }
 
     pub fn put(&mut self, key: Bytes, value: Bytes) {
@@ -34,7 +37,10 @@ impl MemTable {
             .get(&key)
             .map(|v| key.len() + v.as_ref().map_or(0, |b| b.len()))
             .unwrap_or(0);
-        self.size_bytes = self.size_bytes.saturating_add(added).saturating_sub(removed);
+        self.size_bytes = self
+            .size_bytes
+            .saturating_add(added)
+            .saturating_sub(removed);
         self.data.insert(key, Some(value));
     }
 
@@ -45,7 +51,10 @@ impl MemTable {
             .map(|v| key.len() + v.as_ref().map_or(0, |b| b.len()))
             .unwrap_or(0);
         // Tombstone: key.len() bytes for the key slot
-        self.size_bytes = self.size_bytes.saturating_add(key.len()).saturating_sub(removed);
+        self.size_bytes = self
+            .size_bytes
+            .saturating_add(key.len())
+            .saturating_sub(removed);
         self.data.insert(key, None);
     }
 
@@ -127,6 +136,9 @@ mod tests {
         m.put(Bytes::from("a"), Bytes::from("1"));
         m.put(Bytes::from("b"), Bytes::from("2"));
         let keys: Vec<_> = m.iter().map(|e| e.key.clone()).collect();
-        assert_eq!(keys, vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
+        assert_eq!(
+            keys,
+            vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]
+        );
     }
 }

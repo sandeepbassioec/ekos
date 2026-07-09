@@ -7,8 +7,8 @@
 
 use crate::config::WalConfig;
 use crate::error::{WalError, WalResult};
-use crate::frame::{Frame, PayloadType, GENESIS_HASH};
-use crate::segment::{list_segment_ids, segment_path, SegmentReader, SegmentWriter};
+use crate::frame::{Frame, GENESIS_HASH, PayloadType};
+use crate::segment::{SegmentReader, SegmentWriter, list_segment_ids, segment_path};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,15 +18,15 @@ use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct WalTip {
-    pub sequence:   u64,
+    pub sequence: u64,
     pub frame_hash: [u8; 32],
     pub segment_id: u64,
 }
 
 struct WriterInner {
-    config:     WalConfig,
-    segment:    SegmentWriter,
-    next_seq:   u64,
+    config: WalConfig,
+    segment: SegmentWriter,
+    next_seq: u64,
     chain_hash: [u8; 32],
 }
 
@@ -42,7 +42,11 @@ impl WriterInner {
     fn rotate(&mut self) -> WalResult<()> {
         self.segment.flush()?;
         let new_id = self.segment.id + 1;
-        info!(old_segment = self.segment.id, new_segment = new_id, "rotating WAL segment");
+        info!(
+            old_segment = self.segment.id,
+            new_segment = new_id,
+            "rotating WAL segment"
+        );
         self.segment = SegmentWriter::create(
             &self.config.dir,
             new_id,
@@ -57,17 +61,17 @@ impl WriterInner {
         if payload.len() > self.config.max_payload_bytes {
             return Err(WalError::PayloadTooLarge {
                 size: payload.len(),
-                max:  self.config.max_payload_bytes,
+                max: self.config.max_payload_bytes,
             });
         }
 
         let mut frame = Frame {
-            sequence:     self.next_seq,
+            sequence: self.next_seq,
             timestamp_ns: Self::now_ns(),
-            prev_hash:    self.chain_hash,
+            prev_hash: self.chain_hash,
             payload_type,
             payload,
-            frame_hash:   [0u8; 32],
+            frame_hash: [0u8; 32],
         };
         let encoded = frame.encode();
 
@@ -78,12 +82,16 @@ impl WriterInner {
         self.segment.append_bytes(&encoded)?;
         self.chain_hash = frame.frame_hash;
         let tip = WalTip {
-            sequence:   self.next_seq,
+            sequence: self.next_seq,
             frame_hash: frame.frame_hash,
             segment_id: self.segment.id,
         };
         self.next_seq += 1;
-        debug!(sequence = tip.sequence, segment = tip.segment_id, "frame appended");
+        debug!(
+            sequence = tip.sequence,
+            segment = tip.segment_id,
+            "frame appended"
+        );
         Ok(tip)
     }
 }
@@ -106,12 +114,13 @@ impl WalWriter {
 
         let (segment, next_seq, chain_hash) = if ids.is_empty() {
             // Fresh WAL.
-            let seg = SegmentWriter::create(&config.dir, 0, 1, config.segment_max_bytes, config.fsync)?;
+            let seg =
+                SegmentWriter::create(&config.dir, 0, 1, config.segment_max_bytes, config.fsync)?;
             info!(dir = %config.dir.display(), "created new WAL");
             (seg, 1u64, GENESIS_HASH)
         } else {
             // Recover from the last segment.
-            let last_id  = *ids.last().unwrap();
+            let last_id = *ids.last().unwrap();
             let last_path = segment_path(&config.dir, last_id);
             let mut reader = SegmentReader::open(&last_path)?;
             let frames = reader.all_frames()?;
@@ -143,7 +152,12 @@ impl WalWriter {
         };
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(WriterInner { config, segment, next_seq, chain_hash })),
+            inner: Arc::new(Mutex::new(WriterInner {
+                config,
+                segment,
+                next_seq,
+                chain_hash,
+            })),
         })
     }
 
@@ -162,7 +176,7 @@ impl WalWriter {
     pub fn tip(&self) -> WalTip {
         let g = self.inner.lock();
         WalTip {
-            sequence:   g.next_seq.saturating_sub(1),
+            sequence: g.next_seq.saturating_sub(1),
             frame_hash: g.chain_hash,
             segment_id: g.segment.id,
         }
@@ -183,9 +197,7 @@ mod tests {
     #[test]
     fn append_and_recover() {
         let dir = TempDir::new().unwrap();
-        let cfg = WalConfig::default()
-            .with_dir(dir.path())
-            .with_fsync(false);
+        let cfg = WalConfig::default().with_dir(dir.path()).with_fsync(false);
 
         let writer = WalWriter::open(cfg.clone()).unwrap();
         let tip1 = writer.append(b"first".to_vec()).unwrap();
@@ -212,7 +224,9 @@ mod tests {
 
         let writer = WalWriter::open(cfg).unwrap();
         for i in 0..20u64 {
-            writer.append(format!("payload-{}", i).into_bytes()).unwrap();
+            writer
+                .append(format!("payload-{}", i).into_bytes())
+                .unwrap();
         }
         writer.flush().unwrap();
 

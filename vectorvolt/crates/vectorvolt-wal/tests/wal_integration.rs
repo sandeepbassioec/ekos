@@ -1,8 +1,8 @@
 //! End-to-end WAL integration tests.
 
 use tempfile::TempDir;
-use vectorvolt_wal::{WalConfig, WalReader, WalWriter, GroupCommitBatcher, WalCursor};
 use tokio::time::Duration;
+use vectorvolt_wal::{GroupCommitBatcher, WalConfig, WalCursor, WalReader, WalWriter};
 
 fn cfg(dir: &std::path::Path) -> WalConfig {
     WalConfig::default().with_dir(dir).with_fsync(false)
@@ -44,7 +44,9 @@ fn crash_recovery() {
     {
         let writer = WalWriter::open(cfg(dir.path())).unwrap();
         for i in 0u32..30 {
-            writer.append(format!("before-crash-{}", i).into_bytes()).unwrap();
+            writer
+                .append(format!("before-crash-{}", i).into_bytes())
+                .unwrap();
         }
         writer.flush().unwrap();
         // drop without explicit close = simulated crash
@@ -54,7 +56,10 @@ fn crash_recovery() {
     {
         let writer = WalWriter::open(cfg(dir.path())).unwrap();
         let tip = writer.tip();
-        assert_eq!(tip.sequence, 30, "recovery should find seq 30 as last written");
+        assert_eq!(
+            tip.sequence, 30,
+            "recovery should find seq 30 as last written"
+        );
 
         writer.append(b"after-crash".to_vec()).unwrap();
         writer.flush().unwrap();
@@ -84,7 +89,9 @@ fn multi_segment_verify() {
 
     let writer = WalWriter::open(cfg_small.clone()).unwrap();
     for i in 0u32..100 {
-        writer.append(format!("payload-{:04}", i).into_bytes()).unwrap();
+        writer
+            .append(format!("payload-{:04}", i).into_bytes())
+            .unwrap();
     }
     writer.flush().unwrap();
 

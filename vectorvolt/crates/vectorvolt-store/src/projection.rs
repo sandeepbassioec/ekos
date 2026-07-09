@@ -32,9 +32,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::StoreResult;
 use crate::scan::{ScanEntry, ScanRequest};
 use crate::store::KvStore;
-use crate::StoreResult;
 
 // --------------------------------------------------------------------------
 // Projection trait
@@ -60,7 +60,10 @@ pub struct KeyOnlyProjection;
 
 impl Projection for KeyOnlyProjection {
     fn apply(&self, entry: ScanEntry) -> Option<ScanEntry> {
-        Some(ScanEntry { key: entry.key, value: Bytes::new() })
+        Some(ScanEntry {
+            key: entry.key,
+            value: Bytes::new(),
+        })
     }
 }
 
@@ -177,15 +180,24 @@ mod tests {
 
     #[test]
     fn identity_passes_through() {
-        let e = ScanEntry { key: Bytes::from("k"), value: Bytes::from("v") };
+        let e = ScanEntry {
+            key: Bytes::from("k"),
+            value: Bytes::from("v"),
+        };
         assert_eq!(IdentityProjection.apply(e.clone()), Some(e));
     }
 
     #[test]
     fn filter_projection() {
         let p = FilterProjection(|e: &ScanEntry| e.key.starts_with(b"user:"));
-        let user = ScanEntry { key: Bytes::from("user:alice"), value: Bytes::from("v") };
-        let order = ScanEntry { key: Bytes::from("order:1"),   value: Bytes::from("v") };
+        let user = ScanEntry {
+            key: Bytes::from("user:alice"),
+            value: Bytes::from("v"),
+        };
+        let order = ScanEntry {
+            key: Bytes::from("order:1"),
+            value: Bytes::from("v"),
+        };
         assert!(p.apply(user).is_some());
         assert!(p.apply(order).is_none());
     }
@@ -193,11 +205,19 @@ mod tests {
     #[test]
     fn pipeline_short_circuits() {
         let p = PipelineProjection(vec![
-            Box::new(FilterProjection(|e: &ScanEntry| e.key != Bytes::from("skip"))),
+            Box::new(FilterProjection(|e: &ScanEntry| {
+                e.key != Bytes::from("skip")
+            })),
             Box::new(IdentityProjection),
         ]);
-        let skip = ScanEntry { key: Bytes::from("skip"), value: Bytes::from("v") };
-        let keep = ScanEntry { key: Bytes::from("keep"), value: Bytes::from("v") };
+        let skip = ScanEntry {
+            key: Bytes::from("skip"),
+            value: Bytes::from("v"),
+        };
+        let keep = ScanEntry {
+            key: Bytes::from("keep"),
+            value: Bytes::from("v"),
+        };
         assert!(p.apply(skip).is_none());
         assert!(p.apply(keep).is_some());
     }

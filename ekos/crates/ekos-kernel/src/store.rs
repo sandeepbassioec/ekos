@@ -57,10 +57,8 @@ impl KoStore {
         let tx_ns = ko.tx_time.timestamp_nanos_opt().unwrap_or(0);
 
         // Write latest version
-        self.kv.put(
-            index::ko_key(&ko.namespace, &ko.id.as_str()),
-            bytes.clone(),
-        )?;
+        self.kv
+            .put(index::ko_key(&ko.namespace, &ko.id.as_str()), bytes.clone())?;
 
         // Write history entry
         self.kv.put(
@@ -79,7 +77,8 @@ impl KoStore {
 
     /// Fetch the latest active version of a KO by id.
     pub fn ko_get(&self, namespace: &str, id: &str) -> KernelResult<KnowledgeObject> {
-        let ko = self.ko_get_raw(namespace, id)?
+        let ko = self
+            .ko_get_raw(namespace, id)?
             .ok_or_else(|| KernelError::NotFound(format!("{namespace}/{id}")))?;
         if ko.is_deleted() {
             return Err(KernelError::Deleted(id.to_string()));
@@ -93,7 +92,8 @@ impl KoStore {
     /// The KO is retained in history; only the latest-version lookup is marked deleted.
     #[instrument(skip(self), fields(ns = namespace, id = id))]
     pub fn ko_delete(&self, namespace: &str, id: &str) -> KernelResult<()> {
-        let mut ko = self.ko_get_raw(namespace, id)?
+        let mut ko = self
+            .ko_get_raw(namespace, id)?
             .ok_or_else(|| KernelError::NotFound(format!("{namespace}/{id}")))?;
 
         if ko.is_deleted() {
@@ -110,7 +110,8 @@ impl KoStore {
         let tx_ns = ko.tx_time.timestamp_nanos_opt().unwrap_or(0);
 
         self.kv.put(index::ko_key(namespace, id), bytes.clone())?;
-        self.kv.put(index::ko_history_key(namespace, id, tx_ns), bytes)?;
+        self.kv
+            .put(index::ko_history_key(namespace, id, tx_ns), bytes)?;
 
         debug!("ko_delete complete");
         Ok(())
@@ -132,7 +133,9 @@ impl KoStore {
             // Use the kind index for efficient filtered scan
             let req = {
                 let mut r = ScanRequest::prefix(index::idx_kind_prefix(namespace, k));
-                if let Some(n) = limit { r = r.with_limit(n); }
+                if let Some(n) = limit {
+                    r = r.with_limit(n);
+                }
                 r
             };
             let ids: Vec<String> = pd
@@ -152,14 +155,14 @@ impl KoStore {
             // Full namespace scan via primary key prefix
             let req = {
                 let mut r = ScanRequest::prefix(index::ko_namespace_prefix(namespace));
-                if let Some(n) = limit { r = r.with_limit(n); }
+                if let Some(n) = limit {
+                    r = r.with_limit(n);
+                }
                 r
             };
             pd.scan(req)?
                 .into_iter()
-                .filter_map(|e| {
-                    KnowledgeObject::from_bytes(&e.value).ok()
-                })
+                .filter_map(|e| KnowledgeObject::from_bytes(&e.value).ok())
                 .filter(|ko| !ko.is_deleted())
                 .collect()
         };
@@ -170,11 +173,7 @@ impl KoStore {
     // ── Syscall 5: ko_history ─────────────────────────────────────────────
 
     /// Return all recorded versions of a KO, oldest first (ascending tx_time).
-    pub fn ko_history(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> KernelResult<Vec<KnowledgeObject>> {
+    pub fn ko_history(&self, namespace: &str, id: &str) -> KernelResult<Vec<KnowledgeObject>> {
         let pd = ProjectionDispatcher::new(self.kv.clone());
         let req = ScanRequest::prefix(index::ko_history_prefix(namespace, id));
 
@@ -202,7 +201,9 @@ impl KoStore {
         let pd = ProjectionDispatcher::new(self.kv.clone());
         let req = {
             let mut r = ScanRequest::prefix(index::idx_tag_prefix(namespace, tag));
-            if let Some(n) = limit { r = r.with_limit(n); }
+            if let Some(n) = limit {
+                r = r.with_limit(n);
+            }
             r
         };
 
@@ -227,7 +228,7 @@ impl KoStore {
         match self.kv.get(index::ko_key(namespace, id))? {
             None => Ok(None),
             Some(bytes) => Ok(Some(
-                KnowledgeObject::from_bytes(&bytes).map_err(KernelError::from)?
+                KnowledgeObject::from_bytes(&bytes).map_err(KernelError::from)?,
             )),
         }
     }
@@ -247,13 +248,14 @@ impl KoStore {
     }
 
     fn remove_indexes(&self, ko: &KnowledgeObject) -> KernelResult<()> {
-        self.kv.delete(
-            index::idx_kind_key(&ko.namespace, ko.kind.as_str(), &ko.id.as_str()),
-        )?;
+        self.kv.delete(index::idx_kind_key(
+            &ko.namespace,
+            ko.kind.as_str(),
+            &ko.id.as_str(),
+        ))?;
         for tag in &ko.tags {
-            self.kv.delete(
-                index::idx_tag_key(&ko.namespace, tag, &ko.id.as_str()),
-            )?;
+            self.kv
+                .delete(index::idx_tag_key(&ko.namespace, tag, &ko.id.as_str()))?;
         }
         Ok(())
     }

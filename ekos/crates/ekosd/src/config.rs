@@ -34,20 +34,32 @@ pub struct StoreConfig {
     pub fsync: bool,
 }
 
-fn default_data_dir() -> PathBuf { PathBuf::from("./ekosd-data") }
-fn default_bind()     -> String  { "[::1]:50051".to_string() }
-fn default_log_level()-> String  { "info".to_string() }
-fn default_flush_threshold()  -> usize { 4 * 1024 * 1024 }
-fn default_compaction_trigger()-> usize { 8 }
-fn default_true() -> bool { true }
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("./ekosd-data")
+}
+fn default_bind() -> String {
+    "[::1]:50051".to_string()
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_flush_threshold() -> usize {
+    4 * 1024 * 1024
+}
+fn default_compaction_trigger() -> usize {
+    8
+}
+fn default_true() -> bool {
+    true
+}
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            data_dir:  default_data_dir(),
-            bind:      default_bind(),
+            data_dir: default_data_dir(),
+            bind: default_bind(),
             log_level: default_log_level(),
-            store:     StoreConfig::default(),
+            store: StoreConfig::default(),
         }
     }
 }

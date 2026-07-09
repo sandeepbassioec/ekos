@@ -30,7 +30,7 @@ impl Default for WalConfig {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("./wal"),
-            segment_max_bytes: 64 * 1024 * 1024,    // 64 MiB
+            segment_max_bytes: 64 * 1024 * 1024,     // 64 MiB
             group_commit_max_bytes: 4 * 1024 * 1024, // 4 MiB
             group_commit_interval: Duration::from_micros(500),
             group_commit_channel_capacity: 8_192,

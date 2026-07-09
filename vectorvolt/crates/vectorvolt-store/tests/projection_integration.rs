@@ -23,7 +23,9 @@ fn open(dir: &std::path::Path) -> ProjectionDispatcher {
 fn seed(dir: &std::path::Path, pairs: &[(&str, &str)]) {
     let store = KvStore::open(cfg(dir)).unwrap();
     for (k, v) in pairs {
-        store.put(Bytes::from(k.to_string()), Bytes::from(v.to_string())).unwrap();
+        store
+            .put(Bytes::from(k.to_string()), Bytes::from(v.to_string()))
+            .unwrap();
     }
     store.flush().unwrap();
 }
@@ -45,12 +47,15 @@ fn full_scan_returns_all_live_entries() {
 #[test]
 fn prefix_scan() {
     let dir = TempDir::new().unwrap();
-    seed(dir.path(), &[
-        ("user:alice", "30"),
-        ("user:bob",   "25"),
-        ("order:1",    "100"),
-        ("order:2",    "200"),
-    ]);
+    seed(
+        dir.path(),
+        &[
+            ("user:alice", "30"),
+            ("user:bob", "25"),
+            ("order:1", "100"),
+            ("order:2", "200"),
+        ],
+    );
 
     let pd = open(dir.path());
     let results = pd.scan_prefix("user:").unwrap();
@@ -62,9 +67,15 @@ fn prefix_scan() {
 #[test]
 fn prefix_scan_with_limit() {
     let dir = TempDir::new().unwrap();
-    seed(dir.path(), &[
-        ("tag:a", "1"), ("tag:b", "2"), ("tag:c", "3"), ("tag:d", "4"),
-    ]);
+    seed(
+        dir.path(),
+        &[
+            ("tag:a", "1"),
+            ("tag:b", "2"),
+            ("tag:c", "3"),
+            ("tag:d", "4"),
+        ],
+    );
 
     let pd = open(dir.path());
     let results = pd.scan_prefix_limit("tag:", 2).unwrap();
@@ -76,7 +87,7 @@ fn tombstone_excluded_from_scan() {
     let dir = TempDir::new().unwrap();
     let store = KvStore::open(cfg(dir.path())).unwrap();
     store.put("alive", "yes").unwrap();
-    store.put("dead",  "no").unwrap();
+    store.put("dead", "no").unwrap();
     store.delete("dead").unwrap();
     store.flush().unwrap();
 
@@ -91,11 +102,14 @@ fn tombstone_excluded_from_scan() {
 #[test]
 fn filter_projection() {
     let dir = TempDir::new().unwrap();
-    seed(dir.path(), &[
-        ("score:100", "alice"),
-        ("score:050", "bob"),
-        ("score:200", "charlie"),
-    ]);
+    seed(
+        dir.path(),
+        &[
+            ("score:100", "alice"),
+            ("score:050", "bob"),
+            ("score:200", "charlie"),
+        ],
+    );
 
     let pd = open(dir.path());
     // Keep only entries whose value is "alice" or "charlie"
@@ -112,7 +126,9 @@ fn key_only_projection() {
     seed(dir.path(), &[("k1", "big-value-1"), ("k2", "big-value-2")]);
 
     let pd = open(dir.path());
-    let results = pd.scan_with(ScanRequest::full(), &KeyOnlyProjection).unwrap();
+    let results = pd
+        .scan_with(ScanRequest::full(), &KeyOnlyProjection)
+        .unwrap();
     assert!(results.iter().all(|e| e.value.is_empty()));
     assert_eq!(results.len(), 2);
 }
@@ -120,7 +136,10 @@ fn key_only_projection() {
 #[test]
 fn count() {
     let dir = TempDir::new().unwrap();
-    seed(dir.path(), &[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")]);
+    seed(
+        dir.path(),
+        &[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")],
+    );
 
     let pd = open(dir.path());
     assert_eq!(pd.count(ScanRequest::full()).unwrap(), 4);
@@ -140,14 +159,13 @@ fn keys_only() {
 #[test]
 fn pipeline_projection() {
     let dir = TempDir::new().unwrap();
-    seed(dir.path(), &[
-        ("keep:a", "value"),
-        ("skip:b", "value"),
-    ]);
+    seed(dir.path(), &[("keep:a", "value"), ("skip:b", "value")]);
 
     let pd = open(dir.path());
     let p = PipelineProjection(vec![
-        Box::new(FilterProjection(|e: &ScanEntry| e.key.starts_with(b"keep:"))),
+        Box::new(FilterProjection(|e: &ScanEntry| {
+            e.key.starts_with(b"keep:")
+        })),
         Box::new(IdentityProjection),
     ]);
     let results = pd.scan_with(ScanRequest::full(), &p).unwrap();
