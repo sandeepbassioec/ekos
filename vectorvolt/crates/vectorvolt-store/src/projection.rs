@@ -205,9 +205,7 @@ mod tests {
     #[test]
     fn pipeline_short_circuits() {
         let p = PipelineProjection(vec![
-            Box::new(FilterProjection(|e: &ScanEntry| {
-                e.key != Bytes::from("skip")
-            })),
+            Box::new(FilterProjection(|e: &ScanEntry| e.key != "skip".as_bytes())),
             Box::new(IdentityProjection),
         ]);
         let skip = ScanEntry {

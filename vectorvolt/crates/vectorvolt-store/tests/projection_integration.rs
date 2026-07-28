@@ -114,7 +114,7 @@ fn filter_projection() {
     let pd = open(dir.path());
     // Keep only entries whose value is "alice" or "charlie"
     let p = FilterProjection(|e: &ScanEntry| {
-        e.value == Bytes::from("alice") || e.value == Bytes::from("charlie")
+        e.value == "alice".as_bytes() || e.value == "charlie".as_bytes()
     });
     let results = pd.scan_with(ScanRequest::full(), &p).unwrap();
     assert_eq!(results.len(), 2);

@@ -16,7 +16,7 @@ pub fn ko_to_proto(ko: KnowledgeObject) -> pb::KnowledgeObject {
         id: ko.id.to_string(),
         namespace: ko.namespace,
         kind: ko.kind.0,
-        payload: ko.payload.into(),
+        payload: ko.payload,
         valid_from: Some(dt_to_ts(ko.valid_from)),
         valid_until: ko.valid_until.map(dt_to_ts),
         tx_time: Some(dt_to_ts(ko.tx_time)),

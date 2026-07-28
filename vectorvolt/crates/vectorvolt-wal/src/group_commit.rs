@@ -179,7 +179,7 @@ impl GroupCommitBatcher {
 
         metrics.record_flush(frame_count, batch_bytes as u64, latency_us);
 
-        for (sub, tip) in batch.into_iter().zip(tips.into_iter()) {
+        for (sub, tip) in batch.into_iter().zip(tips) {
             let _ = sub.done_tx.send(tip);
         }
     }

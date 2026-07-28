@@ -134,10 +134,7 @@ impl WalWriter {
             info!(last_segment = last_id, next_seq, "recovered WAL");
 
             // Re-open the last segment for appending.
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(&last_path)?;
+            let file = std::fs::OpenOptions::new().append(true).open(&last_path)?;
             let byte_offset = file.metadata()?.len();
             let seg = SegmentWriter::reopen(
                 last_id,

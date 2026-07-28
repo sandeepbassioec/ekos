@@ -82,10 +82,10 @@ impl Manifest {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let s = name.to_string_lossy();
-                if s.ends_with(".vvsst") {
-                    if let Ok(id) = s.trim_end_matches(".vvsst").parse::<u64>() {
-                        ids.push(id);
-                    }
+                if let Some(stem) = s.strip_suffix(".vvsst")
+                    && let Ok(id) = stem.parse::<u64>()
+                {
+                    ids.push(id);
                 }
             }
         }
@@ -130,7 +130,7 @@ impl StoreInner {
         if self.active.is_empty() {
             return Ok(());
         }
-        let table = std::mem::replace(&mut self.active, MemTable::new());
+        let table = std::mem::take(&mut self.active);
         let id = self.manifest.next_id();
         let path = sstable_path(&self.cfg.dir, id);
 

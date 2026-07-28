@@ -2,7 +2,7 @@
 
 use tempfile::TempDir;
 use tokio::time::Duration;
-use vectorvolt_wal::{GroupCommitBatcher, WalConfig, WalCursor, WalReader, WalWriter};
+use vectorvolt_wal::{GroupCommitBatcher, WalConfig, WalReader, WalWriter};
 
 fn cfg(dir: &std::path::Path) -> WalConfig {
     WalConfig::default().with_dir(dir).with_fsync(false)
