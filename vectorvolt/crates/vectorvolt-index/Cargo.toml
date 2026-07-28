@@ -1,0 +1,17 @@
+[package]
+name        = "vectorvolt-index"
+description = "VectorVolt index layer — Cuckoo PK index, Roaring secondary index, ZoneMap, CuckooFilter"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+
+[dependencies]
+thiserror  = { workspace = true }
+bytes      = { workspace = true }
+roaring    = { workspace = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
