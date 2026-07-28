@@ -21,6 +21,12 @@
       "autoPort": false
     }
   ,{
+      "name": "vectorvolt-dashboard",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8770", "--directory", "C:/VectorVolt"],
+      "port": 8770
+    }
+  ,{
       "name": "esip",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "esip", "run", "dev"],

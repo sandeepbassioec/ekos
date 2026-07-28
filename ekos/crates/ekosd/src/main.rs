@@ -45,8 +45,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let mut cfg = config::Config::load(&cli.config)?;
-    if let Some(b) = cli.bind     { cfg.bind     = b; }
-    if let Some(d) = cli.data_dir { cfg.data_dir = d; }
+    if let Some(b) = cli.bind {
+        cfg.bind = b;
+    }
+    if let Some(d) = cli.data_dir {
+        cfg.data_dir = d;
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -65,7 +69,7 @@ async fn main() -> Result<()> {
         .with_fsync(cfg.store.fsync);
 
     let store = ekos_kernel::KoStore::open(store_cfg)?;
-    let svc   = EkosKernelService::new(store);
+    let svc = EkosKernelService::new(store);
 
     let addr = cfg.bind.parse()?;
     info!("ekosd listening on {addr}");
@@ -77,7 +81,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let mut sigterm = signal(SignalKind::terminate()).unwrap();
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}

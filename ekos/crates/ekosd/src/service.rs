@@ -20,11 +20,11 @@ impl EkosKernelService {
 fn kernel_err(e: ekos_kernel::KernelError) -> Status {
     use ekos_kernel::KernelError::*;
     match e {
-        NotFound(msg)       => Status::not_found(msg),
-        Deleted(msg)        => Status::failed_precondition(format!("deleted: {msg}")),
-        InvalidArgument(msg)=> Status::invalid_argument(msg),
-        Store(msg)          => Status::internal(format!("store: {msg}")),
-        Serialize(msg)      => Status::internal(format!("serialize: {msg}")),
+        NotFound(msg) => Status::not_found(msg),
+        Deleted(msg) => Status::failed_precondition(format!("deleted: {msg}")),
+        InvalidArgument(msg) => Status::invalid_argument(msg),
+        Store(msg) => Status::internal(format!("store: {msg}")),
+        Serialize(msg) => Status::internal(format!("serialize: {msg}")),
     }
 }
 
@@ -45,8 +45,8 @@ impl KernelService for EkosKernelService {
             return Err(Status::invalid_argument("kind is required"));
         }
 
-        let ko = mapping::proto_to_ko(&inner)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let ko =
+            mapping::proto_to_ko(&inner).map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         // If an id was supplied and a previous version exists, let KoStore
         // handle the version increment.  Just pass through.
@@ -80,7 +80,9 @@ impl KernelService for EkosKernelService {
         req: Request<pb::KoDeleteRequest>,
     ) -> Result<Response<pb::KoDeleteResponse>, Status> {
         let r = req.into_inner();
-        self.store.ko_delete(&r.namespace, &r.id).map_err(kernel_err)?;
+        self.store
+            .ko_delete(&r.namespace, &r.id)
+            .map_err(kernel_err)?;
         Ok(Response::new(pb::KoDeleteResponse { ok: true }))
     }
 
@@ -91,10 +93,21 @@ impl KernelService for EkosKernelService {
         req: Request<pb::KoScanRequest>,
     ) -> Result<Response<pb::KoScanResponse>, Status> {
         let r = req.into_inner();
-        let kind = if r.kind.is_empty() { None } else { Some(r.kind.as_str()) };
-        let limit = if r.limit == 0 { None } else { Some(r.limit as usize) };
+        let kind = if r.kind.is_empty() {
+            None
+        } else {
+            Some(r.kind.as_str())
+        };
+        let limit = if r.limit == 0 {
+            None
+        } else {
+            Some(r.limit as usize)
+        };
 
-        let kos = self.store.ko_scan(&r.namespace, kind, limit).map_err(kernel_err)?;
+        let kos = self
+            .store
+            .ko_scan(&r.namespace, kind, limit)
+            .map_err(kernel_err)?;
         let total = kos.len() as u32;
         Ok(Response::new(pb::KoScanResponse {
             kos: kos.into_iter().map(mapping::ko_to_proto).collect(),
@@ -109,7 +122,10 @@ impl KernelService for EkosKernelService {
         req: Request<pb::KoHistoryRequest>,
     ) -> Result<Response<pb::KoHistoryResponse>, Status> {
         let r = req.into_inner();
-        let versions = self.store.ko_history(&r.namespace, &r.id).map_err(kernel_err)?;
+        let versions = self
+            .store
+            .ko_history(&r.namespace, &r.id)
+            .map_err(kernel_err)?;
         Ok(Response::new(pb::KoHistoryResponse {
             versions: versions.into_iter().map(mapping::ko_to_proto).collect(),
         }))
@@ -122,8 +138,15 @@ impl KernelService for EkosKernelService {
         req: Request<pb::KoQueryTagRequest>,
     ) -> Result<Response<pb::KoQueryTagResponse>, Status> {
         let r = req.into_inner();
-        let limit = if r.limit == 0 { None } else { Some(r.limit as usize) };
-        let kos = self.store.ko_query_tag(&r.namespace, &r.tag, limit).map_err(kernel_err)?;
+        let limit = if r.limit == 0 {
+            None
+        } else {
+            Some(r.limit as usize)
+        };
+        let kos = self
+            .store
+            .ko_query_tag(&r.namespace, &r.tag, limit)
+            .map_err(kernel_err)?;
         let total = kos.len() as u32;
         Ok(Response::new(pb::KoQueryTagResponse {
             kos: kos.into_iter().map(mapping::ko_to_proto).collect(),

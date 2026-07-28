@@ -6,7 +6,7 @@
 use crate::config::WalConfig;
 use crate::error::{WalError, WalResult};
 use crate::frame::{Frame, GENESIS_HASH};
-use crate::segment::{list_segment_ids, segment_path, SegmentReader, SEG_HEADER_SIZE};
+use crate::segment::{SEG_HEADER_SIZE, SegmentReader, list_segment_ids, segment_path};
 use tracing::debug;
 
 // ── WalCursor ─────────────────────────────────────────────────────────────────
@@ -15,12 +15,15 @@ use tracing::debug;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalCursor {
     pub segment_id: u64,
-    pub offset:     u64,
+    pub offset: u64,
 }
 
 impl WalCursor {
     pub fn beginning() -> Self {
-        Self { segment_id: 0, offset: SEG_HEADER_SIZE }
+        Self {
+            segment_id: 0,
+            offset: SEG_HEADER_SIZE,
+        }
     }
 }
 
@@ -65,7 +68,10 @@ impl WalReader {
                 match reader.next_frame()? {
                     None => break,
                     Some(frame) => {
-                        cur = WalCursor { segment_id: seg_id, offset: pos };
+                        cur = WalCursor {
+                            segment_id: seg_id,
+                            offset: pos,
+                        };
                         let keep_going = f(frame);
                         if !keep_going {
                             return Ok(cur);
@@ -73,7 +79,10 @@ impl WalReader {
                     }
                 }
             }
-            cur = WalCursor { segment_id: seg_id + 1, offset: SEG_HEADER_SIZE };
+            cur = WalCursor {
+                segment_id: seg_id + 1,
+                offset: SEG_HEADER_SIZE,
+            };
         }
 
         Ok(cur)
@@ -82,7 +91,10 @@ impl WalReader {
     /// Scan and collect all frames into a Vec.
     pub fn read_all(&self) -> WalResult<Vec<Frame>> {
         let mut frames = Vec::new();
-        self.scan(WalCursor::beginning(), |f| { frames.push(f); true })?;
+        self.scan(WalCursor::beginning(), |f| {
+            frames.push(f);
+            true
+        })?;
         Ok(frames)
     }
 
@@ -133,7 +145,7 @@ impl WalReader {
             return Err(WalError::ChainBroken {
                 sequence: broken_at,
                 expected: hex(&prev),
-                actual:   hex(&GENESIS_HASH), // placeholder; real value in the frame
+                actual: hex(&GENESIS_HASH), // placeholder; real value in the frame
             });
         }
 
@@ -145,43 +157,45 @@ impl WalReader {
     pub fn stats(&self) -> WalResult<WalStats> {
         let ids = self.segment_ids()?;
         let mut total_frames = 0u64;
-        let mut total_bytes  = 0u64;
-        let mut first_seq    = None;
-        let mut last_seq     = None;
-        let mut last_hash    = GENESIS_HASH;
+        let mut total_bytes = 0u64;
+        let mut first_seq = None;
+        let mut last_seq = None;
+        let mut last_hash = GENESIS_HASH;
 
         for &id in &ids {
             let path = segment_path(&self.config.dir, id);
             let mut r = SegmentReader::open(&path)?;
             let frames = r.all_frames()?;
             total_frames += frames.len() as u64;
-            total_bytes  += path.metadata()?.len();
+            total_bytes += path.metadata()?.len();
             for f in &frames {
-                if first_seq.is_none() { first_seq = Some(f.sequence); }
-                last_seq  = Some(f.sequence);
+                if first_seq.is_none() {
+                    first_seq = Some(f.sequence);
+                }
+                last_seq = Some(f.sequence);
                 last_hash = f.frame_hash;
             }
         }
 
         Ok(WalStats {
-            segments:       ids.len() as u64,
+            segments: ids.len() as u64,
             total_frames,
             total_bytes,
             first_sequence: first_seq.unwrap_or(0),
-            last_sequence:  last_seq.unwrap_or(0),
-            chain_tip:      last_hash,
+            last_sequence: last_seq.unwrap_or(0),
+            chain_tip: last_hash,
         })
     }
 }
 
 #[derive(Debug)]
 pub struct WalStats {
-    pub segments:       u64,
-    pub total_frames:   u64,
-    pub total_bytes:    u64,
+    pub segments: u64,
+    pub total_frames: u64,
+    pub total_bytes: u64,
     pub first_sequence: u64,
-    pub last_sequence:  u64,
-    pub chain_tip:      [u8; 32],
+    pub last_sequence: u64,
+    pub chain_tip: [u8; 32],
 }
 
 fn hex(bytes: &[u8]) -> String {

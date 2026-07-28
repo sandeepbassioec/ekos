@@ -34,7 +34,7 @@ use std::{
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
 
-use crate::{memtable::MemEntry, StoreError, StoreResult};
+use crate::{StoreError, StoreResult, memtable::MemEntry};
 
 const HEADER_MAGIC: &[u8; 8] = b"VVST0001";
 const FOOTER_MAGIC: &[u8; 8] = b"VVSTFOOT";
@@ -66,9 +66,15 @@ impl SsTableWriter {
             .map_err(|e| StoreError::Io(e.to_string()))?;
         let mut writer = BufWriter::new(file);
         // Write placeholder header (will be seeked back to fill count)
-        writer.write_all(HEADER_MAGIC).map_err(|e| StoreError::Io(e.to_string()))?;
-        writer.write_u32::<BigEndian>(0).map_err(|e| StoreError::Io(e.to_string()))?; // count placeholder
-        writer.write_u32::<BigEndian>(0).map_err(|e| StoreError::Io(e.to_string()))?; // pad
+        writer
+            .write_all(HEADER_MAGIC)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        writer
+            .write_u32::<BigEndian>(0)
+            .map_err(|e| StoreError::Io(e.to_string()))?; // count placeholder
+        writer
+            .write_u32::<BigEndian>(0)
+            .map_err(|e| StoreError::Io(e.to_string()))?; // pad
         Ok(SsTableWriter {
             path: path.as_ref().to_path_buf(),
             writer,
@@ -80,26 +86,37 @@ impl SsTableWriter {
 
     /// Append one entry. Entries MUST be supplied in sorted key order.
     pub fn append(&mut self, entry: &MemEntry) -> StoreResult<()> {
-        self.index_entries.push((entry.key.clone(), self.data_offset));
+        self.index_entries
+            .push((entry.key.clone(), self.data_offset));
 
         let key_len = entry.key.len() as u32;
-        self.writer.write_u32::<BigEndian>(key_len).map_err(|e| StoreError::Io(e.to_string()))?;
-        self.writer.write_all(&entry.key).map_err(|e| StoreError::Io(e.to_string()))?;
+        self.writer
+            .write_u32::<BigEndian>(key_len)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        self.writer
+            .write_all(&entry.key)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
 
         match &entry.value {
             Some(val) => {
-                self.writer.write_u8(VAL_TYPE_VALUE).map_err(|e| StoreError::Io(e.to_string()))?;
+                self.writer
+                    .write_u8(VAL_TYPE_VALUE)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
                 self.writer
                     .write_u32::<BigEndian>(val.len() as u32)
                     .map_err(|e| StoreError::Io(e.to_string()))?;
-                self.writer.write_all(val).map_err(|e| StoreError::Io(e.to_string()))?;
+                self.writer
+                    .write_all(val)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
                 self.data_offset += 4 + key_len as u64 + 1 + 4 + val.len() as u64;
             }
             None => {
                 self.writer
                     .write_u8(VAL_TYPE_TOMBSTONE)
                     .map_err(|e| StoreError::Io(e.to_string()))?;
-                self.writer.write_u32::<BigEndian>(0).map_err(|e| StoreError::Io(e.to_string()))?;
+                self.writer
+                    .write_u32::<BigEndian>(0)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
                 self.data_offset += 4 + key_len as u64 + 1 + 4;
             }
         }
@@ -116,7 +133,9 @@ impl SsTableWriter {
             self.writer
                 .write_u32::<BigEndian>(key.len() as u32)
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            self.writer.write_all(key).map_err(|e| StoreError::Io(e.to_string()))?;
+            self.writer
+                .write_all(key)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
             self.writer
                 .write_u64::<BigEndian>(*offset)
                 .map_err(|e| StoreError::Io(e.to_string()))?;
@@ -126,17 +145,26 @@ impl SsTableWriter {
         self.writer
             .write_u64::<BigEndian>(index_offset)
             .map_err(|e| StoreError::Io(e.to_string()))?;
-        self.writer.write_all(FOOTER_MAGIC).map_err(|e| StoreError::Io(e.to_string()))?;
+        self.writer
+            .write_all(FOOTER_MAGIC)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
 
-        self.writer.flush().map_err(|e| StoreError::Io(e.to_string()))?;
+        self.writer
+            .flush()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
 
         // Rewrite count in header
         {
-            let mut file = self.writer.into_inner().map_err(|e| StoreError::Io(e.to_string()))?;
-            file.seek(SeekFrom::Start(8)).map_err(|e| StoreError::Io(e.to_string()))?;
+            let mut file = self
+                .writer
+                .into_inner()
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            file.seek(SeekFrom::Start(8))
+                .map_err(|e| StoreError::Io(e.to_string()))?;
             {
                 let mut w = BufWriter::new(&mut file);
-                w.write_u32::<BigEndian>(self.count).map_err(|e| StoreError::Io(e.to_string()))?;
+                w.write_u32::<BigEndian>(self.count)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
                 w.flush().map_err(|e| StoreError::Io(e.to_string()))?;
                 // `w` drops here, releasing the mutable borrow on `file`
             }
@@ -171,21 +199,25 @@ impl SsTable {
     /// Open an existing SSTable and load its index into memory.
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut file = BufReader::new(
-            File::open(&path).map_err(|e| StoreError::Io(e.to_string()))?,
-        );
+        let mut file =
+            BufReader::new(File::open(&path).map_err(|e| StoreError::Io(e.to_string()))?);
 
         // Validate header magic
         let mut magic = [0u8; 8];
-        file.read_exact(&mut magic).map_err(|e| StoreError::Io(e.to_string()))?;
+        file.read_exact(&mut magic)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
         if &magic != HEADER_MAGIC {
             return Err(StoreError::Corrupt(format!(
                 "{}: bad header magic",
                 path.display()
             )));
         }
-        let count = file.read_u32::<BigEndian>().map_err(|e| StoreError::Io(e.to_string()))?;
-        let _pad = file.read_u32::<BigEndian>().map_err(|e| StoreError::Io(e.to_string()))?;
+        let count = file
+            .read_u32::<BigEndian>()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let _pad = file
+            .read_u32::<BigEndian>()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
 
         // Read footer for index_offset
         let file_len = std::fs::metadata(&path)
@@ -199,10 +231,12 @@ impl SsTable {
         }
         file.seek(SeekFrom::Start(file_len - FOOTER_LEN))
             .map_err(|e| StoreError::Io(e.to_string()))?;
-        let index_offset =
-            file.read_u64::<BigEndian>().map_err(|e| StoreError::Io(e.to_string()))?;
+        let index_offset = file
+            .read_u64::<BigEndian>()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
         let mut footer_magic = [0u8; 8];
-        file.read_exact(&mut footer_magic).map_err(|e| StoreError::Io(e.to_string()))?;
+        file.read_exact(&mut footer_magic)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
         if &footer_magic != FOOTER_MAGIC {
             return Err(StoreError::Corrupt(format!(
                 "{}: bad footer magic",
@@ -215,17 +249,32 @@ impl SsTable {
             .map_err(|e| StoreError::Io(e.to_string()))?;
         let index_end = file_len - FOOTER_LEN;
         let mut index = Vec::with_capacity(count as usize);
-        while file.stream_position().map_err(|e| StoreError::Io(e.to_string()))? < index_end {
-            let key_len =
-                file.read_u32::<BigEndian>().map_err(|e| StoreError::Io(e.to_string()))? as usize;
+        while file
+            .stream_position()
+            .map_err(|e| StoreError::Io(e.to_string()))?
+            < index_end
+        {
+            let key_len = file
+                .read_u32::<BigEndian>()
+                .map_err(|e| StoreError::Io(e.to_string()))? as usize;
             let mut key_buf = vec![0u8; key_len];
-            file.read_exact(&mut key_buf).map_err(|e| StoreError::Io(e.to_string()))?;
-            let offset =
-                file.read_u64::<BigEndian>().map_err(|e| StoreError::Io(e.to_string()))?;
-            index.push(IndexEntry { key: Bytes::from(key_buf), offset });
+            file.read_exact(&mut key_buf)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let offset = file
+                .read_u64::<BigEndian>()
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            index.push(IndexEntry {
+                key: Bytes::from(key_buf),
+                offset,
+            });
         }
 
-        Ok(SsTable { path, count, index, index_offset })
+        Ok(SsTable {
+            path,
+            count,
+            index,
+            index_offset,
+        })
     }
 
     /// Point lookup. Returns `Some(None)` for tombstone, `None` for not-found.
@@ -239,36 +288,42 @@ impl SsTable {
     }
 
     fn read_entry_at(&self, offset: u64) -> StoreResult<MemEntry> {
-        let mut file = BufReader::new(
-            File::open(&self.path).map_err(|e| StoreError::Io(e.to_string()))?,
-        );
+        let mut file =
+            BufReader::new(File::open(&self.path).map_err(|e| StoreError::Io(e.to_string()))?);
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| StoreError::Io(e.to_string()))?;
 
-        let key_len =
-            file.read_u32::<BigEndian>().map_err(|e| StoreError::Io(e.to_string()))? as usize;
+        let key_len = file
+            .read_u32::<BigEndian>()
+            .map_err(|e| StoreError::Io(e.to_string()))? as usize;
         let mut key_buf = vec![0u8; key_len];
-        file.read_exact(&mut key_buf).map_err(|e| StoreError::Io(e.to_string()))?;
+        file.read_exact(&mut key_buf)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
 
         let val_type = file.read_u8().map_err(|e| StoreError::Io(e.to_string()))?;
-        let val_len =
-            file.read_u32::<BigEndian>().map_err(|e| StoreError::Io(e.to_string()))? as usize;
+        let val_len = file
+            .read_u32::<BigEndian>()
+            .map_err(|e| StoreError::Io(e.to_string()))? as usize;
 
         let value = match val_type {
             VAL_TYPE_VALUE => {
                 let mut vbuf = vec![0u8; val_len];
-                file.read_exact(&mut vbuf).map_err(|e| StoreError::Io(e.to_string()))?;
+                file.read_exact(&mut vbuf)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
                 Some(Bytes::from(vbuf))
             }
             VAL_TYPE_TOMBSTONE => None,
             _ => {
                 return Err(StoreError::Corrupt(format!(
                     "unknown val_type {val_type} at offset {offset}"
-                )))
+                )));
             }
         };
 
-        Ok(MemEntry { key: Bytes::from(key_buf), value })
+        Ok(MemEntry {
+            key: Bytes::from(key_buf),
+            value,
+        })
     }
 
     /// Iterate all entries in sorted key order.
@@ -353,7 +408,11 @@ mod tests {
         let path = dir.path().join("scan.vvsst");
 
         let mut w = SsTableWriter::create(&path).unwrap();
-        for e in entries(&[("apple", Some("a")), ("banana", Some("b")), ("cherry", Some("c"))]) {
+        for e in entries(&[
+            ("apple", Some("a")),
+            ("banana", Some("b")),
+            ("cherry", Some("c")),
+        ]) {
             w.append(&e).unwrap();
         }
         w.finish().unwrap();

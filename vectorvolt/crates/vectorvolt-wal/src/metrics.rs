@@ -5,8 +5,8 @@
 //! moving average (EMA) with α = 0.1 — cheap, no heap allocation, good
 //! enough for operational dashboards.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Shared metrics handle — cheap to clone (Arc inside).
 #[derive(Clone, Default)]
@@ -43,15 +43,22 @@ impl BatcherMetrics {
     pub fn record_flush(&self, frame_count: u64, byte_count: u64, latency_us: u64) {
         let inner = &self.0;
         inner.fsync_count.fetch_add(1, Ordering::Relaxed);
-        inner.frames_committed.fetch_add(frame_count, Ordering::Relaxed);
-        inner.bytes_committed.fetch_add(byte_count, Ordering::Relaxed);
+        inner
+            .frames_committed
+            .fetch_add(frame_count, Ordering::Relaxed);
+        inner
+            .bytes_committed
+            .fetch_add(byte_count, Ordering::Relaxed);
         inner.batch_count.fetch_add(1, Ordering::Relaxed);
 
         // Update peak
         let mut prev = inner.peak_batch_size.load(Ordering::Relaxed);
         while frame_count > prev {
             match inner.peak_batch_size.compare_exchange_weak(
-                prev, frame_count, Ordering::Relaxed, Ordering::Relaxed,
+                prev,
+                frame_count,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(cur) => prev = cur,
@@ -113,14 +120,14 @@ impl BatcherMetrics {
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
-            fsync_count:     self.fsync_count(),
+            fsync_count: self.fsync_count(),
             frames_committed: self.frames_committed(),
             bytes_committed: self.bytes_committed(),
-            batch_count:     self.batch_count(),
-            avg_batch_size:  self.avg_batch_size(),
-            avg_latency_us:  self.avg_latency_us(),
+            batch_count: self.batch_count(),
+            avg_batch_size: self.avg_batch_size(),
+            avg_latency_us: self.avg_latency_us(),
             peak_batch_size: self.peak_batch_size(),
-            frames_dropped:  self.frames_dropped(),
+            frames_dropped: self.frames_dropped(),
         }
     }
 }
@@ -128,14 +135,14 @@ impl BatcherMetrics {
 /// Point-in-time snapshot of all batcher metrics.
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
-    pub fsync_count:      u64,
+    pub fsync_count: u64,
     pub frames_committed: u64,
-    pub bytes_committed:  u64,
-    pub batch_count:      u64,
-    pub avg_batch_size:   f64,
-    pub avg_latency_us:   f64,
-    pub peak_batch_size:  u64,
-    pub frames_dropped:   u64,
+    pub bytes_committed: u64,
+    pub batch_count: u64,
+    pub avg_batch_size: f64,
+    pub avg_latency_us: f64,
+    pub peak_batch_size: u64,
+    pub frames_dropped: u64,
 }
 
 impl std::fmt::Display for MetricsSnapshot {

@@ -43,9 +43,9 @@ pub fn segment_id_from_path(path: &Path) -> Option<u64> {
 
 #[derive(Debug, Clone)]
 pub struct SegmentHeader {
-    pub segment_id:  u64,
-    pub base_seq:    u64,
-    pub created_ns:  u64,
+    pub segment_id: u64,
+    pub base_seq: u64,
+    pub created_ns: u64,
 }
 
 impl SegmentHeader {
@@ -54,7 +54,11 @@ impl SegmentHeader {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        Self { segment_id, base_seq, created_ns }
+        Self {
+            segment_id,
+            base_seq,
+            created_ns,
+        }
     }
 
     pub fn write<W: Write>(&self, w: &mut W) -> WalResult<()> {
@@ -64,7 +68,7 @@ impl SegmentHeader {
         w.write_u64::<LittleEndian>(self.base_seq)?;
         w.write_u64::<LittleEndian>(self.created_ns)?;
         w.write_u32::<LittleEndian>(0)?; // flags
-        w.write_all(&[0u8; 24])?;        // reserved
+        w.write_all(&[0u8; 24])?; // reserved
         Ok(())
     }
 
@@ -72,31 +76,40 @@ impl SegmentHeader {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         if &magic != SEG_MAGIC {
-            return Err(WalError::InvalidSegmentMagic { path: path.to_owned() });
+            return Err(WalError::InvalidSegmentMagic {
+                path: path.to_owned(),
+            });
         }
         let version = r.read_u32::<LittleEndian>()?;
         if version > SEG_VERSION {
-            return Err(WalError::UnsupportedVersion { version, max: SEG_VERSION });
+            return Err(WalError::UnsupportedVersion {
+                version,
+                max: SEG_VERSION,
+            });
         }
         let segment_id = r.read_u64::<LittleEndian>()?;
-        let base_seq   = r.read_u64::<LittleEndian>()?;
+        let base_seq = r.read_u64::<LittleEndian>()?;
         let created_ns = r.read_u64::<LittleEndian>()?;
         let mut tail = [0u8; 28]; // flags(4) + reserved(24)
         r.read_exact(&mut tail)?;
-        Ok(Self { segment_id, base_seq, created_ns })
+        Ok(Self {
+            segment_id,
+            base_seq,
+            created_ns,
+        })
     }
 }
 
 // ── SegmentWriter ─────────────────────────────────────────────────────────────
 
 pub struct SegmentWriter {
-    pub id:          u64,
-    pub path:        PathBuf,
+    pub id: u64,
+    pub path: PathBuf,
     pub byte_offset: u64,
     pub frame_count: u64,
-    writer:          BufWriter<File>,
-    fsync:           bool,
-    max_bytes:       u64,
+    writer: BufWriter<File>,
+    fsync: bool,
+    max_bytes: u64,
 }
 
 impl SegmentWriter {
@@ -109,7 +122,10 @@ impl SegmentWriter {
         fsync: bool,
     ) -> WalResult<Self> {
         let path = segment_path(dir, segment_id);
-        let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
         let mut writer = BufWriter::new(file);
         SegmentHeader::new(segment_id, base_seq).write(&mut writer)?;
         writer.flush()?;
@@ -172,15 +188,19 @@ impl SegmentWriter {
 
 pub struct SegmentReader {
     pub header: SegmentHeader,
-    pub file:   File,
-    pub path:   PathBuf,
+    pub file: File,
+    pub path: PathBuf,
 }
 
 impl SegmentReader {
     pub fn open(path: &Path) -> WalResult<Self> {
         let mut file = File::open(path)?;
         let header = SegmentHeader::read(&mut file, &path.to_string_lossy())?;
-        Ok(Self { header, file, path: path.to_owned() })
+        Ok(Self {
+            header,
+            file,
+            path: path.to_owned(),
+        })
     }
 
     /// Read the next frame at the current file position.
@@ -241,7 +261,7 @@ pub fn list_segment_ids(dir: &Path) -> WalResult<Vec<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{PayloadType, GENESIS_HASH};
+    use crate::frame::{GENESIS_HASH, PayloadType};
     use tempfile::TempDir;
 
     #[test]
@@ -250,8 +270,11 @@ mod tests {
         let mut writer = SegmentWriter::create(dir.path(), 0, 1, 64 * 1024 * 1024, false).unwrap();
 
         let mut frame = Frame {
-            sequence: 1, timestamp_ns: 42, prev_hash: GENESIS_HASH,
-            payload_type: PayloadType::Data, payload: b"test payload".to_vec(),
+            sequence: 1,
+            timestamp_ns: 42,
+            prev_hash: GENESIS_HASH,
+            payload_type: PayloadType::Data,
+            payload: b"test payload".to_vec(),
             frame_hash: [0u8; 32],
         };
         let encoded = frame.encode();

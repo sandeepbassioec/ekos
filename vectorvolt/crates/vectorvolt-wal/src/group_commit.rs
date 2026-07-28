@@ -18,8 +18,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{oneshot, Notify};
-use tokio::time::{interval, Duration};
+use tokio::sync::{Notify, oneshot};
+use tokio::time::{Duration, interval};
 use tracing::{debug, error, warn};
 
 use crate::error::{WalError, WalResult};
@@ -57,8 +57,8 @@ pub struct BatcherConfig {
 impl Default for BatcherConfig {
     fn default() -> Self {
         BatcherConfig {
-            flush_interval:   Duration::from_micros(500),
-            max_batch_bytes:  4 * 1024 * 1024, // 4 MiB
+            flush_interval: Duration::from_micros(500),
+            max_batch_bytes: 4 * 1024 * 1024, // 4 MiB
             channel_capacity: 8192,
         }
     }
@@ -66,9 +66,9 @@ impl Default for BatcherConfig {
 
 #[derive(Clone)]
 pub struct GroupCommitBatcher {
-    tx:       crossbeam_channel::Sender<Submission>,
+    tx: crossbeam_channel::Sender<Submission>,
     shutdown: Arc<Notify>,
-    metrics:  BatcherMetrics,
+    metrics: BatcherMetrics,
 }
 
 impl GroupCommitBatcher {
@@ -81,19 +81,23 @@ impl GroupCommitBatcher {
     ) -> Self {
         Self::start_with_config(
             writer,
-            BatcherConfig { flush_interval, max_batch_bytes, channel_capacity },
+            BatcherConfig {
+                flush_interval,
+                max_batch_bytes,
+                channel_capacity,
+            },
         )
     }
 
     /// Spawn the batcher background task with explicit config.
     pub fn start_with_config(writer: WalWriter, cfg: BatcherConfig) -> Self {
         let (tx, rx) = crossbeam_channel::bounded::<Submission>(cfg.channel_capacity);
-        let shutdown  = Arc::new(Notify::new());
-        let metrics   = BatcherMetrics::new();
+        let shutdown = Arc::new(Notify::new());
+        let metrics = BatcherMetrics::new();
 
         let shutdown_bg = shutdown.clone();
-        let metrics_bg  = metrics.clone();
-        let max_bytes   = cfg.max_batch_bytes;
+        let metrics_bg = metrics.clone();
+        let max_bytes = cfg.max_batch_bytes;
 
         tokio::spawn(async move {
             let mut ticker = interval(cfg.flush_interval);
@@ -112,12 +116,16 @@ impl GroupCommitBatcher {
             }
         });
 
-        Self { tx, shutdown, metrics }
+        Self {
+            tx,
+            shutdown,
+            metrics,
+        }
     }
 
     fn drain_and_flush(
-        rx:      &crossbeam_channel::Receiver<Submission>,
-        writer:  &WalWriter,
+        rx: &crossbeam_channel::Receiver<Submission>,
+        writer: &WalWriter,
         max_batch_bytes: usize,
         metrics: &BatcherMetrics,
     ) {
@@ -129,21 +137,30 @@ impl GroupCommitBatcher {
                 Ok(s) => {
                     batch_bytes += s.payload.len();
                     batch.push(s);
-                    if batch_bytes >= max_batch_bytes { break; }
+                    if batch_bytes >= max_batch_bytes {
+                        break;
+                    }
                 }
-                Err(crossbeam_channel::TryRecvError::Empty)        => break,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
 
-        if batch.is_empty() { return; }
+        if batch.is_empty() {
+            return;
+        }
 
         let frame_count = batch.len() as u64;
-        debug!(count = frame_count, bytes = batch_bytes, "flushing group commit batch");
+        debug!(
+            count = frame_count,
+            bytes = batch_bytes,
+            "flushing group commit batch"
+        );
 
         let t0 = Instant::now();
 
-        let mut tips: Vec<WalResult<WalTip>> = batch.iter()
+        let mut tips: Vec<WalResult<WalTip>> = batch
+            .iter()
             .map(|s| writer.append(s.payload.clone()))
             .collect();
 
@@ -153,16 +170,16 @@ impl GroupCommitBatcher {
         if let Err(ref e) = flush_result {
             error!(error = %e, "WAL flush failed");
             for (sub, _) in batch.into_iter().zip(tips.drain(..)) {
-                let _ = sub.done_tx.send(Err(WalError::Io(
-                    std::io::Error::other(e.to_string()),
-                )));
+                let _ = sub
+                    .done_tx
+                    .send(Err(WalError::Io(std::io::Error::other(e.to_string()))));
             }
             return;
         }
 
         metrics.record_flush(frame_count, batch_bytes as u64, latency_us);
 
-        for (sub, tip) in batch.into_iter().zip(tips.into_iter()) {
+        for (sub, tip) in batch.into_iter().zip(tips) {
             let _ = sub.done_tx.send(tip);
         }
     }
@@ -180,9 +197,7 @@ impl GroupCommitBatcher {
                 self.metrics.record_drop();
                 Err(WalError::Backpressure)
             }
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                Err(WalError::ChannelClosed)
-            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(WalError::ChannelClosed),
         }
     }
 
@@ -237,19 +252,17 @@ mod tests {
         let cfg = WalConfig::default().with_dir(dir.path()).with_fsync(false);
         let writer = WalWriter::open(cfg).unwrap();
 
-        let batcher = GroupCommitBatcher::start(
-            writer,
-            Duration::from_micros(200),
-            4 * 1024 * 1024,
-            8192,
-        );
+        let batcher =
+            GroupCommitBatcher::start(writer, Duration::from_micros(200), 4 * 1024 * 1024, 8192);
 
         let n = 50u32;
         let mut futs = Vec::new();
         for i in 0..n {
             futs.push(batcher.submit(i.to_le_bytes().to_vec()).unwrap());
         }
-        for f in futs { f.wait().await.unwrap(); }
+        for f in futs {
+            f.wait().await.unwrap();
+        }
 
         let snap = batcher.metrics().snapshot();
         assert_eq!(snap.frames_committed, n as u64);

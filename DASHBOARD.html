@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VectorVolt / EKOS / EKR — Master Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    min-height: 100vh;
+    padding: 24px;
+  }
+
+  h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: #f0f6fc;
+    margin-bottom: 4px;
+    letter-spacing: -0.3px;
+  }
+
+  .subtitle {
+    font-size: 13px;
+    color: #6e7681;
+    margin-bottom: 28px;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 16px;
+  }
+
+  .card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px 10px;
+    border-bottom: 1px solid #21262d;
+  }
+
+  .card-header .icon {
+    font-size: 18px;
+    line-height: 1;
+  }
+
+  .card-header h2 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #f0f6fc;
+    flex: 1;
+  }
+
+  .badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 12px;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+  }
+
+  .badge-done    { background: #1a4423; color: #3fb950; border: 1px solid #238636; }
+  .badge-next    { background: #1c2a3a; color: #58a6ff; border: 1px solid #1f6feb; }
+  .badge-planned { background: #1e1e2a; color: #a371f7; border: 1px solid #6e40c9; }
+  .badge-docs    { background: #221c1a; color: #e3b341; border: 1px solid #9e6a03; }
+
+  .card-body {
+    padding: 10px 16px 14px;
+  }
+
+  .link-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .link-list li {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  .link-list a {
+    font-size: 13px;
+    color: #58a6ff;
+    text-decoration: none;
+    line-height: 1.5;
+    transition: color 0.15s;
+  }
+
+  .link-list a:hover { color: #a5d3ff; text-decoration: underline; }
+
+  .link-list .tag {
+    font-size: 10px;
+    color: #6e7681;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .divider {
+    border: none;
+    border-top: 1px solid #21262d;
+    margin: 8px 0;
+  }
+
+  .section-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: #6e7681;
+    margin: 10px 0 5px;
+  }
+
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #8b949e;
+    padding: 3px 0;
+  }
+
+  .dot { font-size: 8px; }
+  .dot-done    { color: #3fb950; }
+  .dot-next    { color: #58a6ff; }
+  .dot-future  { color: #a371f7; }
+  .dot-block   { color: #f85149; }
+
+  .full-width {
+    grid-column: 1 / -1;
+  }
+
+  .impl-card .link-list li {
+    flex-wrap: wrap;
+  }
+
+  .perf-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin-top: 4px;
+  }
+
+  .perf-table th {
+    text-align: left;
+    font-weight: 600;
+    color: #6e7681;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 4px 8px 4px 0;
+    border-bottom: 1px solid #21262d;
+  }
+
+  .perf-table td {
+    padding: 4px 8px 4px 0;
+    color: #c9d1d9;
+    border-bottom: 1px solid #161b22;
+    vertical-align: top;
+  }
+
+  .perf-table td:last-child { color: #58a6ff; font-family: monospace; }
+
+  .note {
+    font-size: 11px;
+    color: #6e7681;
+    margin-top: 8px;
+    line-height: 1.5;
+  }
+
+  .note a { color: #8b949e; }
+  .note a:hover { color: #c9d1d9; }
+
+  .last-updated {
+    font-size: 11px;
+    color: #484f58;
+    text-align: right;
+    margin-top: 20px;
+  }
+</style>
+</head>
+<body>
+
+<h1>VectorVolt · EKOS · EKR · ESIP · EAIP</h1>
+<p class="subtitle">Master Dashboard — open on second monitor, updated after every session &nbsp;·&nbsp; Last updated: 2026-07-09</p>
+
+<div class="grid">
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- STATUS TRACKERS                                         -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+
+  <div class="card">
+    <div class="card-header">
+      <span class="icon">⚡</span>
+      <h2>VectorVolt</h2>
+      <span class="badge badge-next">Phase 2 Next</span>
+    </div>
+    <div class="card-body">
+      <ul class="link-list">
+        <li><a href="docs/status/STATUS_VECTORVOLT.md">STATUS_VECTORVOLT.md</a><span class="tag">live tracker</span></li>
+        <li><a href="docs/MASTER_IMPLEMENTATION_PLAN.md">MASTER_IMPLEMENTATION_PLAN.md</a><span class="tag">full plan</span></li>
+      </ul>
+      <hr class="divider">
+      <div class="section-label">Phase Summary</div>
+      <div class="status-row"><span class="dot dot-done">●</span> Phase 1 — WAL + Core Storage <strong style="color:#3fb950">COMPLETE</strong> (14 tests)</div>
+      <div class="status-row"><span class="dot dot-next">●</span> Phase 2 — Storage Engine Core + gRPC <strong style="color:#58a6ff">NEXT</strong></div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 3 — Graph + Embedding + CIP + SDKs</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 4 — Shadowbox + Admin + Pre-fetch</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 5 — ARP + MVCC + RDMA + PITR</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 6 — Cluster + SWIM + PostgreSQL wire</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 7 — Simulation + Kernel + vvctl TUI</div>
+      <hr class="divider">
+      <div class="section-label">Crate Status</div>
+      <div class="status-row"><span class="dot dot-done">●</span> vectorvolt-wal ✅ &nbsp; vectorvolt-store ✅</div>
+      <div class="status-row"><span class="dot dot-next">●</span> vectorvolt-index · storage · query · vector · server · vvctl</div>
+      <div class="status-row"><span class="dot dot-future">●</span> vectorvolt-graph · sdk-rust · sdk-dotnet · sdk-go · sdk-java · sdk-python</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <span class="icon">🧠</span>
+      <h2>EKOS Engine</h2>
+      <span class="badge badge-next">Phase 2 Next</span>
+    </div>
+    <div class="card-body">
+      <ul class="link-list">
+        <li><a href="docs/status/STATUS_EKOS.md">STATUS_EKOS.md</a><span class="tag">live tracker</span></li>
+      </ul>
+      <hr class="divider">
+      <div class="section-label">Phase Summary</div>
+      <div class="status-row"><span class="dot dot-done">●</span> Phase 1 — ekos-kernel + ekosd <strong style="color:#3fb950">COMPLETE</strong> (18 tests)</div>
+      <div class="status-row"><span class="dot dot-next">●</span> Phase 2 — ekos-security + observability foundation <strong style="color:#58a6ff">NEXT</strong></div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 3 — ekos-embedding + ekos-cip (CIP)</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 4 — ekos-workflow + Shadowbox + Admin + Pre-fetch</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 5 — ekos-arp + Behavioral Fingerprinting</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 6 — Reflexive Encrypted Runtime</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Phase 7 — Cluster + Simulation + kexec</div>
+      <hr class="divider">
+      <div class="section-label">Crate Status</div>
+      <div class="status-row"><span class="dot dot-done">●</span> ekos-kernel ✅ &nbsp; ekosd ✅</div>
+      <div class="status-row"><span class="dot dot-next">●</span> ekos-security (MFA + HMAC session)</div>
+      <div class="status-row"><span class="dot dot-future">●</span> ekos-embedding · ekos-cip · ekos-workflow · ekos-admin · ekos-prefetch · ekos-backup · ekos-arp · ekos-scm · ekos-build · ekos-upgrade</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <span class="icon">📦</span>
+      <h2>EKR + EKOS Knowledge OS</h2>
+      <span class="badge badge-next">Phase 1 MVP Next</span>
+    </div>
+    <div class="card-body">
+      <ul class="link-list">
+        <li><a href="docs/status/STATUS_EKR.md">STATUS_EKR.md</a><span class="tag">live tracker</span></li>
+        <li><a href="esip/docs/ekos/BUILD-PLAN-AND-OQ-TRIAGE.md">BUILD-PLAN-AND-OQ-TRIAGE.md</a><span class="tag">build plan</span></li>
+        <li><a href="esip/docs/ekos/00-MASTER-INDEX.md">00-MASTER-INDEX.md</a><span class="tag">27 volumes</span></li>
+        <li><a href="esip/docs/ekos/ADR-REGISTER.md">ADR-REGISTER.md</a><span class="tag">49 decisions</span></li>
+        <li><a href="esip/docs/ekos/PATENT-CANDIDATE-MATRIX.md">PATENT-CANDIDATE-MATRIX.md</a><span class="tag">29 families</span></li>
+      </ul>
+      <hr class="divider">
+      <div class="section-label">Requirements Status</div>
+      <div class="status-row"><span class="dot dot-done">●</span> 27-volume requirements catalog (~1,560 reqs) ✅ COMPLETE</div>
+      <div class="status-row"><span class="dot dot-done">●</span> 12 architecture docs A00–A11 ✅ COMPLETE</div>
+      <div class="status-row"><span class="dot dot-done">●</span> Cross-AI verified (9.3/10) ✅</div>
+      <div class="status-row"><span class="dot dot-next">●</span> Phase 1 MVP: graph foundation + widgets + ambient AI <strong style="color:#58a6ff">NEXT</strong></div>
+      <hr class="divider">
+      <div class="status-row dot-block"><span class="dot dot-block">●</span> <strong style="color:#f85149">BLOCKER:</strong> Rotate ai-proxy API keys before deploy</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <span class="icon">🔧</span>
+      <h2>ESIP</h2>
+      <span class="badge badge-next">Security Widget Pending</span>
+    </div>
+    <div class="card-body">
+      <ul class="link-list">
+        <li><a href="docs/status/STATUS_ESIP.md">STATUS_ESIP.md</a><span class="tag">live tracker</span></li>
+        <li><a href="esip/ESIP_CODEBASE_CONTEXT.md">ESIP_CODEBASE_CONTEXT.md</a><span class="tag">authoritative map</span></li>
+        <li><a href="esip/docs/SELLING_STRATEGY.md">SELLING_STRATEGY.md</a><span class="tag">strategy</span></li>
+      </ul>
+      <hr class="divider">
+      <div class="section-label">Shipped Features</div>
+      <div class="status-row"><span class="dot dot-done">●</span> PI Planning · Roadmap · Knowledge Hub · Requirements</div>
+      <div class="status-row"><span class="dot dot-done">●</span> Trade-off widget · NFR widget · Traceability Graph</div>
+      <div class="status-row"><span class="dot dot-done">●</span> BPMN · Matrix/Grid · draw.io import · A3/A1 PDF export</div>
+      <div class="status-row"><span class="dot dot-done">●</span> Real-time collab (Yjs) · C4/flow diagrams · Mermaid</div>
+      <hr class="divider">
+      <div class="section-label">Pending</div>
+      <div class="status-row"><span class="dot dot-next">●</span> Security widget &nbsp; <span class="dot dot-next">●</span> SAFe Step 7 metrics</div>
+      <div class="status-row dot-block"><span class="dot dot-block">●</span> <strong style="color:#f85149">BLOCKER:</strong> Rotate ai-proxy API keys (esip/ai-proxy/.env)</div>
+      <hr class="divider">
+      <div class="section-label">ESIP → EKOS Migration</div>
+      <div class="status-row"><span class="dot dot-next">●</span> M0 Rotate keys → M1 DAL port → M2 Graph → M3–M7</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <span class="icon">🗺️</span>
+      <h2>EAIP</h2>
+      <span class="badge badge-planned">Docs Complete, Build TBD</span>
+    </div>
+    <div class="card-body">
+      <ul class="link-list">
+        <li><a href="docs/status/STATUS_EAIP.md">STATUS_EAIP.md</a><span class="tag">live tracker</span></li>
+      </ul>
+      <hr class="divider">
+      <div class="section-label">What EAIP Is</div>
+      <div class="note">Enterprise Architecture Intelligence Platform. Maps enterprise tech landscape, detects drift via policy-as-code (OPA), time-travel graph queries. Direct predecessor to EKOS — architecture intelligence substrate. Discovered 2026-07-09 from <code>C:\eaip\</code> scan.</div>
+      <hr class="divider">
+      <div class="section-label">Status</div>
+      <div class="status-row"><span class="dot dot-done">●</span> Architecture docs complete (FR-001–010, graph model) ✅</div>
+      <div class="status-row"><span class="dot dot-done">●</span> Graph model: 9 node types, 7 edge types ✅</div>
+      <div class="status-row"><span class="dot dot-done">●</span> Commercial model: Community/Pro/Enterprise ✅</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Implementation: deferred until after VectorVolt Phase 2</div>
+      <div class="status-row"><span class="dot dot-future">●</span> Integration with VectorVolt graph storage: Phase 3+</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- LOCKED DECISIONS + PERF TARGETS                        -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+
+  <div class="card">
+    <div class="card-header">
+      <span class="icon">🔒</span>
+      <h2>Locked Decisions + Targets</h2>
+      <span class="badge badge-docs">Reference</span>
+    </div>
+    <div class="card-body">
+      <ul class="link-list">
+        <li><a href="docs/vision/VECTORVOLT_LOCKED_DECISIONS.md">VECTORVOLT_LOCKED_DECISIONS.md</a><span class="tag">48+ LDs</span></li>
+      </ul>
+      <hr class="divider">
+      <div class="section-label">Performance Targets (Locked)</div>
+      <table class="perf-table">
+        <tr><th>Metric</th><th>Target</th></tr>
+        <tr><td>p99.9 memory path</td><td>&lt; 10 µs</td></tr>
+        <tr><td>p99 with WAL fsync</td><td>&lt; 1 ms</td></tr>
+        <tr><td>Single-shard throughput</td><td>500K+ cmd/sec</td></tr>
+        <tr><td>Cluster throughput</td><td>10M+ cmd/sec</td></tr>
+        <tr><td>Max shards per cluster</td><td>65,536</td></tr>
+        <tr><td>Max cluster nodes</td><td>800+</td></tr>
+        <tr><td>Availability</td><td>99.999% (5 nines)</td></tr>
+        <tr><td>Failover time</td><td>&lt; 2 seconds</td></tr>
+        <tr><td>PITR granularity</td><td>Any millisecond</td></tr>
+        <tr><td>Read latency (stale default)</td><td>&lt; 120 ns (L1 hit)</td></tr>
+      </table>
+      <hr class="divider">
+      <div class="section-label">Key Locked Decisions</div>
+      <div class="note">
+        LD-SWIM · LD-VNODE · LD-EPOCH · LD-FAILOVER · LD-QUORUM · LD-GC · LD-PITR ·
+        LD-COLD · LD-READ-01 · LD-RUNTIME-01 · LD-PG-WIRE · LD-PROJ · LD-KAFKA ·
+        LD-DLQ · LD-SDK-01 · LD-ACID · LD-SNAP · LD-REPLAY · LD-CHAOS · LD-BATCH ·
+        LD-BACK · LD-ADAPT · LD-GATE · LD-MT-01…MT-08
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- ARCHITECTURE DOCS — VectorVolt                         -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+
+  <div class="card">
+    <div class="card-header">
+      <span class="icon">📐</span>
+      <h2>VectorVolt Architecture Docs</h2>
+      <span class="badge badge-docs">20 docs</span>
+    </div>
+    <div class="card-body">
+      <div class="section-label">Core Engine</div>
+      <ul class="link-list">
+        <li><a href="docs/vision/VECTORVOLT_CORE_ARCHITECTURE.md">VECTORVOLT_CORE_ARCHITECTURE.md</a><span class="tag">full overview</span></li>
+        <li><a href="docs/vision/CPU_CACHE_NUMA_ISOLATION.md">CPU_CACHE_NUMA_ISOLATION.md</a><span class="tag">NUMA · SIMD · false sharing</span></li>
+        <li><a href="docs/vision/QUERY_EXECUTION_MODEL.md">QUERY_EXECUTION_MODEL.md</a><span class="tag">7 access patterns</span></li>
+        <li><a href="docs/vision/READ_PATH_ARCHITECTURE.md">READ_PATH_ARCHITECTURE.md</a><span class="tag">nanosecond reads</span></li>
+        <li><a href="docs/vision/STORAGE_ENGINE_ADVANCED.md">STORAGE_ENGINE_ADVANCED.md</a><span class="tag">QoS · fingerprints · checksums</span></li>
+        <li><a href="docs/vision/PREDICTIVE_PREFETCH_ENGINE.md">PREDICTIVE_PREFETCH_ENGINE.md</a><span class="tag">Markov pre-fetch</span></li>
+      </ul>
+      <div class="section-label" style="margin-top:10px">Distributed + Storage</div>
+      <ul class="link-list">
+        <li><a href="docs/vision/VECTORVOLT_LOCKED_DECISIONS.md">VECTORVOLT_LOCKED_DECISIONS.md</a><span class="tag">48+ LD codes</span></li>
+        <li><a href="docs/vision/VECTORVOLT_DISTRIBUTED_REPLICATION.md">VECTORVOLT_DISTRIBUTED_REPLICATION.md</a><span class="tag">SWIM · Raft · VNodes · PG wire</span></li>
+        <li><a href="docs/vision/VECTORVOLT_STORAGE_TIERING.md">VECTORVOLT_STORAGE_TIERING.md</a><span class="tag">L0–L4 · PITR · projections</span></li>
+      </ul>
+      <div class="section-label" style="margin-top:10px">Graph + LLM + Advanced</div>
+      <ul class="link-list">
+        <li><a href="docs/vision/IN_PROCESS_LLM_EMBEDDING.md">IN_PROCESS_LLM_EMBEDDING.md</a><span class="tag">VECTOR · HNSW · LoRA</span></li>
+        <li><a href="docs/vision/GRAPH_RELATIONAL_BRIDGE.md">GRAPH_RELATIONAL_BRIDGE.md</a><span class="tag">property graph over relational</span></li>
+        <li><a href="docs/vision/HARDWARE_FRONTIER.md">HARDWARE_FRONTIER.md</a><span class="tag">QAT · DSA · RDMA · CXL · FPGA</span></li>
+        <li><a href="docs/vision/RESEARCH_FRONTIER.md">RESEARCH_FRONTIER.md</a><span class="tag">double-write · retroactive rollback</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- ARCHITECTURE DOCS — EKOS Engine                        -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+
+  <div class="card">
+    <div class="card-header">
+      <span class="icon">🔄</span>
+      <h2>EKOS Engine Architecture Docs</h2>
+      <span class="badge badge-docs">7 docs</span>
+    </div>
+    <div class="card-body">
+      <ul class="link-list">
+        <li><a href="docs/vision/AUTONOMOUS_RUNTIME_VISION.md">AUTONOMOUS_RUNTIME_VISION.md</a><span class="tag">CIP · ARP · Shadowbox · fingerprinting · simulation</span></li>
+        <li><a href="docs/vision/BUILD_SANDBOX_ADMIN.md">BUILD_SANDBOX_ADMIN.md</a><span class="tag">sandbox · admin UI · build system</span></li>
+        <li><a href="docs/vision/DEPENDENCY_SELF_UPGRADE.md">DEPENDENCY_SELF_UPGRADE.md</a><span class="tag">Class A/B/C upgrade · eBPF · kexec</span></li>
+        <li><a href="docs/vision/SOURCE_CONTROL_STRATEGY.md">SOURCE_CONTROL_STRATEGY.md</a><span class="tag">internal SCM on KoStore</span></li>
+        <li><a href="docs/vision/EVOLUTION_ENGINE_AS_A_SERVICE.md">EVOLUTION_ENGINE_AS_A_SERVICE.md</a><span class="tag">commercial SaaS offering</span></li>
+        <li><a href="docs/security/MFA_SESSION_MANDATE.md">MFA_SESSION_MANDATE.md</a><span class="tag">SSH MFA · Phase 2 blocker</span></li>
+        <li><a href="docs/security/BACKUP_STRATEGY.md">BACKUP_STRATEGY.md</a><span class="tag">3-2-1 backup · 4-layer strategy</span></li>
+      </ul>
+      <hr class="divider">
+      <div class="section-label">Traceability</div>
+      <ul class="link-list">
+        <li><a href="docs/traceability/TRACEABILITY.md">TRACEABILITY.md</a><span class="tag">cross-doc traceability matrix</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- EKR ARCHITECTURE DOCS                                   -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+
+  <div class="card">
+    <div class="card-header">
+      <span class="icon">🏛️</span>
+      <h2>EKR / EKOS Knowledge OS Arch Docs</h2>
+      <span class="badge badge-docs">12 docs (A00–A11)</span>
+    </div>
+    <div class="card-body">
+      <ul class="link-list">
+        <li><a href="esip/docs/ekos/architecture/A00-ARCHITECTURE-INDEX.md">A00 — Architecture Index</a></li>
+        <li><a href="esip/docs/ekos/architecture/A01-VISION-AND-QUALITY-ATTRIBUTES.md">A01 — Vision + Quality Attributes</a></li>
+        <li><a href="esip/docs/ekos/architecture/A02-LOGICAL-ARCHITECTURE.md">A02 — Logical Architecture (5-layer OS)</a></li>
+        <li><a href="esip/docs/ekos/architecture/A03-TECH-SELECTION-ADRS.md">A03 — Tech Selection ADRs</a></li>
+        <li><a href="esip/docs/ekos/architecture/A04-DATA-ARCHITECTURE.md">A04 — Data Architecture (bitemporal)</a></li>
+        <li><a href="esip/docs/ekos/architecture/A05-AI-ARCHITECTURE.md">A05 — AI Architecture</a></li>
+        <li><a href="esip/docs/ekos/architecture/A06-SECURITY-ARCHITECTURE.md">A06 — Security Architecture</a></li>
+        <li><a href="esip/docs/ekos/architecture/A07-INTEGRATION-ARCHITECTURE.md">A07 — Integration Architecture</a></li>
+        <li><a href="esip/docs/ekos/architecture/A08-DEPLOYMENT-ARCHITECTURE.md">A08 — Deployment Architecture</a></li>
+        <li><a href="esip/docs/ekos/architecture/A09-15-YEAR-SUSTAINABILITY.md">A09 — 15-Year Sustainability</a></li>
+        <li><a href="esip/docs/ekos/architecture/A10-ESIP-EKOS-MIGRATION.md">A10 — ESIP→EKOS Migration (M0–M7)</a></li>
+        <li><a href="esip/docs/ekos/architecture/A11-IMPLEMENTATION-PLAN.md">A11 — Implementation Plan (16 epics)</a></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- MASTER PLAN (full width)                               -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+
+  <div class="card full-width impl-card">
+    <div class="card-header">
+      <span class="icon">📋</span>
+      <h2>Master Implementation Plan — All Phases</h2>
+      <span class="badge badge-next">Primary Reference</span>
+    </div>
+    <div class="card-body">
+      <ul class="link-list">
+        <li><a href="docs/MASTER_IMPLEMENTATION_PLAN.md">MASTER_IMPLEMENTATION_PLAN.md</a><span class="tag">single source of truth — every item, every phase, every status</span></li>
+      </ul>
+      <hr class="divider">
+      <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; margin-top:4px;">
+        <div>
+          <div class="section-label">Phase 1 ✅</div>
+          <div class="note">WAL · KoStore · 14 tests · Windows MSVC · CI pipelines · EKOS kernel · 18 tests</div>
+        </div>
+        <div>
+          <div class="section-label">Phase 2 ⬜ NEXT</div>
+          <div class="note">vectorvolt-index · vectorvolt-storage · vectorvolt-query · vectorvolt-vector · vectorvolt-server · vvctl · ekos-security · observability foundation</div>
+        </div>
+        <div>
+          <div class="section-label">Phase 3 🔵</div>
+          <div class="note">vectorvolt-graph · SDK-rust · SDK-dotnet · ekos-embedding · ekos-cip (CIP) · QoS priority queue · synthetic data · Intel QAT · Backup Layer 1</div>
+        </div>
+        <div>
+          <div class="section-label">Phase 4 🔵</div>
+          <div class="note">Shadowbox · PromotionEngine · Admin UI (Svelte) · ekos-prefetch · HITL Index Advisor · Intel DSA · Class A upgrade · SDK-go/java/python · Backup Layer 2+3</div>
+        </div>
+        <div>
+          <div class="section-label">Phase 5 🔵</div>
+          <div class="note">ekos-arp · ARP full loop · Evidence Correlation · Behavioral Fingerprinting · Self-upgrading binary · LoRA fine-tune · MVCC · Vectorized joins · PITR · Projection workers · RDMA WAL · ekos-scm</div>
+        </div>
+        <div>
+          <div class="section-label">Phase 6 🔵</div>
+          <div class="note">SWIM membership · 4096 VNodes · Raft per shard · Epoch fencing · Read Fabric binary · PostgreSQL wire · &lt;2s failover · Encrypted KO source · Build-from-KO · Class C eBPF/kmod</div>
+        </div>
+        <div>
+          <div class="section-label">Phase 7 🔵</div>
+          <div class="note">6 simulation modes · vvctl TUI (ratatui) · kexec kernel upgrade · FederationFrame · Full cluster ARP/CIP/Shadowbox</div>
+        </div>
+        <div>
+          <div class="section-label">Phase 7+ 🔵</div>
+          <div class="note">Evolution Engine as SaaS · Evidence SDK · Multi-language synthesis · Evolution Knowledge Graph · Digital Twin · OSS release · livepatch · CXL consensus</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<p class="last-updated">
+  Dashboard: <code>DASHBOARD.html</code> at repo root &nbsp;·&nbsp;
+  Docs: <code>docs/status/</code> (live trackers) &nbsp;·&nbsp;
+  Architecture: <code>docs/vision/</code> (spec docs) &nbsp;·&nbsp;
+  Rule: update status trackers after every session
+</p>
+
+</body>
+</html>

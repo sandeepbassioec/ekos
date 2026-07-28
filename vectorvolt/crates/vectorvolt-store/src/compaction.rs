@@ -9,18 +9,14 @@
 //! The merge iterator uses a min-heap keyed on (key, table_index_desc) so
 //! that for equal keys the newest table wins without extra de-dup logic.
 
-use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
-    path::Path,
-};
+use std::{cmp::Reverse, collections::BinaryHeap, path::Path};
 
 use bytes::Bytes;
 
 use crate::{
+    StoreResult,
     memtable::MemEntry,
     sstable::{SsTable, SsTableWriter, sstable_path},
-    StoreResult,
 };
 
 // --------------------------------------------------------------------------
@@ -36,7 +32,11 @@ struct TableCursor {
 
 impl TableCursor {
     fn new(sst: &SsTable, table_id: u64) -> StoreResult<Self> {
-        Ok(TableCursor { entries: sst.iter()?, pos: 0, table_id })
+        Ok(TableCursor {
+            entries: sst.iter()?,
+            pos: 0,
+            table_id,
+        })
     }
 
     fn peek(&self) -> Option<&MemEntry> {
@@ -98,7 +98,11 @@ impl MergeIter {
             cursors.push(cursor);
         }
 
-        Ok(MergeIter { cursors, heap, last_key: None })
+        Ok(MergeIter {
+            cursors,
+            heap,
+            last_key: None,
+        })
     }
 }
 
@@ -177,7 +181,11 @@ pub fn compact(
 
     writer.finish()?;
 
-    Ok(CompactionResult { output_path: out_path, entries_written, tombstones_dropped })
+    Ok(CompactionResult {
+        output_path: out_path,
+        entries_written,
+        tombstones_dropped,
+    })
 }
 
 #[cfg(test)]

@@ -68,8 +68,12 @@ fn ko_get_returns_latest_version() {
     let v1 = store.ko_put(ko).unwrap();
     let id = v1.id.as_str();
 
-    let v2 = store.ko_put(v1.next_version(r#"{"title":"v2"}"#.as_bytes())).unwrap();
-    let _v3 = store.ko_put(v2.next_version(r#"{"title":"v3"}"#.as_bytes())).unwrap();
+    let v2 = store
+        .ko_put(v1.next_version(r#"{"title":"v2"}"#.as_bytes()))
+        .unwrap();
+    let _v3 = store
+        .ko_put(v2.next_version(r#"{"title":"v3"}"#.as_bytes()))
+        .unwrap();
 
     let fetched = store.ko_get("ekos", &id).unwrap();
     assert_eq!(fetched.version, 3);
@@ -120,8 +124,12 @@ fn ko_delete_excluded_from_scan() {
     let dir = TempDir::new().unwrap();
     let store = open(dir.path());
 
-    let alive = store.ko_put(req("ekos", "Requirement", r#"{"title":"alive"}"#)).unwrap();
-    let dead  = store.ko_put(req("ekos", "Requirement", r#"{"title":"dead"}"#)).unwrap();
+    let alive = store
+        .ko_put(req("ekos", "Requirement", r#"{"title":"alive"}"#))
+        .unwrap();
+    let dead = store
+        .ko_put(req("ekos", "Requirement", r#"{"title":"dead"}"#))
+        .unwrap();
     store.ko_delete("ekos", &dead.id.as_str()).unwrap();
 
     let results = store.ko_scan("ekos", None, None).unwrap();
@@ -138,8 +146,8 @@ fn ko_scan_returns_all_active_in_namespace() {
     let store = open(dir.path());
 
     store.ko_put(req("ekos", "Requirement", "{}")).unwrap();
-    store.ko_put(req("ekos", "Decision",    "{}")).unwrap();
-    store.ko_put(req("ekos", "Component",   "{}")).unwrap();
+    store.ko_put(req("ekos", "Decision", "{}")).unwrap();
+    store.ko_put(req("ekos", "Component", "{}")).unwrap();
 
     let results = store.ko_scan("ekos", None, None).unwrap();
     assert_eq!(results.len(), 3);
@@ -152,7 +160,7 @@ fn ko_scan_filtered_by_kind() {
 
     store.ko_put(req("ekos", "Requirement", "{}")).unwrap();
     store.ko_put(req("ekos", "Requirement", "{}")).unwrap();
-    store.ko_put(req("ekos", "Decision",    "{}")).unwrap();
+    store.ko_put(req("ekos", "Decision", "{}")).unwrap();
 
     let reqs = store.ko_scan("ekos", Some("Requirement"), None).unwrap();
     assert_eq!(reqs.len(), 2);
@@ -164,8 +172,8 @@ fn ko_scan_namespace_isolation() {
     let dir = TempDir::new().unwrap();
     let store = open(dir.path());
 
-    store.ko_put(req("ekos",  "Requirement", "{}")).unwrap();
-    store.ko_put(req("esip",  "Requirement", "{}")).unwrap();
+    store.ko_put(req("ekos", "Requirement", "{}")).unwrap();
+    store.ko_put(req("esip", "Requirement", "{}")).unwrap();
 
     let ekos_results = store.ko_scan("ekos", None, None).unwrap();
     let esip_results = store.ko_scan("esip", None, None).unwrap();
@@ -197,8 +205,12 @@ fn ko_history_returns_all_versions() {
 
     let ko = req("ekos", "Decision", r#"{"status":"draft"}"#);
     let v1 = store.ko_put(ko).unwrap();
-    let v2 = store.ko_put(v1.next_version(r#"{"status":"proposed"}"#.as_bytes())).unwrap();
-    let _v3 = store.ko_put(v2.next_version(r#"{"status":"approved"}"#.as_bytes())).unwrap();
+    let v2 = store
+        .ko_put(v1.next_version(r#"{"status":"proposed"}"#.as_bytes()))
+        .unwrap();
+    let _v3 = store
+        .ko_put(v2.next_version(r#"{"status":"approved"}"#.as_bytes()))
+        .unwrap();
 
     let id = v1.id.as_str();
     let history = store.ko_history("ekos", &id).unwrap();
@@ -241,7 +253,7 @@ fn ko_query_tag_finds_tagged_kos() {
 
     let ko1 = req("ekos", "Requirement", "{}").with_tags(["phase-1", "critical"]);
     let ko2 = req("ekos", "Requirement", "{}").with_tags(["phase-2"]);
-    let ko3 = req("ekos", "Decision",    "{}").with_tags(["phase-1"]);
+    let ko3 = req("ekos", "Decision", "{}").with_tags(["phase-1"]);
 
     store.ko_put(ko1).unwrap();
     store.ko_put(ko2).unwrap();
@@ -283,6 +295,12 @@ fn ko_query_tag_updates_when_tags_change() {
     v2.tags = vec!["new-tag".to_string()];
     store.ko_put(v2).unwrap();
 
-    assert_eq!(store.ko_query_tag("ekos", "old-tag", None).unwrap().len(), 0);
-    assert_eq!(store.ko_query_tag("ekos", "new-tag", None).unwrap().len(), 1);
+    assert_eq!(
+        store.ko_query_tag("ekos", "old-tag", None).unwrap().len(),
+        0
+    );
+    assert_eq!(
+        store.ko_query_tag("ekos", "new-tag", None).unwrap().len(),
+        1
+    );
 }

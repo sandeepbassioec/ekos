@@ -17,11 +17,11 @@ use parking_lot::RwLock;
 use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
 
 use crate::{
+    StoreError, StoreResult,
     compaction::compact,
     memtable::MemTable,
     record::LogRecord,
     sstable::{SsTable, SsTableWriter, sstable_path},
-    StoreError, StoreResult,
 };
 
 // --------------------------------------------------------------------------
@@ -82,10 +82,10 @@ impl Manifest {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let s = name.to_string_lossy();
-                if s.ends_with(".vvsst") {
-                    if let Ok(id) = s.trim_end_matches(".vvsst").parse::<u64>() {
-                        ids.push(id);
-                    }
+                if let Some(stem) = s.strip_suffix(".vvsst")
+                    && let Ok(id) = stem.parse::<u64>()
+                {
+                    ids.push(id);
                 }
             }
         }
@@ -99,7 +99,10 @@ impl Manifest {
         }
 
         let next_sst_id = ids.last().map(|&id| id + 1).unwrap_or(1);
-        Ok(Manifest { tables, next_sst_id })
+        Ok(Manifest {
+            tables,
+            next_sst_id,
+        })
     }
 
     fn next_id(&mut self) -> u64 {
@@ -127,7 +130,7 @@ impl StoreInner {
         if self.active.is_empty() {
             return Ok(());
         }
-        let table = std::mem::replace(&mut self.active, MemTable::new());
+        let table = std::mem::take(&mut self.active);
         let id = self.manifest.next_id();
         let path = sstable_path(&self.cfg.dir, id);
 
@@ -206,7 +209,9 @@ impl KvStore {
         // Replay WAL into a fresh memtable (frames the SSTables don't cover)
         let mut active = MemTable::new();
         let wal_reader = WalReader::open(wal_cfg);
-        let frames = wal_reader.read_all().map_err(|e| StoreError::Wal(e.to_string()))?;
+        let frames = wal_reader
+            .read_all()
+            .map_err(|e| StoreError::Wal(e.to_string()))?;
         for frame in frames {
             let rec = LogRecord::decode(Bytes::from(frame.payload))?;
             match rec {
@@ -233,10 +238,15 @@ impl KvStore {
     pub fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> StoreResult<()> {
         let key = key.into();
         let value = value.into();
-        let rec = LogRecord::Put { key: key.clone(), value: value.clone() };
+        let rec = LogRecord::Put {
+            key: key.clone(),
+            value: value.clone(),
+        };
 
         let mut g = self.inner.write();
-        g.wal.append(rec.encode().to_vec()).map_err(|e| StoreError::Wal(e.to_string()))?;
+        g.wal
+            .append(rec.encode().to_vec())
+            .map_err(|e| StoreError::Wal(e.to_string()))?;
         g.active.put(key, value);
 
         let threshold = g.cfg.memtable_flush_threshold;
@@ -252,7 +262,9 @@ impl KvStore {
         let rec = LogRecord::Delete { key: key.clone() };
 
         let mut g = self.inner.write();
-        g.wal.append(rec.encode().to_vec()).map_err(|e| StoreError::Wal(e.to_string()))?;
+        g.wal
+            .append(rec.encode().to_vec())
+            .map_err(|e| StoreError::Wal(e.to_string()))?;
         g.active.delete(key);
         Ok(())
     }
@@ -267,9 +279,12 @@ impl KvStore {
 
     /// Ordered, tombstone-free scan over memtable + SSTables.
     /// Used by ProjectionDispatcher — not intended for direct use.
-    pub fn scan_raw(&self, req: &crate::scan::ScanRequest) -> StoreResult<Vec<crate::scan::ScanEntry>> {
-        use std::collections::BTreeMap;
+    pub fn scan_raw(
+        &self,
+        req: &crate::scan::ScanRequest,
+    ) -> StoreResult<Vec<crate::scan::ScanEntry>> {
         use crate::scan::ScanEntry;
+        use std::collections::BTreeMap;
 
         let g = self.inner.read();
 
@@ -298,8 +313,12 @@ impl KvStore {
         let limit = req.limit.unwrap_or(usize::MAX);
         let mut results = Vec::new();
         for (key, value) in merged {
-            if results.len() >= limit { break; }
-            if req.range.past_end(&key) { break; }
+            if results.len() >= limit {
+                break;
+            }
+            if req.range.past_end(&key) {
+                break;
+            }
             if let Some(v) = value {
                 results.push(ScanEntry { key, value: v });
             }
@@ -314,7 +333,12 @@ impl KvStore {
             active_memtable_bytes: g.active.size_bytes(),
             active_memtable_entries: g.active.len(),
             sstable_count: g.manifest.tables.len(),
-            sstable_entries: g.manifest.tables.iter().map(|(s, _)| s.entry_count() as u64).sum(),
+            sstable_entries: g
+                .manifest
+                .tables
+                .iter()
+                .map(|(s, _)| s.entry_count() as u64)
+                .sum(),
         }
     }
 }

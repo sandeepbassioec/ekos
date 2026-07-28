@@ -46,8 +46,10 @@ pub fn cmd_stats(dir: PathBuf, fmt: OutputFormat) -> Result<()> {
         }
         OutputFormat::Text => {
             println!("VectorVolt Store — {}", dir.display());
-            println!("  Active memtable : {} entries ({} bytes)",
-                s.active_memtable_entries, s.active_memtable_bytes);
+            println!(
+                "  Active memtable : {} entries ({} bytes)",
+                s.active_memtable_entries, s.active_memtable_bytes
+            );
             println!("  SSTables        : {}", s.sstable_count);
             println!("  SSTable entries : {}", s.sstable_entries);
         }
@@ -65,15 +67,13 @@ pub fn cmd_get(dir: PathBuf, key: String, fmt: OutputFormat) -> Result<()> {
                 OutputFormat::Text => println!("{key} = {value}"),
             }
         }
-        None => {
-            match fmt {
-                OutputFormat::Json => println!("{}", json!({ "key": key, "value": null })),
-                OutputFormat::Text => {
-                    eprintln!("{key}: not found");
-                    std::process::exit(1);
-                }
+        None => match fmt {
+            OutputFormat::Json => println!("{}", json!({ "key": key, "value": null })),
+            OutputFormat::Text => {
+                eprintln!("{key}: not found");
+                std::process::exit(1);
             }
-        }
+        },
     }
     Ok(())
 }
@@ -105,11 +105,14 @@ pub fn cmd_compact(dir: PathBuf, fmt: OutputFormat) -> Result<()> {
     store.flush()?;
     let s = store.stats();
     match fmt {
-        OutputFormat::Json => println!("{}", json!({
-            "ok": true,
-            "sstable_count":   s.sstable_count,
-            "sstable_entries": s.sstable_entries,
-        })),
+        OutputFormat::Json => println!(
+            "{}",
+            json!({
+                "ok": true,
+                "sstable_count":   s.sstable_count,
+                "sstable_entries": s.sstable_entries,
+            })
+        ),
         OutputFormat::Text => println!(
             "compaction complete — {} SSTables, {} entries",
             s.sstable_count, s.sstable_entries
@@ -132,18 +135,19 @@ pub fn cmd_scan(
 
     let req = if let Some(p) = prefix {
         let mut r = ScanRequest::prefix(Bytes::from(p));
-        if let Some(n) = limit { r = r.with_limit(n); }
+        if let Some(n) = limit {
+            r = r.with_limit(n);
+        }
         r
     } else {
         let mut r = match (start, end) {
-            (Some(s), Some(e)) => ScanRequest::inclusive(
-                Bytes::from(s),
-                Bytes::from(e),
-            ),
+            (Some(s), Some(e)) => ScanRequest::inclusive(Bytes::from(s), Bytes::from(e)),
             (Some(s), None) => ScanRequest::from_start(Bytes::from(s)),
-            (None,    _)    => ScanRequest::full(),
+            (None, _) => ScanRequest::full(),
         };
-        if let Some(n) = limit { r = r.with_limit(n); }
+        if let Some(n) = limit {
+            r = r.with_limit(n);
+        }
         r
     };
 

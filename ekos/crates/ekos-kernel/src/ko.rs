@@ -116,7 +116,6 @@ pub struct KnowledgeObject {
     pub payload: Vec<u8>,
 
     // ── Bitemporal ──────────────────────────────────────────────────────────
-
     /// When this version of the fact became true in the real world.
     pub valid_from: DateTime<Utc>,
 
@@ -127,7 +126,6 @@ pub struct KnowledgeObject {
     pub tx_time: DateTime<Utc>,
 
     // ── Metadata ────────────────────────────────────────────────────────────
-
     /// Free-form tags for secondary index lookups.
     pub tags: Vec<String>,
 
@@ -140,23 +138,19 @@ pub struct KnowledgeObject {
 
 impl KnowledgeObject {
     /// Create a new version-1 KO.
-    pub fn new(
-        namespace: impl Into<String>,
-        kind: KoKind,
-        payload: impl Into<Vec<u8>>,
-    ) -> Self {
+    pub fn new(namespace: impl Into<String>, kind: KoKind, payload: impl Into<Vec<u8>>) -> Self {
         let now = Utc::now();
         KnowledgeObject {
-            id:          KoId::new(),
-            namespace:   namespace.into(),
+            id: KoId::new(),
+            namespace: namespace.into(),
             kind,
-            payload:     payload.into(),
-            valid_from:  now,
+            payload: payload.into(),
+            valid_from: now,
             valid_until: None,
-            tx_time:     now,
-            tags:        Vec::new(),
-            version:     1,
-            status:      KoStatus::Active,
+            tx_time: now,
+            tags: Vec::new(),
+            version: 1,
+            status: KoStatus::Active,
         }
     }
 
@@ -183,16 +177,16 @@ impl KnowledgeObject {
     /// tx_time is reset to now; all other fields are inherited.
     pub fn next_version(&self, payload: impl Into<Vec<u8>>) -> Self {
         KnowledgeObject {
-            id:          self.id.clone(),
-            namespace:   self.namespace.clone(),
-            kind:        self.kind.clone(),
-            payload:     payload.into(),
-            valid_from:  self.valid_from,
+            id: self.id.clone(),
+            namespace: self.namespace.clone(),
+            kind: self.kind.clone(),
+            payload: payload.into(),
+            valid_from: self.valid_from,
             valid_until: self.valid_until,
-            tx_time:     Utc::now(),
-            tags:        self.tags.clone(),
-            version:     self.version + 1,
-            status:      KoStatus::Active,
+            tx_time: Utc::now(),
+            tags: self.tags.clone(),
+            version: self.version + 1,
+            status: KoStatus::Active,
         }
     }
 

@@ -88,7 +88,9 @@ mod tests {
 
     #[test]
     fn roundtrip_delete() {
-        let r = LogRecord::Delete { key: Bytes::from("gone") };
+        let r = LogRecord::Delete {
+            key: Bytes::from("gone"),
+        };
         assert_eq!(LogRecord::decode(r.encode()).unwrap(), r);
     }
 }
