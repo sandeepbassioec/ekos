@@ -64,6 +64,19 @@ impl TxnManager {
         flush_dir: impl Into<PathBuf>,
         flush_threshold: usize,
     ) -> Self {
+        Self::with_starting_partition(wal, schema, flush_dir, flush_threshold, 0)
+    }
+
+    /// Like [`new`] but starts the partition counter at `start_partition_id`.
+    /// Use this when re-opening a table that already has flushed partitions on
+    /// disk — pass `max_existing_partition_id + 1` to avoid overwriting them.
+    pub fn with_starting_partition(
+        wal: WalWriter,
+        schema: Vec<String>,
+        flush_dir: impl Into<PathBuf>,
+        flush_threshold: usize,
+        start_partition_id: u16,
+    ) -> Self {
         let schema_width = schema.len();
         TxnManager {
             wal,
@@ -75,7 +88,7 @@ impl TxnManager {
             flush_dir: flush_dir.into(),
             schema,
             next_file_id: AtomicU16::new(0),
-            next_partition_id: AtomicU16::new(0),
+            next_partition_id: AtomicU16::new(start_partition_id),
             total_rows_flushed: AtomicU64::new(0),
         }
     }
@@ -212,6 +225,32 @@ impl TxnManager {
         }))
     }
 
+    // ── Recovery ───────────────────────────────────────────────────────────────
+
+    /// Rebuild the pk_index and CuckooFilter from a set of already-loaded
+    /// PartitionReaders.  Call this after `with_starting_partition` when
+    /// re-opening a table that has existing `.vvsst` files on disk so that
+    /// `get()` can find rows from previous sessions.
+    pub fn rebuild_pk_index_from_partitions(
+        &self,
+        partitions: &std::collections::HashMap<(u16, u16), vectorvolt_storage::PartitionReader>,
+    ) -> TxnResult<()> {
+        let mut idx = self.pk_index.write();
+        let mut flt = self.fk_filter.write();
+        for ((file_id, partition_id), reader) in partitions {
+            let pk_col = reader.read_column(0).map_err(TxnError::Storage)?;
+            let pks = pk_col.to_raw_vec();
+            for (offset, &pk) in pks.iter().enumerate() {
+                idx.insert(
+                    pk,
+                    RowDescriptor::new(*file_id, *partition_id, offset as u32),
+                )?;
+                flt.insert(pk)?;
+            }
+        }
+        Ok(())
+    }
+
     // ── Accessors ──────────────────────────────────────────────────────────────
 
     pub fn row_count_buffered(&self) -> usize {
@@ -220,6 +259,11 @@ impl TxnManager {
 
     pub fn total_rows_flushed(&self) -> u64 {
         self.total_rows_flushed.load(Ordering::Relaxed)
+    }
+
+    /// Seed the flushed-rows counter (used after re-open to reflect on-disk state).
+    pub fn set_total_rows_flushed(&self, count: u64) {
+        self.total_rows_flushed.store(count, Ordering::Relaxed);
     }
 }
 

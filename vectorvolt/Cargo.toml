@@ -6,6 +6,7 @@ members = [
     "crates/vectorvolt-storage",
     "crates/vectorvolt-query",
     "crates/vectorvolt-txn",
+    "crates/vectorvolt-engine",
     "crates/vvctl",
 ]
 resolver = "2"
@@ -53,6 +54,8 @@ vectorvolt-wal     = { path = "crates/vectorvolt-wal" }
 vectorvolt-index   = { path = "crates/vectorvolt-index" }
 vectorvolt-storage = { path = "crates/vectorvolt-storage" }
 vectorvolt-query   = { path = "crates/vectorvolt-query" }
+vectorvolt-txn     = { path = "crates/vectorvolt-txn" }
+vectorvolt-engine  = { path = "crates/vectorvolt-engine" }
 # testing
 tempfile       = "3.14"
 

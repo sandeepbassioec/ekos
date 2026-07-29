@@ -883,6 +883,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "vectorvolt-engine"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "tempfile",
+ "thiserror",
+ "vectorvolt-storage",
+ "vectorvolt-txn",
+ "vectorvolt-wal",
+]
+
+[[package]]
 name = "vectorvolt-index"
 version = "0.1.0"
 dependencies = [
@@ -982,6 +994,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vectorvolt-engine",
  "vectorvolt-store",
  "vectorvolt-wal",
 ]
