@@ -172,7 +172,7 @@ impl TableEngine {
         let col_count = reader.col_count() as usize;
         let mut values = Vec::with_capacity(col_count);
         for c in 0..col_count {
-            values.push(reader.read_column(c)?.get(row_offset));
+            values.push(reader.read_value(c, row_offset)?);
         }
 
         Ok(Some(EngineRow { pk, values }))

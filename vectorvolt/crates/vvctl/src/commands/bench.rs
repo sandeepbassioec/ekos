@@ -49,9 +49,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
     println!("\nVectorVolt in-process micro-benchmark");
     println!("rows={} warmup={} (release build required for real numbers)", args.rows, args.warmup);
     println!("{}", "─".repeat(60));
-    println!("INSERT includes WAL write() syscall (~4 µs floor on Windows).");
-    println!("GET reads full column per lookup — cost scales with partition size.");
-    println!("Both drop to sub-µs once kernel-bypass WAL + lazy column reads land.");
+    println!("INSERT includes WAL write() syscall (~4-6 µs floor on Windows).");
+    println!("GET uses lazy O(1) mmap reads — sub-microsecond at p50.");
+    println!("SCAN uses full column decode + zone pruning — cost scales with partition size.");
 
     let insert_nanos = bench_inserts(&engine, args.rows, args.warmup, args.flush_every)?;
 
