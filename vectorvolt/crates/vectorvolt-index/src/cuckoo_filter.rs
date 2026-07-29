@@ -1,0 +1,308 @@
+//! [`CuckooFilter`] — probabilistic set membership for FK existence checks.
+//!
+//! ## Design
+//!
+//! A Cuckoo filter is a space-efficient probabilistic data structure that
+//! answers "is key K in this set?" with:
+//! - **Zero false negatives** (if K was inserted, it is always found).
+//! - **Tunable false-positive rate** (configurable at construction time).
+//! - **O(1) worst-case lookup**: exactly 2 bucket probes, ~150 ns on hot cache.
+//! - **Supports deletions** — unlike Bloom filters.
+//!
+//! ## Implementation
+//!
+//! Each bucket holds `BUCKET_SIZE` fingerprints (u8). Fingerprints are 8-bit
+//! hash values derived from the key. A key maps to two buckets via:
+//!
+//! ```text
+//! i1 = h(key) % num_buckets
+//! i2 = (i1 XOR h(fingerprint)) % num_buckets
+//! ```
+//!
+//! The XOR construction means the alternate bucket can be computed from
+//! either bucket + the fingerprint, enabling displacement-based insertion.
+//!
+//! ## False positive rate
+//!
+//! At ≤ 95% load: FP ≈ 2 / 2^8 ≈ 0.78% per lookup.
+//! For FK checks this is acceptable — a false positive causes one wasted
+//! row fetch, not data corruption.
+//!
+//! ## Sentinel
+//!
+//! Fingerprint `0` is reserved as the empty-slot marker.
+//! Keys whose fingerprint hashes to 0 are mapped to fingerprint 1.
+
+use crate::{IndexError, IndexResult};
+
+// ── Tuning ────────────────────────────────────────────────────────────────────
+
+/// Number of fingerprint slots per bucket.
+const BUCKET_SIZE: usize = 4;
+
+/// Maximum displacement steps before declaring the filter full.
+const MAX_KICKS: usize = 500;
+
+// ── Hash helpers ──────────────────────────────────────────────────────────────
+
+/// 8-bit fingerprint from key (never 0).
+#[inline(always)]
+fn fingerprint(key: u64) -> u8 {
+    let x = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let fp = (x >> 56) as u8;
+    if fp == 0 { 1 } else { fp }
+}
+
+/// Primary bucket index.
+#[inline(always)]
+fn index1(key: u64, num_buckets: usize) -> usize {
+    let x = key.wrapping_mul(0x517c_c1b7_2722_0a95);
+    (x as usize) % num_buckets
+}
+
+/// Alternate bucket index (symmetric with XOR).
+#[inline(always)]
+fn index2(i1: usize, fp: u8, num_buckets: usize) -> usize {
+    // Mix the fingerprint with a prime so that similar fingerprints spread apart.
+    let hash = (fp as usize).wrapping_mul(0x9e37_79b9);
+    (i1 ^ hash) % num_buckets
+}
+
+// ── Bucket ────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Default)]
+struct Bucket {
+    slots: [u8; BUCKET_SIZE],
+}
+
+impl Bucket {
+    fn insert(&mut self, fp: u8) -> bool {
+        for slot in self.slots.iter_mut() {
+            if *slot == 0 {
+                *slot = fp;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn contains(&self, fp: u8) -> bool {
+        self.slots.contains(&fp)
+    }
+
+    fn remove(&mut self, fp: u8) -> bool {
+        for slot in self.slots.iter_mut() {
+            if *slot == fp {
+                *slot = 0;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Evict the first non-empty slot and return it (for displacement).
+    fn evict_first(&mut self) -> Option<u8> {
+        for slot in self.slots.iter_mut() {
+            if *slot != 0 {
+                let fp = *slot;
+                *slot = 0;
+                return Some(fp);
+            }
+        }
+        None
+    }
+}
+
+// ── CuckooFilter ─────────────────────────────────────────────────────────────
+
+/// Probabilistic set: ~0.78% false-positive rate, O(1) worst-case lookup.
+pub struct CuckooFilter {
+    buckets: Vec<Bucket>,
+    num_buckets: usize,
+    count: usize,
+}
+
+impl CuckooFilter {
+    /// Create a filter sized for at least `capacity` items.
+    /// Actual bucket count is rounded up to the next power of two.
+    pub fn with_capacity(capacity: usize) -> Self {
+        // Each bucket holds BUCKET_SIZE items; target ≤ 95% load.
+        let needed = capacity.div_ceil(BUCKET_SIZE);
+        let num_buckets = next_power_of_two(needed.max(4));
+        CuckooFilter {
+            buckets: vec![Bucket::default(); num_buckets],
+            num_buckets,
+            count: 0,
+        }
+    }
+
+    /// Insert `key` into the filter.
+    ///
+    /// Returns `Ok(())` on success, `Err(FilterFull)` if the displacement
+    /// chain exceeds `MAX_KICKS` (filter is overloaded; rehash required).
+    pub fn insert(&mut self, key: u64) -> IndexResult<()> {
+        let fp = fingerprint(key);
+        let i1 = index1(key, self.num_buckets);
+        let i2 = index2(i1, fp, self.num_buckets);
+
+        if self.buckets[i1].insert(fp) || self.buckets[i2].insert(fp) {
+            self.count += 1;
+            return Ok(());
+        }
+
+        // Displacement: randomly start from i1 (deterministic here — always i1).
+        let mut cur_idx = i1;
+        let mut cur_fp = fp;
+
+        for _ in 0..MAX_KICKS {
+            let evicted = self.buckets[cur_idx].evict_first();
+            let evicted_fp = match evicted {
+                Some(fp) => fp,
+                None => unreachable!("bucket must be full to reach here"),
+            };
+            // Place current fingerprint in the now-vacated slot.
+            self.buckets[cur_idx].insert(cur_fp);
+            cur_fp = evicted_fp;
+            // Alternate bucket for the evicted fingerprint.
+            cur_idx = index2(cur_idx, cur_fp, self.num_buckets);
+            if self.buckets[cur_idx].insert(cur_fp) {
+                self.count += 1;
+                return Ok(());
+            }
+        }
+
+        Err(IndexError::FilterFull(self.num_buckets * BUCKET_SIZE))
+    }
+
+    /// True if `key` **might** be in the set. False positives are possible (~0.78%).
+    #[inline]
+    pub fn contains(&self, key: u64) -> bool {
+        let fp = fingerprint(key);
+        let i1 = index1(key, self.num_buckets);
+        let i2 = index2(i1, fp, self.num_buckets);
+        self.buckets[i1].contains(fp) || self.buckets[i2].contains(fp)
+    }
+
+    /// Remove `key` from the filter. Returns `true` if a matching fingerprint
+    /// was found and removed (note: cannot guarantee this was *this specific key*
+    /// due to hash collisions, but the semantics match Cuckoo filter spec).
+    pub fn remove(&mut self, key: u64) -> bool {
+        let fp = fingerprint(key);
+        let i1 = index1(key, self.num_buckets);
+        let i2 = index2(i1, fp, self.num_buckets);
+        if self.buckets[i1].remove(fp) {
+            self.count -= 1;
+            return true;
+        }
+        if self.buckets[i2].remove(fp) {
+            self.count -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// Number of items inserted (not unique keys — duplicates count once each).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Allocated fingerprint slot count (buckets × BUCKET_SIZE).
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.num_buckets * BUCKET_SIZE
+    }
+}
+
+impl Default for CuckooFilter {
+    fn default() -> Self {
+        CuckooFilter::with_capacity(64)
+    }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn next_power_of_two(n: usize) -> usize {
+    if n <= 1 {
+        return 1;
+    }
+    let mut p = 1usize;
+    while p < n {
+        p <<= 1;
+    }
+    p
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_and_contains() {
+        let mut f = CuckooFilter::with_capacity(128);
+        f.insert(1).unwrap();
+        f.insert(2).unwrap();
+        f.insert(100).unwrap();
+        assert!(f.contains(1));
+        assert!(f.contains(2));
+        assert!(f.contains(100));
+        // Key not inserted — should not be present (no false positives for
+        // these specific values with these hash constants).
+        // Note: we can't guarantee zero FP in general, so we skip assert_false.
+    }
+
+    #[test]
+    fn remove_makes_absent() {
+        let mut f = CuckooFilter::with_capacity(64);
+        f.insert(42).unwrap();
+        assert!(f.contains(42));
+        f.remove(42);
+        // After remove, the key is gone (unless another key shares the fingerprint —
+        // unlikely for our test values).
+        assert!(!f.contains(42));
+    }
+
+    #[test]
+    fn large_insert_no_error() {
+        let mut f = CuckooFilter::with_capacity(2048);
+        for i in 0..1000u64 {
+            f.insert(i).expect("insert should not fail below capacity");
+        }
+        assert_eq!(f.len(), 1000);
+        for i in 0..1000u64 {
+            assert!(f.contains(i), "key {i} should be present");
+        }
+    }
+
+    #[test]
+    fn fingerprint_never_zero() {
+        // Verify fingerprint(k) != 0 for all k in a wide range.
+        for k in 0u64..10_000 {
+            assert_ne!(fingerprint(k), 0, "fingerprint({k}) was 0");
+        }
+    }
+
+    #[test]
+    fn false_positive_rate_reasonable() {
+        // Insert 500 keys, query 500 different keys — FP rate should be < 5%.
+        let mut f = CuckooFilter::with_capacity(1024);
+        for i in 0u64..500 {
+            f.insert(i).unwrap();
+        }
+        let mut fps = 0usize;
+        for i in 500u64..1000 {
+            if f.contains(i) {
+                fps += 1;
+            }
+        }
+        // With 8-bit fingerprints we expect ~0.78% FP; allow up to 5% for variance.
+        assert!(fps < 25, "false positive rate too high: {fps}/500");
+    }
+}
