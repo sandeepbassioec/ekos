@@ -198,7 +198,46 @@ impl PartitionReader {
         Ok((m.zone_min, m.zone_max))
     }
 
+    /// Read a single value from column `col_idx` at `row_offset`.
+    ///
+    /// O(1) for both Raw and Dict encodings — reads exactly 8–16 bytes from the
+    /// mmap without allocating or deserializing the full column.
+    pub fn read_value(&self, col_idx: usize, row_offset: usize) -> StorageResult<u64> {
+        let m = self
+            .col_meta
+            .get(col_idx)
+            .ok_or(StorageError::ColumnOutOfRange(col_idx, self.col_count))?;
+        let data: &[u8] = &self.mmap;
+
+        match m.encoding {
+            ENCODING_RAW => {
+                let offset = m.data_offset as usize + row_offset * 8;
+                let bytes: [u8; 8] = data[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| StorageError::InvalidData("row_offset out of bounds".into()))?;
+                Ok(u64::from_le_bytes(bytes))
+            }
+            ENCODING_DICT => {
+                // Index array starts immediately after the dictionary values.
+                let idx_offset =
+                    m.dict_offset as usize + m.dict_byte_len as usize + row_offset * 4;
+                let idx_bytes: [u8; 4] = data[idx_offset..idx_offset + 4]
+                    .try_into()
+                    .map_err(|_| StorageError::InvalidData("row_offset out of bounds".into()))?;
+                let dict_idx = u32::from_le_bytes(idx_bytes) as usize;
+                let val_offset = m.dict_offset as usize + dict_idx * 8;
+                let val_bytes: [u8; 8] = data[val_offset..val_offset + 8]
+                    .try_into()
+                    .map_err(|_| StorageError::InvalidData("dict index out of bounds".into()))?;
+                Ok(u64::from_le_bytes(val_bytes))
+            }
+            b => Err(StorageError::UnknownEncoding(b)),
+        }
+    }
+
     /// Decode and return the values for column `col_idx`.
+    ///
+    /// Deserializes the full column. Use [`read_value`] for point lookups.
     pub fn read_column(&self, col_idx: usize) -> StorageResult<ColumnValues> {
         let m = self
             .col_meta
