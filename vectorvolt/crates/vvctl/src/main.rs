@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
-use commands::{store, table, wal};
+use commands::{bench, store, table, wal};
 use store::OutputFormat;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -35,6 +35,9 @@ enum Commands {
     /// Table read/write commands (Phase 2 engine).
     #[command(subcommand)]
     Table(table::TableCommand),
+
+    /// In-process micro-benchmark: INSERT / GET / SCAN latency.
+    Bench(bench::BenchArgs),
 
     /// KV store read/write commands.
     #[command(subcommand)]
@@ -129,6 +132,8 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Table(cmd) => table::run(cmd)?,
+
+        Commands::Bench(args) => bench::run(args)?,
 
         Commands::Wal(cmd) => wal::run(cmd)?,
 
