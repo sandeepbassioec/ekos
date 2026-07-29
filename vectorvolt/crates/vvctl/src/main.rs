@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
-use commands::{store, wal};
+use commands::{store, table, wal};
 use store::OutputFormat;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,6 +32,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Table read/write commands (Phase 2 engine).
+    #[command(subcommand)]
+    Table(table::TableCommand),
+
     /// KV store read/write commands.
     #[command(subcommand)]
     Store(StoreCommand),
@@ -124,6 +128,8 @@ fn main() -> Result<()> {
     let fmt = cli.output;
 
     match cli.command {
+        Commands::Table(cmd) => table::run(cmd)?,
+
         Commands::Wal(cmd) => wal::run(cmd)?,
 
         Commands::Store(cmd) => match cmd {

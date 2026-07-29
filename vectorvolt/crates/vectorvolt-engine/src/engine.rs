@@ -18,9 +18,9 @@ use std::path::PathBuf;
 
 use parking_lot::RwLock;
 use vectorvolt_storage::PartitionReader;
-use vectorvolt_txn::TxnManager;
 pub use vectorvolt_txn::{FlushResult, WalTip};
-use vectorvolt_wal::{WalConfig, WalWriter};
+use vectorvolt_txn::{Mutation, TxnManager};
+use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
 
 use crate::{EngineError, EngineResult, EngineRow, EngineStats};
 
@@ -54,18 +54,52 @@ impl TableEngine {
 
         let cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
         let wal = WalWriter::open(cfg)?;
-        let txn = TxnManager::new(wal, schema.clone(), &partition_dir, flush_threshold);
 
         // Recover previously-flushed partitions.
         let mut partitions = HashMap::new();
+        let mut max_partition_id: u16 = 0;
         for entry in std::fs::read_dir(&partition_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("vvsst") {
                 let reader = PartitionReader::open(&path)?;
+                if reader.partition_id() >= max_partition_id {
+                    max_partition_id = reader.partition_id() + 1;
+                }
                 partitions.insert((reader.file_id(), reader.partition_id()), reader);
             }
         }
+
+        // Start the partition counter past any existing files to avoid overwrites.
+        let txn = TxnManager::with_starting_partition(
+            wal,
+            schema.clone(),
+            &partition_dir,
+            flush_threshold,
+            max_partition_id,
+        );
+
+        // Rebuild pk_index from existing partition files so reads work across
+        // process restarts (Phase 2 crash recovery).
+        let rows_on_disk: u64 = partitions.values().map(|r| r.row_count() as u64).sum();
+        txn.rebuild_pk_index_from_partitions(&partitions)?;
+
+        // Replay WAL delete records so deletes made in previous sessions survive
+        // restart.  Insert records are skipped — their rows are already in
+        // partition files (we flush every CLI insert) or are lost pending data
+        // (acceptable Phase 2 limitation).
+        let wal_cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
+        if let Ok(frames) = WalReader::open(wal_cfg).read_all() {
+            let mut idx = txn.pk_index.write();
+            for frame in frames {
+                if let Ok(Mutation::Delete { pk }) = Mutation::decode(&frame.payload) {
+                    idx.remove(pk);
+                }
+            }
+        }
+
+        // Seed the flushed-rows counter so stats() is accurate after a restart.
+        txn.set_total_rows_flushed(rows_on_disk);
 
         Ok(TableEngine {
             txn,
