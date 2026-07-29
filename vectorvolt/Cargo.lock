@@ -893,6 +893,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-query"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
+ "vectorvolt-index",
+ "vectorvolt-storage",
+]
+
+[[package]]
 name = "vectorvolt-storage"
 version = "0.1.0"
 dependencies = [
