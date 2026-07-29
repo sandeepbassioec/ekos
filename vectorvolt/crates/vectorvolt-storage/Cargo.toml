@@ -1,0 +1,18 @@
+[package]
+name        = "vectorvolt-storage"
+description = "VectorVolt storage layer — micro-partition file format (.vvsst), SoA layout, dictionary encoding, mmap reader"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+
+[dependencies]
+thiserror  = { workspace = true }
+byteorder  = { workspace = true }
+crc32fast  = { workspace = true }
+memmap2    = { workspace = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
