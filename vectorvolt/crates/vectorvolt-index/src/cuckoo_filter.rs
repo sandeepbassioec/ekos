@@ -33,7 +33,7 @@
 //! Fingerprint `0` is reserved as the empty-slot marker.
 //! Keys whose fingerprint hashes to 0 are mapped to fingerprint 1.
 
-use crate::{IndexError, IndexResult};
+use crate::IndexResult;
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
 
@@ -116,10 +116,15 @@ impl Bucket {
 // ── CuckooFilter ─────────────────────────────────────────────────────────────
 
 /// Probabilistic set: ~0.78% false-positive rate, O(1) worst-case lookup.
+///
+/// When the cuckoo structure fills beyond its displacement limit, an exact
+/// overflow `HashSet` absorbs further insertions so `insert()` never fails.
 pub struct CuckooFilter {
     buckets: Vec<Bucket>,
     num_buckets: usize,
     count: usize,
+    /// Exact spillover for keys that couldn't fit in the cuckoo structure.
+    overflow: std::collections::HashSet<u64>,
 }
 
 impl CuckooFilter {
@@ -133,13 +138,15 @@ impl CuckooFilter {
             buckets: vec![Bucket::default(); num_buckets],
             num_buckets,
             count: 0,
+            overflow: std::collections::HashSet::new(),
         }
     }
 
-    /// Insert `key` into the filter.
+    /// Insert `key` into the filter. Always succeeds.
     ///
-    /// Returns `Ok(())` on success, `Err(FilterFull)` if the displacement
-    /// chain exceeds `MAX_KICKS` (filter is overloaded; rehash required).
+    /// When the cuckoo structure is full (displacement chain exceeds `MAX_KICKS`),
+    /// the key is stored in an exact overflow `HashSet` instead of returning an
+    /// error, so `insert()` is infallible and the filter unbounded.
     pub fn insert(&mut self, key: u64) -> IndexResult<()> {
         let fp = fingerprint(key);
         let i1 = index1(key, self.num_buckets);
@@ -150,7 +157,7 @@ impl CuckooFilter {
             return Ok(());
         }
 
-        // Displacement: randomly start from i1 (deterministic here — always i1).
+        // Displacement: deterministically start from i1.
         let mut cur_idx = i1;
         let mut cur_fp = fp;
 
@@ -160,10 +167,8 @@ impl CuckooFilter {
                 Some(fp) => fp,
                 None => unreachable!("bucket must be full to reach here"),
             };
-            // Place current fingerprint in the now-vacated slot.
             self.buckets[cur_idx].insert(cur_fp);
             cur_fp = evicted_fp;
-            // Alternate bucket for the evicted fingerprint.
             cur_idx = index2(cur_idx, cur_fp, self.num_buckets);
             if self.buckets[cur_idx].insert(cur_fp) {
                 self.count += 1;
@@ -171,22 +176,31 @@ impl CuckooFilter {
             }
         }
 
-        Err(IndexError::FilterFull(self.num_buckets * BUCKET_SIZE))
+        // Cuckoo structure full — spill to exact overflow.
+        self.overflow.insert(key);
+        self.count += 1;
+        Ok(())
     }
 
     /// True if `key` **might** be in the set. False positives are possible (~0.78%).
+    /// Keys in the overflow set are exact (zero FP for those).
     #[inline]
     pub fn contains(&self, key: u64) -> bool {
+        if self.overflow.contains(&key) {
+            return true;
+        }
         let fp = fingerprint(key);
         let i1 = index1(key, self.num_buckets);
         let i2 = index2(i1, fp, self.num_buckets);
         self.buckets[i1].contains(fp) || self.buckets[i2].contains(fp)
     }
 
-    /// Remove `key` from the filter. Returns `true` if a matching fingerprint
-    /// was found and removed (note: cannot guarantee this was *this specific key*
-    /// due to hash collisions, but the semantics match Cuckoo filter spec).
+    /// Remove `key` from the filter. Returns `true` if found and removed.
     pub fn remove(&mut self, key: u64) -> bool {
+        if self.overflow.remove(&key) {
+            self.count -= 1;
+            return true;
+        }
         let fp = fingerprint(key);
         let i1 = index1(key, self.num_buckets);
         let i2 = index2(i1, fp, self.num_buckets);
@@ -222,6 +236,13 @@ impl CuckooFilter {
 impl Default for CuckooFilter {
     fn default() -> Self {
         CuckooFilter::with_capacity(64)
+    }
+}
+
+/// Number of keys in the exact overflow (diagnostic).
+impl CuckooFilter {
+    pub fn overflow_len(&self) -> usize {
+        self.overflow.len()
     }
 }
 

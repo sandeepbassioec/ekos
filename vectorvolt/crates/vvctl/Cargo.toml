@@ -16,6 +16,7 @@ path = "src/main.rs"
 vectorvolt-wal    = { path = "../vectorvolt-wal" }
 vectorvolt-store  = { path = "../vectorvolt-store" }
 vectorvolt-engine = { workspace = true }
+tempfile         = { workspace = true }
 bytes            = { workspace = true }
 anyhow         = { workspace = true }
 clap           = { workspace = true }
