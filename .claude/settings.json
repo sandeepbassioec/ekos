@@ -45,6 +45,10 @@
             "PowerShell(rustup *)",
             "PowerShell(rustc *)",
 
+            "PowerShell(cd C:\\VectorVolt\\vectorvolt; cargo *)",
+            "PowerShell(cd C:\\VectorVolt\\ekos; cargo *)",
+            "PowerShell(cd C:\\VectorVolt; cargo *)",
+
             "PowerShell(git status *)",
             "PowerShell(git log *)",
             "PowerShell(git diff *)",
@@ -64,6 +68,13 @@
             "PowerShell(git init *)",
             "PowerShell(git clone *)",
             "PowerShell(git rev-parse *)",
+
+            "Bash(git add *)",
+            "Bash(git commit *)",
+            "Bash(git push *)",
+            "Bash(git pull *)",
+            "Bash(git fetch *)",
+            "Bash(cd /c/VectorVolt && git *)",
 
             "PowerShell(npm install *)",
             "PowerShell(npm run *)",

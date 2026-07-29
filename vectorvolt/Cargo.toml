@@ -4,6 +4,7 @@ members = [
     "crates/vectorvolt-store",
     "crates/vectorvolt-index",
     "crates/vectorvolt-storage",
+    "crates/vectorvolt-query",
     "crates/vvctl",
 ]
 resolver = "2"
@@ -46,6 +47,9 @@ serde_json     = "1.0"
 roaring        = "0.10"
 # memory-mapped I/O
 memmap2        = "0.9"
+# internal crates
+vectorvolt-index   = { path = "crates/vectorvolt-index" }
+vectorvolt-storage = { path = "crates/vectorvolt-storage" }
 # testing
 tempfile       = "3.14"
 
