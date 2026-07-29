@@ -931,6 +931,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-txn"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "parking_lot",
+ "tempfile",
+ "thiserror",
+ "vectorvolt-index",
+ "vectorvolt-storage",
+ "vectorvolt-wal",
+]
+
+[[package]]
 name = "vectorvolt-wal"
 version = "0.1.0"
 dependencies = [
