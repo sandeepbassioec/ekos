@@ -111,42 +111,72 @@ impl WalReader {
         Ok(frames)
     }
 
-    /// Verify the entire hash chain from genesis. Returns the number of frames verified.
+    /// Verify the hash chain from genesis. Returns the number of frames verified.
+    ///
+    /// ## What this checks that `Frame::decode` does not
+    ///
+    /// [`Frame::decode`](crate::Frame::decode) already validates each frame *in
+    /// isolation*: its CRC32, and that its stored `frame_hash` matches a hash
+    /// recomputed over its own bytes. A frame failing either never reaches this
+    /// function — [`scan`](Self::scan) propagates the error instead.
+    ///
+    /// What `decode` cannot know is whether frame N's `prev_hash` equals frame
+    /// N−1's `frame_hash`, because that is a *relationship between* frames rather
+    /// than a property of one. Checking that link is this function's entire job,
+    /// and it is what makes the log tamper-**evident** rather than merely
+    /// checksummed: an attacker can rewrite one frame and recompute both its CRC
+    /// and its self-hash (each computable from the frame alone), but the rewrite
+    /// changes that frame's `frame_hash`, so the chain visibly breaks at the *next*
+    /// frame — and cannot be repaired without rewriting every frame after it.
+    ///
+    /// ## Errors
+    ///
+    /// - [`WalError::ChainBroken`] — a frame does not link to its predecessor.
+    ///   Reported at the frame that fails to link, so the tampering is at or
+    ///   before `sequence - 1`.
+    /// - [`WalError::Crc32Mismatch`] / [`WalError::CorruptFrame`] — surfaced from
+    ///   `decode` for accidental corruption, before chain checking begins.
     pub fn verify(&self) -> WalResult<u64> {
         let mut prev_hash = GENESIS_HASH;
         let mut count = 0u64;
+        // Captured inside the closure so the failure detail is recorded at the
+        // moment of detection. The previous implementation returned `false` and
+        // then re-walked the log twice to work out where and why — three full
+        // reads of the WAL, and it reported a hardcoded placeholder as the
+        // offending value.
+        let mut failure: Option<WalError> = None;
 
         self.scan(WalCursor::beginning(), |frame| {
             if frame.prev_hash != prev_hash {
-                return false; // will surface as early return, caller checks count
-            }
-            let computed = frame.compute_hash();
-            if computed != frame.frame_hash {
+                failure = Some(WalError::ChainBroken {
+                    sequence: frame.sequence,
+                    expected: hex(&prev_hash),
+                    actual: hex(&frame.prev_hash),
+                });
                 return false;
             }
+
+            // Defence in depth. `decode` has already verified this, so it should
+            // be unreachable — kept so that if `decode` is ever changed to skip
+            // hash validation for speed, `verify` still catches it rather than
+            // silently degrading into a chain-link-only check.
+            let computed = frame.compute_hash();
+            if computed != frame.frame_hash {
+                failure = Some(WalError::FrameHashMismatch {
+                    sequence: frame.sequence,
+                    expected: hex(&computed),
+                    actual: hex(&frame.frame_hash),
+                });
+                return false;
+            }
+
             prev_hash = frame.frame_hash;
             count += 1;
             true
         })?;
 
-        // Re-walk to detect chain break (scan stops at false return).
-        let total_frames = self.read_all()?.len() as u64;
-        if count != total_frames {
-            // find the break
-            let mut prev = GENESIS_HASH;
-            let mut broken_at = 0u64;
-            for frame in self.read_all()? {
-                if frame.prev_hash != prev {
-                    broken_at = frame.sequence;
-                    break;
-                }
-                prev = frame.frame_hash;
-            }
-            return Err(WalError::ChainBroken {
-                sequence: broken_at,
-                expected: hex(&prev),
-                actual: hex(&GENESIS_HASH), // placeholder; real value in the frame
-            });
+        if let Some(err) = failure {
+            return Err(err);
         }
 
         debug!(frames_verified = count, "hash chain verified OK");
