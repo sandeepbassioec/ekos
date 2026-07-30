@@ -17,6 +17,37 @@
 //! every possible vector-tail remainder — plus adversarial values around
 //! `i64::MAX` where signed/unsigned comparison bugs live.
 //!
+//! ## Capability is fixed for the process lifetime
+//!
+//! [`tier`] caches its answer in a `OnceLock`. The CPU cannot gain or lose AVX2 while we run, so
+//! this is sound — but it has one consequence worth stating: **a hardware change requires a process
+//! restart to take effect.** Resize a VM from a host with AVX-512 to one without, and a
+//! still-running process keeps the tier it detected at startup.
+//!
+//! In practice this is safe. Hypervisors mask `cpuid` to the lowest common denominator across a
+//! migration pool precisely so a live-migrated process cannot lose an instruction set mid-execution,
+//! and AWS does not live-migrate between instance types. Restart-to-adopt is the correct and
+//! intended behaviour, not a limitation to work around.
+//!
+//! ## This module is the reference shape for `Reconciled<T>` (VV-CFG-035)
+//!
+//! The trio [`detect`] / [`tier`] / [`is_capped`] is a worked example of the pattern every
+//! hardware-dependent setting will need:
+//!
+//! | Here | General form | Meaning |
+//! |---|---|---|
+//! | [`detect`] | `available` | what the hardware actually offers |
+//! | [`tier`] | `effective` | what we will really use |
+//! | [`is_capped`] | `was_clamped` | whether the two differ, so it can be reported |
+//!
+//! Core pinning, arena sizing, shard count, and huge-page reservation all need the same treatment:
+//! an *intended* value from config, clamped against live hardware, with the clamp surfaced rather
+//! than silently applied. The difference is that those clamps are *lossy* — a config asking to pin
+//! to core 40 on a 4-core box has to be reduced, and an operator must be told. Here the "clamp" is
+//! only ever a deliberate downward override, so it cannot surprise anyone.
+//!
+//! See `docs/vectorvolt-tasks/LAYER-18-DEPLOYMENT-AUTOCONFIG.md`.
+//!
 //! ## Usage
 //!
 //! ```
@@ -29,6 +60,11 @@
 //! let mut hits = Vec::new();
 //! simd::filter_range(&values, 10, 12, &mut hits);
 //! assert_eq!(hits, vec![10, 11, 12]);
+//!
+//! // The reconciliation trio: available / effective / was-it-clamped.
+//! let available = simd::detect();
+//! let effective = simd::tier();
+//! assert!(!simd::is_capped() || effective != available);
 //! ```
 
 pub mod scalar;

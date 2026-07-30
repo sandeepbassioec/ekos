@@ -36,6 +36,55 @@
 
 ---
 
+## Companion trackers — read these alongside this plan
+
+This document is the **phase-level** plan. Three companions were added 2026-07-30 and carry detail
+this one does not. Where they disagree with this document, **they are newer and win**.
+
+| Doc | Granularity | What it adds |
+|---|---|---|
+| [VECTORVOLT_FEATURE_MATRIX.md](VECTORVOLT_FEATURE_MATRIX.md) | 357 features | Per-feature status verified against code (not against docs), 19 layers, 10-sprint plan, and the latency budget reconciling the nanosecond target against `fsync` physics |
+| [vectorvolt-tasks/](vectorvolt-tasks/README.md) | **1,884 tasks** | Task and sub-task decomposition with `file.rs:line` evidence for every ✅. IDs: `VV-ENG-010` → `.2` → `.2.1` |
+| [HARDWARE_SUPPORT_MATRIX.md](HARDWARE_SUPPORT_MATRIX.md) | 4 hardware tiers | What runs where, the degradation ladder, the 3 cases needing a separate build, x86-vs-ARM analysis, AWS instance naming |
+
+**Seven discrepancies** between this plan and the actual code were found during that audit and are
+recorded in [vectorvolt-tasks/README.md](vectorvolt-tasks/README.md#cross-cutting-findings) — most
+consequentially, two competing point-lookup implementations where one is 400× slower, and a
+`WalReader::verify()` that reports a fabricated hash on chain break.
+
+### Layer 18 — Deployment & Auto-Configuration (`VV-CFG-*`) — NOT IN THIS PLAN'S PHASES
+
+36 features / 227 tasks added 2026-07-30, absent from the original phase structure. It closes a real
+gap: runtime dispatch handles CPU **instructions** (`cpuid` → AVX2 vs scalar), but nothing handled
+**system configuration** — huge-page reservation, core role maps, arena sizing, WAL device choice.
+Those need root, or a reboot, or knowledge of what is mounted, so they cannot be resolved at runtime.
+
+Three configuration layers, which must not be conflated:
+
+| Layer | When | Mechanism | Status |
+|---|---|---|---|
+| Build | compile | one binary per target triple; Cargo features for linked libs (DPDK/RDMA/QAT) | ✅ 5 CI targets |
+| **Install** | package hook | detect host → emit annotated config → optionally tune system | ⬜ **new** |
+| Runtime | process start | `cpuid` → dispatch table; **clamp config intents to live hardware** | 🟡 dispatch done |
+
+Goal: **one codebase, one binary per architecture**, self-configuring per host at install time via
+`apt`/`yum`/`brew`/`winget`/container-entrypoint hooks. Lands in **Phase 2/S3** (detection,
+derivation, reconciliation) and **Phase 3/S7** (package integration).
+
+Two safety rules are non-negotiable and apply to every task in the layer:
+
+1. **Never silently change the system.** Dry-run is the default; privileged changes print what they
+   will do and require explicit opt-in. `isolcpus` is *advised, never applied* — it needs a reboot.
+2. **Never fail the install.** No root, restricted container, unknown platform → safe defaults, warn,
+   exit 0.
+
+Plus the resize rule, from VV-CFG-035/036: **configuration values are intents clamped to live
+hardware, never absolute commands** — and every clamp is logged, metered, and visible in
+`vvctl status`. Downgrade fails loudly; **upgrade fails silently**, which is why under-utilisation
+detection is a first-class requirement rather than a nicety.
+
+---
+
 ## Phase 1 — WAL + Core Storage ✅ COMPLETE
 
 **Goal:** Working Write-Ahead Log, KoStore, Windows MSVC build, CI pipelines, EKOS workspace.

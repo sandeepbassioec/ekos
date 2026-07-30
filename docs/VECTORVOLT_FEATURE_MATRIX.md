@@ -27,10 +27,16 @@ audit of all 8 crates in `vectorvolt/crates/`.
 |---|---|
 | ✅ Implemented | 47 |
 | 🟡 Partial | 6 |
-| ⬜ Pending | 231 |
+| ⬜ Pending | 267 |
 | 🧊 Deferred (env-gated) | 28 |
 | 🔬 Research | 9 |
-| **Total tracked** | **321** |
+| **Total tracked** | **357** |
+
+> **Revised 2026-07-30:** +36 features. Layer 18 (Deployment & Auto-Configuration, `VV-CFG-*`) was
+> added after a gap was identified: runtime dispatch handles CPU *instructions*, but nothing handled
+> *system configuration* — huge-page reservation, core role maps, arena sizing, WAL device choice.
+> Those need root, or a reboot, or knowledge of what is mounted, so they cannot be decided at
+> runtime. See [LAYER-18](vectorvolt-tasks/LAYER-18-DEPLOYMENT-AUTOCONFIG.md).
 
 Current test count on `main`: **140** passing. Zero clippy warnings workspace-wide.
 
@@ -408,6 +414,72 @@ WAL group commit. There is no server binary — `vvctl` runs in-process and exit
 | VV-HW-004 | CXL 3.0 fabric-attached memory | 🔬 | — | |
 | VV-HW-005 | FPGA semantic constraint validation | 🔬 | — | $10k+/chip, explicitly not now |
 
+## LAYER 18 — Deployment & Auto-Configuration (`VV-CFG-*`) — CRATE DOES NOT EXIST
+
+One codebase, one binary per architecture, and the system configures itself per host **at install
+time**. Full task breakdown: [LAYER-18](vectorvolt-tasks/LAYER-18-DEPLOYMENT-AUTOCONFIG.md) — 34
+features, 207 tasks.
+
+The three configuration layers, which must not be conflated:
+
+| Layer | When | Mechanism | Status |
+|---|---|---|---|
+| Build | compile | one binary per target triple; Cargo features for linked libs | ✅ 5 CI targets |
+| **Install** | package install | detect host → emit annotated config → optionally tune system | ⬜ **this layer** |
+| Runtime | process start | `cpuid` → dispatch table | ✅ VV-HAL-004/005 |
+
+| ID | Feature | Status | Sprint | Notes |
+|---|---|---|---|---|
+| VV-CFG-001 | `SystemProfile` cross-platform detection | ⬜ | S3 | Rust; `vv-probe-linux.sh` is the shell prototype |
+| VV-CFG-002 | **Hybrid P-core/E-core classification** | ⬜ | S3 | Found via the dev laptop; pinning a writer to an E-core would harm p99 |
+| VV-CFG-003 | Storage device discovery + `fsync` calibration | ⬜ | S3 | |
+| VV-CFG-004 | Kernel/OS feature probe | ⬜ | S3 | Probe io_uring by *creating a ring*, not version-guessing |
+| VV-CFG-005 | Hardware fingerprint | ⬜ | S3 | Also stamped into benchmark reports |
+| VV-CFG-006 | `vvctl tune` — derive config | ⬜ | S3 | Dry-run by default |
+| VV-CFG-007 | Derive arena/memory sizing | ⬜ | S3 | LD-ARENA; respects cgroup limits |
+| VV-CFG-008 | **Derive core role map** | ⬜ | S3 | P-cores to writers; never two shards on SMT siblings |
+| VV-CFG-009 | Derive huge-page count | ⬜ | S3 | |
+| VV-CFG-010 | Derive WAL/data device | ⬜ | S3 | **Never auto-pick ephemeral instance-store for WAL** |
+| VV-CFG-011 | Derive batching/backpressure/wait strategy | ⬜ | S3 | Window from measured `fsync`, not a fixed 50 µs |
+| VV-CFG-012 | Annotated TOML emission | ⬜ | S3 | Every value carries its reasoning |
+| VV-CFG-013 | Size profiles (edge/small/standard/large) | ⬜ | S3 | |
+| VV-CFG-014 | `--apply` consent-gated tuning | ⬜ | S3 | Dry-run default; audit record |
+| VV-CFG-015 | Huge-page reservation | 🧊 | S3 | Linux |
+| VV-CFG-016 | memlock limit | 🧊 | S3 | Linux/Windows privilege |
+| VV-CFG-017 | `isolcpus` guidance | 🧊 | S3 | **Advise only — never auto-apply.** Needs reboot |
+| VV-CFG-018 | Revert applied tuning | ⬜ | S3 | |
+| VV-CFG-019 | Idempotency | ⬜ | S3 | |
+| VV-CFG-020 | Hardware-change detection at startup | ⬜ | S3 | Fingerprint mismatch → warn, or refuse if unsafe |
+| VV-CFG-021 | `vvctl tune --diff` | ⬜ | S3 | Distinguishes operator edits from stale generated values |
+| VV-CFG-022 | Support bundle with provenance | ⬜ | S7 | |
+| VV-CFG-023 | `.deb` postinst | ⬜ | S7 | |
+| VV-CFG-024 | `.rpm` `%post` | ⬜ | S7 | `%config(noreplace)` preserves edits |
+| VV-CFG-025 | Homebrew `post_install` | ⬜ | S7 | |
+| VV-CFG-026 | winget / MSI custom action | ⬜ | S7 | |
+| VV-CFG-027 | Container entrypoint | ⬜ | S7 | **Respect cgroup limits, not host resources** |
+| VV-CFG-028 | systemd unit with derived limits | ⬜ | S7 | |
+| VV-CFG-029 | **Install must never fail** | ⬜ | S7 | Tuning failure warns; install still succeeds |
+| VV-CFG-030 | Uninstall cleanup | ⬜ | S7 | |
+| VV-CFG-031 | Precedence: generated < file < env < CLI | ⬜ | S3 | Auto-tune never overrides an explicit choice |
+| VV-CFG-032 | Validation with actionable errors | ⬜ | S3 | Reject unknown keys — a silent typo is a latent outage |
+| VV-CFG-033 | `vvctl tune --explain` | ⬜ | S3 | Per-value origin + derivation rule |
+| VV-CFG-034 | Config schema versioning | ⬜ | S3 | Forward migration preserving edits |
+| **VV-CFG-035** | **Startup reconciliation — clamp-and-report** | ⬜ | S3 | Config values are *intents* clamped to live hardware. Every clamp logged, metered (`vv_config_clamped`), and shown in `vvctl status`. `--strict-config` refuses to start on any clamp |
+| **VV-CFG-036** | **Under-utilisation detection (silent upgrade)** | ⬜ | S3 | Warns above 25% unused capacity with an actionable recommendation; `vv_unused_core_fraction` metric. **Never auto-expands** — growing shard count relocates data |
+
+### Why 035/036 exist — the resize asymmetry
+
+**Downgrade fails loudly; upgrade fails silently, and the silent case is worse.** 16→4 cores gives
+`EINVAL` on pinning and an OOM-killed arena. 16→64 cores errors on nothing — the config still runs 8
+shards on cores 4–11 and you get 16 cores of throughput on a 64-core bill, indefinitely.
+
+Only four settings self-correct on a resize: SIMD tier, hardware CRC, prefetch tiers, timer
+calibration. Core pinning, shard count, arena size, huge pages, wait strategy, the L3-derived index
+budget, and device paths all need **reconciliation** — a distinct mechanism from detection.
+
+Full table of per-setting resize behaviour:
+[LAYER-18](vectorvolt-tasks/LAYER-18-DEPLOYMENT-AUTOCONFIG.md#detection-vs-reconciliation--and-why-resize-breaks-asymmetrically)
+
 ## LAYER 17 — Autonomy (EKOS-adjacent, deferred until VectorVolt core is done)
 
 | ID | Feature | Status | Sprint | Notes |
@@ -473,11 +545,11 @@ Each sprint = one branch, one PR, one traceability report appended to this file.
 |---|---|---|---|
 | **S1** | `vectorvolt-hal`: topology, SIMD (AVX2/AVX-512/NEON/scalar), L1/L2/L3/NTA prefetch, CPU pinning, NUMA, huge pages, cycle timer | VV-HAL-001..037 | The silicon foundation. Everything else depends on it |
 | **S2** | Wire SIMD + prefetch into storage/query/index. Encodings, compression, criterion bench, CI perf gate | VV-STO-009..014, VV-QRY-006..010, VV-IDX-007..011 | Prove <100 ns read |
-| **S3** | Type system, multi-table catalog, DDL, **partition control by entity/table/schema**, config system, ring buffer, arenas | VV-ENG-006..019, VV-TXN-008/009/019 | Real database shape |
+| **S3** | Type system, multi-table catalog, DDL, **partition control by entity/table/schema**, config system, ring buffer, arenas, **auto-config detection + derivation + reconciliation** | VV-ENG-006..019, VV-TXN-008/009/019, **VV-CFG-001..021, 031..036** | Real database shape; installs configure themselves |
 | **S4** | `vectorvolt-net` + `vectorvolt-server`: protocol, TCP, transport trait, TLS, metrics endpoint. MVCC + txns | VV-NET-001..013, VV-TXN-010..016 | It becomes a server |
 | **S5** | Tiering L0–L4, snapshots, PITR, retention, projections/CQRS, DLQ, prefetch engine | VV-STO-016..024, VV-PRJ-003..008, VV-PRE-001..008 | Durability & intelligence |
 | **S6** | `vectorvolt-cluster`: SWIM, vnodes, **master-slave replication**, Raft, epoch fencing, <2s failover | VV-CLU-001..018 | It becomes distributed |
-| **S7** | `vectorvolt-control` + admin API/UI, Rust SDK, C# SDK, multi-tenancy, RBAC | VV-CTL-001..015, VV-SDK-001..008 | Operable product |
+| **S7** | `vectorvolt-control` + admin API/UI, Rust SDK, C# SDK, multi-tenancy, RBAC, **package-manager install hooks** (deb/rpm/brew/winget/container/systemd) | VV-CTL-001..015, VV-SDK-001..008, **VV-CFG-022..030** | Operable product; `yum`/`apt`/`brew`/`winget` install self-configures |
 | **S8** | SQL layer, PG wire protocol, read fabric binary, vector/HNSW | VV-QRY-018..020, VV-CLU-019, VV-IDX-012 | SQL + vector search |
 | **S9** | Graph: CSR, traversal, joins, cascade delete, analytics | VV-IDX-013/014, VV-QRY-011..017 | Graph engine |
 | **S10** | Polyglot SDKs, chaos + deterministic sim testing, reference domains | VV-SDK-009..012, VV-TST-009..015 | Hardening |
