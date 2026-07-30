@@ -4,8 +4,10 @@
 //! [`PartitionReader`], and verifies the round-trip.
 
 use std::io::Write;
-use tempfile::NamedTempFile;
-use vectorvolt_storage::{ColumnValues, MicroPartition, PartitionReader, write_partition};
+use tempfile::{NamedTempFile, TempDir};
+use vectorvolt_storage::{
+    ColumnValues, MicroPartition, PartitionReader, StorageError, write_partition,
+};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -203,4 +205,109 @@ fn file_id_and_partition_id_preserved() {
     let r = PartitionReader::open(tmp.path()).unwrap();
     assert_eq!(r.file_id(), 255);
     assert_eq!(r.partition_id(), 65535);
+}
+
+// ── read_value robustness (added with the point-lookup consolidation) ─────────
+//
+// `read_value` computes byte offsets from column metadata and, for dictionary
+// columns, from an index stored *in the file*. None of that may be trusted. The
+// first implementation used direct slice indexing (`data[a..b]`), which **panics**
+// on an out-of-range range — so a stale RowDescriptor or a corrupt dictionary
+// index would abort the process instead of returning an error. These tests pin the
+// error behaviour so that cannot regress.
+
+#[test]
+fn read_value_rejects_row_offset_past_the_end() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("bounds.vvsst");
+
+    let mut mp = MicroPartition::new(0, 0);
+    mp.push_column("id", ColumnValues::Raw(vec![10, 20, 30]))
+        .unwrap();
+    let mut f = std::fs::File::create(&path).unwrap();
+    write_partition(&mut f, &mp).unwrap();
+    drop(f);
+
+    let reader = PartitionReader::open(&path).unwrap();
+    assert_eq!(reader.row_count(), 3);
+
+    // Valid offsets still work.
+    assert_eq!(reader.read_value(0, 0).unwrap(), 10);
+    assert_eq!(reader.read_value(0, 2).unwrap(), 30);
+
+    // One past the end — the case a RowDescriptor cached across a compaction
+    // produces. Must be an error, and must NOT panic.
+    match reader.read_value(0, 3) {
+        Err(StorageError::RowOffsetOutOfBounds {
+            row_offset,
+            row_count,
+        }) => {
+            assert_eq!(row_offset, 3);
+            assert_eq!(row_count, 3);
+        }
+        Err(other) => panic!("wrong error for out-of-range offset: {other}"),
+        Ok(v) => panic!("read_value returned {v} for a nonexistent row"),
+    }
+
+    // Wildly out of range must behave the same way, not wrap or panic.
+    assert!(matches!(
+        reader.read_value(0, usize::MAX / 2),
+        Err(StorageError::RowOffsetOutOfBounds { .. })
+    ));
+}
+
+#[test]
+fn read_value_rejects_unknown_column() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cols.vvsst");
+    let mut mp = MicroPartition::new(0, 0);
+    mp.push_column("id", ColumnValues::Raw(vec![1, 2])).unwrap();
+    let mut f = std::fs::File::create(&path).unwrap();
+    write_partition(&mut f, &mp).unwrap();
+    drop(f);
+
+    let reader = PartitionReader::open(&path).unwrap();
+    assert!(matches!(
+        reader.read_value(5, 0),
+        Err(StorageError::ColumnOutOfRange(5, 1))
+    ));
+}
+
+#[test]
+fn read_value_and_read_column_agree_on_every_row_and_encoding() {
+    // The consolidation only holds if the two paths return identical values.
+    // Dictionary-encoded columns exercise the two-step index-then-value read.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("agree.vvsst");
+
+    let ids: Vec<u64> = (0..200u64).collect();
+    // Few distinct values, so `auto_encode` picks dictionary encoding.
+    let repeated: Vec<u64> = (0..200u64).map(|i| (i % 5) * 1_000_000).collect();
+
+    let mut mp = MicroPartition::new(0, 0);
+    mp.push_column("id", ColumnValues::Raw(ids.clone()))
+        .unwrap();
+    mp.push_column("grade", ColumnValues::auto_encode(repeated.clone()))
+        .unwrap();
+    let mut f = std::fs::File::create(&path).unwrap();
+    write_partition(&mut f, &mp).unwrap();
+    drop(f);
+
+    let reader = PartitionReader::open(&path).unwrap();
+    for col in 0..reader.col_count() as usize {
+        let whole = reader.read_column(col).unwrap().to_raw_vec();
+        assert_eq!(whole.len(), 200, "column {col} has the wrong row count");
+        for (row, expected) in whole.iter().enumerate() {
+            assert_eq!(
+                reader.read_value(col, row).unwrap(),
+                *expected,
+                "read_value and read_column disagree at col {col} row {row}"
+            );
+        }
+    }
+    // And against the source data, so both paths being wrong the same way fails.
+    for row in 0..200usize {
+        assert_eq!(reader.read_value(0, row).unwrap(), ids[row]);
+        assert_eq!(reader.read_value(1, row).unwrap(), repeated[row]);
+    }
 }

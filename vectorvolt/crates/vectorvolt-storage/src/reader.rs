@@ -198,37 +198,86 @@ impl PartitionReader {
         Ok((m.zone_min, m.zone_max))
     }
 
+    /// Read `N` bytes at `start`, or an error if that range is outside the file.
+    ///
+    /// Every offset in this reader is computed from *file contents* — column
+    /// metadata, dictionary indices — so none of it may be trusted. Direct slice
+    /// indexing (`data[a..b]`) **panics** on an out-of-range range, which would turn
+    /// a corrupt partition into a process abort. `.get()` turns it into an error.
+    #[inline]
+    fn bytes_at<const N: usize>(data: &[u8], start: usize) -> StorageResult<[u8; N]> {
+        let end = start
+            .checked_add(N)
+            .ok_or(StorageError::OffsetOutsideFile {
+                start,
+                end: usize::MAX,
+                len: data.len(),
+            })?;
+        let slice = data
+            .get(start..end)
+            .ok_or(StorageError::OffsetOutsideFile {
+                start,
+                end,
+                len: data.len(),
+            })?;
+        // Infallible: `get` already guaranteed exactly N bytes.
+        Ok(slice.try_into().expect("slice length checked by get()"))
+    }
+
     /// Read a single value from column `col_idx` at `row_offset`.
     ///
-    /// O(1) for both Raw and Dict encodings — reads exactly 8–16 bytes from the
-    /// mmap without allocating or deserializing the full column.
+    /// O(1) for both Raw and Dict encodings — reads exactly 8 or 12 bytes from the
+    /// mmap without allocating or deserializing the full column. This is the path
+    /// point lookups should use; [`read_column`](Self::read_column) is for scans.
+    ///
+    /// # Errors
+    ///
+    /// Never panics, for any `col_idx`, `row_offset`, or file content:
+    /// - [`StorageError::ColumnOutOfRange`] — no such column
+    /// - [`StorageError::RowOffsetOutOfBounds`] — offset past the last row, which a
+    ///   stale `RowDescriptor` (e.g. cached across a compaction) can produce
+    /// - [`StorageError::DictIndexOutOfBounds`] — corrupt dictionary index in the file
+    /// - [`StorageError::OffsetOutsideFile`] — corrupt column metadata
     pub fn read_value(&self, col_idx: usize, row_offset: usize) -> StorageResult<u64> {
         let m = self
             .col_meta
             .get(col_idx)
             .ok_or(StorageError::ColumnOutOfRange(col_idx, self.col_count))?;
+
+        // Check the caller's offset against the partition before computing any
+        // byte position, so the error names the real problem rather than a
+        // derived byte range the caller never supplied.
+        if row_offset >= self.row_count as usize {
+            return Err(StorageError::RowOffsetOutOfBounds {
+                row_offset,
+                row_count: self.row_count,
+            });
+        }
+
         let data: &[u8] = &self.mmap;
 
         match m.encoding {
             ENCODING_RAW => {
                 let offset = m.data_offset as usize + row_offset * 8;
-                let bytes: [u8; 8] = data[offset..offset + 8]
-                    .try_into()
-                    .map_err(|_| StorageError::InvalidData("row_offset out of bounds".into()))?;
-                Ok(u64::from_le_bytes(bytes))
+                Ok(u64::from_le_bytes(Self::bytes_at::<8>(data, offset)?))
             }
             ENCODING_DICT => {
                 // Index array starts immediately after the dictionary values.
                 let idx_offset = m.dict_offset as usize + m.dict_byte_len as usize + row_offset * 4;
-                let idx_bytes: [u8; 4] = data[idx_offset..idx_offset + 4]
-                    .try_into()
-                    .map_err(|_| StorageError::InvalidData("row_offset out of bounds".into()))?;
-                let dict_idx = u32::from_le_bytes(idx_bytes) as usize;
+                let dict_idx = u32::from_le_bytes(Self::bytes_at::<4>(data, idx_offset)?) as usize;
+
+                // `dict_idx` came out of the file, so validate it against the
+                // dictionary's own declared size rather than trusting it.
+                let dict_entries = m.dict_byte_len as usize / 8;
+                if dict_idx >= dict_entries {
+                    return Err(StorageError::DictIndexOutOfBounds {
+                        index: dict_idx,
+                        size: dict_entries,
+                    });
+                }
+
                 let val_offset = m.dict_offset as usize + dict_idx * 8;
-                let val_bytes: [u8; 8] = data[val_offset..val_offset + 8]
-                    .try_into()
-                    .map_err(|_| StorageError::InvalidData("dict index out of bounds".into()))?;
-                Ok(u64::from_le_bytes(val_bytes))
+                Ok(u64::from_le_bytes(Self::bytes_at::<8>(data, val_offset)?))
             }
             b => Err(StorageError::UnknownEncoding(b)),
         }
