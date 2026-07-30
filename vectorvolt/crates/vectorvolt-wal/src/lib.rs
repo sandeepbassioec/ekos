@@ -44,6 +44,7 @@ pub mod group_commit;
 pub mod metrics;
 pub mod reader;
 pub mod segment;
+pub mod sync_commit;
 pub mod writer;
 
 // Convenience re-exports.
@@ -54,4 +55,5 @@ pub use group_commit::{BatcherConfig, CommitFuture, GroupCommitBatcher};
 pub use metrics::{BatcherMetrics, MetricsSnapshot};
 pub use reader::{WalCursor, WalReader, WalStats};
 pub use segment::{SegmentReader, list_segment_ids, segment_path};
+pub use sync_commit::{SyncCommitter, SyncStats};
 pub use writer::{WalTip, WalWriter};

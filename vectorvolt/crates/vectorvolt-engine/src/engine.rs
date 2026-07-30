@@ -44,8 +44,10 @@ pub enum Durability {
     ///
     /// The only setting that makes the WAL mean what a WAL is for, so it is the
     /// default. Also the most expensive: an `fsync` costs tens to hundreds of
-    /// microseconds, and one per insert is unamortised — exactly the cost group
-    /// commit exists to spread across many writes (VV-WAL-011, not yet wired).
+    /// microseconds. Concurrent writers share one `fsync` via
+    /// [`vectorvolt_wal::SyncCommitter`] (VV-WAL-011), so the cost stops scaling
+    /// with writer count — but a *single* writer still pays it per commit, because
+    /// there is nobody to batch with. That floor is the storage device.
     Fsync,
 
     /// `write()` to the OS, no `fsync()`. **Survives a process crash; not power loss.**
@@ -126,14 +128,17 @@ impl TableEngine {
     /// The default is now [`Durability::Fsync`]. Use
     /// [`open_with`](Self::open_with) to opt out deliberately.
     ///
-    /// ## Expect this to be slow, for now
+    /// ## What durability costs
     ///
-    /// One `fsync` per insert is the worst possible shape: tens to hundreds of
-    /// microseconds each, unamortised. `GroupCommitBatcher` exists in
-    /// `vectorvolt-wal` precisely to batch N writes into one `fsync` — but nothing
-    /// outside that crate uses it yet, because it is `async` while this write path
-    /// is synchronous. Resolving that mismatch is VV-WAL-011 and is the next piece
-    /// of work; until then, correct-and-slow is the right trade over fast-and-lying.
+    /// Measured on the dev laptop: 526 µs per durable insert against 7.8 µs for the
+    /// same insert unsynced — `fsync` is 67× the actual work.
+    ///
+    /// Concurrent writers now share one `fsync` through
+    /// [`vectorvolt_wal::SyncCommitter`], so that cost is amortised across writers
+    /// rather than paid per commit. **A single sequential writer still pays it every
+    /// time** — group commit removes the scaling penalty, not the device latency.
+    /// Use [`commit_stats`](Self::commit_stats) to see the batching that actually
+    /// occurred.
     pub fn open(
         schema: Vec<String>,
         data_dir: impl Into<PathBuf>,
@@ -463,6 +468,15 @@ impl TableEngine {
     }
 
     // ── Introspection ─────────────────────────────────────────────────────────
+
+    /// Group-commit counters from the write path.
+    ///
+    /// `commits_per_sync() > 1` proves concurrent writers shared an `fsync` rather
+    /// than each paying their own. Exposed so that can be asserted rather than
+    /// assumed.
+    pub fn commit_stats(&self) -> vectorvolt_txn::SyncStats {
+        self.txn.commit_stats()
+    }
 
     /// Snapshot of current engine state (non-flushing).
     pub fn stats(&self) -> EngineStats {

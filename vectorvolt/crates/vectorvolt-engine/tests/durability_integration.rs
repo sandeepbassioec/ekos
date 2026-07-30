@@ -216,3 +216,87 @@ fn each_durability_level_costs_what_it_should() {
         "Fsync ({fsync:?}) was not slower than Buffered ({buffered:?}) — fsync is          probably not being issued at all"
     );
 }
+
+// ── group commit (VV-WAL-011) ─────────────────────────────────────────────────
+
+#[test]
+fn concurrent_durable_writers_share_fsyncs() {
+    // The payoff of wiring SyncCommitter through TxnManager: with fsync at 67x the
+    // cost of the actual work, the thing that matters is that N writers do not cost
+    // N fsyncs.
+    use std::sync::Arc;
+
+    const THREADS: usize = 8;
+    const PER_THREAD: u64 = 30;
+
+    let dir = TempDir::new().unwrap();
+    let engine = Arc::new(
+        TableEngine::open_with(schema(), dir.path(), EngineOptions::new(1_000_000)).unwrap(),
+    );
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let base = t as u64 * 1_000;
+                for i in 1..=PER_THREAD {
+                    engine.insert(base + i, vec![base + i, i]).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("writer thread panicked");
+    }
+
+    let s = engine.commit_stats();
+    println!(
+        "  {THREADS} threads x {PER_THREAD} durable inserts: {} commits, {} fsyncs, \
+         {} free rides ({:.2} commits/sync)",
+        s.commits,
+        s.syncs,
+        s.free_rides,
+        s.commits_per_sync()
+    );
+
+    assert!(
+        s.syncs < s.commits,
+        "no batching through the engine: {} fsyncs for {} commits",
+        s.syncs,
+        s.commits
+    );
+    assert!(
+        s.free_rides > 0,
+        "no commit was made durable by another thread's fsync"
+    );
+
+    // Correctness is not negotiable for a throughput win: every row must be there.
+    for t in 0..THREADS as u64 {
+        for i in 1..=PER_THREAD {
+            let pk = t * 1_000 + i;
+            assert!(
+                engine.get(pk).unwrap().is_some(),
+                "pk {pk} lost under concurrent durable writes"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_writer_gets_no_batching_and_that_is_expected() {
+    // Documents the limit in executable form, so nobody reads "group commit" as
+    // "durable writes are now fast".
+    let dir = TempDir::new().unwrap();
+    let engine =
+        TableEngine::open_with(schema(), dir.path(), EngineOptions::new(1_000_000)).unwrap();
+    for i in 1..=10u64 {
+        engine.insert(i, vec![i, i]).unwrap();
+    }
+    let s = engine.commit_stats();
+    assert_eq!(
+        s.syncs, s.commits,
+        "a lone writer should pay one fsync per commit; got {} syncs for {} commits",
+        s.syncs, s.commits
+    );
+    assert_eq!(s.free_rides, 0);
+}
