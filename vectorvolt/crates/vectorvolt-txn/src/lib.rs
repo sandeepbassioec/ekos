@@ -36,3 +36,4 @@ pub mod ops;
 pub use error::{TxnError, TxnResult};
 pub use manager::{FlushResult, TxnManager, WalTip};
 pub use ops::Mutation;
+pub use vectorvolt_wal::SyncStats;
