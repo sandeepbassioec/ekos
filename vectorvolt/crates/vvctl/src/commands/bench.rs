@@ -47,7 +47,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     // ── INSERT ────────────────────────────────────────────────────────────────
     println!("\nVectorVolt in-process micro-benchmark");
-    println!("rows={} warmup={} (release build required for real numbers)", args.rows, args.warmup);
+    println!(
+        "rows={} warmup={} (release build required for real numbers)",
+        args.rows, args.warmup
+    );
     println!("{}", "─".repeat(60));
     println!("INSERT includes WAL write() syscall (~4-6 µs floor on Windows).");
     println!("GET uses lazy O(1) mmap reads — sub-microsecond at p50.");
@@ -144,7 +147,9 @@ fn print_section(label: &str, samples: &[u64]) {
     }
 
     let stats = Stats::compute(samples);
-    let ops_per_sec = 1_000_000_000u64.checked_div(stats.mean_ns).unwrap_or(u64::MAX);
+    let ops_per_sec = 1_000_000_000u64
+        .checked_div(stats.mean_ns)
+        .unwrap_or(u64::MAX);
 
     println!();
     println!("  {label}");

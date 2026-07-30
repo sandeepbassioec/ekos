@@ -12,8 +12,38 @@ pub enum WalError {
         reason: &'static str,
     },
 
-    #[error("Hash chain broken at sequence {sequence}: expected {expected}, got {actual}")]
+    /// Frame `sequence` does not link to the frame before it.
+    ///
+    /// `expected` is the preceding frame's `frame_hash` — what this frame's
+    /// `prev_hash` should have contained. `actual` is what it does contain.
+    ///
+    /// **Forensic note:** the break is reported at the frame that *fails to link*,
+    /// which means the tampering is at or before `sequence - 1`. A frame can be
+    /// rewritten with a valid self-hash and CRC (both computable from the frame
+    /// alone), but doing so changes its `frame_hash`, so the *next* frame is where
+    /// the chain visibly breaks. That is precisely what makes the log
+    /// tamper-evident rather than merely checksummed.
+    #[error(
+        "Hash chain broken at sequence {sequence}: prev_hash is {actual}, expected {expected} \
+         (tampering is at or before sequence {})", sequence.saturating_sub(1)
+    )]
     ChainBroken {
+        sequence: u64,
+        expected: String,
+        actual: String,
+    },
+
+    /// A frame's stored `frame_hash` does not match a hash recomputed from its
+    /// own contents.
+    ///
+    /// Normally unreachable from [`crate::WalReader::verify`], because
+    /// [`crate::Frame::decode`] performs the same check and rejects the frame
+    /// first. Retained as defence in depth: if `decode` is ever changed to skip
+    /// hash validation for speed, `verify` must not silently become a no-op.
+    #[error(
+        "Frame self-hash mismatch at sequence {sequence}: stored {actual}, computed {expected}"
+    )]
+    FrameHashMismatch {
         sequence: u64,
         expected: String,
         actual: String,
