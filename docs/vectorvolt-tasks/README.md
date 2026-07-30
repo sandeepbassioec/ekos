@@ -76,15 +76,30 @@ primitive is called from the storage, query, index, or engine hot paths. The 2.6
 microbenchmarks; **no real query is faster yet**. Every ✅ kernel task is therefore paired with an
 explicit ⬜ integration task. This is precisely S2's job.
 
-### 4. `WalReader::verify()` reports a fabricated hash on chain break
+### 4. `WalReader::verify()` reports a fabricated hash on chain break — FIXED
 
-`vectorvolt-wal/src/reader.rs:148` returns `GENESIS_HASH` as the `actual` value instead of the
-frame's real `prev_hash` — the code comment admits it is a placeholder. The WAL's SHA3-256 chain
-exists to *prove* tampering; the one moment it fires, it misreports what it found.
+`vectorvolt-wal/src/reader.rs:148` returned `GENESIS_HASH` as the `actual` value instead of the
+frame's real `prev_hash` — the code comment admitted it was a placeholder. The WAL's SHA3-256 chain
+exists to *prove* tampering; the one moment it fired, it misreported what it found.
 
-Second defect in the same block: the re-walk only detects `prev_hash` mismatches, but `scan()` also
-stops on a *self*-hash mismatch. A frame with a corrupt own-hash but intact chain link yields
-`broken_at = 0`, blaming the wrong frame.
+Fixed on branch `fix/wal-verify-chain-error`, together with a single-pass rewrite (the old code read
+the whole WAL **three times**: `scan`, then `read_all` to count, then `read_all` again to locate the
+break) and 9 tamper-detection tests. That path had **zero** test coverage, which is exactly why a
+placeholder survived in it — nothing ever constructed a broken chain, so nothing ever read the
+message.
+
+> **Correction.** An earlier revision of this note claimed a "second defect": that a corrupt
+> self-hash makes the re-walk blame frame 0. **That was wrong.** `Frame::decode` already validates
+> both the CRC32 and the frame's self-hash, so such a frame never reaches `verify()`'s closure —
+> `scan` propagates `decode`'s error instead. The path is unreachable and the re-walk always found
+> the correct frame. The claim came from reading 30 lines of `verify()` without reading `decode()`.
+>
+> What the fix *did* uncover, which is more interesting: to reach the chain check at all, a tamperer
+> must repair **both** the CRC and the self-hash — both computable from a single frame. What cannot
+> be repaired is the *link*, so a break reported at sequence N means the tampering is at or before
+> N−1. The error message now says that. Two tests also assert honest **limitations**: rewriting the
+> final frame and truncating the log are undetectable by chain verification alone, since nothing
+> links after the last frame.
 
 ### 5. `TxnManager.zone_map` is written every flush and never read
 
