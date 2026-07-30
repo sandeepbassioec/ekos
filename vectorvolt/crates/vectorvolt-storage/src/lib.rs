@@ -14,6 +14,7 @@
 //! See [`format`] for the complete binary layout.  All integers are little-endian.
 //! Two CRC32 checksums protect the header and the entire file.
 
+pub mod bitpack;
 pub mod column;
 pub mod format;
 pub mod partition;
