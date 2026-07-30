@@ -1,0 +1,13 @@
+[package]
+name        = "vectorvolt-hal"
+description = "VectorVolt hardware abstraction layer — SIMD kernels, cache control, prefetch, cycle timing"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+# No dependencies. This crate talks to the CPU through `core::arch` intrinsics
+# and `std` feature detection only — nothing here should ever need a third-party
+# crate, and keeping it dependency-free keeps it auditable.
+[dependencies]

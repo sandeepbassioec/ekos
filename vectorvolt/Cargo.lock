@@ -896,6 +896,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-hal"
+version = "0.1.0"
+
+[[package]]
 name = "vectorvolt-index"
 version = "0.1.0"
 dependencies = [
@@ -997,6 +1001,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vectorvolt-engine",
+ "vectorvolt-hal",
  "vectorvolt-store",
  "vectorvolt-wal",
 ]
