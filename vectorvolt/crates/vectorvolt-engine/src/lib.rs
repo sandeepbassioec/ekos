@@ -23,11 +23,13 @@
 //! assert_eq!(row.values[1], 25);
 //! ```
 
+mod compact;
 mod engine;
 mod error;
 mod row;
 mod stats;
 
+pub use compact::CompactResult;
 pub use engine::TableEngine;
 pub use engine::{FlushResult, WalTip};
 pub use error::{EngineError, EngineResult};

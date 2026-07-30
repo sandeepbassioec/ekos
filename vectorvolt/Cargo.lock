@@ -889,6 +889,7 @@ dependencies = [
  "parking_lot",
  "tempfile",
  "thiserror",
+ "vectorvolt-index",
  "vectorvolt-storage",
  "vectorvolt-txn",
  "vectorvolt-wal",

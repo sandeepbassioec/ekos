@@ -11,6 +11,7 @@ repository.workspace = true
 vectorvolt-wal     = { workspace = true }
 vectorvolt-txn     = { workspace = true }
 vectorvolt-storage = { workspace = true }
+vectorvolt-index   = { workspace = true }
 thiserror          = { workspace = true }
 parking_lot        = { workspace = true }
 
