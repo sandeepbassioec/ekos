@@ -1,0 +1,31 @@
+[package]
+name        = "vectorvolt-hal"
+description = "VectorVolt hardware abstraction layer — SIMD kernels, cache control, prefetch, cycle timing"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+# The SIMD, cache, prefetch, and timer modules have no dependencies at all — they
+# reach the CPU through `core::arch` intrinsics and `std` feature detection.
+#
+# Topology detection needs the OS to describe the machine, and only one platform
+# needs a crate for it:
+#   Linux   — plain file reads under /sys, so `std` suffices.
+#   Windows — `GetLogicalProcessorInformationEx` is the only API exposing
+#             EfficiencyClass, which is how P-cores are told from E-cores.
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `sched_setaffinity` / `sched_getaffinity` / `sched_getcpu`.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    # SetThreadAffinityMask, GetCurrentThread.
+    "Win32_System_Threading",
+] }

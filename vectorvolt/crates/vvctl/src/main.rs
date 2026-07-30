@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
-use commands::{bench, store, table, wal};
+use commands::{bench, hal, store, table, wal};
 use store::OutputFormat;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,6 +38,9 @@ enum Commands {
 
     /// In-process micro-benchmark: INSERT / GET / SCAN latency.
     Bench(bench::BenchArgs),
+
+    /// Report detected CPU features and measure scalar-vs-SIMD kernel speedup.
+    Hal(hal::HalArgs),
 
     /// KV store read/write commands.
     #[command(subcommand)]
@@ -134,6 +137,8 @@ fn main() -> Result<()> {
         Commands::Table(cmd) => table::run(cmd)?,
 
         Commands::Bench(args) => bench::run(args)?,
+
+        Commands::Hal(args) => hal::run(args)?,
 
         Commands::Wal(cmd) => wal::run(cmd)?,
 

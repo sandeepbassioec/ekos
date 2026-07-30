@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/vectorvolt-hal",
     "crates/vectorvolt-wal",
     "crates/vectorvolt-store",
     "crates/vectorvolt-index",
@@ -50,6 +51,7 @@ roaring        = "0.10"
 # memory-mapped I/O
 memmap2        = "0.9"
 # internal crates
+vectorvolt-hal     = { path = "crates/vectorvolt-hal" }
 vectorvolt-wal     = { path = "crates/vectorvolt-wal" }
 vectorvolt-index   = { path = "crates/vectorvolt-index" }
 vectorvolt-storage = { path = "crates/vectorvolt-storage" }

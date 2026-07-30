@@ -17,12 +17,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use parking_lot::RwLock;
-use vectorvolt_storage::PartitionReader;
+use vectorvolt_index::RowDescriptor;
+use vectorvolt_storage::{ColumnValues, MicroPartition, PartitionReader, write_partition};
 pub use vectorvolt_txn::{FlushResult, WalTip};
 use vectorvolt_txn::{Mutation, TxnManager};
 use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
 
-use crate::{EngineError, EngineResult, EngineRow, EngineStats};
+use crate::{CompactResult, EngineError, EngineResult, EngineRow, EngineStats};
 
 /// Per-table engine: owns the write path (TxnManager) and read path (PartitionReader map).
 pub struct TableEngine {
@@ -220,6 +221,139 @@ impl TableEngine {
         }
 
         Ok(results)
+    }
+
+    // ── Compaction ────────────────────────────────────────────────────────────
+
+    /// Merge all on-disk partitions into one sorted partition, removing
+    /// tombstoned rows.
+    ///
+    /// ## What it does
+    ///
+    /// 1. Flush any pending write-buffer rows to disk.
+    /// 2. Collect every live row from every partition (a row is live if its PK
+    ///    is still present in the CuckooMap — deleted PKs are skipped).
+    /// 3. Sort live rows by PK for better zone-pruning on subsequent SCANs.
+    /// 4. Write a single merged `.vvsst` file.
+    /// 5. Delete the old partition files and update the in-memory catalog.
+    /// 6. Rebuild the CuckooMap so every PK points to the new partition.
+    ///
+    /// Returns `None` if there was nothing to compact (0 or 1 partition and no
+    /// deleted rows).
+    pub fn compact(&self) -> EngineResult<Option<CompactResult>> {
+        // 1. Flush pending rows first.
+        self.do_flush()?;
+
+        let mut parts = self.partitions.write();
+        if parts.len() <= 1 {
+            // Check if there are any tombstoned rows worth reclaiming.
+            let live: u64 = parts.values().map(|r| r.row_count() as u64).sum();
+            let indexed = self.txn.pk_index.read().len() as u64;
+            if parts.is_empty() || live == indexed {
+                return Ok(None);
+            }
+        }
+
+        // 2. Collect all live rows across all partitions.
+        let col_count = self.schema.len();
+        let mut live_rows: Vec<(u64, Vec<u64>)> = Vec::new();
+
+        for reader in parts.values() {
+            let row_count = reader.row_count() as usize;
+            // Read all columns eagerly (needed to reconstruct full rows).
+            let all_cols: Vec<Vec<u64>> = (0..col_count)
+                .map(|c| {
+                    reader
+                        .read_column(c)
+                        .map(|cv| cv.to_raw_vec())
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            let pk_col = &all_cols[0];
+            let idx = self.txn.pk_index.read();
+            for row_offset in 0..row_count {
+                let pk = pk_col[row_offset];
+                if idx.get(pk).is_some() {
+                    let values: Vec<u64> = all_cols.iter().map(|c| c[row_offset]).collect();
+                    live_rows.push((pk, values));
+                }
+            }
+        }
+
+        if live_rows.is_empty() {
+            return Ok(None);
+        }
+
+        // 3. Sort by PK for optimal zone-pruning on range scans.
+        live_rows.sort_unstable_by_key(|(pk, _)| *pk);
+        let row_count = live_rows.len();
+
+        // 4. Write a single merged partition file.
+        //    Use the next available partition_id to avoid collisions.
+        let new_file_id: u16 = 0;
+        let new_partition_id = self.txn.alloc_partition_id();
+
+        let mut mp = MicroPartition::new(new_file_id, new_partition_id);
+        for (col_idx, col_name) in self.schema.iter().enumerate() {
+            let col_vals: Vec<u64> = live_rows.iter().map(|(_, v)| v[col_idx]).collect();
+            let encoded = if col_idx == 0 {
+                ColumnValues::Raw(col_vals)
+            } else {
+                ColumnValues::auto_encode(col_vals)
+            };
+            mp.push_column(col_name.clone(), encoded)?;
+        }
+
+        let filename = format!("{new_file_id:05}_{new_partition_id:05}.vvsst");
+        let new_path = self.partition_dir.join(&filename);
+        {
+            let mut file = std::fs::File::create(&new_path)?;
+            write_partition(&mut file, &mp)?;
+        }
+
+        // 5. Drop every PartitionReader before deleting files.
+        //
+        // This ordering is load-bearing on Windows: an open mmap holds the file,
+        // and `remove_file` fails with OS error 1224 while a mapping is live.
+        // Clearing the map runs the readers' destructors, releasing the mappings.
+        parts.clear();
+
+        // Delete every old `.vvsst` by scanning the directory rather than from
+        // the map we just cleared — the scan is the authoritative view of what is
+        // on disk, and it also sweeps any orphan left by an interrupted earlier
+        // run. The newly written file is excluded by path; it is not yet
+        // registered, so nothing holds a mapping to it.
+        for entry in std::fs::read_dir(&self.partition_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("vvsst") && path != new_path {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
+        // Register the new merged partition.
+        let new_reader = PartitionReader::open(&new_path)?;
+        parts.insert((new_file_id, new_partition_id), new_reader);
+
+        // 6. Rebuild CuckooMap: update every PK to point to the new partition.
+        {
+            let mut idx = self.txn.pk_index.write();
+            for (new_offset, (pk, _)) in live_rows.iter().enumerate() {
+                let _ = idx.insert(
+                    *pk,
+                    RowDescriptor::new(new_file_id, new_partition_id, new_offset as u32),
+                );
+            }
+        }
+
+        // Reset flushed-row counter to match new on-disk state.
+        self.txn.set_total_rows_flushed(row_count as u64);
+
+        Ok(Some(CompactResult {
+            rows_kept: row_count,
+            path: new_path,
+        }))
     }
 
     // ── Introspection ─────────────────────────────────────────────────────────
