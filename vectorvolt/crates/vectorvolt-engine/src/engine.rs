@@ -34,26 +34,131 @@ pub struct TableEngine {
     pub schema: Vec<String>,
 }
 
+/// How durable a write must be before `insert` returns.
+///
+/// Three genuinely different guarantees. The middle one is easy to miss and is
+/// what the engine silently provided before — see [`Durability::Buffered`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// `write()` + `fsync()` before returning. **Survives power loss and kernel panic.**
+    ///
+    /// The only setting that makes the WAL mean what a WAL is for, so it is the
+    /// default. Also the most expensive: an `fsync` costs tens to hundreds of
+    /// microseconds, and one per insert is unamortised — exactly the cost group
+    /// commit exists to spread across many writes (VV-WAL-011, not yet wired).
+    Fsync,
+
+    /// `write()` to the OS, no `fsync()`. **Survives a process crash; not power loss.**
+    ///
+    /// The kernel owns the bytes and will write them out even if this process dies,
+    /// so a panic or `kill -9` loses nothing. A power cut or kernel panic does.
+    WriteOnly,
+
+    /// Left in this process's own `BufWriter`. **Survives nothing.**
+    ///
+    /// The bytes sit in userspace memory until the buffer fills or the writer is
+    /// dropped, so a process crash loses recent writes — not just a power cut.
+    ///
+    /// **This is what the engine did before durability was configurable**, and it
+    /// is why INSERT measured 4–6 µs: that figure was buffer copy, SHA3-256 frame
+    /// hashing, and index maintenance, with no write syscall on the path at all.
+    /// Kept as an explicit option because it is the right choice for a rebuildable
+    /// cache and for benchmarking the non-durable ceiling — but it must be asked
+    /// for, not defaulted into.
+    Buffered,
+}
+
+impl Durability {
+    /// Whether `fsync` is requested when the WAL is flushed.
+    #[inline]
+    fn wal_fsync(self) -> bool {
+        matches!(self, Durability::Fsync)
+    }
+
+    /// Whether the WAL is flushed out of the userspace buffer on every commit.
+    #[inline]
+    fn sync_on_commit(self) -> bool {
+        !matches!(self, Durability::Buffered)
+    }
+}
+
+/// Options for opening a [`TableEngine`].
+#[derive(Debug, Clone, Copy)]
+pub struct EngineOptions {
+    /// Rows buffered before an automatic flush to a new partition.
+    pub flush_threshold: usize,
+    pub durability: Durability,
+}
+
+impl EngineOptions {
+    pub fn new(flush_threshold: usize) -> Self {
+        EngineOptions {
+            flush_threshold,
+            durability: Durability::Fsync,
+        }
+    }
+
+    /// Trade durability for speed. See [`Durability::WriteOnly`] for exactly what
+    /// is given up.
+    pub fn with_durability(mut self, durability: Durability) -> Self {
+        self.durability = durability;
+        self
+    }
+}
+
 impl TableEngine {
-    /// Open or create a table at `data_dir`.
+    /// Open or create a table at `data_dir`, **durable by default**.
     ///
     /// Directory layout:
     /// - `data_dir/wal/`  — WAL segment files
     /// - `data_dir/data/` — `.vvsst` partition files
     ///
-    /// Existing `.vvsst` files are loaded on open (restart durability).
+    /// Existing `.vvsst` files are loaded on open (restart recovery).
+    ///
+    /// ## Durability, and a correction
+    ///
+    /// This used to hardcode `with_fsync(false)` with no way to change it, so every
+    /// write reached only the OS page cache. That survives a *process* crash but
+    /// **not power loss or a kernel panic** — meaning the engine did not actually
+    /// provide the durability a WAL exists for, and any INSERT latency measured
+    /// against it was measuring a non-durable write.
+    ///
+    /// The default is now [`Durability::Fsync`]. Use
+    /// [`open_with`](Self::open_with) to opt out deliberately.
+    ///
+    /// ## Expect this to be slow, for now
+    ///
+    /// One `fsync` per insert is the worst possible shape: tens to hundreds of
+    /// microseconds each, unamortised. `GroupCommitBatcher` exists in
+    /// `vectorvolt-wal` precisely to batch N writes into one `fsync` — but nothing
+    /// outside that crate uses it yet, because it is `async` while this write path
+    /// is synchronous. Resolving that mismatch is VV-WAL-011 and is the next piece
+    /// of work; until then, correct-and-slow is the right trade over fast-and-lying.
     pub fn open(
         schema: Vec<String>,
         data_dir: impl Into<PathBuf>,
         flush_threshold: usize,
     ) -> EngineResult<Self> {
+        Self::open_with(schema, data_dir, EngineOptions::new(flush_threshold))
+    }
+
+    /// [`open`](Self::open) with explicit options.
+    pub fn open_with(
+        schema: Vec<String>,
+        data_dir: impl Into<PathBuf>,
+        options: EngineOptions,
+    ) -> EngineResult<Self> {
+        let flush_threshold = options.flush_threshold;
+        let durability = options.durability;
         let data_dir = data_dir.into();
         let wal_dir = data_dir.join("wal");
         let partition_dir = data_dir.join("data");
         std::fs::create_dir_all(&wal_dir)?;
         std::fs::create_dir_all(&partition_dir)?;
 
-        let cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
+        let cfg = WalConfig::default()
+            .with_dir(&wal_dir)
+            .with_fsync(durability.wal_fsync());
         let wal = WalWriter::open(cfg)?;
 
         // Recover previously-flushed partitions.
@@ -78,7 +183,8 @@ impl TableEngine {
             &partition_dir,
             flush_threshold,
             max_partition_id,
-        );
+        )
+        .with_sync_on_commit(durability.sync_on_commit());
 
         // Rebuild pk_index from existing partition files so reads work across
         // process restarts (Phase 2 crash recovery).
@@ -89,6 +195,7 @@ impl TableEngine {
         // restart.  Insert records are skipped — their rows are already in
         // partition files (we flush every CLI insert) or are lost pending data
         // (acceptable Phase 2 limitation).
+        // Read-only replay: this reader never writes, so fsync is irrelevant here.
         let wal_cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
         if let Ok(frames) = WalReader::open(wal_cfg).read_all() {
             let mut idx = txn.pk_index.write();

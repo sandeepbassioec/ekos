@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use clap::Args;
-use vectorvolt_engine::TableEngine;
+use vectorvolt_engine::{Durability, EngineOptions, TableEngine};
 
 const FLUSH_THRESHOLD: usize = 1_048_576;
 
@@ -31,6 +31,23 @@ pub struct BenchArgs {
     /// Skip SCAN benchmark.
     #[arg(long)]
     pub no_scan: bool,
+
+    /// Measure non-durable writes: `write()` only, no `fsync()`.
+    ///
+    /// The default is durable (one `fsync` per insert), because that is what the
+    /// engine now does by default and a benchmark should measure the real thing.
+    /// Use this to see the non-durable ceiling — but do not quote the result as a
+    /// durable write figure, which is exactly the mistake earlier numbers made.
+    #[arg(long)]
+    pub no_fsync: bool,
+
+    /// Leave writes in this process's userspace buffer. Survives **nothing**.
+    ///
+    /// This is what the engine silently did before durability was configurable, so
+    /// it is the mode any previously quoted INSERT figure was actually measuring.
+    /// Useful as the non-durable ceiling — never quote it as a durable number.
+    #[arg(long, conflicts_with = "no_fsync")]
+    pub buffered: bool,
 }
 
 pub fn run(args: BenchArgs) -> Result<()> {
@@ -43,7 +60,18 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     let dir = tempfile::tempdir()?;
     let schema = vec!["id".to_owned(), "value".to_owned(), "ts".to_owned()];
-    let engine = TableEngine::open(schema, dir.path(), FLUSH_THRESHOLD)?;
+    let durability = if args.buffered {
+        Durability::Buffered
+    } else if args.no_fsync {
+        Durability::WriteOnly
+    } else {
+        Durability::Fsync
+    };
+    let engine = TableEngine::open_with(
+        schema,
+        dir.path(),
+        EngineOptions::new(FLUSH_THRESHOLD).with_durability(durability),
+    )?;
 
     // ── INSERT ────────────────────────────────────────────────────────────────
     println!("\nVectorVolt in-process micro-benchmark");
@@ -52,9 +80,19 @@ pub fn run(args: BenchArgs) -> Result<()> {
         args.rows, args.warmup
     );
     println!("{}", "─".repeat(60));
-    println!("INSERT includes WAL write() syscall (~4-6 µs floor on Windows).");
+    println!(
+        "durability: {}",
+        match durability {
+            Durability::Fsync =>
+                "FSYNC per insert — survives power loss. Unamortised, because group \
+                 commit (VV-WAL-011) is not wired up yet, so expect hundreds of µs",
+            Durability::WriteOnly => "write() per insert — survives process crash, NOT power loss",
+            Durability::Buffered =>
+                "BUFFERED in userspace — survives NOTHING. Not a durable figure",
+        }
+    );
     println!("GET uses lazy O(1) mmap reads — sub-microsecond at p50.");
-    println!("SCAN uses full column decode + zone pruning — cost scales with partition size.");
+    println!("SCAN uses SIMD range filter + late materialization.");
 
     let insert_nanos = bench_inserts(&engine, args.rows, args.warmup, args.flush_every)?;
 
