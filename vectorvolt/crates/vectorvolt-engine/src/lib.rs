@@ -31,7 +31,7 @@ mod stats;
 
 pub use compact::CompactResult;
 pub use engine::TableEngine;
-pub use engine::{FlushResult, WalTip};
+pub use engine::{Durability, EngineOptions, FlushResult, WalTip};
 pub use error::{EngineError, EngineResult};
 pub use row::EngineRow;
 pub use stats::EngineStats;

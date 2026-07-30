@@ -17,15 +17,21 @@
 //!   is left on disk, the data is unreachable after a restart.
 
 use tempfile::TempDir;
-use vectorvolt_engine::TableEngine;
+use vectorvolt_engine::{Durability, EngineOptions, TableEngine};
+
+/// Non-durable options, for tests that are not about durability.
+fn fast() -> EngineOptions {
+    EngineOptions::new(1_000_000).with_durability(Durability::WriteOnly)
+}
 
 /// Three-column schema: id (PK), price, qty.
 fn make_engine(flush_threshold: usize) -> (TableEngine, TempDir) {
     let dir = TempDir::new().unwrap();
-    let engine = TableEngine::open(
+    // WriteOnly — see the note in engine_integration.rs.
+    let engine = TableEngine::open_with(
         vec!["id".into(), "price".into(), "qty".into()],
         dir.path(),
-        flush_threshold,
+        EngineOptions::new(flush_threshold).with_durability(Durability::WriteOnly),
     )
     .unwrap();
     (engine, dir)
@@ -221,7 +227,7 @@ fn compacted_table_survives_reopen() {
     let schema = vec!["id".to_string(), "price".to_string(), "qty".to_string()];
 
     {
-        let engine = TableEngine::open(schema.clone(), dir.path(), 1_000_000).unwrap();
+        let engine = TableEngine::open_with(schema.clone(), dir.path(), fast()).unwrap();
         insert_one_per_partition(&engine, 12);
         engine.delete(5).unwrap();
         let r = engine
@@ -231,7 +237,7 @@ fn compacted_table_survives_reopen() {
         assert_eq!(r.rows_kept, 11);
     } // engine dropped — mmaps released, process boundary simulated
 
-    let reopened = TableEngine::open(schema, dir.path(), 1_000_000).unwrap();
+    let reopened = TableEngine::open_with(schema, dir.path(), fast()).unwrap();
     assert_eq!(
         reopened.stats().partition_count,
         1,

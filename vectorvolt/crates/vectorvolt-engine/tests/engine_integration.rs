@@ -4,15 +4,22 @@
 //! write + read path, and asserts observable behaviour.
 
 use tempfile::TempDir;
-use vectorvolt_engine::{EngineRow, TableEngine};
+use vectorvolt_engine::{Durability, EngineOptions, EngineRow, TableEngine};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Two-column schema: id (PK) + age.
 fn make_engine(flush_threshold: usize) -> (TableEngine, TempDir) {
     let dir = TempDir::new().unwrap();
-    let engine =
-        TableEngine::open(vec!["id".into(), "age".into()], dir.path(), flush_threshold).unwrap();
+    // WriteOnly: these tests exercise engine logic, not durability, and one fsync
+    // per insert would dominate their runtime. Durability itself is covered by
+    // `durability_integration.rs`.
+    let engine = TableEngine::open_with(
+        vec!["id".into(), "age".into()],
+        dir.path(),
+        EngineOptions::new(flush_threshold).with_durability(Durability::WriteOnly),
+    )
+    .unwrap();
     (engine, dir)
 }
 

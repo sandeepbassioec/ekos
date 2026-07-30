@@ -55,6 +55,8 @@ pub struct TxnManager {
     next_file_id: AtomicU16,
     next_partition_id: AtomicU16,
     total_rows_flushed: AtomicU64,
+    /// Flush the WAL out of its userspace buffer on every commit.
+    sync_on_commit: bool,
 }
 
 impl TxnManager {
@@ -90,7 +92,30 @@ impl TxnManager {
             next_file_id: AtomicU16::new(0),
             next_partition_id: AtomicU16::new(start_partition_id),
             total_rows_flushed: AtomicU64::new(0),
+            // Default off preserves the historical behaviour for direct users of
+            // this crate; TableEngine opts in per its Durability setting.
+            sync_on_commit: false,
         }
+    }
+
+    /// Flush the WAL out of its `BufWriter` after every mutation.
+    ///
+    /// Without this, `wal.append()` only copies into userspace memory — nothing
+    /// reaches the OS until the buffer fills or the writer drops, so a process
+    /// crash loses recent writes. Whether the flush also calls `fsync` is set by
+    /// [`vectorvolt_wal::WalConfig::with_fsync`].
+    pub fn with_sync_on_commit(mut self, sync: bool) -> Self {
+        self.sync_on_commit = sync;
+        self
+    }
+
+    /// Push the WAL past the userspace buffer, if configured to.
+    #[inline]
+    fn sync_wal(&self) -> TxnResult<()> {
+        if self.sync_on_commit {
+            self.wal.flush()?;
+        }
+        Ok(())
     }
 
     // ── INSERT ─────────────────────────────────────────────────────────────────
@@ -113,6 +138,7 @@ impl TxnManager {
             values: values.clone(),
         };
         let tip = self.wal.append(mutation.encode())?;
+        self.sync_wal()?;
 
         // 2-3. CuckooMap: pk → pending RowDescriptor.
         let buf_offset = self.write_buf.lock().len() as u32;
@@ -153,6 +179,7 @@ impl TxnManager {
         }
 
         let tip = self.wal.append(Mutation::Delete { pk }.encode())?;
+        self.sync_wal()?;
         self.pk_index.write().remove(pk);
         Ok(tip)
     }
