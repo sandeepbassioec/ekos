@@ -312,27 +312,22 @@ impl TableEngine {
             write_partition(&mut file, &mp)?;
         }
 
-        // 5. Collect old file paths, clear partition map, delete old files.
-        let old_paths: Vec<PathBuf> = parts
-            .values()
-            .flat_map(|_| {
-                // We'll delete all .vvsst files that aren't the new one after
-                // we rebuild the map — safer to scan the dir.
-                std::iter::empty::<PathBuf>()
-            })
-            .collect();
-        let _ = old_paths; // unused — we scan the dir below
-
+        // 5. Drop every PartitionReader before deleting files.
+        //
+        // This ordering is load-bearing on Windows: an open mmap holds the file,
+        // and `remove_file` fails with OS error 1224 while a mapping is live.
+        // Clearing the map runs the readers' destructors, releasing the mappings.
         parts.clear();
 
-        // Delete every old .vvsst in the dir (the new file isn't visible yet
-        // because we haven't registered it).
+        // Delete every old `.vvsst` by scanning the directory rather than from
+        // the map we just cleared — the scan is the authoritative view of what is
+        // on disk, and it also sweeps any orphan left by an interrupted earlier
+        // run. The newly written file is excluded by path; it is not yet
+        // registered, so nothing holds a mapping to it.
         for entry in std::fs::read_dir(&self.partition_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("vvsst")
-                && path != new_path
-            {
+            if path.extension().and_then(|s| s.to_str()) == Some("vvsst") && path != new_path {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -345,7 +340,10 @@ impl TableEngine {
         {
             let mut idx = self.txn.pk_index.write();
             for (new_offset, (pk, _)) in live_rows.iter().enumerate() {
-                let _ = idx.insert(*pk, RowDescriptor::new(new_file_id, new_partition_id, new_offset as u32));
+                let _ = idx.insert(
+                    *pk,
+                    RowDescriptor::new(new_file_id, new_partition_id, new_offset as u32),
+                );
             }
         }
 
