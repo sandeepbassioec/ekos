@@ -49,7 +49,10 @@ pub fn run(args: HalArgs) -> Result<()> {
     println!("  u64 lanes/instr: {}", tier.lanes_u64());
     println!("  hw CRC-32C     : {}", simd::has_hw_crc32c());
     println!("  cache line     : {} bytes", vectorvolt_hal::CACHE_LINE);
-    println!("  base clock     : {:.2} GHz (RDTSC-calibrated)", timer.ghz());
+    println!(
+        "  base clock     : {:.2} GHz (RDTSC-calibrated)",
+        timer.ghz()
+    );
     println!(
         "  logical cores  : {}",
         std::thread::available_parallelism()
@@ -71,11 +74,19 @@ pub fn run(args: HalArgs) -> Result<()> {
     let hi = u64::MAX / 2;
     let needle = values[args.rows / 2];
 
-    println!("\nScalar vs {} — {} elements, best of {}", tier.name(), args.rows, args.iters);
+    println!(
+        "\nScalar vs {} — {} elements, best of {}",
+        tier.name(),
+        args.rows,
+        args.iters
+    );
     println!("{}", "─".repeat(62));
     println!(
         "  {:<16} {:>12} {:>12} {:>10}",
-        "kernel", "scalar", tier.name(), "speedup"
+        "kernel",
+        "scalar",
+        tier.name(),
+        "speedup"
     );
 
     let mut scratch = Vec::with_capacity(args.rows);

@@ -178,8 +178,9 @@ mod tests {
     #[test]
     fn padded_neighbours_do_not_share_a_line() {
         // The whole point: adjacent entries must land on different lines.
-        let v: Vec<CachePadded<AtomicU64>> =
-            (0..8).map(|_| CachePadded::new(AtomicU64::new(0))).collect();
+        let v: Vec<CachePadded<AtomicU64>> = (0..8)
+            .map(|_| CachePadded::new(AtomicU64::new(0)))
+            .collect();
         for w in v.windows(2) {
             let a = &w[0] as *const _ as usize;
             let b = &w[1] as *const _ as usize;

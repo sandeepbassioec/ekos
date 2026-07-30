@@ -56,7 +56,8 @@ fn assert_all_kernels_agree(values: &[u64], lo: u64, hi: u64, needle: u64, ctx: 
     simd::filter_range(values, lo, hi, &mut got);
     scalar::filter_range(values, lo, hi, &mut want);
     assert_eq!(
-        got, want,
+        got,
+        want,
         "filter_range diverged ({ctx}, len={}, lo={lo}, hi={hi})",
         values.len()
     );
@@ -153,7 +154,10 @@ fn all_values_above_i64_max_are_found() {
     ];
     let count = simd::count_range(&values, (i64::MAX as u64) + 1, u64::MAX);
     assert_eq!(count, 5, "high-bit values were not matched");
-    assert_eq!(count, scalar::count_range(&values, (i64::MAX as u64) + 1, u64::MAX));
+    assert_eq!(
+        count,
+        scalar::count_range(&values, (i64::MAX as u64) + 1, u64::MAX)
+    );
 
     assert_eq!(simd::min_max(&values), Some((1 << 63, u64::MAX)));
 }
@@ -191,7 +195,11 @@ fn filter_range_appends_without_clearing() {
     let values: Vec<u64> = (0..16).collect();
     let mut out = vec![999u32];
     simd::filter_range(&values, 0, 2, &mut out);
-    assert_eq!(out, vec![999, 0, 1, 2], "kernel clobbered existing contents");
+    assert_eq!(
+        out,
+        vec![999, 0, 1, 2],
+        "kernel clobbered existing contents"
+    );
 }
 
 #[test]

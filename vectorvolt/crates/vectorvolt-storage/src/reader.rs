@@ -219,8 +219,7 @@ impl PartitionReader {
             }
             ENCODING_DICT => {
                 // Index array starts immediately after the dictionary values.
-                let idx_offset =
-                    m.dict_offset as usize + m.dict_byte_len as usize + row_offset * 4;
+                let idx_offset = m.dict_offset as usize + m.dict_byte_len as usize + row_offset * 4;
                 let idx_bytes: [u8; 4] = data[idx_offset..idx_offset + 4]
                     .try_into()
                     .map_err(|_| StorageError::InvalidData("row_offset out of bounds".into()))?;
