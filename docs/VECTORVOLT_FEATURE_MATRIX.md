@@ -464,6 +464,21 @@ The three configuration layers, which must not be conflated:
 | VV-CFG-032 | Validation with actionable errors | ⬜ | S3 | Reject unknown keys — a silent typo is a latent outage |
 | VV-CFG-033 | `vvctl tune --explain` | ⬜ | S3 | Per-value origin + derivation rule |
 | VV-CFG-034 | Config schema versioning | ⬜ | S3 | Forward migration preserving edits |
+| **VV-CFG-035** | **Startup reconciliation — clamp-and-report** | ⬜ | S3 | Config values are *intents* clamped to live hardware. Every clamp logged, metered (`vv_config_clamped`), and shown in `vvctl status`. `--strict-config` refuses to start on any clamp |
+| **VV-CFG-036** | **Under-utilisation detection (silent upgrade)** | ⬜ | S3 | Warns above 25% unused capacity with an actionable recommendation; `vv_unused_core_fraction` metric. **Never auto-expands** — growing shard count relocates data |
+
+### Why 035/036 exist — the resize asymmetry
+
+**Downgrade fails loudly; upgrade fails silently, and the silent case is worse.** 16→4 cores gives
+`EINVAL` on pinning and an OOM-killed arena. 16→64 cores errors on nothing — the config still runs 8
+shards on cores 4–11 and you get 16 cores of throughput on a 64-core bill, indefinitely.
+
+Only four settings self-correct on a resize: SIMD tier, hardware CRC, prefetch tiers, timer
+calibration. Core pinning, shard count, arena size, huge pages, wait strategy, the L3-derived index
+budget, and device paths all need **reconciliation** — a distinct mechanism from detection.
+
+Full table of per-setting resize behaviour:
+[LAYER-18](vectorvolt-tasks/LAYER-18-DEPLOYMENT-AUTOCONFIG.md#detection-vs-reconciliation--and-why-resize-breaks-asymmetrically)
 
 ## LAYER 17 — Autonomy (EKOS-adjacent, deferred until VectorVolt core is done)
 
@@ -530,11 +545,11 @@ Each sprint = one branch, one PR, one traceability report appended to this file.
 |---|---|---|---|
 | **S1** | `vectorvolt-hal`: topology, SIMD (AVX2/AVX-512/NEON/scalar), L1/L2/L3/NTA prefetch, CPU pinning, NUMA, huge pages, cycle timer | VV-HAL-001..037 | The silicon foundation. Everything else depends on it |
 | **S2** | Wire SIMD + prefetch into storage/query/index. Encodings, compression, criterion bench, CI perf gate | VV-STO-009..014, VV-QRY-006..010, VV-IDX-007..011 | Prove <100 ns read |
-| **S3** | Type system, multi-table catalog, DDL, **partition control by entity/table/schema**, config system, ring buffer, arenas | VV-ENG-006..019, VV-TXN-008/009/019 | Real database shape |
+| **S3** | Type system, multi-table catalog, DDL, **partition control by entity/table/schema**, config system, ring buffer, arenas, **auto-config detection + derivation + reconciliation** | VV-ENG-006..019, VV-TXN-008/009/019, **VV-CFG-001..021, 031..036** | Real database shape; installs configure themselves |
 | **S4** | `vectorvolt-net` + `vectorvolt-server`: protocol, TCP, transport trait, TLS, metrics endpoint. MVCC + txns | VV-NET-001..013, VV-TXN-010..016 | It becomes a server |
 | **S5** | Tiering L0–L4, snapshots, PITR, retention, projections/CQRS, DLQ, prefetch engine | VV-STO-016..024, VV-PRJ-003..008, VV-PRE-001..008 | Durability & intelligence |
 | **S6** | `vectorvolt-cluster`: SWIM, vnodes, **master-slave replication**, Raft, epoch fencing, <2s failover | VV-CLU-001..018 | It becomes distributed |
-| **S7** | `vectorvolt-control` + admin API/UI, Rust SDK, C# SDK, multi-tenancy, RBAC | VV-CTL-001..015, VV-SDK-001..008 | Operable product |
+| **S7** | `vectorvolt-control` + admin API/UI, Rust SDK, C# SDK, multi-tenancy, RBAC, **package-manager install hooks** (deb/rpm/brew/winget/container/systemd) | VV-CTL-001..015, VV-SDK-001..008, **VV-CFG-022..030** | Operable product; `yum`/`apt`/`brew`/`winget` install self-configures |
 | **S8** | SQL layer, PG wire protocol, read fabric binary, vector/HNSW | VV-QRY-018..020, VV-CLU-019, VV-IDX-012 | SQL + vector search |
 | **S9** | Graph: CSR, traversal, joins, cascade delete, analytics | VV-IDX-013/014, VV-QRY-011..017 | Graph engine |
 | **S10** | Polyglot SDKs, chaos + deterministic sim testing, reference domains | VV-SDK-009..012, VV-TST-009..015 | Hardening |
