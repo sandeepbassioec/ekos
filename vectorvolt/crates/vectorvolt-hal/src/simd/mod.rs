@@ -85,9 +85,17 @@ impl SimdTier {
 static TIER: OnceLock<SimdTier> = OnceLock::new();
 static HAS_SSE42: OnceLock<bool> = OnceLock::new();
 
+/// Environment variable that caps the SIMD tier.
+///
+/// See [`tier`] for why this exists and why it can only cap downward.
+pub const TIER_ENV: &str = "VV_SIMD_TIER";
+
 /// Probe the CPU for the widest supported instruction set.
 ///
-/// Prefer [`tier`], which caches this. Calling `detect` repeatedly re-executes
+/// Ignores [`TIER_ENV`] — this is the raw hardware answer. Use [`tier`] for the
+/// value the dispatchers actually honour.
+///
+/// Prefer [`tier`], which caches. Calling `detect` repeatedly re-executes
 /// `cpuid`, which is serializing and costs hundreds of cycles.
 pub fn detect() -> SimdTier {
     #[cfg(target_arch = "x86_64")]
@@ -105,10 +113,76 @@ pub fn detect() -> SimdTier {
     }
 }
 
-/// The SIMD tier in use, detected once and cached for the process lifetime.
+/// Rank used to compare tiers. Higher is wider.
+#[inline]
+const fn rank(t: SimdTier) -> u8 {
+    match t {
+        SimdTier::Scalar => 0,
+        SimdTier::Neon => 1,
+        SimdTier::Avx2 => 2,
+        SimdTier::Avx512 => 3,
+    }
+}
+
+/// Parse a tier name, case-insensitively. `None` if unrecognised.
+fn parse_tier(s: &str) -> Option<SimdTier> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "scalar" | "none" | "off" => Some(SimdTier::Scalar),
+        "neon" => Some(SimdTier::Neon),
+        "avx2" => Some(SimdTier::Avx2),
+        "avx512" | "avx-512" => Some(SimdTier::Avx512),
+        _ => None,
+    }
+}
+
+/// The SIMD tier the dispatchers use: detected hardware, optionally capped by
+/// the `VV_SIMD_TIER` environment variable. Resolved once, cached for the
+/// process lifetime.
+///
+/// ## Why an override exists
+///
+/// Two problems come from pure auto-detection:
+///
+/// 1. **Untested fallbacks.** On any modern CPU the scalar path never executes,
+///    so it rots silently until someone runs on old hardware.
+/// 2. **Incomparable measurements.** Comparing AVX2 on one machine against
+///    scalar on another confounds the kernel with the cache hierarchy, clock,
+///    and memory bandwidth. To attribute a difference to the *kernel*, you must
+///    vary only the kernel — same box, same cache state.
+///
+/// So: `VV_SIMD_TIER=scalar vvctl hal` forces the scalar path on hardware that
+/// would otherwise pick AVX2, making an honest same-box comparison possible.
+///
+/// ## It can only cap downward
+///
+/// The variable sets a **ceiling**, never a floor. Requesting a tier the CPU
+/// lacks clamps to what is actually available rather than executing an illegal
+/// instruction. Forcing *down* always works; forcing *up* is physically
+/// impossible and is silently clamped — [`describe`](crate::describe) and
+/// `vvctl hal` always print the effective tier, so the clamp is visible rather
+/// than mysterious.
+///
+/// An unrecognised value is ignored (treated as no cap) rather than panicking:
+/// a typo'd env var should not take down a database.
 #[inline]
 pub fn tier() -> SimdTier {
-    *TIER.get_or_init(detect)
+    *TIER.get_or_init(|| {
+        let detected = detect();
+        match std::env::var(TIER_ENV).ok().as_deref().and_then(parse_tier) {
+            // Cap downward only. `min` by rank, so an over-request clamps.
+            Some(requested) if rank(requested) < rank(detected) => requested,
+            _ => detected,
+        }
+    })
+}
+
+/// True if [`tier`] was capped below what the hardware supports.
+///
+/// Worth surfacing in any benchmark report — a figure measured under a cap is
+/// not this machine's best, and a reader needs to know that.
+#[inline]
+pub fn is_capped() -> bool {
+    rank(tier()) < rank(detect())
 }
 
 /// Whether the hardware `crc32` instruction is available.
@@ -218,8 +292,76 @@ mod tests {
     fn tier_is_cached_and_stable() {
         let a = tier();
         let b = tier();
-        assert_eq!(a, b);
-        assert_eq!(a, detect(), "cached tier disagrees with a fresh probe");
+        assert_eq!(a, b, "tier() is not stable across calls");
+        // Without VV_SIMD_TIER set, tier() must equal raw detection. If the test
+        // runner sets the cap, tier() may legitimately be lower.
+        if std::env::var(TIER_ENV).is_err() {
+            assert_eq!(a, detect(), "cached tier disagrees with a fresh probe");
+            assert!(!is_capped());
+        }
+    }
+
+    #[test]
+    fn tier_names_round_trip_through_parsing() {
+        for t in [
+            SimdTier::Scalar,
+            SimdTier::Neon,
+            SimdTier::Avx2,
+            SimdTier::Avx512,
+        ] {
+            assert_eq!(
+                parse_tier(t.name()),
+                Some(t),
+                "{} failed round-trip",
+                t.name()
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tier_is_lenient_about_form_and_strict_about_nonsense() {
+        assert_eq!(parse_tier("AVX2"), Some(SimdTier::Avx2));
+        assert_eq!(parse_tier("  avx-512 "), Some(SimdTier::Avx512));
+        assert_eq!(parse_tier("off"), Some(SimdTier::Scalar));
+        assert_eq!(parse_tier("none"), Some(SimdTier::Scalar));
+        // A typo must be ignored, not panic — this runs inside a database.
+        assert_eq!(parse_tier("avx3"), None);
+        assert_eq!(parse_tier(""), None);
+    }
+
+    #[test]
+    fn rank_orders_tiers_by_width() {
+        assert!(rank(SimdTier::Scalar) < rank(SimdTier::Neon));
+        assert!(rank(SimdTier::Neon) < rank(SimdTier::Avx2));
+        assert!(rank(SimdTier::Avx2) < rank(SimdTier::Avx512));
+    }
+
+    #[test]
+    fn cap_logic_only_ever_lowers() {
+        // Replicates tier()'s resolution without touching the process-wide
+        // OnceLock, so this stays independent of test execution order.
+        let resolve = |detected: SimdTier, requested: Option<SimdTier>| match requested {
+            Some(r) if rank(r) < rank(detected) => r,
+            _ => detected,
+        };
+
+        // Downward: honoured.
+        assert_eq!(
+            resolve(SimdTier::Avx2, Some(SimdTier::Scalar)),
+            SimdTier::Scalar
+        );
+        // Upward: clamped to hardware, never granted.
+        assert_eq!(
+            resolve(SimdTier::Avx2, Some(SimdTier::Avx512)),
+            SimdTier::Avx2
+        );
+        // Equal: no change.
+        assert_eq!(
+            resolve(SimdTier::Avx2, Some(SimdTier::Avx2)),
+            SimdTier::Avx2
+        );
+        // Unset: hardware wins.
+        assert_eq!(resolve(SimdTier::Avx2, None), SimdTier::Avx2);
     }
 
     #[test]
