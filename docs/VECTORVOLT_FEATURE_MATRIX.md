@@ -491,5 +491,69 @@ Each sprint = one branch, one PR, one traceability report appended to this file.
 
 ### S0 — Baseline (pre-existing, merged PRs #10–#13)
 Delivered: `vectorvolt-txn`, `vectorvolt-engine`, `vvctl table`, `vvctl bench`, O(1) `read_value`
-(400× GET speedup, 80 µs → 200 ns p50), partition compaction, CuckooFilter overflow.
+(400× GET speedup, 80 µs → 200 ns p50), CuckooFilter overflow.
 Tests: 140. Clippy: clean.
+Open PR not yet merged: `feat/compaction` (partition compaction, VV-STO-008).
+
+### S1a — HAL: SIMD + cache + prefetch + cycle timer ✅ (branch `feat/hal-simd`)
+
+**Delivered — 12 features moved ⬜ → ✅**
+
+| ID | Feature | Evidence |
+|---|---|---|
+| VV-HAL-002 | Cache-line alignment (`CacheAligned`, `CachePadded`) | test asserts adjacent entries never share a line |
+| VV-HAL-003 | False-sharing avoidance | `CachePadded` size == 64 B enforced by test |
+| VV-HAL-004 | Runtime SIMD detection (`cpuid`, cached) | `simd::detect` / `simd::tier` |
+| VV-HAL-005 | SIMD dispatch table | `OnceLock`-cached tier, branch per call |
+| VV-HAL-006 | **AVX2 kernels** | 6 kernels, 2.6× peak measured |
+| VV-HAL-009 | Scalar fallback kernels (oracle) | `simd::scalar` |
+| VV-HAL-010 | SIMD range filter | `filter_range`, 1.26–1.38× |
+| VV-HAL-011 | SIMD equality scan | `find_first_eq`, 1.75–2.62× |
+| VV-HAL-012 | SIMD min/max (zone maps) | `min_max`, 1.44–1.59× |
+| VV-HAL-014 | SIMD sum/aggregate | `sum`, 1.24× |
+| VV-HAL-017 | Hardware CRC-32C | 44.6× vs bitwise scalar |
+| VV-HAL-018/019/020/021 | **L1 / L2 / L3 / non-temporal prefetch** | x86-64 `PREFETCHT0/T1/T2/NTA`, aarch64 `PRFM` |
+| VV-HAL-022 | ARM `PRFM` prefetch | implemented (compiles for aarch64; unverified on hardware) |
+| VV-HAL-037 | RDTSC cycle timer | `CycleTimer`, calibrated 3.07 GHz |
+| VV-TST-005 | SIMD-vs-scalar equivalence tests | lengths 0–300 × 3 data regimes |
+
+**Measured speedup** (`vvctl hal`, i7 @ 3.07 GHz, AVX2, 22 logical cores):
+
+| Kernel | 8 KB (L1) | 64 KB (L2) | 512 KB | 8 MB (DRAM) |
+|---|---|---|---|---|
+| `count_range` | 2.37× | 2.56× | **2.59×** | 2.18× |
+| `find_first_eq` | 2.01× | 2.54× | **2.62×** | 1.75× |
+| `min_max` | 1.59× | 1.53× | 1.45× | 1.44× |
+| `filter_range` | 1.38× | 1.35× | 1.34× | 1.26× |
+| `crc32c` (hw) | — | — | — | 44.57× |
+
+**Findings worth carrying forward**
+
+1. **A single-accumulator AVX2 `min_max` measured 0.76× — slower than scalar.** The reduction
+   carried a serial dependency chain; LLVM auto-vectorizes the scalar loop with multiple
+   accumulators of its own. Fixed with 4-way independent accumulator unrolling → 1.46×.
+   *Lesson: hand-written SIMD must beat `-O3` LLVM, not beat naive scalar. Always measure.*
+2. **Speedups peak on cache-resident data and decay at 8 MB.** Past L3 the kernels are
+   DRAM-bandwidth bound, not compute bound. This is why the index and hot partitions being
+   cache-resident (VV-IDX-007/011) matters more than wider vectors.
+3. **`filter_range` is capped ~1.35× by its scalar `Vec::push` per match**, not by the compare.
+   Late materialization / bitmask output (VV-QRY-009) is the real fix, not AVX-512.
+4. **AVX2 has no unsigned 64-bit compare.** Kernels apply a `XOR i64::MIN` range shift so signed
+   compare equals unsigned compare. Without it, every PK above `i64::MAX` sorts below 0 and range
+   queries silently return wrong rows. Pinned by adversarial tests.
+5. **CRC-32C ≠ the WAL's CRC-32/ISO-HDLC.** Different polynomial, different values. The 44× win is
+   available only for *new* formats; adopting it in the WAL is a breaking format change.
+
+**Deliberately not done in S1a** (with reasons, not omissions):
+- VV-HAL-007 AVX-512 — intrinsic signatures still churning across toolchains; absent on most
+  consumer CPUs; downclocks some Xeons. Enum variant reserved, `detect()` never returns it.
+- VV-HAL-008 NEON kernels — cannot execute aarch64 here. Shipping untested vector intrinsics is
+  worse than the scalar fallback, which is correct everywhere. aarch64 reports `Scalar` today.
+- VV-HAL-001/024–036 topology, CPU pinning, NUMA, huge pages — need platform FFI
+  (`SetThreadAffinityMask` / `sched_setaffinity`, `VirtualAllocExNuma` / `mbind`). Scheduled S1b.
+
+Tests: **195** workspace-wide (was 140; +55). Clippy: clean, `-D warnings`.
+
+### S1b — HAL: topology, CPU pinning, NUMA, huge pages ⬜ NEXT
+Targets VV-HAL-001, 024–036. Then S2 wires SIMD + prefetch into the storage/query/index scan paths
+to attack the <100 ns read target.
