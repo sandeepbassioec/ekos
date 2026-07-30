@@ -13,10 +13,15 @@ Status: ✅ done · 🟡 partial · ⬜ pending · 🧊 env-gated · 🔬 resear
 | Detection & profiling | 5 | 34 | 0 | 32 | 2 |
 | Config derivation | 8 | 49 | 0 | 49 | 0 |
 | System tuning (privileged) | 6 | 37 | 0 | 29 | 8 |
-| Re-tune & drift | 3 | 17 | 0 | 17 | 0 |
+| **Re-tune, drift & reconciliation** | **5** | **37** | 0 | 37 | 0 |
 | Package integration | 8 | 46 | 0 | 42 | 4 |
 | Precedence & safety | 4 | 24 | 0 | 24 | 0 |
-| **Total** | **34** | **207** | **0** | **193** | **14** |
+| **Total** | **36** | **227** | **0** | **213** | **14** |
+
+**Revised 2026-07-30** (+2 features, +20 tasks): VV-CFG-035 (startup reconciliation /
+clamp-and-report) and VV-CFG-036 (under-utilisation detection) were added after a question exposed
+that the original design covered server *downgrade* but not *upgrade* — see the
+detection-vs-reconciliation section below.
 
 ---
 
@@ -286,6 +291,86 @@ homogeneous server would have hidden this requirement until much later.
 
 ### VV-CFG-021 — `vvctl tune --diff`  ⬜
 ### VV-CFG-022 — Provenance in support bundles  ⬜
+### VV-CFG-035 — Startup reconciliation: clamp-and-report  ⬜
+### VV-CFG-036 — Under-utilisation detection (the silent upgrade)  ⬜
+
+---
+
+## Detection vs reconciliation — and why resize breaks asymmetrically
+
+Runtime detection answers *"what does this machine have?"* It does **not** answer *"the config says
+16 cores and I can see 4 — now what?"* That is **reconciliation**, and it is a separate mechanism.
+
+**Downgrade fails loudly. Upgrade fails silently. The silent case is worse.**
+
+| Scenario | What happens | Visibility |
+|---|---|---|
+| 16 → 4 cores | Pinning to core 8 returns `EINVAL`; a 32 GB arena is OOM-killed | Loud — it tells you |
+| 16 → 64 cores | Nothing errors. Config still runs 8 shards on cores 4–11 | **Silent. You pay for 64 cores and get 16 cores of throughput, indefinitely** |
+
+### Which settings self-correct, and which do not
+
+| Setting | Downgrade 16→4 | Upgrade 16→64 | Mechanism needed |
+|---|---|---|---|
+| SIMD tier | self-corrects | self-corrects | runtime dispatch (built) |
+| Hardware CRC-32C | self-corrects | self-corrects | runtime dispatch (built) |
+| Prefetch tiers | self-corrects | self-corrects | runtime dispatch (built) |
+| Cycle-timer calibration | recalibrates per start | recalibrates | already per-process |
+| **Core pinning** | **`EINVAL`** | 48 cores idle | clamp + report |
+| **Shard count** | oversubscribed, thrashing | 75% of box unused | clamp + nag |
+| **Arena size** | **OOM kill** | under-uses RAM | clamp + report |
+| **Huge pages** | reservation absent | under-reserved | re-tune |
+| **BusySpin wait strategy** | burns all 4 cores | fine | clamp |
+| L3-sized index budget | oversized for smaller L3 | undersized | re-derive |
+| **WAL device path** | may not exist | fine | validate |
+
+Only the first four are free. Everything else needs reconciliation, and the *upgrade* column is the
+half most easily forgotten.
+
+### The governing rule
+
+**Configuration values are intents, clamped to reality at startup — never absolute commands.**
+
+```
+"pin to cores 4-11"   ->  cores 4-11 ∩ actually_available
+"8 shards"            ->  min(8, usable_cores)
+"4 GB arena/shard"    ->  min(4 GB, available_ram / shard_count)
+"BusySpin"            ->  Yielding, unless cores are dedicated AND isolated
+```
+
+Every clamp is **reported**. A silently clamped config is how a team spends a week debugging a
+"performance regression" that is really a VM resize from three months ago.
+
+---
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-CFG-021.1 | ⬜ | Show current config vs freshly derived, value by value |
+| VV-CFG-021.2 | ⬜ | Distinguish operator-edited values from stale generated ones — never propose clobbering a deliberate choice |
+| VV-CFG-021.3 | ⬜ | Exit code signals whether a difference exists, for scripting |
+| VV-CFG-022.1 | ⬜ | `vvctl support-bundle` includes profile, fingerprint, config, and tuning audit |
+| VV-CFG-022.2 | ⬜ | Redact hostnames/IPs by default; `--include-identifiers` to keep them |
+| VV-CFG-022.3 | ⬜ | Test: bundle is reproducible and contains no secrets |
+| **VV-CFG-035.1** | ⬜ | Define `Reconciled<T> { intended: T, effective: T, reason: Option<ClampReason> }` so every clamp is representable and inspectable |
+| VV-CFG-035.2 | ⬜ | Clamp the core role map to available cores; drop references to cores that no longer exist |
+| VV-CFG-035.3 | ⬜ | Clamp shard count to usable cores — never run more write shards than cores, which guarantees context-switch thrashing |
+| VV-CFG-035.4 | ⬜ | Clamp arena size to available RAM (and to the cgroup limit when containerized) before allocating, not after failing |
+| VV-CFG-035.5 | ⬜ | Downgrade `BusySpin` → `Yielding` when cores are not dedicated and isolated — spinning on a shared 4-core box starves everything else |
+| VV-CFG-035.6 | ⬜ | Re-derive the L3-sized index budget from the *live* L3, not the recorded one |
+| VV-CFG-035.7 | ⬜ | Validate the WAL/data device paths exist and are writable; fail with a specific message naming the missing path |
+| VV-CFG-035.8 | ⬜ | Log every clamp at WARN with intended value, effective value, and cause |
+| VV-CFG-035.9 | ⬜ | Expose clamps as a metric (`vv_config_clamped{key}`) so monitoring catches a resize the operator forgot |
+| VV-CFG-035.10 | ⬜ | Surface them in `vvctl status` — an operator must be able to ask "am I running the config I think I am?" |
+| VV-CFG-035.11 | ⬜ | `--strict-config` refuses to start on any clamp, for environments that require exact provisioning |
+| VV-CFG-035.12 | ⬜ | Test: config generated on 16 cores / 62 GB, started with 4 cores / 8 GB visible — starts successfully, every clamp logged, no OOM, no `EINVAL` |
+| **VV-CFG-036.1** | ⬜ | At startup, compare effective config against what `tune` *would* derive for the live hardware |
+| VV-CFG-036.2 | ⬜ | Compute headroom left unused: cores, RAM, and whether a wider SIMD tier is now available |
+| VV-CFG-036.3 | ⬜ | Warn when unused capacity exceeds a threshold (default 25%), naming the specific resource and the concrete gain — "48 of 64 cores unused; `vvctl tune` would configure 32 write shards instead of 8" |
+| VV-CFG-036.4 | ⬜ | Expose as a metric (`vv_unused_core_fraction`) so it is alertable rather than buried in a log |
+| VV-CFG-036.5 | ⬜ | Include it in `vvctl status` and the admin panel (VV-CTL-011) |
+| VV-CFG-036.6 | ⬜ | Never auto-expand into the new capacity. Growing shard count changes the partition→shard mapping and would silently alter data placement; that must be a deliberate operator action |
+| VV-CFG-036.7 | ⬜ | Detect a *newly available* wider SIMD tier after a CPU-family change (e.g. moved to a host with AVX-512) — this one needs no config change, so state plainly that it is already in use |
+| VV-CFG-036.8 | ⬜ | Test: config generated on 4 cores, started with 64 visible — warns with a specific, actionable recommendation and continues running |
 
 | Task | Status | Detail |
 |---|---|---|
