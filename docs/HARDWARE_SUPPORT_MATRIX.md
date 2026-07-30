@@ -235,6 +235,53 @@ the same wins while staying portable. This is a design decision, not an oversigh
 
 ---
 
+## Reading AWS instance names (the `g` trap)
+
+The letter `g` means two opposite things depending on **where** it sits in the name:
+
+| Position | Meaning | Examples | Actual CPU |
+|---|---|---|---|
+| **Suffix**, after the generation digit | **Graviton — ARM** | `c7g`, `m7g`, `r8g`, `t4g` | AWS Graviton |
+| **Prefix**, as the family letter | **GPU family — x86** | `g4dn`, `g5`, `g6` | Intel/AMD + NVIDIA GPU |
+
+**`g4dn.4xlarge` — the box we have — is NOT Graviton.** It is the GPU family: `g`=GPU, gen 4,
+`d`=local NVMe, `n`=enhanced networking. Inside is an Intel Xeon Platinum 8259CL with an NVIDIA T4
+attached, which is exactly what the probe reported. There is no `gr6` family.
+
+Suffix convention generally: `i` = Intel, `a` = AMD, `g` = Graviton.
+
+### Graviton generations
+
+| Generation | Families | SIMD | Relevance |
+|---|---|---|---|
+| Graviton1 | `a1` | NEON | Obsolete — ignore |
+| Graviton2 | `c6g` `m6g` `r6g` `t4g` `i4g` `x2gd` | NEON only — **2×`u64`** | Adequate for correctness testing |
+| **Graviton3** | `c7g` `m7g` `r7g` `c7gd` `c7gn` | **NEON + SVE — 4×`u64`**, DDR5 | **The target.** SVE reaches AVX2 parity |
+| Graviton4 | `c8g` `m8g` `r8g` `x8g` | NEON + SVE, more cores | Better; check regional availability |
+
+### What to rent, per purpose
+
+The memory-model correctness test does **not** need a fast machine — no timing is involved. It does
+benefit from **many real cores**, since more genuine concurrency means more interleavings and a
+better chance of exposing a wrong atomic ordering.
+
+| Purpose | Instance | Rough on-demand | Rationale |
+|---|---|---|---|
+| **Memory-model stress** | `c7g.4xlarge` (16 real cores) | ~$0.6/hr | Maximum interleavings. **2 hours ≈ $1.20** |
+| Cheap ARM smoke test | `t4g.medium` | ~$0.03/hr | Burstable is fine — nothing is timed |
+| SVE kernel work | `c7g.4xlarge` / `c8g` | ~$0.6/hr | Graviton3+ required for SVE |
+| Cheap x86 for VectorVolt | `c7i.4xlarge` | ~$0.7/hr | Cheaper than `g4dn` and clocks higher; the T4 is dead weight here |
+| NUMA validation | `m7i.metal-24xl` or any 2-socket metal | high | Only way to test `mbind`. Hours, not months |
+
+*Approximate us-east-1 on-demand; verify for your region. `c7g` is available in `ap-south-1`;
+confirm `c8g` before planning around it.*
+
+Note this **inverts** the burstable warning given earlier: `t2`/`t3`/`t4g` must never be used for
+latency figures because credit throttling swamps the signal — but for a *correctness* test with no
+timing, they are perfectly valid and nearly free.
+
+---
+
 ## x86-64 vs ARM (Graviton) on AWS
 
 You asked which benefits us. The honest answer is **probably ARM, but for a reason that has nothing
