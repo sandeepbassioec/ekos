@@ -45,7 +45,19 @@ pub fn run(args: HalArgs) -> Result<()> {
 
     println!("\nVectorVolt HAL — detected hardware");
     println!("{}", "─".repeat(62));
-    println!("  SIMD tier      : {}", tier.name());
+    if simd::is_capped() {
+        // Loud, because a capped run is NOT this machine's best and a reader
+        // pasting this output elsewhere must not mistake it for hardware limits.
+        println!(
+            "  SIMD tier      : {}   << CAPPED from {} via {}",
+            tier.name(),
+            simd::detect().name(),
+            simd::TIER_ENV
+        );
+        println!("  !! Speedups below will read 1.00x — both columns run the same kernel.");
+    } else {
+        println!("  SIMD tier      : {}", tier.name());
+    }
     println!("  u64 lanes/instr: {}", tier.lanes_u64());
     println!("  hw CRC-32C     : {}", simd::has_hw_crc32c());
     println!("  cache line     : {} bytes", vectorvolt_hal::CACHE_LINE);

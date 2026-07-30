@@ -62,9 +62,20 @@ pub use timer::{CycleTimer, Stopwatch, cycles};
 /// fallback means something very different from one measured on AVX2.
 pub fn describe() -> String {
     let tier = simd::tier();
+    let cap = if simd::is_capped() {
+        // Never let a capped measurement look like the machine's best.
+        format!(
+            " (CAPPED from {} via {})",
+            simd::detect().name(),
+            simd::TIER_ENV
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "simd={} lanes={} hw_crc32c={} cache_line={}B cores={}",
+        "simd={}{} lanes={} hw_crc32c={} cache_line={}B cores={}",
         tier.name(),
+        cap,
         tier.lanes_u64(),
         simd::has_hw_crc32c(),
         CACHE_LINE,
