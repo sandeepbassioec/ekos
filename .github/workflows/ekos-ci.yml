@@ -25,6 +25,9 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          # Explicit, even though the @stable ref implies it — see the note in
+          # vectorvolt-ci.yml. Prevents "'toolchain' is a required input".
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Cache cargo registry
@@ -57,6 +60,8 @@ jobs:
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry
         uses: actions/cache@v4

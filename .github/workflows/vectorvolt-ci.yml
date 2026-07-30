@@ -23,6 +23,12 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          # Explicit, even though the @stable ref implies it. The action reads
+          # its default from action.yml at the resolved ref; when that ref is a
+          # moving branch, an upstream change can leave the input empty and the
+          # action aborts with "'toolchain' is a required input". Stating it
+          # here makes the workflow independent of the action's defaults.
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Cache cargo registry
@@ -54,6 +60,8 @@ jobs:
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry
         uses: actions/cache@v4
