@@ -47,6 +47,34 @@ pub enum StorageError {
     #[error("column index {0} out of range (partition has {1} columns)")]
     ColumnOutOfRange(usize, u32),
 
+    /// A row offset pointed past the end of the partition.
+    ///
+    /// Reachable from a stale [`crate::PartitionReader`] coordinate — for example a
+    /// `RowDescriptor` cached from before a compaction rewrote the partition. Must
+    /// be an error rather than a panic: a database that aborts on a stale index
+    /// entry is worse than one that reports it.
+    #[error("row_offset {row_offset} out of bounds (partition has {row_count} rows)")]
+    RowOffsetOutOfBounds { row_offset: usize, row_count: u32 },
+
+    /// A dictionary index read from the file pointed outside the dictionary.
+    ///
+    /// Only reachable from corrupt on-disk data, since the index is file content
+    /// rather than a caller argument — which is exactly why it must be validated
+    /// instead of trusted.
+    #[error(
+        "dictionary index {index} out of bounds (dictionary holds {size} entries) — \
+         partition is corrupt"
+    )]
+    DictIndexOutOfBounds { index: usize, size: usize },
+
+    /// A computed byte offset fell outside the mapped file.
+    #[error("byte range {start}..{end} outside mapped file of {len} bytes — partition is corrupt")]
+    OffsetOutsideFile {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
+
     #[error("unknown encoding byte {0:#04x}")]
     UnknownEncoding(u8),
 

@@ -137,11 +137,20 @@ impl QueryEngine {
             });
         }
 
+        // O(1) per column via `read_value`, which reads 8–12 bytes straight out of
+        // the mmap.
+        //
+        // This previously called `read_column(c)` and then `.get(row_offset)` —
+        // decoding and allocating *every* value in the column to return one cell,
+        // once per column. That made a point lookup O(row_count × col_count)
+        // instead of O(col_count), and it is the same cost profile removed from
+        // `vectorvolt-engine::get()` earlier. Having both paths in the tree meant
+        // whichever layer a caller happened to reach through silently decided
+        // whether they got ~200 ns or ~80 µs. There is now one path.
         let col_count = reader.col_count() as usize;
         let mut values: Vec<u64> = Vec::with_capacity(col_count);
         for c in 0..col_count {
-            let col = reader.read_column(c)?;
-            values.push(col.get(row_offset));
+            values.push(reader.read_value(c, row_offset)?);
         }
 
         Ok(QueryRow { pk, values })
