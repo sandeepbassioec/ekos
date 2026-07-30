@@ -454,6 +454,65 @@ Every clamp is **reported**. A silently clamped config is how a team spends a we
 
 ---
 
+---
+
+# Group 7 — YAML as the authored format, and exhaustive configurability
+
+**Added 2026-07-30.** The original design treated config as something *generated* by `vvctl tune` and
+occasionally hand-edited, in TOML. The actual requirement inverts the emphasis: **a developer must be
+able to configure the smallest behaviour by hand, in YAML.** Auto-tune supplies a sensible starting
+point; hand authoring is a first-class path, not a fallback.
+
+### VV-CFG-037 — YAML as the primary authored format  ⬜
+
+YAML is what operators expect (Kubernetes, Compose, CI, Ansible) and is the right ergonomic choice.
+It also has real hazards that must be guarded rather than wished away:
+
+```yaml
+country: NO         # YAML 1.1 parses this as boolean false, not the string "NO"
+version: 1.10       # becomes the float 1.1
+enabled: on         # boolean true, not the string "on"
+```
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-CFG-037.1 | ⬜ | YAML as primary format via `serde_yaml`, pinned to YAML 1.2 semantics where the parser allows |
+| VV-CFG-037.2 | ⬜ | Also accept TOML and JSON — nearly free with serde, and JSON suits machine generation |
+| VV-CFG-037.3 | ⬜ | **Guard the Norway problem:** strictly type every field, and make a bare `NO`/`on`/`yes` where a string is expected a load error that names the fix |
+| VV-CFG-037.4 | ⬜ | Reject duplicate keys — YAML permits them and most parsers silently keep the last |
+| VV-CFG-037.5 | ⬜ | Reject tab indentation with a clear message rather than a parser-internal error |
+| VV-CFG-037.6 | ⬜ | `vvctl config validate` reports line and column for every problem |
+| VV-CFG-037.7 | ⬜ | `vvctl tune` emits YAML by default; `--format toml\|json` for the rest |
+| VV-CFG-037.8 | ⬜ | Round-trip test: the same config in YAML, TOML, and JSON yields identical effective settings |
+
+### VV-CFG-038 — Exhaustive configurability + generated config reference  ⬜
+
+The principle: **every tunable behaviour is reachable from the config file.** No behaviour adjustable
+only by recompiling; no constant an operator could plausibly need to change left hardcoded.
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-CFG-038.1 | ⬜ | Audit every hardcoded constant in the workspace; each is promoted to config or documented as deliberately fixed, with the reason |
+| VV-CFG-038.2 | ⬜ | Derive the config reference **from the Rust types themselves**, so documentation cannot drift from code |
+| VV-CFG-038.3 | ⬜ | Every key documents type, default, valid range, the hardware fact that derives it, and what changing it costs |
+| VV-CFG-038.4 | ⬜ | `vvctl config schema` emits JSON Schema — editor autocomplete and CI validation of config files |
+| VV-CFG-038.5 | ⬜ | Group keys by subsystem, mirroring the layer structure, so the file is navigable |
+| VV-CFG-038.6 | ⬜ | Mark each key `stable` / `advanced` / `unstable` — an operator must know which knobs are load-bearing |
+| VV-CFG-038.7 | ⬜ | CI check: a new `pub` config field without documentation fails the build |
+
+### VV-CFG-039 — Layered config files (base + environment overlay)  ⬜
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-CFG-039.1 | ⬜ | Accept an ordered file list, later overlaying earlier — `base.yaml` + `prod.yaml` |
+| VV-CFG-039.2 | ⬜ | Deep-merge maps; **replace, not append, for lists** — silently appending to a core-pinning list would be a nasty surprise |
+| VV-CFG-039.3 | ⬜ | `vvctl config effective` prints the merged result with each value's originating file and line |
+| VV-CFG-039.4 | ⬜ | `!clear` directive to explicitly empty an inherited list |
+| VV-CFG-039.5 | ⬜ | Include-directory support (`conf.d/*.yaml`) in deterministic lexical order |
+| VV-CFG-039.6 | ⬜ | Test: three-layer merge with per-key origin correctly attributed |
+
+---
+
 ## What this does NOT do
 
 Stated so scope stays honest:

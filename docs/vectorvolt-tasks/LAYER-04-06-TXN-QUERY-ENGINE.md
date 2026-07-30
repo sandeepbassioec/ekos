@@ -710,6 +710,48 @@ schema/namespace
 | VV-ENG-012.5 | ⬜ | Multi-tenancy tie-in: a "schema" is a natural candidate for the tenant-isolation unit once VV-ENG-020/LD-MT-01 lands (tenant = shard group = schema) — document this mapping explicitly so the two features converge |
 | VV-ENG-012.6 | ⬜ | Test: schema default set, two tables without table-level overrides inherit it; a third table with an explicit override does not |
 
+## VV-ENG-023 — Partition control by Aggregate Root  ⬜
+**Added 2026-07-30.** Verified absent from the entire doc set before adding: all 17 prior "aggregate"
+mentions were SQL `SUM`/`COUNT` or "aggregate totals". This is the DDD sense, and it was a real gap.
+**Blocked by:** VV-ENG-006 (catalog), VV-ENG-010 (entity routing), VV-ENG-013 (strategy engine)
+
+### Why this is the most valuable of the four granularities
+
+An **aggregate root** is a cluster of entities across *multiple tables* sharing one root identity,
+where the aggregate is the transactional boundary. `Order` + `OrderLine` + `Payment` for order 42 are
+one aggregate, rooted at `order_id = 42`.
+
+The four granularities, ordered coarse → fine:
+
+| Granularity | Unit | Feature |
+|---|---|---|
+| Schema | every table in a namespace | VV-ENG-012 |
+| Table | one table | VV-ENG-011 |
+| **Aggregate root** | **related rows across several tables, sharing a root key** | **VV-ENG-023** |
+| Entity | one row identity within one table | VV-ENG-010 |
+
+**Why it matters more than the others:** LD-ACID gives full ACID *at shard level* and requires Saga
+or 2PC across shards. A transaction over `Order` + `OrderLine` + `Payment` therefore stays fast and
+fully ACID **only if all three land on the same shard.** Aggregate-root partitioning is what
+guarantees that. Without it, the most common real-world transaction shape — write a parent and its
+children atomically — is a cross-shard distributed transaction by accident.
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-ENG-023.1 | ⬜ | Declare an aggregate in the catalog: a root table, a root key column, and the member tables with the column in each that references the root |
+| VV-ENG-023.2 | ⬜ | Validate at declaration: every member must have a resolvable path to the root key, and a table may belong to at most one aggregate (overlapping aggregates make co-location unsatisfiable) |
+| VV-ENG-023.3 | ⬜ | Route **all** member-table rows by the *root* key, not by their own PK — the whole mechanism |
+| VV-ENG-023.4 | ⬜ | Extract the root key on insert for a member row whose root key is present in the row |
+| VV-ENG-023.5 | ⬜ | Handle the indirect case: a member two hops from the root (`OrderLine` → `Order`), requiring a lookup or a denormalized root key column. Prefer requiring the column — a lookup on the write path costs a read |
+| VV-ENG-023.6 | ⬜ | Reject or explicitly warn on an insert whose root key cannot be determined, rather than silently defaulting to some shard and breaking co-location |
+| VV-ENG-023.7 | ⬜ | Aggregate-root partitioning overrides table-level strategy for member tables; document the precedence: entity override > aggregate root > table > schema |
+| VV-ENG-023.8 | ⬜ | Expose "is this transaction single-shard?" so the txn layer can take the fast path instead of speculatively preparing a Saga (ties to VV-TXN-020) |
+| VV-ENG-023.9 | ⬜ | Handle skew: one enormous aggregate can hot-spot a shard. Detect and report; do **not** silently split, which would destroy the co-location guarantee the feature exists to provide |
+| VV-ENG-023.10 | ⬜ | Test: insert an Order with 50 OrderLines and 3 Payments; assert every row lands in the same partition |
+| VV-ENG-023.11 | ⬜ | Test: a transaction spanning all three tables of one aggregate is reported as single-shard |
+| VV-ENG-023.12 | ⬜ | Test: two different aggregates may land on different shards — co-location is *within* an aggregate, not across |
+| VV-ENG-023.13 | ⬜ | YAML declaration example in the config reference (VV-CFG-038) |
+
 ## VV-ENG-013 — Partition strategy: hash / range / list / composite  ⬜
 **Blocked by:** nothing structurally — this is the strategy engine VV-ENG-010/011/012 all call into
 

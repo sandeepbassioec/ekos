@@ -27,10 +27,10 @@ audit of all 8 crates in `vectorvolt/crates/`.
 |---|---|
 | ✅ Implemented | 47 |
 | 🟡 Partial | 6 |
-| ⬜ Pending | 267 |
+| ⬜ Pending | 310 |
 | 🧊 Deferred (env-gated) | 28 |
 | 🔬 Research | 9 |
-| **Total tracked** | **357** |
+| **Total tracked** | **400** |
 
 > **Revised 2026-07-30:** +36 features. Layer 18 (Deployment & Auto-Configuration, `VV-CFG-*`) was
 > added after a gap was identified: runtime dispatch handles CPU *instructions*, but nothing handled
