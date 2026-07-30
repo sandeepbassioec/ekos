@@ -9,6 +9,8 @@ repository.workspace = true
 homepage.workspace   = true
 
 [dependencies]
+# SIMD range filter and explicit prefetch for the scan path.
+vectorvolt-hal     = { workspace = true }
 thiserror  = { workspace = true }
 byteorder  = { workspace = true }
 crc32fast  = { workspace = true }
