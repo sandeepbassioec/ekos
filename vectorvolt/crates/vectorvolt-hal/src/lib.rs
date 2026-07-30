@@ -49,11 +49,13 @@ pub mod cache;
 pub mod prefetch;
 pub mod simd;
 pub mod timer;
+pub mod topology;
 
 pub use cache::{CACHE_LINE, CacheAligned, CachePadded};
 pub use prefetch::{Locality, prefetch, prefetch_ahead, prefetch_write};
 pub use simd::SimdTier;
 pub use timer::{CycleTimer, Stopwatch, cycles};
+pub use topology::{CacheHierarchy, CoreClass, CoreRoleMap, CpuTopology, LogicalCore, NumaNode};
 
 /// One-line summary of detected hardware capabilities.
 ///
