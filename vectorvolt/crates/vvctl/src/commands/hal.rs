@@ -65,12 +65,37 @@ pub fn run(args: HalArgs) -> Result<()> {
         "  base clock     : {:.2} GHz (RDTSC-calibrated)",
         timer.ghz()
     );
-    println!(
-        "  logical cores  : {}",
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(0)
-    );
+    // ── Topology ──────────────────────────────────────────────────────────────
+    let topo = vectorvolt_hal::CpuTopology::detect();
+    println!("  topology       : {}", topo.summary());
+    if let Some(l1) = topo.cache.l1d_bytes {
+        println!("  L1d / L2 / L3  : {}", fmt_cache(&topo.cache));
+        let _ = l1;
+    }
+    if topo.hybrid {
+        println!(
+            "  P-cores        : {:?}",
+            topo.cores_of_class(vectorvolt_hal::CoreClass::Performance)
+        );
+        println!(
+            "  E-cores        : {:?}",
+            topo.cores_of_class(vectorvolt_hal::CoreClass::Efficient)
+        );
+        println!(
+            "  !! hybrid CPU — latency figures from this machine are unreliable:\n     \
+             a thread migrating P-core -> E-core can swing a measurement ~2x."
+        );
+    }
+
+    let roles = vectorvolt_hal::CoreRoleMap::derive(&topo);
+    println!("\n  Recommended core roles (advice only — nothing is pinned yet)");
+    println!("  {}", roles.summary());
+    let conflicts = roles.writer_reader_conflicts(&topo);
+    if conflicts.is_empty() {
+        println!("  writer/reader physical-core isolation: OK");
+    } else {
+        println!("  !! writer/reader share a physical core: {conflicts:?}");
+    }
 
     if args.no_bench {
         return Ok(());
@@ -218,6 +243,23 @@ fn print_row(label: &str, scalar_ns: u64, simd_ns: u64, tier_name: &str) {
         fmt_ns(simd_ns),
         speedup
     );
+}
+
+fn fmt_cache(c: &vectorvolt_hal::CacheHierarchy) -> String {
+    fn kb(v: Option<usize>) -> String {
+        match v {
+            Some(b) if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+            Some(b) => format!("{} KB", b / 1024),
+            None => "?".into(),
+        }
+    }
+    format!(
+        "{} / {} / {}  (line {} B)",
+        kb(c.l1d_bytes),
+        kb(c.l2_bytes),
+        kb(c.l3_bytes),
+        c.line_bytes
+    )
 }
 
 fn fmt_ns(ns: u64) -> String {

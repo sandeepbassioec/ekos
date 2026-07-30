@@ -7,7 +7,18 @@ edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
-# No dependencies. This crate talks to the CPU through `core::arch` intrinsics
-# and `std` feature detection only — nothing here should ever need a third-party
-# crate, and keeping it dependency-free keeps it auditable.
+# The SIMD, cache, prefetch, and timer modules have no dependencies at all — they
+# reach the CPU through `core::arch` intrinsics and `std` feature detection.
+#
+# Topology detection needs the OS to describe the machine, and only one platform
+# needs a crate for it:
+#   Linux   — plain file reads under /sys, so `std` suffices.
+#   Windows — `GetLogicalProcessorInformationEx` is the only API exposing
+#             EfficiencyClass, which is how P-cores are told from E-cores.
 [dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+] }
