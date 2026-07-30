@@ -898,6 +898,8 @@ dependencies = [
 name = "vectorvolt-hal"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "thiserror",
  "windows-sys 0.59.0",
 ]
 

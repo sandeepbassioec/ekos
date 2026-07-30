@@ -45,12 +45,17 @@
 //! # let _ = ns;
 //! ```
 
+pub mod affinity;
 pub mod cache;
 pub mod prefetch;
 pub mod simd;
 pub mod timer;
 pub mod topology;
 
+pub use affinity::{
+    AffinityError, AffinityGuard, cached_topology, current_core, pin_current_thread_to,
+    pin_current_thread_to_set,
+};
 pub use cache::{CACHE_LINE, CacheAligned, CachePadded};
 pub use prefetch::{Locality, prefetch, prefetch_ahead, prefetch_write};
 pub use simd::SimdTier;
