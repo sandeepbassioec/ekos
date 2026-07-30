@@ -23,14 +23,21 @@ audit of all 8 crates in `vectorvolt/crates/`.
 
 ## Headline count
 
-| | Count |
-|---|---|
-| ✅ Implemented | 47 |
-| 🟡 Partial | 6 |
-| ⬜ Pending | 323 |
-| 🧊 Deferred (env-gated) | 28 |
-| 🔬 Research | 9 |
-| **Total tracked** | **413** |
+| | Count | Share |
+|---|---|---|
+| ✅ Implemented | 72 | 22% |
+| 🟡 Partial | 4 | 1% |
+| ⬜ Pending | 247 | 76% |
+| **Total tracked in this matrix** | **323** | |
+
+Layer 19 (Sinks & Integration) carries a further ~90 features tracked only in
+[LAYER-19](vectorvolt-tasks/LAYER-19-SINKS-AND-INTEGRATION.md) (209 tasks), all pending — no sink
+adapter code exists yet. Counting those gives **413 total, 72 done (17%)**.
+
+> **Recounted 2026-07-30 by parsing the tables rather than by memory.** The previous headline (47
+> done) was stale: Layer 0 was still marked "CRATE DOES NOT EXIST" after `vectorvolt-hal` had shipped
+> and been wired into the scan path. Treat any count in this file as valid only for the commit it was
+> written in — the parse is cheap, so re-run it rather than trusting the number.
 
 > **Revised 2026-07-30:** +36 features. Layer 18 (Deployment & Auto-Configuration, `VV-CFG-*`) was
 > added after a gap was identified: runtime dispatch handles CPU *instructions*, but nothing handled
@@ -38,47 +45,57 @@ audit of all 8 crates in `vectorvolt/crates/`.
 > Those need root, or a reboot, or knowledge of what is mounted, so they cannot be decided at
 > runtime. See [LAYER-18](vectorvolt-tasks/LAYER-18-DEPLOYMENT-AUTOCONFIG.md).
 
-Current test count on `main`: **140** passing. Zero clippy warnings workspace-wide.
+Current test count on `main`: **266** passing. Zero clippy warnings workspace-wide.
 
 ---
 
-## LAYER 0 — Silicon / HAL (`vectorvolt-hal`) — CRATE DOES NOT EXIST
+## LAYER 0 — Silicon / HAL (`vectorvolt-hal`) — BUILT AND WIRED INTO THE SCAN PATH
 
-The single largest gap. Everything the project's identity rests on — SIMD, cache prefetch, CPU
-pinning, NUMA — lives here and none of it is built. Zero SIMD instructions, zero prefetch hints,
-zero affinity calls exist in the entire workspace today (verified by grep for `core::arch`, `_mm_`,
-`_mm256_`, `target_feature`, `prefetch`, `affinity`, `numa` — all returned no matches).
+Was the single largest gap; now the most complete layer after the WAL. `vectorvolt-hal` exists with
+`cache`, `prefetch`, `simd/{scalar,avx2}`, `timer`, `topology`, `affinity`, and the AVX2 range filter
+is live in `PartitionReader::filter_offsets` on the real scan path — not just benchmarked in
+isolation.
+
+Two caveats on the ✅ marks here, because "implemented" is doing more work than usual in this layer:
+
+- **AVX2 kernels are verified against a scalar oracle but measured only on one machine** (Meteor Lake,
+  Windows). The 1.46× on `min_max` and the range-filter speedup are laptop numbers. Nothing is
+  confirmed on Linux, on a server part, or on ARM.
+- **Prefetch and pinning are wired but their *benefit* is unproven.** Pinning showed no improvement
+  under best-of-N measurement (which is migration-immune by construction, so it could not have);
+  jitter is what pinning moves and that needs a quiet Linux box. The primitives are correct; the
+  claim that they help is not yet earned.
 
 | ID | Feature | Status | Sprint | Notes |
 |---|---|---|---|---|
-| VV-HAL-001 | `CpuTopology` detection (cores, sockets, cache sizes) | ⬜ | S1 | Windows `GetLogicalProcessorInformationEx` + Linux `/proc/cpuinfo`, `/sys/devices/system/node/` |
-| VV-HAL-002 | Cache-line alignment primitives `#[repr(align(64))]` | ⬜ | S1 | `CacheAligned<T>`, `CachePadded<T>` |
-| VV-HAL-003 | False-sharing avoidance (one-directional ownership) | ⬜ | S1 | Enforced via Rust `&mut`/`&` split |
-| VV-HAL-004 | Runtime SIMD feature detection (`cpuid`) | ⬜ | S1 | Detect SSE2/AVX2/AVX-512F/BMI2; ARM NEON/SVE |
-| VV-HAL-005 | SIMD dispatch table (compile all, select at startup) | ⬜ | S1 | `SimdTier` enum + fn-pointer dispatch |
-| VV-HAL-006 | **AVX2 baseline kernels** (256-bit, 4×u64/cycle) | ⬜ | S1 | Project's stated minimum tier |
+| VV-HAL-001 | `CpuTopology` detection (cores, sockets, cache sizes) | ✅ | done | Windows `GetLogicalProcessorInformationEx` + Linux `/proc/cpuinfo`, `/sys/devices/system/node/` |
+| VV-HAL-002 | Cache-line alignment primitives `#[repr(align(64))]` | ✅ | done | `CacheAligned<T>`, `CachePadded<T>` |
+| VV-HAL-003 | False-sharing avoidance (one-directional ownership) | ✅ | done | Enforced via Rust `&mut`/`&` split |
+| VV-HAL-004 | Runtime SIMD feature detection (`cpuid`) | ✅ | done | Detect SSE2/AVX2/AVX-512F/BMI2; ARM NEON/SVE |
+| VV-HAL-005 | SIMD dispatch table (compile all, select at startup) | ✅ | done | `SimdTier` enum + fn-pointer dispatch |
+| VV-HAL-006 | **AVX2 baseline kernels** (256-bit, 4×u64/cycle) | ✅ | done | Project's stated minimum tier |
 | VV-HAL-007 | **AVX-512 opportunistic kernels** (512-bit, 8×u64/cycle) | ⬜ | S1 | Ice Lake+/Zen4 |
 | VV-HAL-008 | ARM NEON / SVE kernels | ⬜ | S1 | Graviton/Axion parity |
-| VV-HAL-009 | Scalar fallback kernels (portable) | ⬜ | S1 | Correctness oracle for SIMD tests |
-| VV-HAL-010 | SIMD kernel: range filter (`lo <= v <= hi` → bitmask) | ⬜ | S1 | Target ~8× vs scalar |
-| VV-HAL-011 | SIMD kernel: equality scan / find-first | ⬜ | S1 | |
-| VV-HAL-012 | SIMD kernel: min/max (zone map build) | ⬜ | S1 | |
-| VV-HAL-013 | SIMD kernel: popcount / bitmap iterate | ⬜ | S1 | Roaring accel, ~4× |
-| VV-HAL-014 | SIMD kernel: sum / aggregate | ⬜ | S1 | |
+| VV-HAL-009 | Scalar fallback kernels (portable) | ✅ | done | Correctness oracle for SIMD tests |
+| VV-HAL-010 | SIMD kernel: range filter (`lo <= v <= hi` → bitmask) | ✅ | done | Target ~8× vs scalar |
+| VV-HAL-011 | SIMD kernel: equality scan / find-first | ✅ | done | |
+| VV-HAL-012 | SIMD kernel: min/max (zone map build) | ✅ | done | |
+| VV-HAL-013 | SIMD kernel: popcount / bitmap iterate | ✅ | done | Roaring accel, ~4× |
+| VV-HAL-014 | SIMD kernel: sum / aggregate | ✅ | done | |
 | VV-HAL-015 | SIMD kernel: dictionary decode (`vpshufb`) | ⬜ | S2 | ~4× |
 | VV-HAL-016 | SIMD kernel: cosine similarity FMA (vector search) | ⬜ | S8 | ~8–16×, needs VECTOR type |
-| VV-HAL-017 | Hardware CRC-32C (`_mm_crc32_u64`) | ⬜ | S1 | ~20× vs software crc32fast |
-| VV-HAL-018 | **L1 prefetch** (`_mm_prefetch` `_MM_HINT_T0`) | ⬜ | S1 | |
-| VV-HAL-019 | **L2 prefetch** (`_MM_HINT_T1`) | ⬜ | S1 | |
-| VV-HAL-020 | **L3 prefetch** (`_MM_HINT_T2`) | ⬜ | S1 | |
-| VV-HAL-021 | **Non-temporal / RAM streaming prefetch** (`_MM_HINT_NTA`) | ⬜ | S1 | Bypass cache for streaming scans |
-| VV-HAL-022 | ARM `PRFM` prefetch equivalents | ⬜ | S1 | |
-| VV-HAL-023 | Prefetch-distance tuned scan loop | ⬜ | S2 | Prefetch N cache lines ahead |
-| VV-HAL-024 | **CPU core pinning** (`sched_setaffinity`/`SetThreadAffinityMask`) | ⬜ | S1 | |
-| VV-HAL-025 | Core role map (OS/net/writer/reader/LLM/bg/admin groups) | ⬜ | S1 | Per `CPU_CACHE_NUMA_ISOLATION.md` §5.1 |
-| VV-HAL-026 | Writer/reader core isolation invariant | ⬜ | S3 | Avoid MESI serialization |
+| VV-HAL-017 | Hardware CRC-32C (`_mm_crc32_u64`) | ✅ | done | ~20× vs software crc32fast |
+| VV-HAL-018 | **L1 prefetch** (`_mm_prefetch` `_MM_HINT_T0`) | ✅ | done | |
+| VV-HAL-019 | **L2 prefetch** (`_MM_HINT_T1`) | ✅ | done | |
+| VV-HAL-020 | **L3 prefetch** (`_MM_HINT_T2`) | ✅ | done | |
+| VV-HAL-021 | **Non-temporal / RAM streaming prefetch** (`_MM_HINT_NTA`) | ✅ | done | Bypass cache for streaming scans |
+| VV-HAL-022 | ARM `PRFM` prefetch equivalents | ✅ | done | |
+| VV-HAL-023 | Prefetch-distance tuned scan loop | 🟡 | S2 | Prefetch N cache lines ahead |
+| VV-HAL-024 | **CPU core pinning** (`sched_setaffinity`/`SetThreadAffinityMask`) | ✅ | done | |
+| VV-HAL-025 | Core role map (OS/net/writer/reader/LLM/bg/admin groups) | ✅ | done | Per `CPU_CACHE_NUMA_ISOLATION.md` §5.1 |
+| VV-HAL-026 | Writer/reader core isolation invariant | 🟡 | S3 | Avoid MESI serialization |
 | VV-HAL-027 | Thread-per-core runtime | ⬜ | S3 | |
-| VV-HAL-028 | NUMA topology detection | ⬜ | S1 | |
+| VV-HAL-028 | NUMA topology detection | ✅ | done | |
 | VV-HAL-029 | `LocalNumaArena` bump allocator | ⬜ | S1 | `!Send` for compile-time NUMA locality |
 | VV-HAL-030 | NUMA node binding (`mbind`/`MPOL_BIND`) | 🧊 | — | Linux-only syscall; Windows uses `VirtualAllocExNuma` |
 | VV-HAL-031 | 2MB huge pages (`MAP_HUGETLB` / Win large pages) | ⬜ | S1 | TLB miss reduction |
@@ -87,7 +104,7 @@ zero affinity calls exist in the entire workspace today (verified by grep for `c
 | VV-HAL-034 | jemalloc NUMA arenas (`percpu_arena`) | ⬜ | S3 | |
 | VV-HAL-035 | `isolcpus`/`nohz_full`/`rcu_nocbs` boot-param docs + validator | 🧊 | — | Linux boot config; ship validator + docs |
 | VV-HAL-036 | Wait strategies: BusySpin / Yielding / Blocking | ⬜ | S3 | |
-| VV-HAL-037 | RDTSC / cycle-accurate timer | ⬜ | S1 | Needed to *measure* nanoseconds honestly |
+| VV-HAL-037 | RDTSC / cycle-accurate timer | ✅ | done | Needed to *measure* nanoseconds honestly |
 
 ## LAYER 1 — Durability / WAL (`vectorvolt-wal`) — LARGELY COMPLETE
 
@@ -104,6 +121,8 @@ zero affinity calls exist in the entire workspace today (verified by grep for `c
 | VV-WAL-009 | Backpressure on bounded channel | ✅ | done | |
 | VV-WAL-010 | `BatcherMetrics` (EMA batch size/latency) | ✅ | done | |
 | VV-WAL-011 | **Adaptive batching 1→10,000 cmds/fsync** | ⬜ | S3 | LD-BATCH: currently fixed window |
+| VV-WAL-016 | `SyncCommitter` — synchronous leader-follower group commit | ✅ | done | Added S0. `GroupCommitBatcher` is async/tokio; the write path is sync, so it could not be used. Helps concurrency only — a lone writer still pays one full fsync (~526 µs) per commit |
+| VV-WAL-017 | Durable `TableEngine` writes + `Durability` levels | ✅ | done | Added S0 after finding `TableEngine` hardcoded `with_fsync(false)` AND `WalWriter::append` never flushed its `BufWriter`. `Fsync` / `WriteOnly` / `Buffered` |
 | VV-WAL-012 | Token-bucket backpressure per shard + 429/Retry-After | ⬜ | S6 | LD-BACK |
 | VV-WAL-013 | WAL log compaction (post-snapshot + projection safe point) | ⬜ | S5 | |
 | VV-WAL-014 | WAL-as-event-log for projections (LSN offsets) | ⬜ | S5 | LD-KAFKA |
