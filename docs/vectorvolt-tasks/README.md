@@ -1,6 +1,6 @@
 # VectorVolt — Task-Level Traceability Index
 
-**1,657 tasks** across **321 features** across **17 layers**. Generated 2026-07-30 by auditing every
+**1,864 tasks** across **355 features** across **18 layers**. Generated 2026-07-30 by auditing every
 planning document against every line of code in `vectorvolt/crates/`.
 
 Status: ✅ done · 🟡 partial · ⬜ pending · 🧊 env-gated (needs Linux/specific hardware) · 🔬 unscheduled research
@@ -12,6 +12,13 @@ Status: ✅ done · 🟡 partial · ⬜ pending · 🧊 env-gated (needs Linux/s
 | **4** Transactions · **5** Query · **6** Engine/Partitioning | [LAYER-04-06-TXN-QUERY-ENGINE.md](LAYER-04-06-TXN-QUERY-ENGINE.md) | 63 | **369** |
 | **7** Network · **8** Cluster · **9** Control Plane · **10** SDKs | [LAYER-07-10-NET-CLUSTER-CONTROL-SDK.md](LAYER-07-10-NET-CLUSTER-CONTROL-SDK.md) | 65 | **353** |
 | **11** Observability · **13** Security · **14** Prefetch · **15** Projections · **16** Hardware · **17** Autonomy | [LAYER-11-17-OBS-SEC-PREFETCH-PROJ-HW-AUTONOMY.md](LAYER-11-17-OBS-SEC-PREFETCH-PROJ-HW-AUTONOMY.md) | 52 | **294** |
+| **18** Deployment & Auto-Configuration | [LAYER-18-DEPLOYMENT-AUTOCONFIG.md](LAYER-18-DEPLOYMENT-AUTOCONFIG.md) | 34 | **207** |
+
+**Layer 18 added 2026-07-30**, closing a gap the original audit missed: runtime dispatch handles CPU
+*instructions*, but nothing handled *system configuration* — huge-page reservation, core role maps,
+arena sizing, WAL device selection. Those need root, or a reboot, or knowledge of what is mounted, so
+they cannot be resolved at runtime. It is what makes "one codebase, self-configuring" real at install
+time rather than aspirational.
 
 Feature-level rollup and sprint plan: [../VECTORVOLT_FEATURE_MATRIX.md](../VECTORVOLT_FEATURE_MATRIX.md)
 

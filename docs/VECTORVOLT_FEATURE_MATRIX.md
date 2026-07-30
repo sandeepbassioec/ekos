@@ -27,10 +27,16 @@ audit of all 8 crates in `vectorvolt/crates/`.
 |---|---|
 | ✅ Implemented | 47 |
 | 🟡 Partial | 6 |
-| ⬜ Pending | 231 |
+| ⬜ Pending | 265 |
 | 🧊 Deferred (env-gated) | 28 |
 | 🔬 Research | 9 |
-| **Total tracked** | **321** |
+| **Total tracked** | **355** |
+
+> **Revised 2026-07-30:** +34 features. Layer 18 (Deployment & Auto-Configuration, `VV-CFG-*`) was
+> added after a gap was identified: runtime dispatch handles CPU *instructions*, but nothing handled
+> *system configuration* — huge-page reservation, core role maps, arena sizing, WAL device choice.
+> Those need root, or a reboot, or knowledge of what is mounted, so they cannot be decided at
+> runtime. See [LAYER-18](vectorvolt-tasks/LAYER-18-DEPLOYMENT-AUTOCONFIG.md).
 
 Current test count on `main`: **140** passing. Zero clippy warnings workspace-wide.
 
@@ -407,6 +413,57 @@ WAL group commit. There is no server binary — `vvctl` runs in-process and exit
 | VV-HW-003 | ARM as default deployment target | ⬜ | S1 | Via VV-HAL-008 NEON |
 | VV-HW-004 | CXL 3.0 fabric-attached memory | 🔬 | — | |
 | VV-HW-005 | FPGA semantic constraint validation | 🔬 | — | $10k+/chip, explicitly not now |
+
+## LAYER 18 — Deployment & Auto-Configuration (`VV-CFG-*`) — CRATE DOES NOT EXIST
+
+One codebase, one binary per architecture, and the system configures itself per host **at install
+time**. Full task breakdown: [LAYER-18](vectorvolt-tasks/LAYER-18-DEPLOYMENT-AUTOCONFIG.md) — 34
+features, 207 tasks.
+
+The three configuration layers, which must not be conflated:
+
+| Layer | When | Mechanism | Status |
+|---|---|---|---|
+| Build | compile | one binary per target triple; Cargo features for linked libs | ✅ 5 CI targets |
+| **Install** | package install | detect host → emit annotated config → optionally tune system | ⬜ **this layer** |
+| Runtime | process start | `cpuid` → dispatch table | ✅ VV-HAL-004/005 |
+
+| ID | Feature | Status | Sprint | Notes |
+|---|---|---|---|---|
+| VV-CFG-001 | `SystemProfile` cross-platform detection | ⬜ | S3 | Rust; `vv-probe-linux.sh` is the shell prototype |
+| VV-CFG-002 | **Hybrid P-core/E-core classification** | ⬜ | S3 | Found via the dev laptop; pinning a writer to an E-core would harm p99 |
+| VV-CFG-003 | Storage device discovery + `fsync` calibration | ⬜ | S3 | |
+| VV-CFG-004 | Kernel/OS feature probe | ⬜ | S3 | Probe io_uring by *creating a ring*, not version-guessing |
+| VV-CFG-005 | Hardware fingerprint | ⬜ | S3 | Also stamped into benchmark reports |
+| VV-CFG-006 | `vvctl tune` — derive config | ⬜ | S3 | Dry-run by default |
+| VV-CFG-007 | Derive arena/memory sizing | ⬜ | S3 | LD-ARENA; respects cgroup limits |
+| VV-CFG-008 | **Derive core role map** | ⬜ | S3 | P-cores to writers; never two shards on SMT siblings |
+| VV-CFG-009 | Derive huge-page count | ⬜ | S3 | |
+| VV-CFG-010 | Derive WAL/data device | ⬜ | S3 | **Never auto-pick ephemeral instance-store for WAL** |
+| VV-CFG-011 | Derive batching/backpressure/wait strategy | ⬜ | S3 | Window from measured `fsync`, not a fixed 50 µs |
+| VV-CFG-012 | Annotated TOML emission | ⬜ | S3 | Every value carries its reasoning |
+| VV-CFG-013 | Size profiles (edge/small/standard/large) | ⬜ | S3 | |
+| VV-CFG-014 | `--apply` consent-gated tuning | ⬜ | S3 | Dry-run default; audit record |
+| VV-CFG-015 | Huge-page reservation | 🧊 | S3 | Linux |
+| VV-CFG-016 | memlock limit | 🧊 | S3 | Linux/Windows privilege |
+| VV-CFG-017 | `isolcpus` guidance | 🧊 | S3 | **Advise only — never auto-apply.** Needs reboot |
+| VV-CFG-018 | Revert applied tuning | ⬜ | S3 | |
+| VV-CFG-019 | Idempotency | ⬜ | S3 | |
+| VV-CFG-020 | Hardware-change detection at startup | ⬜ | S3 | Fingerprint mismatch → warn, or refuse if unsafe |
+| VV-CFG-021 | `vvctl tune --diff` | ⬜ | S3 | Distinguishes operator edits from stale generated values |
+| VV-CFG-022 | Support bundle with provenance | ⬜ | S7 | |
+| VV-CFG-023 | `.deb` postinst | ⬜ | S7 | |
+| VV-CFG-024 | `.rpm` `%post` | ⬜ | S7 | `%config(noreplace)` preserves edits |
+| VV-CFG-025 | Homebrew `post_install` | ⬜ | S7 | |
+| VV-CFG-026 | winget / MSI custom action | ⬜ | S7 | |
+| VV-CFG-027 | Container entrypoint | ⬜ | S7 | **Respect cgroup limits, not host resources** |
+| VV-CFG-028 | systemd unit with derived limits | ⬜ | S7 | |
+| VV-CFG-029 | **Install must never fail** | ⬜ | S7 | Tuning failure warns; install still succeeds |
+| VV-CFG-030 | Uninstall cleanup | ⬜ | S7 | |
+| VV-CFG-031 | Precedence: generated < file < env < CLI | ⬜ | S3 | Auto-tune never overrides an explicit choice |
+| VV-CFG-032 | Validation with actionable errors | ⬜ | S3 | Reject unknown keys — a silent typo is a latent outage |
+| VV-CFG-033 | `vvctl tune --explain` | ⬜ | S3 | Per-value origin + derivation rule |
+| VV-CFG-034 | Config schema versioning | ⬜ | S3 | Forward migration preserving edits |
 
 ## LAYER 17 — Autonomy (EKOS-adjacent, deferred until VectorVolt core is done)
 
