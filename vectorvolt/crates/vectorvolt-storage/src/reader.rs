@@ -21,15 +21,21 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use crate::{
-    StorageError, StorageResult,
+    StorageError, StorageResult, bitpack,
     column::ColumnValues,
-    format::{COL_META_SIZE, ENCODING_DICT, ENCODING_RAW, HEADER_FIXED_SIZE, MAGIC, VERSION},
+    column::FRAME_BLOCK,
+    format::{
+        COL_META_SIZE, ENCODING_BLOCKED_FRAME, ENCODING_DICT, ENCODING_FRAME, ENCODING_RAW,
+        ENCODING_RLE, HEADER_FIXED_SIZE, MAGIC, MIN_READABLE_VERSION, VERSION,
+    },
 };
 
 // ── Internal metadata per column ─────────────────────────────────────────────
 
 struct ColMeta {
     encoding: u8,
+    /// Bits per packed value, for the frame encodings. Zero for the others.
+    bit_width: u8,
     data_offset: u64,
     #[allow(dead_code)]
     data_byte_len: u64,
@@ -68,6 +74,27 @@ impl PartitionReader {
         Self::parse(file, mmap)
     }
 
+    /// A file section, or an error if it does not lie inside the mapping.
+    ///
+    /// Every offset in a `.vvsst` file is read *from* that file, so a truncated
+    /// or hostile file can name a range past the end of the mapping. Slicing with
+    /// `&data[a..b]` turns that into a panic — which for a database means the
+    /// process dies on a partially-written file instead of reporting it and
+    /// carrying on. `what` names the section so the error says which one.
+    fn section<'a>(
+        data: &'a [u8],
+        start: usize,
+        end: usize,
+        what: &'static str,
+    ) -> StorageResult<&'a [u8]> {
+        data.get(start..end).ok_or_else(|| {
+            StorageError::InvalidData(format!(
+                "{what} section [{start}, {end}) lies outside a {}-byte file",
+                data.len()
+            ))
+        })
+    }
+
     fn parse(file: std::fs::File, mmap: memmap2::Mmap) -> StorageResult<Self> {
         let data: &[u8] = &mmap;
 
@@ -94,7 +121,10 @@ impl PartitionReader {
         let mut cur = Cursor::new(data);
         cur.set_position(8); // skip magic (already verified)
         let version = cur.read_u32::<LittleEndian>()?;
-        if version != VERSION {
+        // A range, not equality: v1 files remain readable because v2 only claimed
+        // one previously-reserved metadata byte and added encoding tags. Rejecting
+        // them would make the encoding work a breaking change for no reason.
+        if !(MIN_READABLE_VERSION..=VERSION).contains(&version) {
             return Err(StorageError::UnsupportedVersion(version));
         }
         let file_id = cur.read_u16::<LittleEndian>()?;
@@ -115,9 +145,14 @@ impl PartitionReader {
         }
 
         // ── Schema ────────────────────────────────────────────────────────
+        //
+        // `schema_len` and `col_count` come out of the file, so every slice
+        // derived from them is a potential panic on a truncated or corrupt file.
+        // `&data[a..b]` panics; `.get(a..b)` does not. This is the same defect
+        // class as the `read_value` bounds bug — see `section` below.
         let schema_start = HEADER_FIXED_SIZE;
         let schema_end = schema_start + schema_len as usize;
-        let mut scur = Cursor::new(&data[schema_start..schema_end]);
+        let mut scur = Cursor::new(Self::section(data, schema_start, schema_end, "schema")?);
         let mut schema: Vec<String> = Vec::with_capacity(col_count as usize);
         for _ in 0..col_count {
             let name_len = scur.read_u16::<LittleEndian>()? as usize;
@@ -130,12 +165,22 @@ impl PartitionReader {
 
         // ── Column metadata ───────────────────────────────────────────────
         let meta_start = schema_end;
-        let meta_end = meta_start + col_count as usize * COL_META_SIZE;
-        let mut mcur = Cursor::new(&data[meta_start..meta_end]);
+        let meta_end = meta_start
+            .checked_add((col_count as usize).saturating_mul(COL_META_SIZE))
+            .ok_or(StorageError::InvalidData(
+                "column metadata length overflows".into(),
+            ))?;
+        let mut mcur = Cursor::new(Self::section(
+            data,
+            meta_start,
+            meta_end,
+            "column metadata",
+        )?);
         let mut col_meta: Vec<ColMeta> = Vec::with_capacity(col_count as usize);
         for _ in 0..col_count {
             let encoding = mcur.read_u8()?;
-            let mut reserved = [0u8; 7];
+            let bit_width = mcur.read_u8()?;
+            let mut reserved = [0u8; 6];
             mcur.read_exact(&mut reserved)?;
             let data_offset = mcur.read_u64::<LittleEndian>()?;
             let data_byte_len = mcur.read_u64::<LittleEndian>()?;
@@ -145,6 +190,7 @@ impl PartitionReader {
             let zone_max = mcur.read_u64::<LittleEndian>()?;
             col_meta.push(ColMeta {
                 encoding,
+                bit_width,
                 data_offset,
                 data_byte_len,
                 dict_offset,
@@ -279,8 +325,104 @@ impl PartitionReader {
                 let val_offset = m.dict_offset as usize + dict_idx * 8;
                 Ok(u64::from_le_bytes(Self::bytes_at::<8>(data, val_offset)?))
             }
+            ENCODING_RLE => {
+                // Binary search the exclusive run-end array for the first run
+                // ending past `row_offset`. O(log r) — the one encoding whose
+                // point lookup is not O(1); see `ColumnValues` for why that trade
+                // is only accepted when RLE at least halves the column.
+                let run_count = m.dict_byte_len as usize / 8;
+                if run_count == 0 {
+                    return Err(StorageError::InvalidData("RLE column has no runs".into()));
+                }
+                let ends_start = m.dict_offset as usize + m.dict_byte_len as usize;
+
+                let mut lo = 0usize;
+                let mut hi = run_count; // first k with run_ends[k] > row_offset
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let end = u32::from_le_bytes(Self::bytes_at::<4>(data, ends_start + mid * 4)?)
+                        as usize;
+                    if end <= row_offset {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if lo >= run_count {
+                    // Only reachable if the final run end is <= row_offset, i.e.
+                    // the runs do not cover row_count rows. The header said they
+                    // do, so the file is inconsistent.
+                    return Err(StorageError::InvalidData(
+                        "RLE runs do not cover row_count".into(),
+                    ));
+                }
+                let val_offset = m.dict_offset as usize + lo * 8;
+                Ok(u64::from_le_bytes(Self::bytes_at::<8>(data, val_offset)?))
+            }
+            ENCODING_FRAME => {
+                let base = u64::from_le_bytes(Self::bytes_at::<8>(data, m.data_offset as usize)?);
+                let words_start = m.data_offset as usize + 8;
+                let offset = Self::unpack_at(data, words_start, m.bit_width, row_offset)?;
+                // The file supplies both base and offset, so a corrupt file could
+                // make these sum past u64::MAX. Wrapping would fabricate a small
+                // value from two large ones and report it as real data.
+                base.checked_add(offset).ok_or(StorageError::InvalidData(
+                    "frame base + offset overflows u64".into(),
+                ))
+            }
+            ENCODING_BLOCKED_FRAME => {
+                let block = row_offset / FRAME_BLOCK;
+                let block_count = m.dict_byte_len as usize / 8;
+                if block >= block_count {
+                    return Err(StorageError::InvalidData(
+                        "blocked-frame row is past the last block base".into(),
+                    ));
+                }
+                let base = u64::from_le_bytes(Self::bytes_at::<8>(
+                    data,
+                    m.dict_offset as usize + block * 8,
+                )?);
+                let words_start = m.dict_offset as usize + m.dict_byte_len as usize;
+                let offset = Self::unpack_at(data, words_start, m.bit_width, row_offset)?;
+                base.checked_add(offset).ok_or(StorageError::InvalidData(
+                    "blocked-frame base + offset overflows u64".into(),
+                ))
+            }
             b => Err(StorageError::UnknownEncoding(b)),
         }
+    }
+
+    /// Unpack one bit-packed value straight from the mmap, without materializing
+    /// the word array.
+    ///
+    /// Reads at most two `u64`s. The packed words are not `u64`-aligned in the
+    /// file (`data_offset` is arbitrary), so they are read via
+    /// [`bytes_at`](Self::bytes_at) rather than reinterpreted — an unaligned
+    /// `*const u64` deref is undefined behaviour in Rust even on x86, where the
+    /// hardware would tolerate it.
+    #[inline]
+    fn unpack_at(data: &[u8], words_start: usize, bit_width: u8, i: usize) -> StorageResult<u64> {
+        if bit_width == 0 {
+            return Ok(0);
+        }
+        if bit_width > 64 {
+            return Err(StorageError::InvalidData(
+                "column bit_width exceeds 64".into(),
+            ));
+        }
+        let w = bit_width as usize;
+        let pos = i * w;
+        let word = pos / 64;
+        let shift = pos % 64;
+
+        let lo = u64::from_le_bytes(Self::bytes_at::<8>(data, words_start + word * 8)?);
+        let mut v = lo >> shift;
+        if shift + w > 64 {
+            let hi = u64::from_le_bytes(Self::bytes_at::<8>(data, words_start + (word + 1) * 8)?);
+            v |= hi << (64 - shift);
+        }
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        Ok(v & mask)
     }
 
     /// Byte address of one cell, for prefetching. `None` if out of range or the
@@ -423,7 +565,7 @@ impl PartitionReader {
             ENCODING_RAW => {
                 let start = m.data_offset as usize;
                 let end = start + row_count * 8;
-                let mut cur = Cursor::new(&data[start..end]);
+                let mut cur = Cursor::new(Self::section(data, start, end, "raw column")?);
                 let mut vals = Vec::with_capacity(row_count);
                 for _ in 0..row_count {
                     vals.push(cur.read_u64::<LittleEndian>()?);
@@ -434,7 +576,7 @@ impl PartitionReader {
                 let dict_size = m.dict_byte_len as usize / 8;
                 let ds = m.dict_offset as usize;
                 let de = ds + m.dict_byte_len as usize;
-                let mut dcur = Cursor::new(&data[ds..de]);
+                let mut dcur = Cursor::new(Self::section(data, ds, de, "dictionary")?);
                 let mut dict = Vec::with_capacity(dict_size);
                 for _ in 0..dict_size {
                     dict.push(dcur.read_u64::<LittleEndian>()?);
@@ -442,7 +584,7 @@ impl PartitionReader {
 
                 let is = de; // indices start right after the dict
                 let ie = is + row_count * 4;
-                let mut icur = Cursor::new(&data[is..ie]);
+                let mut icur = Cursor::new(Self::section(data, is, ie, "dictionary indices")?);
                 let mut indices = Vec::with_capacity(row_count);
                 for _ in 0..row_count {
                     indices.push(icur.read_u32::<LittleEndian>()?);
@@ -450,7 +592,101 @@ impl PartitionReader {
 
                 Ok(ColumnValues::DictEncoded { dict, indices })
             }
+            ENCODING_RLE => {
+                let run_count = m.dict_byte_len as usize / 8;
+                let mut values = Vec::with_capacity(run_count);
+                for k in 0..run_count {
+                    values.push(u64::from_le_bytes(Self::bytes_at::<8>(
+                        data,
+                        m.dict_offset as usize + k * 8,
+                    )?));
+                }
+                let ends_start = m.dict_offset as usize + m.dict_byte_len as usize;
+                let mut run_ends = Vec::with_capacity(run_count);
+                for k in 0..run_count {
+                    run_ends.push(u32::from_le_bytes(Self::bytes_at::<4>(
+                        data,
+                        ends_start + k * 4,
+                    )?));
+                }
+                // `run_ends` must be strictly increasing and end exactly at
+                // row_count, or `to_raw_vec` would produce the wrong length (or
+                // panic on a reversed subtraction). Validated here rather than
+                // trusted, because these bytes came off disk.
+                let mut prev = 0u32;
+                for (k, &e) in run_ends.iter().enumerate() {
+                    if e <= prev && !(k == 0 && e > 0) {
+                        return Err(StorageError::InvalidData(
+                            "RLE run ends are not strictly increasing".into(),
+                        ));
+                    }
+                    prev = e;
+                }
+                if prev as usize != row_count {
+                    return Err(StorageError::InvalidData(
+                        "RLE run ends do not sum to row_count".into(),
+                    ));
+                }
+                Ok(ColumnValues::Rle { values, run_ends })
+            }
+            ENCODING_FRAME => {
+                let base = u64::from_le_bytes(Self::bytes_at::<8>(data, m.data_offset as usize)?);
+                let words_start = m.data_offset as usize + 8;
+                let packed = Self::read_packed_words(data, words_start, m.bit_width, row_count)?;
+                Ok(ColumnValues::Frame {
+                    base,
+                    bit_width: m.bit_width,
+                    packed,
+                    row_count,
+                })
+            }
+            ENCODING_BLOCKED_FRAME => {
+                let block_count = m.dict_byte_len as usize / 8;
+                if block_count != row_count.div_ceil(FRAME_BLOCK) {
+                    return Err(StorageError::InvalidData(
+                        "blocked-frame base count does not match row_count".into(),
+                    ));
+                }
+                let mut block_bases = Vec::with_capacity(block_count);
+                for k in 0..block_count {
+                    block_bases.push(u64::from_le_bytes(Self::bytes_at::<8>(
+                        data,
+                        m.dict_offset as usize + k * 8,
+                    )?));
+                }
+                let words_start = m.dict_offset as usize + m.dict_byte_len as usize;
+                let packed = Self::read_packed_words(data, words_start, m.bit_width, row_count)?;
+                Ok(ColumnValues::BlockedFrame {
+                    block_bases,
+                    bit_width: m.bit_width,
+                    packed,
+                    row_count,
+                })
+            }
             b => Err(StorageError::UnknownEncoding(b)),
         }
+    }
+
+    /// Read the packed word array for a bit-packed column.
+    fn read_packed_words(
+        data: &[u8],
+        words_start: usize,
+        bit_width: u8,
+        row_count: usize,
+    ) -> StorageResult<Vec<u64>> {
+        if bit_width > 64 {
+            return Err(StorageError::InvalidData(
+                "column bit_width exceeds 64".into(),
+            ));
+        }
+        let n_words = bitpack::packed_words(row_count, bit_width);
+        let mut packed = Vec::with_capacity(n_words);
+        for k in 0..n_words {
+            packed.push(u64::from_le_bytes(Self::bytes_at::<8>(
+                data,
+                words_start + k * 8,
+            )?));
+        }
+        Ok(packed)
     }
 }

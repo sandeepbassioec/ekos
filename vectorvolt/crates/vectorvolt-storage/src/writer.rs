@@ -19,9 +19,29 @@ use std::io::Write;
 use crate::{
     StorageError, StorageResult,
     column::ColumnValues,
-    format::{COL_META_SIZE, ENCODING_DICT, ENCODING_RAW, HEADER_FIXED_SIZE, MAGIC, VERSION},
+    format::{COL_META_SIZE, HEADER_FIXED_SIZE, MAGIC, VERSION},
     partition::MicroPartition,
 };
+
+/// Byte length of a column's first data section, for encodings split in two.
+///
+/// Three of the five encodings store two arrays back to back, and the reader
+/// needs to know where the second starts. That boundary is written into
+/// `dict_byte_len` — a field named for the encoding that came first, kept rather
+/// than renamed so v1 files stay readable.
+///
+/// `None` means the encoding has a single section, and `dict_offset`/
+/// `dict_byte_len` are written as zero.
+fn first_section_bytes(col: &ColumnValues) -> Option<usize> {
+    match col {
+        // Single-section encodings. `Frame`'s base is a fixed 8 bytes, so the
+        // reader locates the packed words without needing a stored boundary.
+        ColumnValues::Raw(_) | ColumnValues::Frame { .. } => None,
+        ColumnValues::DictEncoded { dict, .. } => Some(dict.len() * 8),
+        ColumnValues::Rle { values, .. } => Some(values.len() * 8),
+        ColumnValues::BlockedFrame { block_bases, .. } => Some(block_bases.len() * 8),
+    }
+}
 
 /// Serialize `partition` into `writer` in `.vvsst` format.
 pub fn write_partition<W: Write>(writer: &mut W, partition: &MicroPartition) -> StorageResult<()> {
@@ -47,6 +67,7 @@ pub fn write_partition<W: Write>(writer: &mut W, partition: &MicroPartition) -> 
 
     struct ColLayout {
         encoding: u8,
+        bit_width: u8,
         data_offset: u64,
         data_byte_len: u64,
         dict_offset: u64,
@@ -59,39 +80,28 @@ pub fn write_partition<W: Write>(writer: &mut W, partition: &MicroPartition) -> 
     let mut cursor = data_start;
     for col in &partition.columns {
         let (zone_min, zone_max) = col.zone_min_max();
-        let lo = match col {
-            ColumnValues::Raw(_) => {
-                let dbl = row_count as u64 * 8;
-                let lo = ColLayout {
-                    encoding: ENCODING_RAW,
-                    data_offset: cursor,
-                    data_byte_len: dbl,
-                    dict_offset: 0,
-                    dict_byte_len: 0,
-                    zone_min,
-                    zone_max,
-                };
-                cursor += dbl;
-                lo
-            }
-            ColumnValues::DictEncoded { dict, .. } => {
-                let dict_bytes = dict.len() as u64 * 8;
-                let idx_bytes = row_count as u64 * 4;
-                let total = dict_bytes + idx_bytes;
-                let lo = ColLayout {
-                    encoding: ENCODING_DICT,
-                    data_offset: cursor,
-                    data_byte_len: total,
-                    dict_offset: cursor,
-                    dict_byte_len: dict_bytes,
-                    zone_min,
-                    zone_max,
-                };
-                cursor += total;
-                lo
-            }
+        let total = col.payload_bytes() as u64;
+
+        // `dict_byte_len` is the length of the column's *first* section, for the
+        // encodings that have two. It is derived from the encoding rather than
+        // recomputed per arm, so a new encoding cannot silently get this wrong:
+        // the writer and the reader both go through `first_section_bytes`.
+        let (dict_offset, dict_byte_len) = match first_section_bytes(col) {
+            Some(len) => (cursor, len as u64),
+            None => (0, 0),
         };
-        layouts.push(lo);
+
+        layouts.push(ColLayout {
+            encoding: col.encoding_byte(),
+            bit_width: col.bit_width(),
+            data_offset: cursor,
+            data_byte_len: total,
+            dict_offset,
+            dict_byte_len,
+            zone_min,
+            zone_max,
+        });
+        cursor += total;
     }
 
     // ── Step 3: write into a buffer ───────────────────────────────────────────
@@ -117,7 +127,8 @@ pub fn write_partition<W: Write>(writer: &mut W, partition: &MicroPartition) -> 
     // ── Step 5: column metadata ───────────────────────────────────────────────
     for lo in &layouts {
         buf.write_u8(lo.encoding)?;
-        buf.extend_from_slice(&[0u8; 7]); // reserved
+        buf.write_u8(lo.bit_width)?;
+        buf.extend_from_slice(&[0u8; 6]); // reserved
         buf.write_u64::<LittleEndian>(lo.data_offset)?;
         buf.write_u64::<LittleEndian>(lo.data_byte_len)?;
         buf.write_u64::<LittleEndian>(lo.dict_offset)?;
@@ -128,6 +139,7 @@ pub fn write_partition<W: Write>(writer: &mut W, partition: &MicroPartition) -> 
 
     // ── Step 6: column data ───────────────────────────────────────────────────
     for col in &partition.columns {
+        let before = buf.len();
         match col {
             ColumnValues::Raw(vals) => {
                 for &v in vals {
@@ -142,7 +154,46 @@ pub fn write_partition<W: Write>(writer: &mut W, partition: &MicroPartition) -> 
                     buf.write_u32::<LittleEndian>(i)?;
                 }
             }
+            ColumnValues::Rle { values, run_ends } => {
+                for &v in values {
+                    buf.write_u64::<LittleEndian>(v)?;
+                }
+                for &e in run_ends {
+                    buf.write_u32::<LittleEndian>(e)?;
+                }
+            }
+            ColumnValues::Frame { base, packed, .. } => {
+                buf.write_u64::<LittleEndian>(*base)?;
+                for &w in packed {
+                    buf.write_u64::<LittleEndian>(w)?;
+                }
+            }
+            ColumnValues::BlockedFrame {
+                block_bases,
+                packed,
+                ..
+            } => {
+                for &b in block_bases {
+                    buf.write_u64::<LittleEndian>(b)?;
+                }
+                for &w in packed {
+                    buf.write_u64::<LittleEndian>(w)?;
+                }
+            }
         }
+        // The offsets in column metadata were computed from `payload_bytes()`
+        // before any bytes were written. If serialization emits a different
+        // number, every subsequent column's `data_offset` is wrong and the file
+        // decodes as garbage — a corruption that would surface far from its
+        // cause. Cheap to check here, so check.
+        debug_assert_eq!(
+            buf.len() - before,
+            col.payload_bytes(),
+            "encoding {} wrote {} bytes but payload_bytes() promised {}",
+            col.encoding_byte(),
+            buf.len() - before,
+            col.payload_bytes()
+        );
     }
 
     // ── Step 7: file CRC footer ───────────────────────────────────────────────

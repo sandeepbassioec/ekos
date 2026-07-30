@@ -40,8 +40,18 @@ fn raw_column_round_trip() {
     assert_eq!(col.to_raw_vec(), values);
 }
 
+/// A low-cardinality column round-trips — and is no longer dictionary-encoded.
+///
+/// This test used to assert `DictEncoded`. Once VV-STO-010/011 landed, values
+/// `0..=6` are better served by a frame encoding: they span a range of 6, so 3
+/// bits each is 200 B against the dictionary's `7·8 + 500·4 = 2056 B`. The
+/// dictionary now wins only when the distinct values are also *far apart*.
+///
+/// The assertion was narrowed to what actually matters here — the round-trip —
+/// plus a check that whatever was chosen beats a dictionary, so this still fails
+/// if the cost model regresses.
 #[test]
-fn dict_encoded_column_round_trip() {
+fn low_cardinality_column_round_trip() {
     let values: Vec<u64> = (0u64..500).map(|i| i % 7).collect();
     let mut p = MicroPartition::new(0, 3);
     p.push_column("status", ColumnValues::auto_encode(values.clone()))
@@ -51,11 +61,17 @@ fn dict_encoded_column_round_trip() {
     let r = PartitionReader::open(tmp.path()).unwrap();
 
     let col = r.read_column(0).unwrap();
-    assert!(
-        matches!(&col, ColumnValues::DictEncoded { dict, .. } if dict.len() == 7),
-        "expected DictEncoded with 7 entries"
-    );
     assert_eq!(col.to_raw_vec(), values);
+    assert!(
+        col.payload_bytes() < 7 * 8 + 500 * 4,
+        "encoding {} used {} B, worse than a dictionary would",
+        col.encoding_byte(),
+        col.payload_bytes()
+    );
+    // Point reads agree with the bulk decode.
+    for (i, &want) in values.iter().enumerate() {
+        assert_eq!(r.read_value(0, i).unwrap(), want, "read_value({i})");
+    }
 }
 
 #[test]
