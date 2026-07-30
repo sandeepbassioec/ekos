@@ -48,29 +48,16 @@ impl QueryEngine {
                 return Err(QueryError::ColIdxOutOfRange { col_idx, col_count });
             }
 
-            // Read the scan column to find matching row offsets.
-            let scan_col = reader.read_column(col_idx)?;
-            let scan_vals = scan_col.to_raw_vec();
-
-            // Read ALL columns once per partition so we can reconstruct full rows.
-            let mut all_cols: Vec<Vec<u64>> = Vec::with_capacity(col_count);
-            for c in 0..col_count {
-                all_cols.push(reader.read_column(c)?.to_raw_vec());
-            }
-
-            for (row_offset, &val) in scan_vals.iter().enumerate() {
-                if val >= lo && val <= hi {
-                    // Recover the PK by looking at column 0 (convention: col 0 is the PK).
-                    let pk = all_cols
-                        .first()
-                        .and_then(|c| c.get(row_offset))
-                        .copied()
-                        .unwrap_or(u64::MAX);
-
-                    let values: Vec<u64> = all_cols.iter().map(|c| c[row_offset]).collect();
-
-                    results.push(QueryRow { pk, values });
-                }
+            // SIMD-filter the scan column, then materialize only matched rows.
+            //
+            // The previous version decoded the scan column TWICE — once as
+            // `scan_col` and again inside `all_cols` — then decoded every other
+            // column in full regardless of how few rows matched.
+            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
+            for values in reader.materialize_rows(&offsets)? {
+                // Column 0 is the PK by convention.
+                let pk = values.first().copied().unwrap_or(u64::MAX);
+                results.push(QueryRow { pk, values });
             }
 
             let _ = (file_id, partition_id); // suppress unused variable lint

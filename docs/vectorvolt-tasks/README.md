@@ -69,12 +69,32 @@ it exists only on the unmerged `feat/compaction` branch. **Three features are bl
 (VV-STO-015 tiered compaction, VV-STO-016 cross-partition checksum, VV-WAL-013 WAL log compaction).
 Both trackers mark it 🟡 with the branch named.
 
-### 3. HAL is built but not wired to anything
+### 3. HAL is built but not wired to anything — ADDRESSED
 
-`vectorvolt-hal` is a dependency of `vvctl` **only**. No SIMD kernel, prefetch hint, or cache
-primitive is called from the storage, query, index, or engine hot paths. The 2.6× kernel speedups are
-microbenchmarks; **no real query is faster yet**. Every ✅ kernel task is therefore paired with an
-explicit ⬜ integration task. This is precisely S2's job.
+`vectorvolt-hal` was a dependency of `vvctl` **only**. No SIMD kernel, prefetch hint, or cache
+primitive was called from any storage, query, index, or engine hot path — so the 2.6× kernel speedups
+were microbenchmarks and **no real query was faster**.
+
+Fixed on branch `feat/simd-scan`. Three `PartitionReader` methods put the SIMD in one place so both
+scan callers share it: `filter_offsets` (SIMD range filter over one column), `read_row` (O(1) per
+cell), and `materialize_rows` (adaptive — late materialization below 15% selectivity, bulk decode
+above, chosen from the *exact* match count the filter already produced rather than from an estimate).
+The late path prefetches 4 rows ahead, which is the VV-HAL-018/023 integration task: in a
+struct-of-arrays layout consecutive matched rows are not adjacent, so the hardware prefetcher sees no
+stride.
+
+Both scans previously decoded **every** column in full and scalar-compared the filter column;
+`vectorvolt-query` decoded the filter column twice. A 0.14%-selective query paid to decode 100% of
+every column.
+
+Measured: **2.4× faster** end-to-end on the `vvctl bench` SCAN workload (6.94 ms → 2.85 ms mean,
+debug build both sides — the ratio is directional, not the release figure). Release AFTER: 18.9 µs
+p50 at 20k rows. A rigorous release A/B belongs in the criterion suite (VV-TST-007) behind a CI perf
+gate (VV-TST-008) rather than a hand-run comparison; fat-LTO rebuild time made capturing it by hand
+impractical.
+
+**Still unwired:** `vectorvolt-index` (SIMD bucket probe, VV-IDX-009) and the `min_max` kernel for
+zone-map construction (VV-HAL-012). Those remain ⬜.
 
 ### 4. `WalReader::verify()` reports a fabricated hash on chain break — FIXED
 

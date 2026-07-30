@@ -283,6 +283,131 @@ impl PartitionReader {
         }
     }
 
+    /// Byte address of one cell, for prefetching. `None` if out of range or the
+    /// column is dictionary-encoded (where the value lives behind an indirection,
+    /// so a single address is not meaningful).
+    #[inline]
+    fn raw_cell_ptr(&self, col_idx: usize, row_offset: usize) -> Option<*const u8> {
+        let m = self.col_meta.get(col_idx)?;
+        if m.encoding != ENCODING_RAW || row_offset >= self.row_count as usize {
+            return None;
+        }
+        let off = m.data_offset as usize + row_offset * 8;
+        let data: &[u8] = &self.mmap;
+        if off + 8 > data.len() {
+            return None;
+        }
+        Some(unsafe { data.as_ptr().add(off) })
+    }
+
+    /// Row offsets where column `col_idx` falls in `[lo, hi]`, inclusive.
+    ///
+    /// Uses the SIMD range filter (AVX2 where available, scalar otherwise), which
+    /// measured 2.5–2.6× the scalar loop on cache-resident data. The comparison is
+    /// unsigned, so primary keys above `i64::MAX` behave correctly — see the
+    /// range-shift note in `vectorvolt-hal`'s AVX2 module.
+    pub fn filter_offsets(&self, col_idx: usize, lo: u64, hi: u64) -> StorageResult<Vec<u32>> {
+        // An inverted range can never match; skip the decode entirely.
+        if lo > hi {
+            return Ok(Vec::new());
+        }
+        let values = self.read_column(col_idx)?.to_raw_vec();
+        let mut out = Vec::new();
+        vectorvolt_hal::simd::filter_range(&values, lo, hi, &mut out);
+        Ok(out)
+    }
+
+    /// Every column's value for one row, via the O(1) [`read_value`](Self::read_value) path.
+    pub fn read_row(&self, row_offset: usize) -> StorageResult<Vec<u64>> {
+        let n = self.col_count as usize;
+        let mut values = Vec::with_capacity(n);
+        for c in 0..n {
+            values.push(self.read_value(c, row_offset)?);
+        }
+        Ok(values)
+    }
+
+    /// Selectivity at or below which late materialization is used.
+    ///
+    /// Below this, fetching individual cells for matched rows beats decoding whole
+    /// columns. Above it, the per-cell call overhead exceeds what skipping
+    /// non-matching rows saves, and a bulk decode wins.
+    ///
+    /// 0.15 is a starting estimate, not a measured optimum. It is a named constant
+    /// precisely so the crossover can be re-derived per platform later (the S1a
+    /// cache measurements showed thresholds do not transfer between machines).
+    pub const LATE_MATERIALIZATION_MAX_SELECTIVITY: f64 = 0.15;
+
+    /// Build full rows for `offsets`, choosing the cheaper strategy.
+    ///
+    /// ## Why adaptive rather than always-late
+    ///
+    /// Late materialization — read only the cells belonging to matched rows — is a
+    /// large win on a selective query: at 1% selectivity over 3 columns it touches
+    /// ~3% of the cells a full decode would. But it is a *loss* on an unselective
+    /// one, where per-cell call overhead is paid for nearly every cell anyway and a
+    /// bulk decode amortises better.
+    ///
+    /// The filter has already run by this point, so the exact match count is known
+    /// — the choice needs no estimate or statistics, which is consistent with
+    /// `QUERY_EXECUTION_MODEL.md`'s stance against cost-based planning.
+    pub fn materialize_rows(&self, offsets: &[u32]) -> StorageResult<Vec<Vec<u64>>> {
+        if offsets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self.row_count as usize;
+        let selectivity = if rows == 0 {
+            1.0
+        } else {
+            offsets.len() as f64 / rows as f64
+        };
+
+        if selectivity > Self::LATE_MATERIALIZATION_MAX_SELECTIVITY {
+            // Bulk path: one decode per column, then gather.
+            let n = self.col_count as usize;
+            let cols: Vec<Vec<u64>> = (0..n)
+                .map(|c| self.read_column(c).map(|cv| cv.to_raw_vec()))
+                .collect::<StorageResult<_>>()?;
+            return offsets
+                .iter()
+                .map(|&o| {
+                    let o = o as usize;
+                    cols.iter()
+                        .map(|c| {
+                            c.get(o).copied().ok_or(StorageError::RowOffsetOutOfBounds {
+                                row_offset: o,
+                                row_count: self.row_count,
+                            })
+                        })
+                        .collect::<StorageResult<Vec<u64>>>()
+                })
+                .collect();
+        }
+
+        // Late path: touch only the matched rows' cells.
+        //
+        // Prefetch a few rows ahead. In a struct-of-arrays layout the cells of one
+        // row are scattered across columns, so consecutive matched rows are not
+        // adjacent in memory and the hardware prefetcher sees no stride — this is
+        // exactly the indexed-gather case explicit prefetch exists for
+        // (VV-HAL-018/023 integration).
+        const PREFETCH_ROWS_AHEAD: usize = 4;
+        let n = self.col_count as usize;
+        let mut rows_out = Vec::with_capacity(offsets.len());
+
+        for (i, &off) in offsets.iter().enumerate() {
+            if let Some(&future) = offsets.get(i + PREFETCH_ROWS_AHEAD) {
+                for c in 0..n {
+                    if let Some(p) = self.raw_cell_ptr(c, future as usize) {
+                        vectorvolt_hal::prefetch::prefetch(p, vectorvolt_hal::Locality::L1);
+                    }
+                }
+            }
+            rows_out.push(self.read_row(off as usize)?);
+        }
+        Ok(rows_out)
+    }
+
     /// Decode and return the values for column `col_idx`.
     ///
     /// Deserializes the full column. Use [`read_value`] for point lookups.

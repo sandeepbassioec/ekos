@@ -933,6 +933,7 @@ dependencies = [
  "memmap2",
  "tempfile",
  "thiserror",
+ "vectorvolt-hal",
 ]
 
 [[package]]

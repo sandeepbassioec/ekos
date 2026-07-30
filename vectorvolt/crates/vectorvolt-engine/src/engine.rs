@@ -204,19 +204,18 @@ impl TableEngine {
                 continue;
             }
 
-            // Decode all columns eagerly (SoA layout amortises the decode cost).
-            let all_cols: Vec<Vec<u64>> = (0..reader.col_count() as usize)
-                .map(|c| reader.read_column(c).map(|cv| cv.to_raw_vec()))
-                .collect::<Result<_, _>>()?;
-
-            let scan_vals = &all_cols[col_idx];
-            for offset in 0..scan_vals.len() {
-                let val = scan_vals[offset];
-                if val >= lo && val <= hi {
-                    let pk = all_cols[0][offset];
-                    let values: Vec<u64> = all_cols.iter().map(|c| c[offset]).collect();
-                    results.push(EngineRow { pk, values });
-                }
+            // SIMD-filter the scan column, then materialize only matched rows.
+            //
+            // Previously this decoded EVERY column up front and scalar-compared the
+            // filter column, so a 1%-selective query still paid to decode 100% of
+            // every column. Now the filter column alone is decoded, the comparison
+            // is vectorized, and `materialize_rows` picks late-materialization or a
+            // bulk decode based on the match count it can already see.
+            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
+            for values in reader.materialize_rows(&offsets)? {
+                // Column 0 is the PK by convention.
+                let pk = values.first().copied().unwrap_or(u64::MAX);
+                results.push(EngineRow { pk, values });
             }
         }
 
