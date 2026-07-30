@@ -86,6 +86,12 @@ pub enum TableCommand {
         /// Table directory.
         dir: PathBuf,
     },
+
+    /// Merge all partitions into one sorted file, removing deleted rows.
+    Compact {
+        /// Table directory.
+        dir: PathBuf,
+    },
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -99,6 +105,7 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::Delete { dir, pk } => cmd_delete(dir, pk),
         TableCommand::Stats { dir } => cmd_stats(dir),
         TableCommand::Flush { dir } => cmd_flush(dir),
+        TableCommand::Compact { dir } => cmd_compact(dir),
     }
 }
 
@@ -230,6 +237,28 @@ fn cmd_flush(dir: PathBuf) -> Result<()> {
     match engine.flush().with_context(|| "flush")? {
         None => println!("nothing to flush"),
         Some(r) => println!("flushed {} row(s) → {}", r.row_count, r.path.display()),
+    }
+    Ok(())
+}
+
+fn cmd_compact(dir: PathBuf) -> Result<()> {
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+
+    let before = engine.stats();
+    match engine.compact().with_context(|| "compact")? {
+        None => println!(
+            "nothing to compact ({} partition(s), {} row(s) — already optimal)",
+            before.partition_count, before.rows_flushed
+        ),
+        Some(r) => {
+            println!(
+                "compacted {} partition(s) → 1 partition",
+                before.partition_count
+            );
+            println!("rows kept: {}", r.rows_kept);
+            println!("output:    {}", r.path.display());
+        }
     }
     Ok(())
 }

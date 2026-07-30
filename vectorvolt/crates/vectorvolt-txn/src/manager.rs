@@ -265,6 +265,11 @@ impl TxnManager {
     pub fn set_total_rows_flushed(&self, count: u64) {
         self.total_rows_flushed.store(count, Ordering::Relaxed);
     }
+
+    /// Allocate and return the next partition ID, advancing the counter.
+    pub fn alloc_partition_id(&self) -> u16 {
+        self.next_partition_id.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
