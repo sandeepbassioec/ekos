@@ -1,22 +1,31 @@
 # Layer 19 — Sinks & External Integration (`VV-SNK-*`)
 
 **Added 2026-07-30.** Publishing VectorVolt's WAL outward: to relational, NoSQL, and graph databases,
-to event buses, and to analytics stores. 39 features / 231 tasks.
+to event buses, and to analytics stores — plus the adapter SDK that lets anyone add a target we did
+not write. **52 features / 209 tasks.**
 
 Status: ✅ done · 🟡 partial · ⬜ pending · 🧊 env-gated · 🔬 research
 
 ## Rollup
 
-| Group | Features | Tasks | ⬜ |
-|---|---|---|---|
-| Sink framework | 12 | 78 | 78 |
-| Relational sinks | 4 | 22 | 22 |
-| NoSQL sinks | 5 | 27 | 27 |
-| Graph sinks | 2 | 13 | 13 |
-| Analytics / object store | 3 | 18 | 18 |
-| Event bus | 9 | 48 | 48 |
-| Configuration & operations | 4 | 25 | 25 |
-| **Total** | **39** | **231** | **231** |
+| Group | Features | Tasks |
+|---|---|---|
+| 1. Sink framework | 12 | 54 |
+| 2. Relational sinks | 4 | 15 |
+| 3. NoSQL sinks | 5 | 13 |
+| 4. Graph sinks | 2 | 7 |
+| 5. Analytics / object store | 3 | 9 |
+| 6. Event bus | 9 | 25 |
+| 7. Configuration & operations | 4 | 18 |
+| 8. **Adapter SDK & extensibility** | **11** | **58** |
+| 9. Additional named targets | 2 | 10 |
+| **Total** | **52** | **209** |
+
+All ⬜ pending — nothing in this layer is built yet.
+
+Counts are measured from this file (unique `VV-SNK-NNN` ids and `VV-SNK-NNN.N` task rows), not
+asserted. An earlier revision of this header claimed 231 tasks, which was an estimate rather than a
+count; corrected here.
 
 ---
 
@@ -288,6 +297,177 @@ negative. Every task in the framework group exists to enforce this.
 | VV-SNK-039.3 | ⬜ | `vvctl sink replay --from-lsn` / `--from-timestamp` |
 | VV-SNK-039.4 | ⬜ | `vvctl sink replay-dlq` and `vvctl sink dlq list` |
 | VV-SNK-039.5 | ⬜ | `vvctl sink test <name>` — send a synthetic event end-to-end |
+
+---
+
+---
+
+# Group 8 — Adapter SDK and extensibility
+
+**Added 2026-07-30.** The reframe that makes this layer viable commercially.
+
+## The problem this group solves
+
+Customers will name targets we have not written: Oracle, CosmosDB, SAP HANA, DB2, Informix, an
+internal message bus. Shipping 25 native adapters does not fix it — the 26th request still loses the
+deal. And 25 native adapters means maintaining 25 integrations against 25 upstream projects' version
+churn indefinitely, which is how integration-heavy projects collapse under their own weight.
+
+So the load-bearing features here are **not the adapters**. They are the *contract*, the *generic
+adapters*, and the *plugin protocol*.
+
+### Three tiers, by effort and by who maintains them
+
+| Tier | Mechanism | Covers | Maintainer |
+|---|---|---|---|
+| **1. Generic, config-only** | YAML: connection string + statement template + type mapping | **Oracle, DB2, HANA, Informix, Snowflake** — anything with SQL. Plus any REST API — **CosmosDB**, cloud services | Us: 3 adapters, not 25 |
+| **2. Native Rust** | Implements `Sink`, in-tree or as an external crate | The 5–6 worth hand-optimising | Us for core, community beyond |
+| **3. Out-of-process** | Subprocess speaking gRPC over a Unix socket | **Any language.** JDBC in a Java sidecar, Python, Go | The customer |
+
+Tier 1 alone likely answers ~70% of "can you support X?" with **zero new code** — just YAML. That is
+the difference between "we'll add it next quarter" and "here is the config."
+
+**Why out-of-process is not optional:** there is no mature pure-Rust Oracle driver (the `oracle` crate
+needs OCI client libraries), so Oracle realistically arrives via ODBC or a JDBC sidecar. Designing for
+that now beats discovering it during a deal. It also buys crash isolation — **a buggy
+customer-written adapter must not be able to take down the database** — and the IPC cost is
+acceptable precisely because sinks are async and batched, so it amortises across a whole batch rather
+than per event.
+
+**Why not WASM,** despite `wasmtime` already being planned for CIP (VV-AUT-004): a sink's entire job
+is to talk to the network, and WASI's socket story is not mature enough to connect to Oracle or
+Kafka. gRPC-over-UDS to a native subprocess is the right mechanism for *this* problem.
+
+---
+
+### VV-SNK-040 — Stable, versioned public `Sink` trait  ⬜
+**The contract everything else depends on.**
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-SNK-040.1 | ⬜ | Publish the trait in its own minimal crate (`vectorvolt-sink-api`) so an adapter author depends on the contract, not on the engine |
+| VV-SNK-040.2 | ⬜ | Semver discipline: adding a *required* trait method is a breaking change. New capabilities arrive as defaulted methods |
+| VV-SNK-040.3 | ⬜ | `ChangeEvent` is part of the public contract; version its wire form explicitly |
+| VV-SNK-040.4 | ⬜ | Declare and honour an MSRV, so adapter authors know what toolchain they need |
+| VV-SNK-040.5 | ⬜ | Compatibility policy documented: which engine versions accept which API versions |
+| VV-SNK-040.6 | ⬜ | CI check: any change to the trait's required surface fails without a major-version bump |
+
+### VV-SNK-041 — Adapter capability declaration  ⬜
+**The framework adapts to the adapter, rather than assuming every target behaves like PostgreSQL.**
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-SNK-041.1 | ⬜ | `SinkCapabilities { upsert, delete, transactions, idempotent_write, max_batch, ordered_per_key, ddl_bootstrap, .. }` |
+| VV-SNK-041.2 | ⬜ | Framework consults capabilities: no upsert → insert-then-update fallback; no idempotency → warn plainly that replay duplicates |
+| VV-SNK-041.3 | ⬜ | Refuse a config that requests a guarantee the adapter has not declared, rather than silently degrading it |
+| VV-SNK-041.4 | ⬜ | `vvctl sink capabilities <name>` prints what a target actually guarantees |
+| VV-SNK-041.5 | ⬜ | Every shipped adapter documents its real guarantee — at-least-once or effectively-once — with no hand-waving |
+
+### VV-SNK-042 — Out-of-tree native adapters  ⬜
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-SNK-042.1 | ⬜ | Registration so an external crate can supply a sink type name |
+| VV-SNK-042.2 | ⬜ | Decide and document the linkage model: recompile-with-feature (simple, safe) vs `dlopen` (flexible, ABI-fragile). Recommend the former; Rust has no stable ABI |
+| VV-SNK-042.3 | ⬜ | A `vectorvolt-server` build that includes third-party adapters must report them in `vvctl version` |
+| VV-SNK-042.4 | ⬜ | Example out-of-tree adapter crate in the repo, kept compiling in CI |
+
+### VV-SNK-043 — Generic SQL adapter (config-only)  ⬜
+**Tier 1. The single highest-leverage feature in this layer.**
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-SNK-043.1 | ⬜ | Driver selection by URL scheme (`postgres://`, `mysql://`, `mssql://`, `odbc://`) |
+| VV-SNK-043.2 | ⬜ | **ODBC backend** — the escape hatch that reaches Oracle, DB2, HANA, Informix, Teradata, and anything else with an ODBC driver |
+| VV-SNK-043.3 | ⬜ | Config-declared statement templates for insert / upsert / delete, with named parameter binding |
+| VV-SNK-043.4 | ⬜ | **Always parameterised, never string-concatenated** — a template engine that interpolates values into SQL is an injection vector by construction |
+| VV-SNK-043.5 | ⬜ | Config-declared type mapping per target, with an explicit error on lossy conversion |
+| VV-SNK-043.6 | ⬜ | Declared dialect quirks: identifier quoting, upsert syntax, max parameters per statement |
+| VV-SNK-043.7 | ⬜ | Batch-size negotiation against the driver's parameter limit |
+| VV-SNK-043.8 | ⬜ | Ship worked YAML examples for **Oracle** and **DB2** as proof the escape hatch works |
+| VV-SNK-043.9 | ⬜ | Document the tradeoff honestly: slower than a native adapter, available immediately for anything |
+
+### VV-SNK-044 — Generic HTTP/REST adapter (config-only)  ⬜
+**Tier 1. Reaches CosmosDB and essentially every cloud service.**
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-SNK-044.1 | ⬜ | Config-declared method, URL template, headers, and body template per operation |
+| VV-SNK-044.2 | ⬜ | Body templating to JSON with field mapping from the change event |
+| VV-SNK-044.3 | ⬜ | Auth modes: bearer, basic, API key header, HMAC signing, AWS SigV4, Azure AD, GCP OIDC |
+| VV-SNK-044.4 | ⬜ | Batch semantics: N events per request where the API supports it, else pipelined singles |
+| VV-SNK-044.5 | ⬜ | Response handling: which status codes are success, retryable, or permanent |
+| VV-SNK-044.6 | ⬜ | Honour `Retry-After`; per-request timeout; bounded concurrency |
+| VV-SNK-044.7 | ⬜ | Worked YAML example for **CosmosDB** (SQL API) and a generic webhook |
+
+### VV-SNK-045 — Generic gRPC adapter  ⬜
+### VV-SNK-046 — Out-of-process adapter protocol  ⬜
+**Tier 3. Any language, with crash isolation.**
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-SNK-045.1 | ⬜ | Config-declared proto descriptor + method; map change events to request messages |
+| VV-SNK-045.2 | ⬜ | Reflection or a supplied descriptor set, so no recompile is needed per target |
+| VV-SNK-046.1 | ⬜ | Define the adapter protocol as protobuf: `Open`, `WriteBatch`, `Flush`, `Health`, `Capabilities`, `Close` |
+| VV-SNK-046.2 | ⬜ | Transport over Unix domain socket (named pipe on Windows) — never TCP by default, which would expose the plane |
+| VV-SNK-046.3 | ⬜ | Supervise the subprocess: spawn, health-check, restart with backoff, surface state |
+| VV-SNK-046.4 | ⬜ | **Crash isolation:** an adapter that panics, hangs, or leaks must not affect the engine. Enforce a timeout and kill; treat it as sink-down, not engine-down |
+| VV-SNK-046.5 | ⬜ | Checkpoint only on acknowledgement, so a crash mid-batch replays rather than loses |
+| VV-SNK-046.6 | ⬜ | Resource limits per adapter process (memory, CPU share) so it cannot starve the engine |
+| VV-SNK-046.7 | ⬜ | Reference adapters in **Python** and **Java** (the Java one demonstrating JDBC → Oracle) |
+| VV-SNK-046.8 | ⬜ | Document the latency cost measured, not assumed, so users can choose tier deliberately |
+
+### VV-SNK-047 — Adapter conformance test suite  ⬜
+**How an author proves an adapter is correct without reading our internals.**
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-SNK-047.1 | ⬜ | Publishable test harness an adapter author runs against their own implementation |
+| VV-SNK-047.2 | ⬜ | Asserts: per-key ordering, at-least-once under kill-restart, DLQ on permanent error, backpressure without blocking, batch-boundary correctness |
+| VV-SNK-047.3 | ⬜ | Asserts declared capabilities match observed behaviour — an adapter claiming idempotency is tested for it |
+| VV-SNK-047.4 | ⬜ | Fault injection: target down, target slow, target returning partial success |
+| VV-SNK-047.5 | ⬜ | Machine-readable conformance report, so certification is evidence-based rather than a claim |
+| VV-SNK-047.6 | ⬜ | Every in-tree adapter passes it — the suite is not just for outsiders |
+
+### VV-SNK-048 — Certification tiers  ⬜
+### VV-SNK-049 — Adapter registry and version negotiation  ⬜
+### VV-SNK-050 — Adapter developer kit  ⬜
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-SNK-048.1 | ⬜ | Three tiers: **Core** (we maintain, we test, we support), **Certified** (third-party, passes conformance, listed), **Community** (unverified, clearly labelled) |
+| VV-SNK-048.2 | ⬜ | `vvctl sink list --available` shows each adapter's tier, so nobody deploys an experimental adapter believing it supported |
+| VV-SNK-048.3 | ⬜ | Log a warning at startup for a non-Core adapter, naming its tier |
+| VV-SNK-048.4 | ⬜ | Publish the support policy: what Core guarantees and what it does not |
+| VV-SNK-049.1 | ⬜ | Manifest per adapter: name, version, API version, capabilities, tier, maintainer |
+| VV-SNK-049.2 | ⬜ | Reject an adapter built against an incompatible API version, with a message stating both versions |
+| VV-SNK-049.3 | ⬜ | Discoverable index of known adapters, resolvable offline for air-gapped installs |
+| VV-SNK-050.1 | ⬜ | `cargo generate` template producing a compiling skeleton adapter with conformance tests wired up |
+| VV-SNK-050.2 | ⬜ | Local harness: run an adapter against a synthetic change stream with no engine required |
+| VV-SNK-050.3 | ⬜ | Authoring guide covering batching, idempotency, and error classification — the three things adapter authors get wrong |
+| VV-SNK-050.4 | ⬜ | Worked walkthrough: build a working adapter for an unsupported target, start to finish |
+
+---
+
+# Group 9 — Additional named targets
+
+Explicitly requested and not covered by the original Layer 19 list.
+
+### VV-SNK-051 — Oracle  ⬜
+### VV-SNK-052 — Azure CosmosDB  ⬜
+
+| Task | Status | Detail |
+|---|---|---|
+| VV-SNK-051.1 | ⬜ | **Path A (available immediately):** generic SQL adapter over ODBC — worked YAML config, no new code |
+| VV-SNK-051.2 | ⬜ | **Path B:** out-of-process JDBC adapter, the pragmatic route given Oracle's Rust driver situation |
+| VV-SNK-051.3 | ⬜ | **Path C (only on real demand):** native adapter via the `oracle` crate, which requires OCI client libraries on the host — a deployment burden worth avoiding until a customer justifies it |
+| VV-SNK-051.4 | ⬜ | `MERGE INTO` upsert template and Oracle type mapping (`NUMBER` scale/precision is the trap) |
+| VV-SNK-051.5 | ⬜ | Document the three paths with their tradeoffs so the choice is informed |
+| VV-SNK-052.1 | ⬜ | SQL API via the generic HTTP adapter — worked YAML, no new code |
+| VV-SNK-052.2 | ⬜ | MongoDB API via the existing Mongo adapter (VV-SNK-017) — note this is often the simplest route |
+| VV-SNK-052.3 | ⬜ | Gremlin API via VV-SNK-023 for graph workloads |
+| VV-SNK-052.4 | ⬜ | Partition-key mapping, since Cosmos requires an explicit partition key |
+| VV-SNK-052.5 | ⬜ | Request-Unit awareness: treat 429 as retryable and respect the returned backoff, or the bill and the throttling both bite |
 
 ---
 

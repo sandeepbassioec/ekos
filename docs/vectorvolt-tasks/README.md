@@ -1,6 +1,6 @@
 # VectorVolt — Task-Level Traceability Index
 
-**2,149 tasks** across **400 features** across **19 layers**. Generated 2026-07-30 by auditing every
+**2,127 tasks** across **413 features** across **19 layers**. Generated 2026-07-30 by auditing every
 planning document against every line of code in `vectorvolt/crates/`.
 
 Status: ✅ done · 🟡 partial · ⬜ pending · 🧊 env-gated (needs Linux/specific hardware) · 🔬 unscheduled research
@@ -13,7 +13,7 @@ Status: ✅ done · 🟡 partial · ⬜ pending · 🧊 env-gated (needs Linux/s
 | **7** Network · **8** Cluster · **9** Control Plane · **10** SDKs | [LAYER-07-10-NET-CLUSTER-CONTROL-SDK.md](LAYER-07-10-NET-CLUSTER-CONTROL-SDK.md) | 65 | **353** |
 | **11** Observability · **13** Security · **14** Prefetch · **15** Projections · **16** Hardware · **17** Autonomy | [LAYER-11-17-OBS-SEC-PREFETCH-PROJ-HW-AUTONOMY.md](LAYER-11-17-OBS-SEC-PREFETCH-PROJ-HW-AUTONOMY.md) | 52 | **294** |
 | **18** Deployment & Auto-Configuration | [LAYER-18-DEPLOYMENT-AUTOCONFIG.md](LAYER-18-DEPLOYMENT-AUTOCONFIG.md) | 39 | **248** |
-| **19** Sinks & External Integration | [LAYER-19-SINKS-AND-INTEGRATION.md](LAYER-19-SINKS-AND-INTEGRATION.md) | 39 | **231** |
+| **19** Sinks & External Integration | [LAYER-19-SINKS-AND-INTEGRATION.md](LAYER-19-SINKS-AND-INTEGRATION.md) | 52 | **209** |
 
 **Layer 18 added 2026-07-30**, closing a gap the original audit missed: runtime dispatch handles CPU
 *instructions*, but nothing handled *system configuration* — huge-page reservation, core role maps,
@@ -42,7 +42,7 @@ injection, Shadowbox, self-upgrading binary, in-process LLM) is the **EKOS auton
 top of** VectorVolt, and the source docs — `RESEARCH_FRONTIER.md`, `HARDWARE_FRONTIER.md` — explicitly
 disclaim any schedule for it. Excluding it is not scope-cutting; it is reading the docs correctly.
 
-Of the 2,149 tasks, **50 are 🔬 unscheduled research** and **111 are 🧊 hardware-gated**. The
+Of the 2,127 tasks, **50 are 🔬 unscheduled research** and **111 are 🧊 hardware-gated**. The
 buildable core is roughly **1,500 tasks**, of which about **415 are done**.
 
 ---

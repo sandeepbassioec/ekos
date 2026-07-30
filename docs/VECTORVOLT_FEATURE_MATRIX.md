@@ -27,10 +27,10 @@ audit of all 8 crates in `vectorvolt/crates/`.
 |---|---|
 | ✅ Implemented | 47 |
 | 🟡 Partial | 6 |
-| ⬜ Pending | 310 |
+| ⬜ Pending | 323 |
 | 🧊 Deferred (env-gated) | 28 |
 | 🔬 Research | 9 |
-| **Total tracked** | **400** |
+| **Total tracked** | **413** |
 
 > **Revised 2026-07-30:** +36 features. Layer 18 (Deployment & Auto-Configuration, `VV-CFG-*`) was
 > added after a gap was identified: runtime dispatch handles CPU *instructions*, but nothing handled
@@ -547,12 +547,13 @@ Each sprint = one branch, one PR, one traceability report appended to this file.
 | **S2** | Wire SIMD + prefetch into storage/query/index. Encodings, compression, criterion bench, CI perf gate | VV-STO-009..014, VV-QRY-006..010, VV-IDX-007..011 | Prove <100 ns read |
 | **S3** | Type system, multi-table catalog, DDL, **partition control by entity/table/schema**, config system, ring buffer, arenas, **auto-config detection + derivation + reconciliation** | VV-ENG-006..019, VV-TXN-008/009/019, **VV-CFG-001..021, 031..036** | Real database shape; installs configure themselves |
 | **S4** | `vectorvolt-net` + `vectorvolt-server`: protocol, TCP, transport trait, TLS, metrics endpoint. MVCC + txns | VV-NET-001..013, VV-TXN-010..016 | It becomes a server |
-| **S5** | Tiering L0–L4, snapshots, PITR, retention, projections/CQRS, DLQ, prefetch engine | VV-STO-016..024, VV-PRJ-003..008, VV-PRE-001..008 | Durability & intelligence |
+| **S5** | Tiering L0–L4, snapshots, PITR, retention, projections/CQRS, DLQ, prefetch engine. **Sink framework + generic SQL/HTTP adapters + Postgres & Kafka natives** | VV-STO-016..024, VV-PRJ-003..008, VV-PRE-001..008, **VV-SNK-001..012, 036..039, 043, 044, 013, 027** | Durability & intelligence; WAL can feed anything with SQL or HTTP |
+| **S5b** | **Adapter SDK: public `Sink` trait crate, capability declaration, out-of-process protocol, conformance suite, certification tiers, dev kit** | **VV-SNK-040..042, 045..050** | Customers can add targets we never wrote |
 | **S6** | `vectorvolt-cluster`: SWIM, vnodes, **master-slave replication**, Raft, epoch fencing, <2s failover | VV-CLU-001..018 | It becomes distributed |
 | **S7** | `vectorvolt-control` + admin API/UI, Rust SDK, C# SDK, multi-tenancy, RBAC, **package-manager install hooks** (deb/rpm/brew/winget/container/systemd) | VV-CTL-001..015, VV-SDK-001..008, **VV-CFG-022..030** | Operable product; `yum`/`apt`/`brew`/`winget` install self-configures |
 | **S8** | SQL layer, PG wire protocol, read fabric binary, vector/HNSW | VV-QRY-018..020, VV-CLU-019, VV-IDX-012 | SQL + vector search |
 | **S9** | Graph: CSR, traversal, joins, cascade delete, analytics | VV-IDX-013/014, VV-QRY-011..017 | Graph engine |
-| **S10** | Polyglot SDKs, chaos + deterministic sim testing, reference domains | VV-SDK-009..012, VV-TST-009..015 | Hardening |
+| **S10** | Polyglot SDKs, chaos + deterministic sim testing, reference domains. **Remaining native adapters on real demand** (Mongo/Redis/Dynamo/ES/Cassandra/Neo4j/Parquet/ClickHouse/NATS/AMQP/cloud buses, Oracle, CosmosDB) | VV-SDK-009..012, VV-TST-009..015, **VV-SNK-014..035, 051, 052** | Hardening; adapter breadth |
 | **Linux** | eBPF/XDP, DPDK, io_uring, O_DIRECT, PAM MFA, perf profiling | all 🧊 | Needs a Linux box — traits land in S4 so these drop in |
 
 ---
