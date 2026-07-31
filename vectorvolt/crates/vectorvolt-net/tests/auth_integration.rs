@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use vectorvolt_engine::{Durability, EngineOptions, TableEngine};
 use vectorvolt_net::server::ServerStats;
 use vectorvolt_net::{
-    AuthConfig, Client, Request, Response, Secret, Server, ServerConfig, error_code,
+    AuthConfig, Client, Request, Response, Scope, Secret, Server, ServerConfig, error_code,
 };
 
 const SECRET: &[u8] = b"a-sufficiently-long-shared-secret";
@@ -37,9 +37,15 @@ fn start(auth: bool) -> Harness {
     );
     let mut cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
     if auth {
-        cfg = cfg.with_auth(
-            AuthConfig::disabled().with_key("app1", Secret::new(SECRET.to_vec()).unwrap()),
-        );
+        // Admin explicitly. `with_key` defaults to ReadOnly (least privilege), so
+        // these tests — which are about AUTHENTICATION, not authorisation — must
+        // ask for full access rather than inherit it. Three of them failed when
+        // the default was introduced, which is the default doing its job.
+        cfg = cfg.with_auth(AuthConfig::disabled().with_scoped_key(
+            "app1",
+            Secret::new(SECRET.to_vec()).unwrap(),
+            Scope::Admin,
+        ));
         assert!(cfg.requires_auth());
     }
     let server = Server::bind(engine, cfg).unwrap();

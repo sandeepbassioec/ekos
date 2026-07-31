@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vectorvolt_engine::TableEngine;
 
-use crate::auth::{AuthConfig, AuthState};
+use crate::auth::{AuthConfig, AuthState, Scope};
 use crate::protocol::{HEADER_SIZE, Header, Request, Response, encode_response, verify_payload};
 use crate::{NetError, NetResult, error_code};
 
@@ -66,6 +66,8 @@ pub struct ServerStats {
     pub protocol_errors: AtomicU64,
     /// Requests refused because the connection had not authenticated.
     pub unauthenticated_rejections: AtomicU64,
+    /// Requests refused because the key lacked the required scope.
+    pub forbidden_rejections: AtomicU64,
     /// Failed authentication attempts. Worth alerting on: a rising count is
     /// either a misconfigured client or someone guessing.
     pub auth_failures: AtomicU64,
@@ -347,7 +349,42 @@ fn serve_authenticated(
                 message: "authenticate with Hello then Auth before issuing requests".into(),
             })
         }
-        other => Ok(serve_request(engine, other)),
+        other => {
+            // Authorisation, after authentication. Enforced here rather than in
+            // `serve_request` so the check cannot be forgotten when an opcode is
+            // added: `required_scope` is exhaustive over `Request`, so a new
+            // variant fails to compile until someone decides what it costs.
+            if let Err(e) = auth.require(required_scope(&other)) {
+                stats.forbidden_rejections.fetch_add(1, Ordering::Relaxed);
+                return Ok(Response::Error {
+                    code: error_code::FORBIDDEN,
+                    message: e.to_string(),
+                });
+            }
+            Ok(serve_request(engine, other))
+        }
+    }
+}
+
+/// The scope an operation needs.
+///
+/// Exhaustive on purpose. A `_ =>` arm here would silently give every future
+/// opcode the scope of whatever it fell through to, which for an authorisation
+/// table is the wrong direction to fail in.
+fn required_scope(req: &Request) -> Scope {
+    match req {
+        // Reads, plus Stats — it exposes row counts and byte totals, which is
+        // information about the data and so is not free.
+        Request::Get { .. } | Request::RangeScan { .. } | Request::Stats => Scope::ReadOnly,
+        // Row-scoped mutation.
+        Request::Insert { .. } | Request::Delete { .. } => Scope::ReadWrite,
+        // File-scoped: Compact rewrites every partition in a job and deletes the
+        // originals, so one call from a misconfigured client can rewrite a whole
+        // table. Flush is included because it forces partition creation and is the
+        // same class of operational control.
+        Request::Flush | Request::Compact => Scope::Admin,
+        // Reached only through the auth gate above, which handles them first.
+        Request::Ping | Request::Hello | Request::Auth { .. } => Scope::ReadOnly,
     }
 }
 
