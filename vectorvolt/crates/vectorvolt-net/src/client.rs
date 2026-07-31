@@ -5,6 +5,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::protocol::{HEADER_SIZE, Header, Request, Response, encode_request, verify_payload};
+use crate::tls::{ClientConn, ClientTlsConfig};
 use crate::{NetError, NetResult};
 
 /// A connection to a VectorVolt server.
@@ -14,36 +15,64 @@ use crate::{NetError, NetResult};
 /// to manage outstanding requests, and that belongs in the SDK rather than here.
 /// This is the smallest thing that can talk to the server correctly.
 pub struct Client {
-    stream: TcpStream,
+    stream: ClientConn,
     next_id: u64,
 }
 
 impl Client {
     pub fn connect(addr: impl ToSocketAddrs) -> NetResult<Self> {
-        let stream = TcpStream::connect(addr)?;
+        Self::connect_with_tls(addr, None)
+    }
+
+    /// Connect over TLS.
+    ///
+    /// The certificate is verified during `connect`, so a server this client does
+    /// not trust fails HERE — before any credential is sent. Deferring
+    /// verification to first use would open a window in which a caller has already
+    /// handed its secret to an unverified peer.
+    pub fn connect_tls(addr: impl ToSocketAddrs, tls: &ClientTlsConfig) -> NetResult<Self> {
+        Self::connect_with_tls(addr, Some(tls))
+    }
+
+    fn connect_with_tls(
+        addr: impl ToSocketAddrs,
+        tls: Option<&ClientTlsConfig>,
+    ) -> NetResult<Self> {
+        let tcp = TcpStream::connect(addr)?;
         // Nagle off for the same reason the server disables it: a request/response
         // protocol has nothing to coalesce, and the delay lands on every call.
-        let _ = stream.set_nodelay(true);
-        Ok(Client { stream, next_id: 1 })
+        let _ = tcp.set_nodelay(true);
+        Ok(Client {
+            stream: ClientConn::connect(tcp, tls)?,
+            next_id: 1,
+        })
+    }
+
+    /// True if this connection is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.stream.is_tls()
     }
 
     /// Connect with a timeout, so an unreachable host fails fast instead of
     /// waiting out the OS default (which can be over a minute).
     pub fn connect_timeout(addr: SocketAddr, timeout: Duration) -> NetResult<Self> {
-        let stream = TcpStream::connect_timeout(&addr, timeout)?;
-        let _ = stream.set_nodelay(true);
-        Ok(Client { stream, next_id: 1 })
+        let tcp = TcpStream::connect_timeout(&addr, timeout)?;
+        let _ = tcp.set_nodelay(true);
+        Ok(Client {
+            stream: ClientConn::connect(tcp, None)?,
+            next_id: 1,
+        })
     }
 
     /// Bound how long a single call may block.
     pub fn set_timeout(&self, timeout: Option<Duration>) -> NetResult<()> {
-        self.stream.set_read_timeout(timeout)?;
-        self.stream.set_write_timeout(timeout)?;
+        self.stream.socket().set_read_timeout(timeout)?;
+        self.stream.socket().set_write_timeout(timeout)?;
         Ok(())
     }
 
     pub fn local_addr(&self) -> NetResult<SocketAddr> {
-        Ok(self.stream.local_addr()?)
+        Ok(self.stream.socket().local_addr()?)
     }
 
     /// Send a request and wait for its response.
@@ -118,6 +147,18 @@ impl Client {
         secret: &[u8],
     ) -> NetResult<Self> {
         let mut c = Self::connect(addr)?;
+        c.authenticate(key_id, secret)?;
+        Ok(c)
+    }
+
+    /// Connect over TLS and authenticate. The production path.
+    pub fn connect_tls_authenticated(
+        addr: impl ToSocketAddrs,
+        tls: &ClientTlsConfig,
+        key_id: &str,
+        secret: &[u8],
+    ) -> NetResult<Self> {
+        let mut c = Self::connect_tls(addr, tls)?;
         c.authenticate(key_id, secret)?;
         Ok(c)
     }

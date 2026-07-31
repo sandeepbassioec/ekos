@@ -9,6 +9,7 @@ use vectorvolt_engine::TableEngine;
 
 use crate::auth::{AuthConfig, AuthState, Scope};
 use crate::protocol::{HEADER_SIZE, Header, Request, Response, encode_response, verify_payload};
+use crate::tls::{ServerConn, ServerTlsConfig};
 use crate::{NetError, NetResult, error_code};
 
 /// Server tuning.
@@ -30,6 +31,13 @@ pub struct ServerConfig {
     pub nodelay: bool,
     /// Who may connect. Empty means authentication is disabled.
     pub auth: AuthConfig,
+    /// TLS. `None` means plaintext.
+    ///
+    /// Separate from `auth` because they answer different questions and are
+    /// independently useful: TLS without auth is an encrypted channel to an
+    /// anonymous peer, auth without TLS is a known peer over a readable channel.
+    /// Production wants both; the two knobs make it visible when only one is set.
+    pub tls: Option<ServerTlsConfig>,
 }
 
 impl ServerConfig {
@@ -44,6 +52,17 @@ impl ServerConfig {
         self.auth.is_enabled()
     }
 
+    /// Serve over TLS.
+    pub fn with_tls(mut self, tls: ServerTlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// True if the transport is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.tls.is_some()
+    }
+
     pub fn new(addr: SocketAddr) -> Self {
         ServerConfig {
             addr,
@@ -54,6 +73,7 @@ impl ServerConfig {
             // simply appear broken. `requires_auth()` reports which mode is
             // active, so a deployment can assert it rather than assume.
             auth: AuthConfig::disabled(),
+            tls: None,
         }
     }
 }
@@ -72,6 +92,12 @@ pub struct ServerStats {
     /// either a misconfigured client or someone guessing.
     pub auth_failures: AtomicU64,
     pub auth_successes: AtomicU64,
+    /// Connections dropped because the TLS handshake failed.
+    ///
+    /// Counted separately from protocol errors: a handshake failure is a
+    /// certificate or trust problem, not a malformed frame, and conflating them
+    /// hides the difference between a misconfigured client and a hostile one.
+    pub tls_handshake_failures: AtomicU64,
 }
 
 /// A running server.
@@ -156,8 +182,20 @@ impl Server {
             let live = Arc::clone(&self.live);
             let shutdown = Arc::clone(&self.shutdown);
             let auth = self.config.auth.clone();
+            let tls = self.config.tls.clone();
             std::thread::spawn(move || {
-                let _ = handle_connection(stream, &engine, &stats, &shutdown, &auth);
+                // The handshake runs on the connection thread, not the accept
+                // loop. It involves several round trips, so doing it inline would
+                // let one slow or hostile peer stall every pending accept — a
+                // denial of service that costs the attacker a single socket.
+                match ServerConn::accept(stream, tls.as_ref()) {
+                    Ok(conn) => {
+                        let _ = handle_connection(conn, &engine, &stats, &shutdown, &auth);
+                    }
+                    Err(_) => {
+                        stats.tls_handshake_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 live.fetch_sub(1, Ordering::AcqRel);
             });
         }
@@ -192,7 +230,7 @@ impl ShutdownHandle {
 /// from a truncated frame. They are treated differently: a peer that closes
 /// between frames is normal and ends the loop quietly, whereas one that closes
 /// mid-frame is a protocol error worth counting.
-fn read_exact_or_eof(stream: &mut TcpStream, buf: &mut [u8]) -> NetResult<bool> {
+fn read_exact_or_eof<R: Read>(stream: &mut R, buf: &mut [u8]) -> NetResult<bool> {
     let mut read = 0;
     while read < buf.len() {
         match stream.read(&mut buf[read..]) {
@@ -215,7 +253,7 @@ fn read_exact_or_eof(stream: &mut TcpStream, buf: &mut [u8]) -> NetResult<bool> 
 }
 
 fn handle_connection(
-    mut stream: TcpStream,
+    mut stream: ServerConn,
     engine: &TableEngine,
     stats: &ServerStats,
     shutdown: &AtomicBool,
