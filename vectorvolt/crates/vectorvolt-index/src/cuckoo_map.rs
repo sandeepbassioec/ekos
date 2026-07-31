@@ -613,4 +613,49 @@ mod hash_quality_tests {
             }
         }
     }
+
+    /// Mimic the real engine workload: every key is inserted TWICE — once as a
+    /// PENDING descriptor at insert time, once with real coordinates at flush
+    /// time — with the map growing throughout.
+    ///
+    /// The earlier order probe only did fresh inserts and found nothing. This
+    /// covers the update path, which is what the engine actually does and which
+    /// exercises displacement against keys that are already present.
+    #[test]
+    fn reinserting_existing_keys_never_loses_one() {
+        for seed in 0..300u64 {
+            let n = 320u64;
+            let mut order: Vec<u64> = (0..n).collect();
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            for i in (1..order.len()).rev() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                order.swap(i, (s % (i as u64 + 1)) as usize);
+            }
+            let mut m = CuckooMap::with_capacity(64);
+            // Phase 1: PENDING entries, as `TxnManager::insert` writes them.
+            for (off, &k) in order.iter().enumerate() {
+                m.insert(k, RowDescriptor::new(u16::MAX, 0, off as u32))
+                    .unwrap();
+            }
+            // Phase 2: rewrite each with real coordinates, as `flush` does.
+            for (off, &k) in order.iter().enumerate() {
+                m.insert(k, RowDescriptor::new(0, 1, off as u32)).unwrap();
+            }
+            let missing: Vec<u64> = (0..n).filter(|k| m.get(*k).is_none()).collect();
+            assert!(
+                missing.is_empty(),
+                "seed {seed}: {} of {n} keys lost after re-insert, e.g. {:?}",
+                missing.len(),
+                &missing[..missing.len().min(5)]
+            );
+            assert_eq!(
+                m.len(),
+                n as usize,
+                "seed {seed}: len drifted to {}",
+                m.len()
+            );
+        }
+    }
 }

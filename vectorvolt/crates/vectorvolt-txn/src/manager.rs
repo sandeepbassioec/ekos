@@ -422,10 +422,13 @@ impl TxnManager {
             {
                 let mut idx = self.pk_index.write();
                 for (row_offset, pk) in outcome.output_pks.iter().enumerate() {
-                    let _ = idx.insert(
+                    // Same reasoning as the flush path: a key that fails to
+                    // re-index after compaction points at partitions that are
+                    // about to be deleted. Silently dropping it loses the row.
+                    idx.insert(
                         *pk,
                         RowDescriptor::new(file_id, partition_id, row_offset as u32),
-                    );
+                    )?;
                 }
             }
             // The merged partition's key range, so range scans can still prune it.
@@ -473,7 +476,25 @@ impl TxnManager {
     }
 
     pub fn flush(&self) -> TxnResult<Option<FlushResult>> {
-        let rows = self.write_buf.lock().drain();
+        // The buffer lock is held for the WHOLE flush, not just the drain.
+        //
+        // A row must always be findable: either it is in the write buffer with a
+        // PENDING index entry, or it is in a partition with a real one. Draining
+        // first and updating the index later leaves a window where it is in
+        // NEITHER — the index still says PENDING but the buffer no longer holds
+        // the row, so a concurrent reader resolves the descriptor to nothing and
+        // errors on a row that is perfectly intact.
+        //
+        // Holding the lock across the file write serialises inserts against a
+        // flush. That is a real cost and it is the right trade: flush already
+        // dominates the write path, and the alternative is a read that
+        // intermittently fails.
+        //
+        // Lock ORDER matters. `insert` takes the buffer lock and then the index
+        // lock; this must do the same. Taking the index lock first here would
+        // invert the order against `insert` and deadlock.
+        let mut buf_guard = self.write_buf.lock();
+        let rows = buf_guard.drain();
         if rows.is_empty() {
             return Ok(None);
         }
@@ -524,9 +545,20 @@ impl TxnManager {
         {
             let mut idx = self.pk_index.write();
             for (off, (pk, _)) in rows.iter().enumerate() {
-                let _ = idx.insert(*pk, RowDescriptor::new(file_id, partition_id, off as u32));
+                // Propagated, not discarded. `CuckooMap::insert` can fail after
+                // exhausting its grow retries, and `let _ =` here meant the key
+                // silently left the index while its row sat in a partition on
+                // disk — the row is durable and permanently unreachable, which is
+                // indistinguishable from data loss to anyone reading.
+                //
+                // A flush that cannot index what it wrote has not succeeded, so it
+                // reports that rather than returning Ok.
+                idx.insert(*pk, RowDescriptor::new(file_id, partition_id, off as u32))?;
             }
         }
+
+        // Every drained row now has a real descriptor, so the buffer lock can go.
+        drop(buf_guard);
 
         // ZoneMap: record PK min/max for this partition.
         let pk_min = rows.iter().map(|(pk, _)| *pk).min().unwrap_or(0);
