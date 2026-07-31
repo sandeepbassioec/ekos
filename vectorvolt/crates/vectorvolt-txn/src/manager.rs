@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use vectorvolt_index::{CuckooFilter, CuckooMap, RowDescriptor, SecondaryIndex, ZoneMap};
 use vectorvolt_storage::{ColumnValues, MicroPartition, write_partition};
+use vectorvolt_storage::{Manifest, ManifestEdit, ManifestRecovery, PartitionMeta};
 pub use vectorvolt_wal::WalTip;
 use vectorvolt_wal::{SyncCommitter, SyncStats, WalWriter};
 
@@ -57,6 +58,14 @@ pub struct TxnManager {
     total_rows_flushed: AtomicU64,
     /// Flush the WAL out of its userspace buffer on every commit.
     sync_on_commit: bool,
+    /// Durable record of which partitions exist, once enabled.
+    ///
+    /// `Option` because [`TxnManager::new`] is infallible and opening a manifest
+    /// is I/O that can fail. Making the constructor fallible would break every
+    /// caller to add a feature most of them do not use yet, so it is opted into
+    /// via [`TxnManager::enable_manifest`], which surfaces both the error and
+    /// what recovery had to discard.
+    manifest: Mutex<Option<Manifest>>,
 }
 
 impl TxnManager {
@@ -95,6 +104,7 @@ impl TxnManager {
             // Default off preserves the historical behaviour for direct users of
             // this crate; TableEngine opts in per its Durability setting.
             sync_on_commit: false,
+            manifest: Mutex::new(None),
         }
     }
 
@@ -204,6 +214,45 @@ impl TxnManager {
     /// Returns `None` if the buffer was empty. On success, updates the
     /// CuckooMap so all flushed PKs point to the real (file_id, partition_id),
     /// and records the PK zone [min_pk, max_pk] in the ZoneMap.
+    /// Open (or create) the partition manifest in the flush directory.
+    ///
+    /// Returns what recovery found. A non-clean [`ManifestRecovery`] means bytes
+    /// were discarded — see its docs; a small count is a torn tail from an
+    /// unclean shutdown, a large one suggests real corruption. It is returned
+    /// rather than logged so a caller can decide which it is.
+    pub fn enable_manifest(&self) -> TxnResult<ManifestRecovery> {
+        std::fs::create_dir_all(&self.flush_dir)?;
+        let (m, recovery) = Manifest::open(self.flush_dir.join("MANIFEST"))?;
+        *self.manifest.lock() = Some(m);
+        Ok(recovery)
+    }
+
+    /// Every partition the manifest knows about, or empty if it is not enabled.
+    ///
+    /// This is the input to `CompactionStrategy::plan`, `RetentionPolicy::plan`,
+    /// and `verify_partitions`.
+    pub fn partitions(&self) -> Vec<PartitionMeta> {
+        self.manifest
+            .lock()
+            .as_ref()
+            .map(|m| m.partitions())
+            .unwrap_or_default()
+    }
+
+    /// Apply an edit to the manifest, if one is enabled.
+    ///
+    /// `Ok(false)` when no manifest is open — a caller updating statistics should
+    /// not have to care, but should be able to tell.
+    pub fn record(&self, edit: ManifestEdit) -> TxnResult<bool> {
+        match self.manifest.lock().as_mut() {
+            Some(m) => {
+                m.apply(edit)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub fn flush(&self) -> TxnResult<Option<FlushResult>> {
         let rows = self.write_buf.lock().drain();
         if rows.is_empty() {
@@ -227,6 +276,13 @@ impl TxnManager {
         }
 
         // Write .vvsst file.
+        //
+        // The directory is created here rather than assumed. Previously a manager
+        // pointed at a non-existent flush_dir failed at flush time with a bare
+        // NotFound, and once enable_manifest started calling create_dir_all,
+        // whether flush worked at all depended on whether a manifest was enabled —
+        // an unrelated setting silently changing a core operation.
+        std::fs::create_dir_all(&self.flush_dir)?;
         let filename = format!("{file_id:05}_{partition_id:05}.vvsst");
         let path = self.flush_dir.join(&filename);
         let mut file = std::fs::File::create(&path)?;
@@ -253,6 +309,29 @@ impl TxnManager {
         let pk_min = rows.iter().map(|(pk, _)| *pk).min().unwrap_or(0);
         let pk_max = rows.iter().map(|(pk, _)| *pk).max().unwrap_or(0);
         self.zone_map.write().set(partition_id, pk_min, pk_max);
+
+        // Manifest: record the partition so compaction planning, retention, and
+        // verification can see it. Written AFTER the .vvsst file is on disk and
+        // after the WAL checkpoint, so the manifest can never name a partition
+        // that does not exist. The reverse — a file with no manifest entry — is
+        // survivable: it leaks disk until a scan for orphans finds it, whereas a
+        // manifest entry pointing at nothing breaks every read that follows it.
+        if let Some(m) = self.manifest.lock().as_mut() {
+            let size_bytes = std::fs::metadata(&path).map(|md| md.len()).unwrap_or(0);
+            m.apply(ManifestEdit::Add(Box::new(PartitionMeta {
+                file_id,
+                partition_id,
+                path: path.clone(),
+                level: 0,
+                size_bytes,
+                row_count: row_count as u32,
+                created_at_millis: now_millis(),
+                min_key: pk_min,
+                max_key: pk_max,
+                tombstones: 0,
+                worm_locked: false,
+            })))?;
+        }
 
         let _ = base; // used by fetch_add above
 
@@ -321,4 +400,16 @@ fn col_value_hash(col_idx: usize, value: u64) -> u32 {
         .wrapping_add(col_idx as u64)
         .wrapping_mul(0x517c_c1b7_2722_0a95);
     (mixed ^ (mixed >> 32)) as u32
+}
+
+/// Wall-clock milliseconds since the Unix epoch.
+///
+/// Saturates to 0 if the system clock is before the epoch rather than panicking.
+/// A nonsense clock should not take down a flush, and retention already treats a
+/// nonsensical timestamp safely (see `RetentionPolicy::plan`).
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
