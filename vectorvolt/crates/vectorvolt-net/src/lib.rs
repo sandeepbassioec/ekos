@@ -29,11 +29,13 @@ pub mod auth;
 pub mod client;
 pub mod protocol;
 pub mod server;
+pub mod tls;
 
 pub use auth::{AuthConfig, AuthError, AuthState, Scope, Secret};
 pub use client::Client;
 pub use protocol::{Header, OpCode, Request, Response};
 pub use server::{Server, ServerConfig};
+pub use tls::{ClientTlsConfig, ServerTlsConfig};
 
 /// Errors from framing, parsing, or transport.
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +75,9 @@ pub enum NetError {
 
     #[error("authentication: {0}")]
     Auth(#[from] auth::AuthError),
+
+    #[error("TLS: {0}")]
+    Tls(String),
 }
 
 pub type NetResult<T> = Result<T, NetError>;
