@@ -921,6 +921,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-net"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "tempfile",
+ "thiserror",
+ "vectorvolt-engine",
+]
+
+[[package]]
 name = "vectorvolt-query"
 version = "0.1.0"
 dependencies = [
