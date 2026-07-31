@@ -18,7 +18,10 @@ use std::path::PathBuf;
 
 use parking_lot::RwLock;
 use vectorvolt_index::RowDescriptor;
-use vectorvolt_storage::{ColumnValues, MicroPartition, PartitionReader, write_partition};
+use vectorvolt_storage::{
+    CompactionJob, CompactionStrategy, ManifestEdit, ManifestRecovery, PartitionMeta,
+    PartitionReader, RetentionPlan, RetentionPolicy, VerifyReport, WriteOptions, verify_partitions,
+};
 pub use vectorvolt_txn::{FlushResult, WalTip};
 use vectorvolt_txn::{Mutation, TxnManager};
 use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
@@ -32,6 +35,12 @@ pub struct TableEngine {
     partitions: RwLock<HashMap<(u16, u16), PartitionReader>>,
     partition_dir: PathBuf,
     pub schema: Vec<String>,
+    /// How `compact` chooses what to merge.
+    compaction_strategy: CompactionStrategy,
+    /// Storage options for compaction output.
+    write_options: WriteOptions,
+    /// What manifest recovery found at open. See [`TableEngine::manifest_recovery`].
+    manifest_recovery: ManifestRecovery,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -90,6 +99,13 @@ pub struct EngineOptions {
     /// Rows buffered before an automatic flush to a new partition.
     pub flush_threshold: usize,
     pub durability: Durability,
+    /// How `compact` chooses what to merge. Defaults to leveled, matching
+    /// VectorVolt's read-latency target — see [`CompactionStrategy`].
+    pub compaction_strategy: CompactionStrategy,
+    /// Storage options for compaction output. Compaction is the natural place to
+    /// enable LZ4, since a compacted partition is colder than a fresh one, but it
+    /// costs O(1) point reads so it is off by default.
+    pub write_options: WriteOptions,
 }
 
 impl EngineOptions {
@@ -97,6 +113,8 @@ impl EngineOptions {
         EngineOptions {
             flush_threshold,
             durability: Durability::Fsync,
+            compaction_strategy: CompactionStrategy::default(),
+            write_options: WriteOptions::default(),
         }
     }
 
@@ -104,6 +122,18 @@ impl EngineOptions {
     /// is given up.
     pub fn with_durability(mut self, durability: Durability) -> Self {
         self.durability = durability;
+        self
+    }
+
+    pub fn with_compaction_strategy(mut self, strategy: CompactionStrategy) -> Self {
+        self.compaction_strategy = strategy;
+        self
+    }
+
+    /// LZ4-compress compaction output. Point reads on a compressed partition are
+    /// O(column) rather than O(1) — see `vectorvolt_storage::COMPRESSION_LZ4`.
+    pub fn with_compressed_compaction(mut self) -> Self {
+        self.write_options = WriteOptions::new().with_lz4();
         self
     }
 }
@@ -214,11 +244,75 @@ impl TableEngine {
         // Seed the flushed-rows counter so stats() is accurate after a restart.
         txn.set_total_rows_flushed(rows_on_disk);
 
+        // The manifest is enabled unconditionally here, unlike in TxnManager where
+        // it is opt-in. TableEngine is the top-level type and its `compact`,
+        // `apply_retention`, and `verify` all read from it — without one they
+        // would silently do nothing, which is a far worse failure than the open
+        // returning an error.
+        //
+        // Recovery is deliberately not silent. A torn tail is expected after an
+        // unclean shutdown; a large discard is not, and the difference cannot be
+        // told from the bytes (see `ManifestRecovery`). It is recorded on the
+        // engine so a caller can inspect it rather than having it swallowed.
+        let manifest_recovery = txn.enable_manifest()?;
+
+        // Adopt partitions found on disk ONLY when the manifest is empty.
+        //
+        // The distinction is load-bearing, and an earlier version of this got it
+        // wrong by adopting any unknown file. Two situations produce a partition
+        // the manifest does not name, and they need opposite handling:
+        //
+        // - **Empty manifest**: a table written before the manifest existed. Every
+        //   file is real data and must be adopted, or the table appears empty.
+        // - **Populated manifest**: an orphan from an interrupted compaction —
+        //   inputs still on disk with the manifest already naming only the output.
+        //   Adopting one DOUBLES every row it holds, silently, in every scan.
+        //
+        // The second case is the dangerous one, and it is also the common one, so
+        // an unknown file beside a populated manifest is left strictly alone. Not
+        // deleted either: reclaiming it is an orphan-sweep decision that wants an
+        // explicit operation, not a side effect of opening a table.
+        if txn.partitions().is_empty() && !partitions.is_empty() {
+            for ((file_id, partition_id), reader) in partitions.iter() {
+                let path = partition_dir.join(format!("{file_id:05}_{partition_id:05}.vvsst"));
+                let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let (min_key, max_key) = reader.zone_min_max(0).unwrap_or((0, 0));
+                txn.record(ManifestEdit::Add(Box::new(PartitionMeta {
+                    file_id: *file_id,
+                    partition_id: *partition_id,
+                    path,
+                    level: 0,
+                    size_bytes,
+                    row_count: reader.row_count(),
+                    // Unknown, and 0 is the honest answer: it sorts these first for
+                    // age-based retention, which is right — they predate everything
+                    // the manifest has seen.
+                    created_at_millis: 0,
+                    min_key,
+                    max_key,
+                    tombstones: 0,
+                    worm_locked: false,
+                })))?;
+            }
+        } else {
+            // Drop readers for files the manifest does not name, so an orphan is
+            // not served by scans either.
+            let known: std::collections::HashSet<(u16, u16)> = txn
+                .partitions()
+                .iter()
+                .map(|p| (p.file_id, p.partition_id))
+                .collect();
+            partitions.retain(|k, _| known.contains(k));
+        }
+
         Ok(TableEngine {
             txn,
             partitions: RwLock::new(partitions),
             partition_dir,
             schema,
+            compaction_strategy: options.compaction_strategy,
+            write_options: options.write_options,
+            manifest_recovery,
         })
     }
 
@@ -336,135 +430,188 @@ impl TableEngine {
 
     // ── Compaction ────────────────────────────────────────────────────────────
 
-    /// Merge all on-disk partitions into one sorted partition, removing
-    /// tombstoned rows.
+    /// Compact this table, delegating to the shared planner and executor.
     ///
-    /// ## What it does
+    /// Was a second, independent merge implementation living here — it collected
+    /// live rows, wrote one merged file, deleted everything else in the directory,
+    /// and rebuilt the index. It worked, but it duplicated
+    /// `CompactionStrategy::plan` + `execute_job` with different behaviour: it
+    /// always merged EVERYTHING regardless of level or size, and it swept the
+    /// partition directory with a `read_dir` rather than acting on a known input
+    /// set. Two compaction paths that disagree is how a storage engine grows a bug
+    /// that only appears under one of them.
     ///
-    /// 1. Flush any pending write-buffer rows to disk.
-    /// 2. Collect every live row from every partition (a row is live if its PK
-    ///    is still present in the CuckooMap — deleted PKs are skipped).
-    /// 3. Sort live rows by PK for better zone-pruning on subsequent SCANs.
-    /// 4. Write a single merged `.vvsst` file.
-    /// 5. Delete the old partition files and update the in-memory catalog.
-    /// 6. Rebuild the CuckooMap so every PK points to the new partition.
+    /// ## Dropping the readers is load-bearing, not tidiness
     ///
-    /// Returns `None` if there was nothing to compact (0 or 1 partition and no
-    /// deleted rows).
+    /// Every `PartitionReader` holds a live memory mapping. On Windows a mapped
+    /// file cannot be deleted — `remove_file` returns OS error 1224 — so the
+    /// executor's cleanup would fail on every input and silently leak them.
+    /// Clearing the map runs the readers' destructors and releases the mappings
+    /// first. The previous implementation had the same `parts.clear()` for the
+    /// same reason; the requirement moved, it did not disappear.
+    ///
+    /// Returns `None` when the planner found nothing to do.
     pub fn compact(&self) -> EngineResult<Option<CompactResult>> {
-        // 1. Flush pending rows first.
         self.do_flush()?;
 
         let mut parts = self.partitions.write();
-        if parts.len() <= 1 {
-            // Check if there are any tombstoned rows worth reclaiming.
-            let live: u64 = parts.values().map(|r| r.row_count() as u64).sum();
-            let indexed = self.txn.pk_index.read().len() as u64;
-            if parts.is_empty() || live == indexed {
-                return Ok(None);
-            }
-        }
-
-        // 2. Collect all live rows across all partitions.
-        let col_count = self.schema.len();
-        let mut live_rows: Vec<(u64, Vec<u64>)> = Vec::new();
-
-        for reader in parts.values() {
-            let row_count = reader.row_count() as usize;
-            // Read all columns eagerly (needed to reconstruct full rows).
-            let all_cols: Vec<Vec<u64>> = (0..col_count)
-                .map(|c| {
-                    reader
-                        .read_column(c)
-                        .map(|cv| cv.to_raw_vec())
-                        .unwrap_or_default()
-                })
-                .collect();
-
-            let pk_col = &all_cols[0];
-            let idx = self.txn.pk_index.read();
-            for row_offset in 0..row_count {
-                let pk = pk_col[row_offset];
-                if idx.get(pk).is_some() {
-                    let values: Vec<u64> = all_cols.iter().map(|c| c[row_offset]).collect();
-                    live_rows.push((pk, values));
-                }
-            }
-        }
-
-        if live_rows.is_empty() {
+        if parts.is_empty() {
             return Ok(None);
         }
 
-        // 3. Sort by PK for optimal zone-pruning on range scans.
-        live_rows.sort_unstable_by_key(|(pk, _)| *pk);
-        let row_count = live_rows.len();
-
-        // 4. Write a single merged partition file.
-        //    Use the next available partition_id to avoid collisions.
-        let new_file_id: u16 = 0;
-        let new_partition_id = self.txn.alloc_partition_id();
-
-        let mut mp = MicroPartition::new(new_file_id, new_partition_id);
-        for (col_idx, col_name) in self.schema.iter().enumerate() {
-            let col_vals: Vec<u64> = live_rows.iter().map(|(_, v)| v[col_idx]).collect();
-            let encoded = if col_idx == 0 {
-                ColumnValues::Raw(col_vals)
-            } else {
-                ColumnValues::auto_encode(col_vals)
-            };
-            mp.push_column(col_name.clone(), encoded)?;
-        }
-
-        let filename = format!("{new_file_id:05}_{new_partition_id:05}.vvsst");
-        let new_path = self.partition_dir.join(&filename);
-        {
-            let mut file = std::fs::File::create(&new_path)?;
-            write_partition(&mut file, &mp)?;
-        }
-
-        // 5. Drop every PartitionReader before deleting files.
-        //
-        // This ordering is load-bearing on Windows: an open mmap holds the file,
-        // and `remove_file` fails with OS error 1224 while a mapping is live.
-        // Clearing the map runs the readers' destructors, releasing the mappings.
+        // Release every mapping before the executor tries to delete input files.
         parts.clear();
 
-        // Delete every old `.vvsst` by scanning the directory rather than from
-        // the map we just cleared — the scan is the authoritative view of what is
-        // on disk, and it also sweeps any orphan left by an interrupted earlier
-        // run. The newly written file is excluded by path; it is not yet
-        // registered, so nothing holds a mapping to it.
-        for entry in std::fs::read_dir(&self.partition_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("vvsst") && path != new_path {
-                let _ = std::fs::remove_file(&path);
-            }
+        let outcomes = self
+            .txn
+            .run_compaction(self.compaction_strategy, self.write_options)?;
+
+        // Re-open whatever the manifest now says is live. Driven by the manifest
+        // rather than by a directory scan, so an orphan left by an interrupted run
+        // is not silently adopted as a live partition.
+        for meta in self.txn.partitions() {
+            let reader = PartitionReader::open(&meta.path)?;
+            parts.insert((reader.file_id(), reader.partition_id()), reader);
         }
 
-        // Register the new merged partition.
-        let new_reader = PartitionReader::open(&new_path)?;
-        parts.insert((new_file_id, new_partition_id), new_reader);
+        let Some(last) = outcomes.last() else {
+            return Ok(None);
+        };
 
-        // 6. Rebuild CuckooMap: update every PK to point to the new partition.
-        {
-            let mut idx = self.txn.pk_index.write();
-            for (new_offset, (pk, _)) in live_rows.iter().enumerate() {
-                let _ = idx.insert(
-                    *pk,
-                    RowDescriptor::new(new_file_id, new_partition_id, new_offset as u32),
-                );
-            }
-        }
+        // Leaked inputs are surfaced through `CompactResult::leaked_files` rather
+        // than logged: this crate has no logging dependency, and a warning nobody
+        // configured a subscriber for is indistinguishable from silence.
+        let leaked: usize = outcomes.iter().map(|o| o.undeleted.len()).sum();
 
-        // Reset flushed-row counter to match new on-disk state.
-        self.txn.set_total_rows_flushed(row_count as u64);
+        let rows_kept: u64 = outcomes.iter().map(|o| o.rows_out).sum();
+        self.txn.set_total_rows_flushed(rows_kept);
 
         Ok(Some(CompactResult {
-            rows_kept: row_count,
-            path: new_path,
+            rows_kept: rows_kept as usize,
+            path: last.output.path.clone(),
+            leaked_files: leaked,
         }))
+    }
+
+    /// What manifest recovery discarded at open.
+    ///
+    /// `is_clean()` is the only fully healthy answer. A small `discarded_bytes` is
+    /// a torn tail from an unclean shutdown and is expected; a large one suggests
+    /// real corruption and that partitions may be missing. The bytes cannot
+    /// distinguish these, so the number is reported rather than judged.
+    pub fn manifest_recovery(&self) -> ManifestRecovery {
+        self.manifest_recovery
+    }
+
+    /// Every partition the manifest knows about.
+    pub fn partition_meta(&self) -> Vec<PartitionMeta> {
+        self.txn.partitions()
+    }
+
+    /// What compaction *would* do, without doing it.
+    ///
+    /// Compaction destroys data, so being able to inspect the plan before running
+    /// it is not a nicety. Pure — touches no files.
+    pub fn compaction_plan(&self) -> Vec<CompactionJob> {
+        let eligible: Vec<PartitionMeta> = self
+            .txn
+            .partitions()
+            .into_iter()
+            .filter(|p| !p.worm_locked)
+            .collect();
+        self.compaction_strategy.plan(&eligible)
+    }
+
+    /// What `policy` would delete, without deleting it.
+    ///
+    /// Returns both the deletions and the vetoes, so a caller can see a WORM lock
+    /// or the last-partition rail clamping the policy rather than wondering why
+    /// disk use is not falling. `now_millis` is supplied rather than read from the
+    /// clock, so the answer is reproducible.
+    pub fn retention_plan(&self, policy: &RetentionPolicy, now_millis: u64) -> RetentionPlan {
+        policy.plan(&self.txn.partitions(), now_millis)
+    }
+
+    /// Execute a retention policy: delete the selected partitions.
+    ///
+    /// Manifest first, then the files — the same ordering compaction uses, and for
+    /// the same reason. A crash between the two leaves an unreferenced file, which
+    /// leaks disk; the opposite order would leave the manifest naming a file that
+    /// no longer exists, which breaks every read that follows.
+    ///
+    /// Returns the plan that was carried out.
+    pub fn apply_retention(
+        &self,
+        policy: &RetentionPolicy,
+        now_millis: u64,
+    ) -> EngineResult<RetentionPlan> {
+        let plan = self.retention_plan(policy, now_millis);
+        if plan.delete.is_empty() {
+            return Ok(plan);
+        }
+
+        let mut parts = self.partitions.write();
+        // Same Windows constraint as compaction: a mapped file will not delete.
+        parts.clear();
+
+        let removes: Vec<(u16, u16)> = plan
+            .delete
+            .iter()
+            .map(|a| (a.partition.file_id, a.partition.partition_id))
+            .collect();
+        self.txn.record(ManifestEdit::Replace {
+            adds: Vec::new(),
+            removes,
+        })?;
+
+        let mut undeleted: Vec<std::path::PathBuf> = Vec::new();
+        for action in &plan.delete {
+            if std::fs::remove_file(&action.partition.path).is_err()
+                && action.partition.path.exists()
+            {
+                undeleted.push(action.partition.path.clone());
+            }
+        }
+
+        // Rows belonging to deleted partitions must leave the index, or a lookup
+        // resolves into a file that is gone. Done by rebuilding from what remains
+        // rather than by subtracting, because the deleted partitions' key lists
+        // are no longer readable once their files are unlinked.
+        for meta in self.txn.partitions() {
+            let reader = PartitionReader::open(&meta.path)?;
+            parts.insert((reader.file_id(), reader.partition_id()), reader);
+        }
+        self.rebuild_index_from(&parts)?;
+
+        let mut plan = plan;
+        plan.undeleted = undeleted;
+        Ok(plan)
+    }
+
+    /// Verify every live partition, individually and against each other.
+    pub fn verify(&self) -> EngineResult<VerifyReport> {
+        Ok(verify_partitions(&self.txn.partitions())?)
+    }
+
+    /// Rebuild the PK index from the given readers.
+    ///
+    /// Used after retention, where partitions vanish wholesale. Everything not
+    /// present in a surviving partition is dropped, which is exactly right: a
+    /// retained row is one that still lives somewhere on disk.
+    fn rebuild_index_from(&self, parts: &HashMap<(u16, u16), PartitionReader>) -> EngineResult<()> {
+        let mut idx = self.txn.pk_index.write();
+        *idx = vectorvolt_index::CuckooMap::with_capacity(64);
+        let mut total: u64 = 0;
+        for ((file_id, partition_id), reader) in parts {
+            for row in 0..reader.row_count() as usize {
+                let pk = reader.read_value(0, row)?;
+                let _ = idx.insert(pk, RowDescriptor::new(*file_id, *partition_id, row as u32));
+                total += 1;
+            }
+        }
+        drop(idx);
+        self.txn.set_total_rows_flushed(total);
+        Ok(())
     }
 
     // ── Introspection ─────────────────────────────────────────────────────────
