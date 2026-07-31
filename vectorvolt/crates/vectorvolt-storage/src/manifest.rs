@@ -96,6 +96,17 @@ pub enum ManifestEdit {
         partition_id: u16,
         locked: bool,
     },
+    /// Swap one set of partitions for another in a single record.
+    ///
+    /// The atomicity primitive compaction needs. Adding the output and removing
+    /// the inputs as two separate edits leaves a window where a crash lands
+    /// between them and recovery sees BOTH — every row in the merged output
+    /// duplicated against its originals. As one record it either replays whole or
+    /// not at all, because a partial record fails its CRC and is discarded.
+    Replace {
+        adds: Vec<PartitionMeta>,
+        removes: Vec<(u16, u16)>,
+    },
 }
 
 const TAG_ADD: u8 = 1;
@@ -103,6 +114,7 @@ const TAG_REMOVE: u8 = 2;
 const TAG_TOMBSTONES: u8 = 3;
 const TAG_LEVEL: u8 = 4;
 const TAG_WORM: u8 = 5;
+const TAG_REPLACE: u8 = 6;
 
 impl ManifestEdit {
     fn encode(&self) -> StorageResult<Vec<u8>> {
@@ -176,6 +188,31 @@ impl ManifestEdit {
                 b.extend_from_slice(&partition_id.to_le_bytes());
                 b.push(u8::from(*locked));
             }
+            ManifestEdit::Replace { adds, removes } => {
+                b.push(TAG_REPLACE);
+                let n_adds = u16::try_from(adds.len()).map_err(|_| {
+                    StorageError::InvalidData("Replace has more than 65535 adds".into())
+                })?;
+                b.extend_from_slice(&n_adds.to_le_bytes());
+                for a in adds {
+                    // Each nested Add is length-prefixed rather than fixed-size,
+                    // because a path is variable length. Without the prefix a
+                    // decoder cannot find where one add ends and the next begins.
+                    let body = ManifestEdit::Add(Box::new(a.clone())).encode()?;
+                    let len = u32::try_from(body.len())
+                        .map_err(|_| StorageError::InvalidData("nested add too large".into()))?;
+                    b.extend_from_slice(&len.to_le_bytes());
+                    b.extend_from_slice(&body);
+                }
+                let n_rem = u16::try_from(removes.len()).map_err(|_| {
+                    StorageError::InvalidData("Replace has more than 65535 removes".into())
+                })?;
+                b.extend_from_slice(&n_rem.to_le_bytes());
+                for (f, pid) in removes {
+                    b.extend_from_slice(&f.to_le_bytes());
+                    b.extend_from_slice(&pid.to_le_bytes());
+                }
+            }
         }
         Ok(b)
     }
@@ -213,6 +250,32 @@ impl ManifestEdit {
 
         let mut c = Cur { b, at: 0 };
         let tag = c.u8()?;
+
+        // Replace carries no single partition id, so it is decoded before the
+        // shared header that every other variant starts with.
+        if tag == TAG_REPLACE {
+            let n_adds = c.u16()? as usize;
+            let mut adds = Vec::with_capacity(n_adds.min(1024));
+            for _ in 0..n_adds {
+                let len = c.u32()? as usize;
+                let body = c.take(len)?;
+                match ManifestEdit::decode(body)? {
+                    ManifestEdit::Add(p) => adds.push(*p),
+                    _ => {
+                        return Err(StorageError::InvalidData(
+                            "Replace contains a nested edit that is not an Add".into(),
+                        ));
+                    }
+                }
+            }
+            let n_rem = c.u16()? as usize;
+            let mut removes = Vec::with_capacity(n_rem.min(1024));
+            for _ in 0..n_rem {
+                removes.push((c.u16()?, c.u16()?));
+            }
+            return Ok(ManifestEdit::Replace { adds, removes });
+        }
+
         let file_id = c.u16()?;
         let partition_id = c.u16()?;
         match tag {
@@ -441,6 +504,18 @@ impl Manifest {
             } => {
                 if let Some(p) = state.get_mut(&(file_id, partition_id)) {
                     p.worm_locked = locked;
+                }
+            }
+            ManifestEdit::Replace { adds, removes } => {
+                // Removes first, then adds. The other order would drop a
+                // partition that appears in both lists — which is exactly what an
+                // in-place rewrite does, and it is the natural way to express
+                // garbage collection of a single partition.
+                for key in removes {
+                    state.remove(&key);
+                }
+                for p in adds {
+                    state.insert((p.file_id, p.partition_id), p);
                 }
             }
         }

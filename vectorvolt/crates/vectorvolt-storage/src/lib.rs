@@ -16,6 +16,7 @@
 
 pub mod bitpack;
 pub mod column;
+pub mod compaction;
 pub mod format;
 pub mod lifecycle;
 pub mod manifest;
@@ -24,6 +25,9 @@ pub mod reader;
 pub mod writer;
 
 pub use column::ColumnValues;
+pub use compaction::{
+    CompactionOptions, CompactionOutcome, KeepAll, Liveness, RowLocation, execute_job,
+};
 pub use lifecycle::{
     CompactionJob, CompactionReason, CompactionStrategy, PartitionMeta, RetentionAction,
     RetentionPlan, RetentionPolicy, RetentionRule, RetentionVeto, VerifyFinding, VerifyReport,
