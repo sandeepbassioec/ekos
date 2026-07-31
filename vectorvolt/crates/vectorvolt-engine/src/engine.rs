@@ -355,10 +355,17 @@ impl TableEngine {
     /// Pending (un-flushed) rows are flushed before the lookup so the result
     /// is always up-to-date.  Returns `None` if the pk is not found.
     pub fn get(&self, pk: u64) -> EngineResult<Option<EngineRow>> {
-        if self.txn.row_count_buffered() > 0 {
-            self.do_flush()?;
-        }
-
+        // A read does NOT flush.
+        //
+        // This used to force a flush whenever the write buffer was non-empty,
+        // which made `get` rewrite partitions and rebuild the index — not a read
+        // at all. It also made every concurrent reader a concurrent writer, which
+        // is what made the two publication races reachable from a lookup in the
+        // first place: with 8 clients reading, 8 threads could be inside flush at
+        // once.
+        //
+        // A PENDING descriptor is now resolved against the buffer directly. The
+        // row is already there; forcing it to disk to read it was pure cost.
         let desc = match self.txn.pk_index.read().get(pk) {
             Some(d) => d,
             None => return Ok(None),
@@ -367,6 +374,45 @@ impl TableEngine {
         let file_id = desc.file_id();
         let partition_id = desc.partition_id();
         let row_offset = desc.row_offset() as usize;
+
+        if file_id == vectorvolt_txn::PENDING_FILE_ID {
+            // Still buffered. A miss here is not an error: a concurrent flush may
+            // have moved the row to a partition and republished the descriptor
+            // between the index read above and this lookup, so re-read the index
+            // and resolve again rather than reporting the row absent.
+            if let Some(values) = self.txn.buffered_row(pk, row_offset) {
+                return Ok(Some(EngineRow { pk, values }));
+            }
+            let Some(fresh) = self.txn.pk_index.read().get(pk) else {
+                return Ok(None);
+            };
+            if fresh.file_id() == vectorvolt_txn::PENDING_FILE_ID {
+                // Still pending and still not in the buffer. The only way that
+                // happens is a flush in progress that has not yet republished, so
+                // fall back to the old behaviour for this one read.
+                return match self.txn.buffered_row(pk, fresh.row_offset() as usize) {
+                    Some(values) => Ok(Some(EngineRow { pk, values })),
+                    None => Ok(None),
+                };
+            }
+            let values = match self.read_row_from(
+                fresh.file_id(),
+                fresh.partition_id(),
+                fresh.row_offset() as usize,
+            ) {
+                Ok(v) => v,
+                Err(EngineError::PartitionMissing { .. }) => {
+                    self.sync_partitions()?;
+                    self.read_row_from(
+                        fresh.file_id(),
+                        fresh.partition_id(),
+                        fresh.row_offset() as usize,
+                    )?
+                }
+                Err(e) => return Err(e),
+            };
+            return Ok(Some(EngineRow { pk, values }));
+        }
 
         // A descriptor can name a partition this engine has not opened yet.
         //

@@ -201,3 +201,86 @@ fn readers_never_observe_a_torn_row() {
         "a reader saw an index entry pointing at another row"
     );
 }
+
+/// **A read must not flush.**
+///
+/// `get` used to force a flush whenever the write buffer was non-empty, which made
+/// every reader a writer and was what made the publication races reachable from a
+/// lookup. Asserted directly: reading buffered rows must not create partitions.
+#[test]
+fn reads_do_not_flush_the_write_buffer() {
+    let dir = TempDir::new().unwrap();
+    let m = manager(&dir, 10_000_000);
+
+    for pk in 0..200u64 {
+        m.insert(pk, vec![pk, pk * 2, pk * 3]).unwrap();
+    }
+    let before = m.stats().partition_count;
+    assert_eq!(before, 0, "nothing should be flushed yet");
+
+    // Read everything back — from the buffer.
+    for pk in 0..200u64 {
+        let row = m.get(pk).unwrap().expect("buffered row must be readable");
+        assert_eq!(row.values, vec![pk, pk * 2, pk * 3], "pk {pk}");
+    }
+
+    assert_eq!(
+        m.stats().partition_count,
+        0,
+        "reading created partitions — get is still flushing"
+    );
+    assert_eq!(m.stats().rows_flushed, 0, "reading flushed rows to disk");
+
+    // An explicit flush still works, and rows stay readable across the move from
+    // buffer to partition.
+    m.flush().unwrap();
+    assert_eq!(m.stats().partition_count, 1);
+    for pk in 0..200u64 {
+        let row = m.get(pk).unwrap().expect("row lost in flush");
+        assert_eq!(row.values, vec![pk, pk * 2, pk * 3], "pk {pk} after flush");
+    }
+}
+
+/// Readers and writers together, with reads no longer forcing flushes.
+///
+/// The configuration that used to fail: many clients inserting and immediately
+/// reading their own keys back, with a flush threshold low enough that real
+/// flushes happen underneath.
+#[test]
+fn readers_and_writers_interleave_across_a_flush_boundary() {
+    let dir = TempDir::new().unwrap();
+    let m = manager(&dir, 128);
+    const THREADS: u64 = 12;
+    const PER_THREAD: u64 = 150;
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let m = Arc::clone(&m);
+            std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let pk = i * THREADS + t;
+                    m.insert(pk, vec![pk, t, i]).unwrap();
+                    // Read back IMMEDIATELY, while the row is almost certainly
+                    // still buffered and other threads are flushing.
+                    let row = m
+                        .get(pk)
+                        .unwrap_or_else(|e| panic!("pk {pk} errored right after insert: {e}"))
+                        .unwrap_or_else(|| panic!("pk {pk} missing right after insert"));
+                    assert_eq!(row.values[0], pk);
+                    assert_eq!(row.values[1], t, "pk {pk} resolved to another thread's row");
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    for t in 0..THREADS {
+        for i in 0..PER_THREAD {
+            let pk = i * THREADS + t;
+            let row = m.get(pk).unwrap().unwrap_or_else(|| panic!("pk {pk} lost"));
+            assert_eq!(row.values, vec![pk, t, i], "pk {pk}");
+        }
+    }
+}

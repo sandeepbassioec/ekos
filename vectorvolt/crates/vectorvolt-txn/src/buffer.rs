@@ -37,6 +37,21 @@ impl WriteBuffer {
     }
 
     /// Drain all rows, leaving the buffer empty.
+    /// The row at `offset`, if it is there and belongs to `pk`.
+    ///
+    /// The pk check is not paranoia. A `RowDescriptor` records a buffer offset,
+    /// and a flush empties the buffer — so an offset captured before a flush can
+    /// point at a slot that a *different* row now occupies. Returning that row
+    /// would silently answer a lookup with someone else's data, which is worse
+    /// than returning nothing. Verifying the key makes a stale offset a miss
+    /// instead of a wrong answer.
+    pub fn row_for(&self, pk: u64, offset: usize) -> Option<&[u64]> {
+        match self.rows.get(offset) {
+            Some((k, values)) if *k == pk => Some(values),
+            _ => None,
+        }
+    }
+
     pub fn drain(&mut self) -> Vec<(u64, Vec<u64>)> {
         std::mem::take(&mut self.rows)
     }

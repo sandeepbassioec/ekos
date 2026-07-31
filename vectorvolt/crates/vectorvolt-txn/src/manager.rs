@@ -36,7 +36,9 @@ use vectorvolt_wal::{SyncCommitter, SyncStats, WalWriter};
 use crate::{TxnError, TxnResult, buffer::WriteBuffer, ops::Mutation};
 
 // Sentinel file_id for rows still in the write buffer.
-const PENDING_FILE_ID: u16 = u16::MAX;
+/// `file_id` marking a descriptor that points into the write buffer rather than
+/// a partition file.
+pub const PENDING_FILE_ID: u16 = u16::MAX;
 
 /// Metadata returned after a successful partition flush.
 #[derive(Debug, Clone)]
@@ -626,6 +628,18 @@ impl TxnManager {
     }
 
     // ── Accessors ──────────────────────────────────────────────────────────────
+
+    /// A row still sitting in the write buffer, by the offset its descriptor
+    /// recorded.
+    ///
+    /// Lets a reader resolve a PENDING descriptor without forcing a flush. See
+    /// `WriteBuffer::row_for` for why the pk is re-checked.
+    pub fn buffered_row(&self, pk: u64, offset: usize) -> Option<Vec<u64>> {
+        self.write_buf
+            .lock()
+            .row_for(pk, offset)
+            .map(|v| v.to_vec())
+    }
 
     pub fn row_count_buffered(&self) -> usize {
         self.write_buf.lock().len()
