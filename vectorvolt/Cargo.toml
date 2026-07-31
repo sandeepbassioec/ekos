@@ -48,6 +48,8 @@ serde          = { version = "1.0", features = ["derive"] }
 serde_json     = "1.0"
 # bitmap / probabilistic
 roaring        = "0.10"
+# compression (cold-tier storage)
+lz4_flex       = { version = "0.11", default-features = false, features = ["std"] }
 # memory-mapped I/O
 memmap2        = "0.9"
 # internal crates

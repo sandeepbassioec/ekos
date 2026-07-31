@@ -17,6 +17,7 @@
 //! CRC32 before returning.  A single flipped bit is detected immediately.
 
 use byteorder::{LittleEndian, ReadBytesExt};
+use std::borrow::Cow;
 use std::io::{Cursor, Read};
 use std::path::Path;
 
@@ -25,8 +26,9 @@ use crate::{
     column::ColumnValues,
     column::FRAME_BLOCK,
     format::{
-        COL_META_SIZE, ENCODING_BLOCKED_FRAME, ENCODING_DICT, ENCODING_FRAME, ENCODING_RAW,
-        ENCODING_RLE, HEADER_FIXED_SIZE, MAGIC, MIN_READABLE_VERSION, VERSION,
+        COL_META_SIZE, COMPRESSION_LZ4, COMPRESSION_NONE, ENCODING_BLOCKED_FRAME, ENCODING_DICT,
+        ENCODING_FRAME, ENCODING_RAW, ENCODING_RLE, HEADER_FIXED_SIZE, MAGIC, MIN_READABLE_VERSION,
+        VERSION,
     },
 };
 
@@ -36,11 +38,16 @@ struct ColMeta {
     encoding: u8,
     /// Bits per packed value, for the frame encodings. Zero for the others.
     bit_width: u8,
+    /// `COMPRESSION_NONE` or `COMPRESSION_LZ4`.
+    compression: u8,
     data_offset: u64,
-    #[allow(dead_code)]
+    /// Bytes actually stored in the file (compressed length, when compressed).
     data_byte_len: u64,
-    dict_offset: u64,
-    dict_byte_len: u64,
+    /// Payload length after decompression.
+    uncompressed_len: u64,
+    /// Length of the payload's first section, for the two-section encodings.
+    /// **Relative to the payload**, not the file.
+    first_section_len: u64,
     pub zone_min: u64,
     pub zone_max: u64,
 }
@@ -180,21 +187,23 @@ impl PartitionReader {
         for _ in 0..col_count {
             let encoding = mcur.read_u8()?;
             let bit_width = mcur.read_u8()?;
-            let mut reserved = [0u8; 6];
+            let compression = mcur.read_u8()?;
+            let mut reserved = [0u8; 5];
             mcur.read_exact(&mut reserved)?;
             let data_offset = mcur.read_u64::<LittleEndian>()?;
             let data_byte_len = mcur.read_u64::<LittleEndian>()?;
-            let dict_offset = mcur.read_u64::<LittleEndian>()?;
-            let dict_byte_len = mcur.read_u64::<LittleEndian>()?;
+            let uncompressed_len = mcur.read_u64::<LittleEndian>()?;
+            let first_section_len = mcur.read_u64::<LittleEndian>()?;
             let zone_min = mcur.read_u64::<LittleEndian>()?;
             let zone_max = mcur.read_u64::<LittleEndian>()?;
             col_meta.push(ColMeta {
                 encoding,
                 bit_width,
+                compression,
                 data_offset,
                 data_byte_len,
-                dict_offset,
-                dict_byte_len,
+                uncompressed_len,
+                first_section_len,
                 zone_min,
                 zone_max,
             });
@@ -270,20 +279,74 @@ impl PartitionReader {
         Ok(slice.try_into().expect("slice length checked by get()"))
     }
 
+    /// The column's payload bytes, decompressing if needed.
+    ///
+    /// Returns a borrowed slice of the mmap for a verbatim column and an owned
+    /// buffer for a compressed one. **That difference is the entire cost model of
+    /// compression**: the borrowed case is free and O(1)-indexable, the owned case
+    /// allocates and decompresses the whole column to answer for a single value.
+    /// See [`COMPRESSION_LZ4`].
+    fn payload(&self, m: &ColMeta) -> StorageResult<Cow<'_, [u8]>> {
+        let data: &[u8] = &self.mmap;
+        let start = m.data_offset as usize;
+        let end = start
+            .checked_add(m.data_byte_len as usize)
+            .ok_or_else(|| StorageError::InvalidData("column payload length overflows".into()))?;
+        let raw = Self::section(data, start, end, "column payload")?;
+
+        match m.compression {
+            COMPRESSION_NONE => Ok(Cow::Borrowed(raw)),
+            COMPRESSION_LZ4 => {
+                // `uncompressed_len` comes from the file, so it is a
+                // corruption-controlled allocation size. Capped rather than
+                // trusted: without this, 8 bad bytes request an 18-exabyte Vec.
+                const MAX_PAYLOAD: u64 = 1 << 34; // 16 GiB
+                if m.uncompressed_len > MAX_PAYLOAD {
+                    return Err(StorageError::InvalidData(format!(
+                        "declared uncompressed length {} exceeds the {MAX_PAYLOAD}-byte cap",
+                        m.uncompressed_len
+                    )));
+                }
+                let out = lz4_flex::block::decompress(raw, m.uncompressed_len as usize)
+                    .map_err(|e| StorageError::InvalidData(format!("LZ4 decompress: {e}")))?;
+                Ok(Cow::Owned(out))
+            }
+            other => Err(StorageError::InvalidData(format!(
+                "unknown compression tag {other}"
+            ))),
+        }
+    }
+
+    /// True if point reads on this partition are O(1).
+    ///
+    /// False when any column is compressed, because reading one value then costs a
+    /// full-column decompress. Exposed so a caller choosing between a point lookup
+    /// and a scan can tell, rather than discovering it as unexplained latency.
+    pub fn is_point_read_optimal(&self) -> bool {
+        self.col_meta
+            .iter()
+            .all(|m| m.compression == COMPRESSION_NONE)
+    }
+
+    /// True if `col_idx` is stored compressed.
+    pub fn is_column_compressed(&self, col_idx: usize) -> bool {
+        self.col_meta
+            .get(col_idx)
+            .is_some_and(|m| m.compression != COMPRESSION_NONE)
+    }
+
     /// Read a single value from column `col_idx` at `row_offset`.
     ///
-    /// O(1) for both Raw and Dict encodings — reads exactly 8 or 12 bytes from the
-    /// mmap without allocating or deserializing the full column. This is the path
-    /// point lookups should use; [`read_column`](Self::read_column) is for scans.
+    /// **O(1) for every encoding** on an uncompressed column — at most a few
+    /// unaligned reads out of the mmap, no allocation, no full-column decode. The
+    /// two exceptions are stated rather than hidden:
+    /// - `Rle` is O(log r): a binary search over the run-end array.
+    /// - A **compressed** column is O(column): the payload must be decompressed in
+    ///   full first. That is why compression is opt-in — see [`COMPRESSION_LZ4`].
     ///
     /// # Errors
     ///
-    /// Never panics, for any `col_idx`, `row_offset`, or file content:
-    /// - [`StorageError::ColumnOutOfRange`] — no such column
-    /// - [`StorageError::RowOffsetOutOfBounds`] — offset past the last row, which a
-    ///   stale `RowDescriptor` (e.g. cached across a compaction) can produce
-    /// - [`StorageError::DictIndexOutOfBounds`] — corrupt dictionary index in the file
-    /// - [`StorageError::OffsetOutsideFile`] — corrupt column metadata
+    /// Never panics, for any `col_idx`, `row_offset`, or file content.
     pub fn read_value(&self, col_idx: usize, row_offset: usize) -> StorageResult<u64> {
         let m = self
             .col_meta
@@ -291,8 +354,8 @@ impl PartitionReader {
             .ok_or(StorageError::ColumnOutOfRange(col_idx, self.col_count))?;
 
         // Check the caller's offset against the partition before computing any
-        // byte position, so the error names the real problem rather than a
-        // derived byte range the caller never supplied.
+        // byte position, so the error names the real problem rather than a derived
+        // byte range the caller never supplied.
         if row_offset >= self.row_count as usize {
             return Err(StorageError::RowOffsetOutOfBounds {
                 row_offset,
@@ -300,90 +363,80 @@ impl PartitionReader {
             });
         }
 
-        let data: &[u8] = &self.mmap;
+        let payload = self.payload(m)?;
+        Self::value_at(&payload, m, row_offset)
+    }
 
+    /// Decode one value out of a column payload.
+    ///
+    /// All offsets are relative to the payload start, so this is identical for
+    /// compressed and verbatim columns — which is the reason the format stores
+    /// relative section lengths rather than absolute file offsets. A compressed
+    /// payload has no file offset for its inner sections at all.
+    fn value_at(p: &[u8], m: &ColMeta, row: usize) -> StorageResult<u64> {
+        let first_len = m.first_section_len as usize;
         match m.encoding {
-            ENCODING_RAW => {
-                let offset = m.data_offset as usize + row_offset * 8;
-                Ok(u64::from_le_bytes(Self::bytes_at::<8>(data, offset)?))
-            }
+            ENCODING_RAW => Ok(u64::from_le_bytes(Self::bytes_at::<8>(p, row * 8)?)),
             ENCODING_DICT => {
-                // Index array starts immediately after the dictionary values.
-                let idx_offset = m.dict_offset as usize + m.dict_byte_len as usize + row_offset * 4;
-                let dict_idx = u32::from_le_bytes(Self::bytes_at::<4>(data, idx_offset)?) as usize;
-
-                // `dict_idx` came out of the file, so validate it against the
-                // dictionary's own declared size rather than trusting it.
-                let dict_entries = m.dict_byte_len as usize / 8;
-                if dict_idx >= dict_entries {
+                let idx_off = first_len + row * 4;
+                let dict_idx = u32::from_le_bytes(Self::bytes_at::<4>(p, idx_off)?) as usize;
+                // Came out of the file, so validate against the dictionary's own
+                // declared size rather than trusting it.
+                let entries = first_len / 8;
+                if dict_idx >= entries {
                     return Err(StorageError::DictIndexOutOfBounds {
                         index: dict_idx,
-                        size: dict_entries,
+                        size: entries,
                     });
                 }
-
-                let val_offset = m.dict_offset as usize + dict_idx * 8;
-                Ok(u64::from_le_bytes(Self::bytes_at::<8>(data, val_offset)?))
+                Ok(u64::from_le_bytes(Self::bytes_at::<8>(p, dict_idx * 8)?))
             }
             ENCODING_RLE => {
                 // Binary search the exclusive run-end array for the first run
-                // ending past `row_offset`. O(log r) — the one encoding whose
-                // point lookup is not O(1); see `ColumnValues` for why that trade
-                // is only accepted when RLE at least halves the column.
-                let run_count = m.dict_byte_len as usize / 8;
+                // ending past `row`. O(log r) — the one encoding whose point lookup
+                // is not O(1); see `ColumnValues` for why that trade is only taken
+                // when RLE at least halves the column.
+                let run_count = first_len / 8;
                 if run_count == 0 {
                     return Err(StorageError::InvalidData("RLE column has no runs".into()));
                 }
-                let ends_start = m.dict_offset as usize + m.dict_byte_len as usize;
-
-                let mut lo = 0usize;
-                let mut hi = run_count; // first k with run_ends[k] > row_offset
+                let ends = first_len;
+                let (mut lo, mut hi) = (0usize, run_count);
                 while lo < hi {
                     let mid = lo + (hi - lo) / 2;
-                    let end = u32::from_le_bytes(Self::bytes_at::<4>(data, ends_start + mid * 4)?)
-                        as usize;
-                    if end <= row_offset {
+                    let end = u32::from_le_bytes(Self::bytes_at::<4>(p, ends + mid * 4)?) as usize;
+                    if end <= row {
                         lo = mid + 1;
                     } else {
                         hi = mid;
                     }
                 }
                 if lo >= run_count {
-                    // Only reachable if the final run end is <= row_offset, i.e.
-                    // the runs do not cover row_count rows. The header said they
-                    // do, so the file is inconsistent.
                     return Err(StorageError::InvalidData(
                         "RLE runs do not cover row_count".into(),
                     ));
                 }
-                let val_offset = m.dict_offset as usize + lo * 8;
-                Ok(u64::from_le_bytes(Self::bytes_at::<8>(data, val_offset)?))
+                Ok(u64::from_le_bytes(Self::bytes_at::<8>(p, lo * 8)?))
             }
             ENCODING_FRAME => {
-                let base = u64::from_le_bytes(Self::bytes_at::<8>(data, m.data_offset as usize)?);
-                let words_start = m.data_offset as usize + 8;
-                let offset = Self::unpack_at(data, words_start, m.bit_width, row_offset)?;
-                // The file supplies both base and offset, so a corrupt file could
-                // make these sum past u64::MAX. Wrapping would fabricate a small
-                // value from two large ones and report it as real data.
+                let base = u64::from_le_bytes(Self::bytes_at::<8>(p, 0)?);
+                let offset = Self::unpack_at(p, 8, m.bit_width, row)?;
+                // Both operands come from the file, so a corrupt file could make
+                // these sum past u64::MAX. Wrapping would fabricate a small value
+                // out of two large ones and report it as real data.
                 base.checked_add(offset).ok_or(StorageError::InvalidData(
                     "frame base + offset overflows u64".into(),
                 ))
             }
             ENCODING_BLOCKED_FRAME => {
-                let block = row_offset / FRAME_BLOCK;
-                let block_count = m.dict_byte_len as usize / 8;
-                if block >= block_count {
+                let block = row / FRAME_BLOCK;
+                if block >= first_len / 8 {
                     return Err(StorageError::InvalidData(
                         "blocked-frame row is past the last block base".into(),
                     ));
                 }
-                let base = u64::from_le_bytes(Self::bytes_at::<8>(
-                    data,
-                    m.dict_offset as usize + block * 8,
-                )?);
-                let words_start = m.dict_offset as usize + m.dict_byte_len as usize;
-                let offset = Self::unpack_at(data, words_start, m.bit_width, row_offset)?;
+                let base = u64::from_le_bytes(Self::bytes_at::<8>(p, block * 8)?);
+                let offset = Self::unpack_at(p, first_len, m.bit_width, row)?;
                 base.checked_add(offset).ok_or(StorageError::InvalidData(
                     "blocked-frame base + offset overflows u64".into(),
                 ))
@@ -392,16 +445,16 @@ impl PartitionReader {
         }
     }
 
-    /// Unpack one bit-packed value straight from the mmap, without materializing
-    /// the word array.
+    /// Unpack one bit-packed value from a payload, without materializing the word
+    /// array.
     ///
-    /// Reads at most two `u64`s. The packed words are not `u64`-aligned in the
-    /// file (`data_offset` is arbitrary), so they are read via
+    /// Reads at most two `u64`s. The packed words are not `u64`-aligned (a payload
+    /// starts at an arbitrary file offset), so they are read via
     /// [`bytes_at`](Self::bytes_at) rather than reinterpreted — an unaligned
     /// `*const u64` deref is undefined behaviour in Rust even on x86, where the
-    /// hardware would tolerate it.
+    /// hardware itself would tolerate it.
     #[inline]
-    fn unpack_at(data: &[u8], words_start: usize, bit_width: u8, i: usize) -> StorageResult<u64> {
+    fn unpack_at(p: &[u8], words_start: usize, bit_width: u8, i: usize) -> StorageResult<u64> {
         if bit_width == 0 {
             return Ok(0);
         }
@@ -415,23 +468,29 @@ impl PartitionReader {
         let word = pos / 64;
         let shift = pos % 64;
 
-        let lo = u64::from_le_bytes(Self::bytes_at::<8>(data, words_start + word * 8)?);
+        let lo = u64::from_le_bytes(Self::bytes_at::<8>(p, words_start + word * 8)?);
         let mut v = lo >> shift;
         if shift + w > 64 {
-            let hi = u64::from_le_bytes(Self::bytes_at::<8>(data, words_start + (word + 1) * 8)?);
+            let hi = u64::from_le_bytes(Self::bytes_at::<8>(p, words_start + (word + 1) * 8)?);
             v |= hi << (64 - shift);
         }
         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
         Ok(v & mask)
     }
 
-    /// Byte address of one cell, for prefetching. `None` if out of range or the
-    /// column is dictionary-encoded (where the value lives behind an indirection,
-    /// so a single address is not meaningful).
+    /// Byte address of one cell, for prefetching.
+    ///
+    /// `None` unless the column is verbatim `Raw`, where a value has a single
+    /// stable file address. Every other encoding reaches its value through an
+    /// indirection or a bit offset, and a compressed column has no file address for
+    /// its values at all.
     #[inline]
     fn raw_cell_ptr(&self, col_idx: usize, row_offset: usize) -> Option<*const u8> {
         let m = self.col_meta.get(col_idx)?;
-        if m.encoding != ENCODING_RAW || row_offset >= self.row_count as usize {
+        if m.encoding != ENCODING_RAW
+            || m.compression != COMPRESSION_NONE
+            || row_offset >= self.row_count as usize
+        {
             return None;
         }
         let off = m.data_offset as usize + row_offset * 8;
@@ -442,24 +501,163 @@ impl PartitionReader {
         Some(unsafe { data.as_ptr().add(off) })
     }
 
+    /// Decode a whole column into `out`, reusing its allocation (VV-STO-013/014).
+    ///
+    /// The scan primitive. Three things it does that the previous
+    /// `read_column().to_raw_vec()` did not:
+    ///
+    /// 1. **One allocation, reusable across partitions.** The old path allocated a
+    ///    `ColumnValues` (holding a dictionary or a packed word array), then
+    ///    allocated a second `Vec<u64>` to flatten it, then dropped the first. For
+    ///    a 4096-row column that is two allocations and a 32 KiB copy, per column,
+    ///    per partition scanned.
+    /// 2. **Decodes straight from the mmap.** No intermediate `ColumnValues`.
+    /// 3. **Prefetches ahead of the read cursor.** This is the smaller win: a
+    ///    sequential walk is the one access pattern the hardware prefetcher already
+    ///    handles well, so the hint mostly helps at the start of a column and after
+    ///    a page boundary. The large win is (1).
+    pub fn decode_column_into(&self, col_idx: usize, out: &mut Vec<u64>) -> StorageResult<()> {
+        let m = self
+            .col_meta
+            .get(col_idx)
+            .ok_or(StorageError::ColumnOutOfRange(col_idx, self.col_count))?;
+        let n = self.row_count as usize;
+        let payload = self.payload(m)?;
+        let p: &[u8] = &payload;
+
+        out.clear();
+        out.reserve(n);
+
+        // Prefetch distance in cache lines, chosen to cover roughly L2 latency at
+        // the rate a decode loop consumes bytes.
+        const PREFETCH_LINES: usize = 8;
+        let prefetch = |byte_off: usize| {
+            let target = byte_off + PREFETCH_LINES * vectorvolt_hal::cache::CACHE_LINE;
+            if target < p.len() {
+                // SAFETY: `target` is in bounds, and prefetch never dereferences.
+                let ptr = unsafe { p.as_ptr().add(target) };
+                vectorvolt_hal::prefetch::prefetch(ptr, vectorvolt_hal::Locality::L1);
+            }
+        };
+
+        let first_len = m.first_section_len as usize;
+        match m.encoding {
+            ENCODING_RAW => {
+                for i in 0..n {
+                    prefetch(i * 8);
+                    out.push(u64::from_le_bytes(Self::bytes_at::<8>(p, i * 8)?));
+                }
+            }
+            ENCODING_DICT => {
+                let entries = first_len / 8;
+                let mut dict = Vec::with_capacity(entries);
+                for k in 0..entries {
+                    dict.push(u64::from_le_bytes(Self::bytes_at::<8>(p, k * 8)?));
+                }
+                for i in 0..n {
+                    prefetch(first_len + i * 4);
+                    let idx =
+                        u32::from_le_bytes(Self::bytes_at::<4>(p, first_len + i * 4)?) as usize;
+                    let v = *dict.get(idx).ok_or(StorageError::DictIndexOutOfBounds {
+                        index: idx,
+                        size: entries,
+                    })?;
+                    out.push(v);
+                }
+            }
+            ENCODING_RLE => {
+                // Expanded run by run rather than row by row: one binary search
+                // avoided per row, and `extend` fills contiguously.
+                let run_count = first_len / 8;
+                let mut start = 0usize;
+                for k in 0..run_count {
+                    let v = u64::from_le_bytes(Self::bytes_at::<8>(p, k * 8)?);
+                    let end =
+                        u32::from_le_bytes(Self::bytes_at::<4>(p, first_len + k * 4)?) as usize;
+                    if end > n || end <= start {
+                        return Err(StorageError::InvalidData(
+                            "RLE run ends are not strictly increasing within row_count".into(),
+                        ));
+                    }
+                    out.extend(std::iter::repeat_n(v, end - start));
+                    start = end;
+                }
+                if start != n {
+                    return Err(StorageError::InvalidData(
+                        "RLE runs do not cover row_count".into(),
+                    ));
+                }
+            }
+            ENCODING_FRAME => {
+                let base = u64::from_le_bytes(Self::bytes_at::<8>(p, 0)?);
+                let bw = m.bit_width;
+                for i in 0..n {
+                    prefetch(8 + (i * bw as usize) / 8);
+                    let off = Self::unpack_at(p, 8, bw, i)?;
+                    out.push(base.checked_add(off).ok_or(StorageError::InvalidData(
+                        "frame base + offset overflows u64".into(),
+                    ))?);
+                }
+            }
+            ENCODING_BLOCKED_FRAME => {
+                let blocks = first_len / 8;
+                if blocks != n.div_ceil(FRAME_BLOCK) {
+                    return Err(StorageError::InvalidData(
+                        "blocked-frame base count does not match row_count".into(),
+                    ));
+                }
+                let bw = m.bit_width;
+                // The base is re-read once per block rather than once per row —
+                // 1/64th the reads of the naive `block_bases[i / FRAME_BLOCK]`.
+                let mut base = 0u64;
+                for i in 0..n {
+                    if i % FRAME_BLOCK == 0 {
+                        base = u64::from_le_bytes(Self::bytes_at::<8>(p, (i / FRAME_BLOCK) * 8)?);
+                    }
+                    prefetch(first_len + (i * bw as usize) / 8);
+                    let off = Self::unpack_at(p, first_len, bw, i)?;
+                    out.push(base.checked_add(off).ok_or(StorageError::InvalidData(
+                        "blocked-frame base + offset overflows u64".into(),
+                    ))?);
+                }
+            }
+            b => return Err(StorageError::UnknownEncoding(b)),
+        }
+        Ok(())
+    }
+
     /// Row offsets where column `col_idx` falls in `[lo, hi]`, inclusive.
     ///
-    /// Uses the SIMD range filter (AVX2 where available, scalar otherwise), which
-    /// measured 2.5–2.6× the scalar loop on cache-resident data. The comparison is
-    /// unsigned, so primary keys above `i64::MAX` behave correctly — see the
-    /// range-shift note in `vectorvolt-hal`'s AVX2 module.
+    /// Uses the SIMD range filter (AVX2 where available, scalar otherwise). The
+    /// comparison is unsigned, so primary keys above `i64::MAX` behave correctly —
+    /// see the range-shift note in `vectorvolt-hal`'s AVX2 module.
     pub fn filter_offsets(&self, col_idx: usize, lo: u64, hi: u64) -> StorageResult<Vec<u32>> {
+        let mut scratch = Vec::new();
+        self.filter_offsets_into(col_idx, lo, hi, &mut scratch)
+    }
+
+    /// [`filter_offsets`](Self::filter_offsets) with a caller-owned decode buffer.
+    ///
+    /// A scan across N partitions can hand the same buffer to every one and pay a
+    /// single allocation instead of N.
+    pub fn filter_offsets_into(
+        &self,
+        col_idx: usize,
+        lo: u64,
+        hi: u64,
+        scratch: &mut Vec<u64>,
+    ) -> StorageResult<Vec<u32>> {
         // An inverted range can never match; skip the decode entirely.
         if lo > hi {
             return Ok(Vec::new());
         }
-        let values = self.read_column(col_idx)?.to_raw_vec();
+        self.decode_column_into(col_idx, scratch)?;
         let mut out = Vec::new();
-        vectorvolt_hal::simd::filter_range(&values, lo, hi, &mut out);
+        vectorvolt_hal::simd::filter_range(scratch, lo, hi, &mut out);
         Ok(out)
     }
 
-    /// Every column's value for one row, via the O(1) [`read_value`](Self::read_value) path.
+    /// Every column's value for one row, via the [`read_value`](Self::read_value) path.
     pub fn read_row(&self, row_offset: usize) -> StorageResult<Vec<u64>> {
         let n = self.col_count as usize;
         let mut values = Vec::with_capacity(n);
@@ -476,23 +674,20 @@ impl PartitionReader {
     /// non-matching rows saves, and a bulk decode wins.
     ///
     /// 0.15 is a starting estimate, not a measured optimum. It is a named constant
-    /// precisely so the crossover can be re-derived per platform later (the S1a
-    /// cache measurements showed thresholds do not transfer between machines).
+    /// precisely so the crossover can be re-derived per platform later.
     pub const LATE_MATERIALIZATION_MAX_SELECTIVITY: f64 = 0.15;
 
     /// Build full rows for `offsets`, choosing the cheaper strategy.
     ///
-    /// ## Why adaptive rather than always-late
-    ///
     /// Late materialization — read only the cells belonging to matched rows — is a
-    /// large win on a selective query: at 1% selectivity over 3 columns it touches
-    /// ~3% of the cells a full decode would. But it is a *loss* on an unselective
-    /// one, where per-cell call overhead is paid for nearly every cell anyway and a
-    /// bulk decode amortises better.
+    /// large win on a selective query and a loss on an unselective one, where
+    /// per-cell overhead is paid for nearly every cell anyway. The filter has
+    /// already run by this point, so the exact match count is known and the choice
+    /// needs no estimate or statistics.
     ///
-    /// The filter has already run by this point, so the exact match count is known
-    /// — the choice needs no estimate or statistics, which is consistent with
-    /// `QUERY_EXECUTION_MODEL.md`'s stance against cost-based planning.
+    /// A **compressed** column forces the bulk path regardless of selectivity:
+    /// per-cell reads would decompress the whole column once per cell, so late
+    /// materialization there is not merely worse, it is quadratic.
     pub fn materialize_rows(&self, offsets: &[u32]) -> StorageResult<Vec<Vec<u64>>> {
         if offsets.is_empty() {
             return Ok(Vec::new());
@@ -503,13 +698,16 @@ impl PartitionReader {
         } else {
             offsets.len() as f64 / rows as f64
         };
+        let any_compressed = !self.is_point_read_optimal();
 
-        if selectivity > Self::LATE_MATERIALIZATION_MAX_SELECTIVITY {
-            // Bulk path: one decode per column, then gather.
+        if selectivity > Self::LATE_MATERIALIZATION_MAX_SELECTIVITY || any_compressed {
             let n = self.col_count as usize;
-            let cols: Vec<Vec<u64>> = (0..n)
-                .map(|c| self.read_column(c).map(|cv| cv.to_raw_vec()))
-                .collect::<StorageResult<_>>()?;
+            let mut buf = Vec::new();
+            let mut cols: Vec<Vec<u64>> = Vec::with_capacity(n);
+            for c in 0..n {
+                self.decode_column_into(c, &mut buf)?;
+                cols.push(std::mem::take(&mut buf));
+            }
             return offsets
                 .iter()
                 .map(|&o| {
@@ -530,18 +728,16 @@ impl PartitionReader {
         //
         // Prefetch a few rows ahead. In a struct-of-arrays layout the cells of one
         // row are scattered across columns, so consecutive matched rows are not
-        // adjacent in memory and the hardware prefetcher sees no stride — this is
-        // exactly the indexed-gather case explicit prefetch exists for
-        // (VV-HAL-018/023 integration).
+        // adjacent in memory and the hardware prefetcher sees no stride — exactly
+        // the indexed-gather case explicit prefetch exists for.
         const PREFETCH_ROWS_AHEAD: usize = 4;
         let n = self.col_count as usize;
         let mut rows_out = Vec::with_capacity(offsets.len());
-
         for (i, &off) in offsets.iter().enumerate() {
             if let Some(&future) = offsets.get(i + PREFETCH_ROWS_AHEAD) {
                 for c in 0..n {
-                    if let Some(p) = self.raw_cell_ptr(c, future as usize) {
-                        vectorvolt_hal::prefetch::prefetch(p, vectorvolt_hal::Locality::L1);
+                    if let Some(ptr) = self.raw_cell_ptr(c, future as usize) {
+                        vectorvolt_hal::prefetch::prefetch(ptr, vectorvolt_hal::Locality::L1);
                     }
                 }
             }
@@ -550,69 +746,61 @@ impl PartitionReader {
         Ok(rows_out)
     }
 
-    /// Decode and return the values for column `col_idx`.
+    /// Decode a column back into a [`ColumnValues`].
     ///
-    /// Deserializes the full column. Use [`read_value`] for point lookups.
+    /// Reconstructs the encoded form. Most callers want
+    /// [`decode_column_into`](Self::decode_column_into), which skips this
+    /// intermediate entirely; this exists for callers that need to inspect or
+    /// re-serialize the encoding itself.
     pub fn read_column(&self, col_idx: usize) -> StorageResult<ColumnValues> {
         let m = self
             .col_meta
             .get(col_idx)
             .ok_or(StorageError::ColumnOutOfRange(col_idx, self.col_count))?;
-        let data: &[u8] = &self.mmap;
         let row_count = self.row_count as usize;
+        let payload = self.payload(m)?;
+        let p: &[u8] = &payload;
+        let first_len = m.first_section_len as usize;
 
         match m.encoding {
             ENCODING_RAW => {
-                let start = m.data_offset as usize;
-                let end = start + row_count * 8;
-                let mut cur = Cursor::new(Self::section(data, start, end, "raw column")?);
                 let mut vals = Vec::with_capacity(row_count);
-                for _ in 0..row_count {
-                    vals.push(cur.read_u64::<LittleEndian>()?);
+                for i in 0..row_count {
+                    vals.push(u64::from_le_bytes(Self::bytes_at::<8>(p, i * 8)?));
                 }
                 Ok(ColumnValues::Raw(vals))
             }
             ENCODING_DICT => {
-                let dict_size = m.dict_byte_len as usize / 8;
-                let ds = m.dict_offset as usize;
-                let de = ds + m.dict_byte_len as usize;
-                let mut dcur = Cursor::new(Self::section(data, ds, de, "dictionary")?);
-                let mut dict = Vec::with_capacity(dict_size);
-                for _ in 0..dict_size {
-                    dict.push(dcur.read_u64::<LittleEndian>()?);
+                let entries = first_len / 8;
+                let mut dict = Vec::with_capacity(entries);
+                for k in 0..entries {
+                    dict.push(u64::from_le_bytes(Self::bytes_at::<8>(p, k * 8)?));
                 }
-
-                let is = de; // indices start right after the dict
-                let ie = is + row_count * 4;
-                let mut icur = Cursor::new(Self::section(data, is, ie, "dictionary indices")?);
                 let mut indices = Vec::with_capacity(row_count);
-                for _ in 0..row_count {
-                    indices.push(icur.read_u32::<LittleEndian>()?);
+                for i in 0..row_count {
+                    indices.push(u32::from_le_bytes(Self::bytes_at::<4>(
+                        p,
+                        first_len + i * 4,
+                    )?));
                 }
-
                 Ok(ColumnValues::DictEncoded { dict, indices })
             }
             ENCODING_RLE => {
-                let run_count = m.dict_byte_len as usize / 8;
+                let run_count = first_len / 8;
                 let mut values = Vec::with_capacity(run_count);
                 for k in 0..run_count {
-                    values.push(u64::from_le_bytes(Self::bytes_at::<8>(
-                        data,
-                        m.dict_offset as usize + k * 8,
-                    )?));
+                    values.push(u64::from_le_bytes(Self::bytes_at::<8>(p, k * 8)?));
                 }
-                let ends_start = m.dict_offset as usize + m.dict_byte_len as usize;
                 let mut run_ends = Vec::with_capacity(run_count);
                 for k in 0..run_count {
                     run_ends.push(u32::from_le_bytes(Self::bytes_at::<4>(
-                        data,
-                        ends_start + k * 4,
+                        p,
+                        first_len + k * 4,
                     )?));
                 }
-                // `run_ends` must be strictly increasing and end exactly at
-                // row_count, or `to_raw_vec` would produce the wrong length (or
-                // panic on a reversed subtraction). Validated here rather than
-                // trusted, because these bytes came off disk.
+                // Must be strictly increasing and end exactly at row_count, or
+                // `to_raw_vec` produces the wrong length (or panics on a reversed
+                // subtraction). Validated because these bytes came off disk.
                 let mut prev = 0u32;
                 for (k, &e) in run_ends.iter().enumerate() {
                     if e <= prev && !(k == 0 && e > 0) {
@@ -630,9 +818,8 @@ impl PartitionReader {
                 Ok(ColumnValues::Rle { values, run_ends })
             }
             ENCODING_FRAME => {
-                let base = u64::from_le_bytes(Self::bytes_at::<8>(data, m.data_offset as usize)?);
-                let words_start = m.data_offset as usize + 8;
-                let packed = Self::read_packed_words(data, words_start, m.bit_width, row_count)?;
+                let base = u64::from_le_bytes(Self::bytes_at::<8>(p, 0)?);
+                let packed = Self::read_packed_words(p, 8, m.bit_width, row_count)?;
                 Ok(ColumnValues::Frame {
                     base,
                     bit_width: m.bit_width,
@@ -641,21 +828,17 @@ impl PartitionReader {
                 })
             }
             ENCODING_BLOCKED_FRAME => {
-                let block_count = m.dict_byte_len as usize / 8;
-                if block_count != row_count.div_ceil(FRAME_BLOCK) {
+                let blocks = first_len / 8;
+                if blocks != row_count.div_ceil(FRAME_BLOCK) {
                     return Err(StorageError::InvalidData(
                         "blocked-frame base count does not match row_count".into(),
                     ));
                 }
-                let mut block_bases = Vec::with_capacity(block_count);
-                for k in 0..block_count {
-                    block_bases.push(u64::from_le_bytes(Self::bytes_at::<8>(
-                        data,
-                        m.dict_offset as usize + k * 8,
-                    )?));
+                let mut block_bases = Vec::with_capacity(blocks);
+                for k in 0..blocks {
+                    block_bases.push(u64::from_le_bytes(Self::bytes_at::<8>(p, k * 8)?));
                 }
-                let words_start = m.dict_offset as usize + m.dict_byte_len as usize;
-                let packed = Self::read_packed_words(data, words_start, m.bit_width, row_count)?;
+                let packed = Self::read_packed_words(p, first_len, m.bit_width, row_count)?;
                 Ok(ColumnValues::BlockedFrame {
                     block_bases,
                     bit_width: m.bit_width,
@@ -669,7 +852,7 @@ impl PartitionReader {
 
     /// Read the packed word array for a bit-packed column.
     fn read_packed_words(
-        data: &[u8],
+        p: &[u8],
         words_start: usize,
         bit_width: u8,
         row_count: usize,
@@ -683,7 +866,7 @@ impl PartitionReader {
         let mut packed = Vec::with_capacity(n_words);
         for k in 0..n_words {
             packed.push(u64::from_le_bytes(Self::bytes_at::<8>(
-                data,
+                p,
                 words_start + k * 8,
             )?));
         }

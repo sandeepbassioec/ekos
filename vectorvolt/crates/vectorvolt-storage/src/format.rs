@@ -15,12 +15,15 @@
 //! ├──────────────────────────────────────────┤
 //! │ Column Metadata  (col_count × 56 bytes)  │
 //! │   per column: encoding[1] bit_width[1]   │
-//! │     pad[6]                               │
+//! │     compression[1]  pad[5]               │
 //! │     data_offset[8]  data_byte_len[8]     │
-//! │     dict_offset[8]  dict_byte_len[8]     │
+//! │     uncompressed_len[8]                  │
+//! │     first_section_len[8]                 │
 //! │     zone_min[8]     zone_max[8]          │
 //! ├──────────────────────────────────────────┤
-//! │ Data Section  (variable)                 │
+//! │ Data Section — one payload per column,   │
+//! │ optionally LZ4-compressed as a unit.     │
+//! │ Offsets below are RELATIVE to payload 0. │
 //! │   Raw:     u64[row_count]                │
 //! │   Dict:    u64[dict_size] ‖ u32[rows]    │
 //! │   Rle:     u64[runs] ‖ u32[runs]         │
@@ -32,7 +35,14 @@
 //! ```
 //!
 //! All multi-byte integers are **little-endian**.
-//! `data_offset` and `dict_offset` are **absolute file offsets**.
+//!
+//! `data_offset` is an absolute file offset; everything *within* a payload is
+//! relative to that payload start. That distinction is what lets a payload be
+//! compressed: after decompression its sections exist only in a temporary buffer
+//! and have no file address, so absolute inner offsets could not be expressed.
+//! `first_section_len` is the boundary between the two arrays for the encodings
+//! that have two, and `uncompressed_len` is the payload size after decompression
+//! (equal to `data_byte_len` when stored verbatim).
 
 pub const MAGIC: &[u8; 8] = b"VVSST001";
 
@@ -41,17 +51,51 @@ pub const MAGIC: &[u8; 8] = b"VVSST001";
 /// | Version | Change |
 /// |---|---|
 /// | 1 | Raw + dictionary encodings |
-/// | 2 | Added RLE, frame-of-reference, blocked-frame; `bit_width` in column metadata byte 1 |
+/// | 2 | Added RLE, frame-of-reference, blocked-frame; bit_width in column metadata byte 1 |
+/// | 3 | Optional LZ4 per column; section offsets became payload-relative |
 ///
-/// Version 2 is backward-compatible *for readers*: byte 1 was previously part of
-/// the 7 reserved bytes and always written as zero, and the three encodings that
-/// existed in v1 use `bit_width = 0`. So a v1 file parses correctly under v2
-/// rules. The reverse is not true — a v1 reader hits `UnknownEncoding` on a v2
-/// file, which is the intended loud failure. The reader accepts both versions.
-pub const VERSION: u32 = 2;
+/// **v3 is a breaking change and `MIN_READABLE_VERSION` says so.** v1 and v2
+/// stored `dict_offset` as an absolute file offset; v3 replaced that slot with
+/// `uncompressed_len` and made all inner section offsets payload-relative, which
+/// a compressed payload requires. Reading a v2 file under v3 rules would treat a
+/// large absolute offset as a decompressed length and produce garbage rather than
+/// an error — silently. Rejecting the file is the only safe behaviour, so the
+/// reader accepts v3 only.
+///
+/// This is acceptable *today* because no v1/v2 file exists outside tests; the
+/// format has never shipped. Once it has, a conversion path is required rather
+/// than a version bump.
+pub const VERSION: u32 = 3;
 
 /// Oldest format version this build can read.
-pub const MIN_READABLE_VERSION: u32 = 1;
+pub const MIN_READABLE_VERSION: u32 = 3;
+
+/// Column payload is stored verbatim.
+pub const COMPRESSION_NONE: u8 = 0;
+
+/// Column payload is LZ4 block-compressed (VV-STO-012).
+///
+/// ## Why this is opt-in and off by default
+///
+/// LZ4 is applied to the whole column payload, so reading **one** value requires
+/// decompressing **all** of it. That converts `read_value` from O(1) — two
+/// unaligned reads out of the mmap — into O(column). VectorVolt's read
+/// architecture rests on that O(1); enabling compression by default would trade
+/// away the single property the project is built around, to save space that the
+/// encodings in [`crate::column`] already recover most of.
+///
+/// So compression is for **cold data**: partitions that are scanned or archived
+/// rather than point-queried — the L3/L4 tiers in `VECTORVOLT_STORAGE_TIERING.md`.
+/// [`crate::writer::WriteOptions`] makes the choice explicit per partition, and
+/// [`crate::reader::PartitionReader::is_point_read_optimal`] lets a caller detect
+/// a compressed partition rather than be surprised by its latency.
+///
+/// Block-level compression (compress each 64 KiB chunk separately, decompress
+/// only the chunk a row lands in) would soften this to O(chunk). That is the
+/// right eventual design and is deliberately not built yet — it needs a chunk
+/// index in the column metadata, which is a second format change best made once
+/// the tiering work defines what a cold partition actually looks like.
+pub const COMPRESSION_LZ4: u8 = 1;
 
 /// Byte length of the fixed header.
 pub const HEADER_FIXED_SIZE: usize = 32;
