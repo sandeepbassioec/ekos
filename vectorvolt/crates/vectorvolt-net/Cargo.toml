@@ -11,6 +11,9 @@ repository.workspace = true
 vectorvolt-engine  = { workspace = true }
 thiserror  = { workspace = true }
 crc32fast  = { workspace = true }
+sha3       = { workspace = true }
+getrandom  = { workspace = true }
+subtle     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

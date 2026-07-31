@@ -73,6 +73,8 @@ pub enum OpCode {
     Flush = 6,
     Compact = 7,
     Stats = 8,
+    Hello = 9,
+    Auth = 10,
     // Responses
     Pong = 129,
     Row = 130,
@@ -81,6 +83,7 @@ pub enum OpCode {
     Rows = 133,
     StatsReply = 134,
     Error = 135,
+    Challenge = 136,
 }
 
 impl OpCode {
@@ -100,6 +103,8 @@ impl OpCode {
             6 => Flush,
             7 => Compact,
             8 => Stats,
+            9 => Hello,
+            10 => Auth,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -107,6 +112,7 @@ impl OpCode {
             133 => Rows,
             134 => StatsReply,
             135 => Error,
+            136 => Challenge,
             other => return Err(NetError::UnknownOpcode(other)),
         })
     }
@@ -209,6 +215,13 @@ pub enum Request {
     Flush,
     Compact,
     Stats,
+    /// Ask for an authentication challenge.
+    Hello,
+    /// Answer a challenge. `response` is `SHA3-256(secret ‖ nonce)`.
+    Auth {
+        key_id: String,
+        response: Vec<u8>,
+    },
 }
 
 /// A server response.
@@ -233,6 +246,10 @@ pub enum Response {
     Error {
         code: u16,
         message: String,
+    },
+    /// A per-connection nonce to authenticate against.
+    Challenge {
+        nonce: Vec<u8>,
     },
 }
 
@@ -320,6 +337,16 @@ impl<'a> R<'a> {
         }
         Ok(out)
     }
+    /// Read a length-prefixed byte string.
+    ///
+    /// The length is validated against what remains before allocating, for the
+    /// same reason as `u64s`: the count sits inside an otherwise legal frame, so
+    /// the frame cap does not bound it.
+    fn bytes(&mut self) -> NetResult<Vec<u8>> {
+        let n = self.u32()? as usize;
+        Ok(self.take(n)?.to_vec())
+    }
+
     fn string(&mut self) -> NetResult<String> {
         let n = self.u32()? as usize;
         let bytes = self.take(n)?;
@@ -349,13 +376,27 @@ impl Request {
             Request::Flush => OpCode::Flush,
             Request::Compact => OpCode::Compact,
             Request::Stats => OpCode::Stats,
+            Request::Hello => OpCode::Hello,
+            Request::Auth { .. } => OpCode::Auth,
         }
     }
 
     pub fn encode_payload(&self) -> NetResult<Vec<u8>> {
         let mut w = W::new();
         match self {
-            Request::Ping | Request::Flush | Request::Compact | Request::Stats => {}
+            Request::Ping | Request::Flush | Request::Compact | Request::Stats | Request::Hello => {
+            }
+            Request::Auth { key_id, response } => {
+                let k = key_id.as_bytes();
+                let n =
+                    u32::try_from(k.len()).map_err(|_| NetError::Malformed("key id too long"))?;
+                w.u32(n);
+                w.0.extend_from_slice(k);
+                let n = u32::try_from(response.len())
+                    .map_err(|_| NetError::Malformed("response too long"))?;
+                w.u32(n);
+                w.0.extend_from_slice(response);
+            }
             Request::Get { pk } | Request::Delete { pk } => {
                 w.u64(*pk);
             }
@@ -377,6 +418,11 @@ impl Request {
             OpCode::Flush => Request::Flush,
             OpCode::Compact => Request::Compact,
             OpCode::Stats => Request::Stats,
+            OpCode::Hello => Request::Hello,
+            OpCode::Auth => Request::Auth {
+                key_id: r.string()?,
+                response: r.bytes()?,
+            },
             OpCode::Get => Request::Get { pk: r.u64()? },
             OpCode::Delete => Request::Delete { pk: r.u64()? },
             OpCode::Insert => Request::Insert {
@@ -405,6 +451,7 @@ impl Response {
             Response::Ok { .. } => OpCode::Ok,
             Response::Rows { .. } => OpCode::Rows,
             Response::Stats { .. } => OpCode::StatsReply,
+            Response::Challenge { .. } => OpCode::Challenge,
             Response::Error { .. } => OpCode::Error,
         }
     }
@@ -433,6 +480,12 @@ impl Response {
                 bytes,
             } => {
                 w.u64(*rows).u64(*partitions).u64(*bytes);
+            }
+            Response::Challenge { nonce } => {
+                let n = u32::try_from(nonce.len())
+                    .map_err(|_| NetError::Malformed("nonce too long"))?;
+                w.u32(n);
+                w.0.extend_from_slice(nonce);
             }
             Response::Error { code, message } => {
                 w.u16(*code);
@@ -474,6 +527,7 @@ impl Response {
                 partitions: r.u64()?,
                 bytes: r.u64()?,
             },
+            OpCode::Challenge => Response::Challenge { nonce: r.bytes()? },
             OpCode::Error => Response::Error {
                 code: r.u16()?,
                 message: r.string()?,

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vectorvolt_engine::TableEngine;
 
+use crate::auth::{AuthConfig, AuthState};
 use crate::protocol::{HEADER_SIZE, Header, Request, Response, encode_response, verify_payload};
 use crate::{NetError, NetResult, error_code};
 
@@ -27,14 +28,32 @@ pub struct ServerConfig {
     /// response IS the whole message — it can add up to 40 ms to a reply that took
     /// microseconds to compute.
     pub nodelay: bool,
+    /// Who may connect. Empty means authentication is disabled.
+    pub auth: AuthConfig,
 }
 
 impl ServerConfig {
+    /// Require authentication with the given credentials.
+    pub fn with_auth(mut self, auth: AuthConfig) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// True if connections must authenticate before doing anything.
+    pub fn requires_auth(&self) -> bool {
+        self.auth.is_enabled()
+    }
+
     pub fn new(addr: SocketAddr) -> Self {
         ServerConfig {
             addr,
             max_connections: 256,
             nodelay: true,
+            // Disabled by default. An embedded or single-process deployment does
+            // not want a handshake, and a server that silently required one would
+            // simply appear broken. `requires_auth()` reports which mode is
+            // active, so a deployment can assert it rather than assume.
+            auth: AuthConfig::disabled(),
         }
     }
 }
@@ -45,6 +64,12 @@ pub struct ServerStats {
     pub connections_accepted: AtomicU64,
     pub requests_handled: AtomicU64,
     pub protocol_errors: AtomicU64,
+    /// Requests refused because the connection had not authenticated.
+    pub unauthenticated_rejections: AtomicU64,
+    /// Failed authentication attempts. Worth alerting on: a rising count is
+    /// either a misconfigured client or someone guessing.
+    pub auth_failures: AtomicU64,
+    pub auth_successes: AtomicU64,
 }
 
 /// A running server.
@@ -128,8 +153,9 @@ impl Server {
             let stats = Arc::clone(&self.stats);
             let live = Arc::clone(&self.live);
             let shutdown = Arc::clone(&self.shutdown);
+            let auth = self.config.auth.clone();
             std::thread::spawn(move || {
-                let _ = handle_connection(stream, &engine, &stats, &shutdown);
+                let _ = handle_connection(stream, &engine, &stats, &shutdown, &auth);
                 live.fetch_sub(1, Ordering::AcqRel);
             });
         }
@@ -191,8 +217,12 @@ fn handle_connection(
     engine: &TableEngine,
     stats: &ServerStats,
     shutdown: &AtomicBool,
+    auth_config: &AuthConfig,
 ) -> NetResult<()> {
     let mut header_buf = [0u8; HEADER_SIZE];
+    // Auth state is per CONNECTION, not per process. Authenticating once must not
+    // authorise anyone else, and a new socket starts over.
+    let mut auth = AuthState::new(auth_config);
 
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -232,7 +262,17 @@ fn handle_connection(
         {
             Ok(req) => {
                 stats.requests_handled.fetch_add(1, Ordering::Relaxed);
-                serve_request(engine, req)
+                match serve_authenticated(engine, req, &mut auth, auth_config, stats) {
+                    Ok(r) => r,
+                    // Lock-out: answer, then close. Replying first means the client
+                    // learns why instead of seeing an unexplained reset.
+                    Err(r) => {
+                        let frame = encode_response(header.request_id, &r)?;
+                        stream.write_all(&frame)?;
+                        stream.flush()?;
+                        return Ok(());
+                    }
+                }
             }
             Err(e) => {
                 stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
@@ -246,6 +286,68 @@ fn handle_connection(
         let frame = encode_response(header.request_id, &response)?;
         stream.write_all(&frame)?;
         stream.flush()?;
+    }
+}
+
+/// Apply the authentication gate, then serve.
+///
+/// `Err(response)` means "send this and close the connection" — used only for
+/// lock-out, where continuing to serve would defeat the attempt limit.
+///
+/// ## What an unauthenticated connection may do
+///
+/// Only `Hello`, `Auth`, and `Ping`. Everything else is refused.
+///
+/// `Ping` is allowed deliberately: a load balancer or health check needs to know
+/// the server is alive without holding credentials, and a liveness probe reveals
+/// nothing that a successful TCP connect does not already reveal. `Stats` is NOT
+/// allowed, even though it looks similarly harmless — row counts and byte totals
+/// are information about the data, and an unauthenticated peer should learn
+/// nothing about it.
+fn serve_authenticated(
+    engine: &TableEngine,
+    req: Request,
+    auth: &mut AuthState,
+    config: &AuthConfig,
+    stats: &ServerStats,
+) -> Result<Response, Response> {
+    match req {
+        Request::Hello => {
+            let nonce = auth.new_challenge();
+            Ok(Response::Challenge {
+                nonce: nonce.to_vec(),
+            })
+        }
+        Request::Auth { key_id, response } => match auth.verify(config, &key_id, &response) {
+            Ok(()) => {
+                stats.auth_successes.fetch_add(1, Ordering::Relaxed);
+                Ok(Response::Ok { affected: 0 })
+            }
+            Err(e) => {
+                stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                let resp = Response::Error {
+                    code: error_code::AUTH_FAILED,
+                    message: e.to_string(),
+                };
+                if auth.is_locked_out() {
+                    Err(resp)
+                } else {
+                    Ok(resp)
+                }
+            }
+        },
+        Request::Ping => Ok(Response::Pong),
+        other if !auth.is_authenticated() => {
+            stats
+                .unauthenticated_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = other;
+            Ok(Response::Error {
+                code: error_code::UNAUTHENTICATED,
+                message: "authenticate with Hello then Auth before issuing requests".into(),
+            })
+        }
+        other => Ok(serve_request(engine, other)),
     }
 }
 
@@ -307,6 +409,12 @@ fn serve_request(engine: &TableEngine, req: Request) -> Response {
             },
             Ok(None) => Response::Ok { affected: 0 },
             Err(e) => engine_error(e),
+        },
+
+        // Handled by the auth gate before reaching here.
+        Request::Hello | Request::Auth { .. } => Response::Error {
+            code: error_code::MALFORMED,
+            message: "auth messages are handled before dispatch".into(),
         },
 
         Request::Stats => {
