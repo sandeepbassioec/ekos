@@ -182,13 +182,8 @@ impl TxnManager {
         };
         let tip = self.commit(mutation.encode())?;
 
-        // 2-3. CuckooMap: pk → pending RowDescriptor.
-        let buf_offset = self.write_buf.lock().len() as u32;
-        self.pk_index
-            .write()
-            .insert(pk, RowDescriptor::new(PENDING_FILE_ID, 0, buf_offset))?;
-
-        // 4. SecondaryIndex: one entry per non-PK column.
+        // 2. SecondaryIndex: one entry per non-PK column. Done before the row is
+        //    buffered, while `values` is still borrowable.
         {
             let mut sec = self.secondary_index.write();
             for (col_idx, &val) in values.iter().enumerate().skip(1) {
@@ -196,11 +191,37 @@ impl TxnManager {
             }
         }
 
-        // 5. CuckooFilter.
+        // 3. CuckooFilter.
         self.fk_filter.write().insert(pk)?;
 
-        // 6-7. Buffer; auto-flush if full.
-        let full = self.write_buf.lock().push(pk, values);
+        // 4-5. Buffer offset, index entry, and push — under ONE acquisition of the
+        //      buffer lock.
+        //
+        // This used to read `write_buf.len()`, RELEASE the lock, record that
+        // offset in the index, and re-acquire the lock to push. Two concurrent
+        // inserts could both observe length 5, both record offset 5, and then push
+        // into slots 5 and 6 — leaving one row's index entry pointing at the other
+        // row's data. A `get` for that key then found the wrong pk in the slot and
+        // reported the row missing.
+        //
+        // Silent, load-dependent, and a data-correctness bug rather than a
+        // performance one. Found by a concurrency test that failed roughly one run
+        // in three under full-workspace load; single-crate runs never reproduced it.
+        //
+        // The index insert happens BEFORE the push, still under the lock: if it
+        // fails, nothing has been buffered, so there is no row without an index
+        // entry. `full` is captured inside the scope and acted on after the lock is
+        // dropped, because `flush` takes the same lock.
+        let full = {
+            let mut buf = self.write_buf.lock();
+            let buf_offset = buf.len() as u32;
+            self.pk_index
+                .write()
+                .insert(pk, RowDescriptor::new(PENDING_FILE_ID, 0, buf_offset))?;
+            buf.push(pk, values)
+        };
+
+        // 6. Auto-flush if the buffer filled.
         if full {
             self.flush()?;
         }
