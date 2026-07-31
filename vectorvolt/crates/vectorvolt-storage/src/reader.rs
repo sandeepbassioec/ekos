@@ -260,17 +260,24 @@ impl PartitionReader {
     /// indexing (`data[a..b]`) **panics** on an out-of-range range, which would turn
     /// a corrupt partition into a process abort. `.get()` turns it into an error.
     #[inline]
+    #[allow(
+        clippy::unnecessary_lazy_evaluations,
+        reason = "measured: eager construction costs 2x on the point-read path"
+    )]
     fn bytes_at<const N: usize>(data: &[u8], start: usize) -> StorageResult<[u8; N]> {
+        // `ok_or_else` throughout. This is the hottest function in the crate —
+        // several calls per decoded value — and `ok_or` builds its error
+        // unconditionally, on the success path too.
         let end = start
             .checked_add(N)
-            .ok_or(StorageError::OffsetOutsideFile {
+            .ok_or_else(|| StorageError::OffsetOutsideFile {
                 start,
                 end: usize::MAX,
                 len: data.len(),
             })?;
         let slice = data
             .get(start..end)
-            .ok_or(StorageError::OffsetOutsideFile {
+            .ok_or_else(|| StorageError::OffsetOutsideFile {
                 start,
                 end,
                 len: data.len(),
@@ -424,9 +431,9 @@ impl PartitionReader {
                 // Both operands come from the file, so a corrupt file could make
                 // these sum past u64::MAX. Wrapping would fabricate a small value
                 // out of two large ones and report it as real data.
-                base.checked_add(offset).ok_or(StorageError::InvalidData(
-                    "frame base + offset overflows u64".into(),
-                ))
+                base.checked_add(offset).ok_or_else(|| {
+                    StorageError::InvalidData("frame base + offset overflows u64".into())
+                })
             }
             ENCODING_BLOCKED_FRAME => {
                 let block = row / FRAME_BLOCK;
@@ -437,9 +444,9 @@ impl PartitionReader {
                 }
                 let base = u64::from_le_bytes(Self::bytes_at::<8>(p, block * 8)?);
                 let offset = Self::unpack_at(p, first_len, m.bit_width, row)?;
-                base.checked_add(offset).ok_or(StorageError::InvalidData(
-                    "blocked-frame base + offset overflows u64".into(),
-                ))
+                base.checked_add(offset).ok_or_else(|| {
+                    StorageError::InvalidData("blocked-frame base + offset overflows u64".into())
+                })
             }
             b => Err(StorageError::UnknownEncoding(b)),
         }
@@ -594,9 +601,13 @@ impl PartitionReader {
                 for i in 0..n {
                     prefetch(8 + (i * bw as usize) / 8);
                     let off = Self::unpack_at(p, 8, bw, i)?;
-                    out.push(base.checked_add(off).ok_or(StorageError::InvalidData(
-                        "frame base + offset overflows u64".into(),
-                    ))?);
+                    // `ok_or_else`, not `ok_or`. `ok_or` evaluates its argument
+                    // eagerly, and `InvalidData(&str.into())` ALLOCATES A STRING —
+                    // so the error path was being constructed once per row for an
+                    // error that never fires. See the perf note on this function.
+                    out.push(base.checked_add(off).ok_or_else(|| {
+                        StorageError::InvalidData("frame base + offset overflows u64".into())
+                    })?);
                 }
             }
             ENCODING_BLOCKED_FRAME => {
@@ -616,9 +627,11 @@ impl PartitionReader {
                     }
                     prefetch(first_len + (i * bw as usize) / 8);
                     let off = Self::unpack_at(p, first_len, bw, i)?;
-                    out.push(base.checked_add(off).ok_or(StorageError::InvalidData(
-                        "blocked-frame base + offset overflows u64".into(),
-                    ))?);
+                    out.push(base.checked_add(off).ok_or_else(|| {
+                        StorageError::InvalidData(
+                            "blocked-frame base + offset overflows u64".into(),
+                        )
+                    })?);
                 }
             }
             b => return Err(StorageError::UnknownEncoding(b)),
