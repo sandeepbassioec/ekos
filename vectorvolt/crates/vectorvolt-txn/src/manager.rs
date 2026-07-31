@@ -422,10 +422,13 @@ impl TxnManager {
             {
                 let mut idx = self.pk_index.write();
                 for (row_offset, pk) in outcome.output_pks.iter().enumerate() {
-                    let _ = idx.insert(
+                    // Same reasoning as the flush path: a key that fails to
+                    // re-index after compaction points at partitions that are
+                    // about to be deleted. Silently dropping it loses the row.
+                    idx.insert(
                         *pk,
                         RowDescriptor::new(file_id, partition_id, row_offset as u32),
-                    );
+                    )?;
                 }
             }
             // The merged partition's key range, so range scans can still prune it.
@@ -524,7 +527,15 @@ impl TxnManager {
         {
             let mut idx = self.pk_index.write();
             for (off, (pk, _)) in rows.iter().enumerate() {
-                let _ = idx.insert(*pk, RowDescriptor::new(file_id, partition_id, off as u32));
+                // Propagated, not discarded. `CuckooMap::insert` can fail after
+                // exhausting its grow retries, and `let _ =` here meant the key
+                // silently left the index while its row sat in a partition on
+                // disk — the row is durable and permanently unreachable, which is
+                // indistinguishable from data loss to anyone reading.
+                //
+                // A flush that cannot index what it wrote has not succeeded, so it
+                // reports that rather than returning Ok.
+                idx.insert(*pk, RowDescriptor::new(file_id, partition_id, off as u32))?;
             }
         }
 
