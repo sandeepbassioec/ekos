@@ -19,3 +19,8 @@ memmap2    = { workspace = true }
 
 [dev-dependencies]
 tempfile   = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "storage_bench"
+harness = false
