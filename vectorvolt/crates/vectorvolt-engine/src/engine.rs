@@ -368,19 +368,34 @@ impl TableEngine {
         let partition_id = desc.partition_id();
         let row_offset = desc.row_offset() as usize;
 
-        let parts = self.partitions.read();
-        let reader = parts
-            .get(&(file_id, partition_id))
-            .ok_or(EngineError::PartitionMissing {
-                file_id,
-                partition_id,
-            })?;
-
-        let col_count = reader.col_count() as usize;
-        let mut values = Vec::with_capacity(col_count);
-        for c in 0..col_count {
-            values.push(reader.read_value(c, row_offset)?);
-        }
+        // A descriptor can name a partition this engine has not opened yet.
+        //
+        // `TxnManager::flush` publishes index entries for a new partition, and
+        // `sync_partitions` registers a reader for it only afterwards. Between
+        // those two steps any concurrent reader that looks up one of those keys
+        // finds a descriptor pointing at a partition that is not in the map — and
+        // returned `PartitionMissing`, an error, for a row that is perfectly fine.
+        //
+        // That was an intermittent failure under load: a client would insert keys,
+        // read them straight back, and one read in a few hundred would error. It
+        // only reproduced when several threads were flushing concurrently, which
+        // is why single-crate test runs never showed it.
+        //
+        // Refreshing and retrying is CORRECT here, not a papering-over, because of
+        // an ordering invariant on the write side: `flush` writes the `.vvsst`
+        // file to disk *before* it publishes any index entry pointing into it. So
+        // a descriptor always names a file that already exists, and a directory
+        // rescan is guaranteed to find it. The retry is bounded at one — if the
+        // partition is still absent after a rescan, it genuinely does not exist
+        // and the error is real.
+        let values = match self.read_row_from(file_id, partition_id, row_offset) {
+            Ok(v) => v,
+            Err(EngineError::PartitionMissing { .. }) => {
+                self.sync_partitions()?;
+                self.read_row_from(file_id, partition_id, row_offset)?
+            }
+            Err(e) => return Err(e),
+        };
 
         Ok(Some(EngineRow { pk, values }))
     }
@@ -646,6 +661,28 @@ impl TableEngine {
     }
 
     /// Scan `partition_dir` and register any `.vvsst` files not yet in the map.
+    /// Read every column of one row from a registered partition.
+    fn read_row_from(
+        &self,
+        file_id: u16,
+        partition_id: u16,
+        row_offset: usize,
+    ) -> EngineResult<Vec<u64>> {
+        let parts = self.partitions.read();
+        let reader = parts
+            .get(&(file_id, partition_id))
+            .ok_or(EngineError::PartitionMissing {
+                file_id,
+                partition_id,
+            })?;
+        let col_count = reader.col_count() as usize;
+        let mut values = Vec::with_capacity(col_count);
+        for c in 0..col_count {
+            values.push(reader.read_value(c, row_offset)?);
+        }
+        Ok(values)
+    }
+
     fn sync_partitions(&self) -> EngineResult<()> {
         let mut parts = self.partitions.write();
         for entry in std::fs::read_dir(&self.partition_dir)? {

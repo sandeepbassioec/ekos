@@ -476,7 +476,25 @@ impl TxnManager {
     }
 
     pub fn flush(&self) -> TxnResult<Option<FlushResult>> {
-        let rows = self.write_buf.lock().drain();
+        // The buffer lock is held for the WHOLE flush, not just the drain.
+        //
+        // A row must always be findable: either it is in the write buffer with a
+        // PENDING index entry, or it is in a partition with a real one. Draining
+        // first and updating the index later leaves a window where it is in
+        // NEITHER — the index still says PENDING but the buffer no longer holds
+        // the row, so a concurrent reader resolves the descriptor to nothing and
+        // errors on a row that is perfectly intact.
+        //
+        // Holding the lock across the file write serialises inserts against a
+        // flush. That is a real cost and it is the right trade: flush already
+        // dominates the write path, and the alternative is a read that
+        // intermittently fails.
+        //
+        // Lock ORDER matters. `insert` takes the buffer lock and then the index
+        // lock; this must do the same. Taking the index lock first here would
+        // invert the order against `insert` and deadlock.
+        let mut buf_guard = self.write_buf.lock();
+        let rows = buf_guard.drain();
         if rows.is_empty() {
             return Ok(None);
         }
@@ -538,6 +556,9 @@ impl TxnManager {
                 idx.insert(*pk, RowDescriptor::new(file_id, partition_id, off as u32))?;
             }
         }
+
+        // Every drained row now has a real descriptor, so the buffer lock can go.
+        drop(buf_guard);
 
         // ZoneMap: record PK min/max for this partition.
         let pk_min = rows.iter().map(|(pk, _)| *pk).min().unwrap_or(0);
