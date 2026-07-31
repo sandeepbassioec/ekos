@@ -84,6 +84,44 @@ impl Client {
 
     // ── Convenience wrappers ──────────────────────────────────────────────────
 
+    /// Authenticate with `key_id` and `secret`.
+    ///
+    /// Two round trips: ask for a challenge, answer it. The secret never leaves
+    /// this process — only `SHA3-256(secret ‖ nonce)` goes on the wire, and the
+    /// nonce differs per connection, so a captured exchange is not replayable.
+    ///
+    /// **This does not encrypt the session.** Everything after the handshake is
+    /// plaintext. See the `auth` module: authentication answers "who is this", not
+    /// "is anyone listening".
+    pub fn authenticate(&mut self, key_id: &str, secret: &[u8]) -> NetResult<()> {
+        let nonce = match self.call(&Request::Hello)? {
+            Response::Challenge { nonce } => nonce,
+            other => return Err(unexpected(other)),
+        };
+        if nonce.len() != crate::auth::NONCE_LEN {
+            return Err(NetError::Malformed("challenge nonce has the wrong length"));
+        }
+        let response = crate::auth::client_response(secret, &nonce);
+        match self.call(&Request::Auth {
+            key_id: key_id.to_string(),
+            response: response.to_vec(),
+        })? {
+            Response::Ok { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Connect and authenticate in one step.
+    pub fn connect_authenticated(
+        addr: impl ToSocketAddrs,
+        key_id: &str,
+        secret: &[u8],
+    ) -> NetResult<Self> {
+        let mut c = Self::connect(addr)?;
+        c.authenticate(key_id, secret)?;
+        Ok(c)
+    }
+
     pub fn ping(&mut self) -> NetResult<()> {
         match self.call(&Request::Ping)? {
             Response::Pong => Ok(()),

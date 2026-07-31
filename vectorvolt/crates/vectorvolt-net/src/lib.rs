@@ -25,10 +25,12 @@
 //! tens of thousands of idle clients. That is the trade, and it is revisitable —
 //! the protocol codec is entirely independent of how bytes are moved.
 
+pub mod auth;
 pub mod client;
 pub mod protocol;
 pub mod server;
 
+pub use auth::{AuthConfig, AuthError, AuthState, Secret};
 pub use client::Client;
 pub use protocol::{Header, OpCode, Request, Response};
 pub use server::{Server, ServerConfig};
@@ -68,6 +70,9 @@ pub enum NetError {
 
     #[error("engine error: {0}")]
     Engine(String),
+
+    #[error("authentication: {0}")]
+    Auth(#[from] auth::AuthError),
 }
 
 pub type NetResult<T> = Result<T, NetError>;
@@ -87,4 +92,8 @@ pub mod error_code {
     pub const NOT_FOUND: u16 = 4;
     /// The row does not match the table schema.
     pub const SCHEMA: u16 = 5;
+    /// The connection has not authenticated.
+    pub const UNAUTHENTICATED: u16 = 6;
+    /// Authentication failed.
+    pub const AUTH_FAILED: u16 = 7;
 }
