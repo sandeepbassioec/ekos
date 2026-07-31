@@ -22,6 +22,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+
 use vectorvolt_index::{CuckooFilter, CuckooMap, RowDescriptor, SecondaryIndex, ZoneMap};
 use vectorvolt_storage::{ColumnValues, MicroPartition, write_partition};
 use vectorvolt_storage::{
@@ -69,6 +71,18 @@ pub struct TxnManager {
     /// via [`TxnManager::enable_manifest`], which surfaces both the error and
     /// what recovery had to discard.
     manifest: Mutex<Option<Manifest>>,
+    /// Tombstone counts not yet written to the manifest, per partition.
+    ///
+    /// Deletes are frequent and a manifest edit costs an `fsync`, so writing one
+    /// per delete would put a disk sync on the delete path. They are accumulated
+    /// here and persisted in a batch at the next flush or compaction.
+    ///
+    /// **Losing these on a crash is acceptable and deliberate.** A tombstone count
+    /// only decides how eagerly compaction reclaims space; a lost count makes
+    /// compaction lazier, never incorrect. The PK index — which decides what is
+    /// actually visible — is rebuilt from the WAL, and that is the durable record
+    /// that matters.
+    pending_tombstones: Mutex<HashMap<(u16, u16), u32>>,
 }
 
 impl TxnManager {
@@ -108,6 +122,7 @@ impl TxnManager {
             // this crate; TableEngine opts in per its Durability setting.
             sync_on_commit: false,
             manifest: Mutex::new(None),
+            pending_tombstones: Mutex::new(HashMap::new()),
         }
     }
 
@@ -201,12 +216,18 @@ impl TxnManager {
     /// Does not remove the row from any flushed `.vvsst` file — that requires
     /// compaction (deferred to a later phase).
     pub fn delete(&self, pk: u64) -> TxnResult<WalTip> {
-        if self.pk_index.read().get(pk).is_none() {
+        // The descriptor is captured BEFORE the row leaves the index, because it
+        // is the only record of which partition the dead row lives in. Without it
+        // compaction has no way to know a partition is mostly garbage, and
+        // garbage-driven collection can never fire.
+        let Some(desc) = self.pk_index.read().get(pk) else {
             return Err(TxnError::PkNotFound(pk));
-        }
+        };
+        let home = (desc.file_id(), desc.partition_id());
 
         let tip = self.commit(Mutation::Delete { pk }.encode())?;
         self.pk_index.write().remove(pk);
+        *self.pending_tombstones.lock().entry(home).or_insert(0) += 1;
         Ok(tip)
     }
 
@@ -235,11 +256,60 @@ impl TxnManager {
     /// This is the input to `CompactionStrategy::plan`, `RetentionPolicy::plan`,
     /// and `verify_partitions`.
     pub fn partitions(&self) -> Vec<PartitionMeta> {
-        self.manifest
+        let mut parts: Vec<PartitionMeta> = self
+            .manifest
             .lock()
             .as_ref()
             .map(|m| m.partitions())
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // Overlay tombstones not yet persisted. A planner asking what to compact
+        // must see deletes that happened seconds ago, not only those that survived
+        // a flush — otherwise a table that is deleted-then-compacted reclaims
+        // nothing, which is exactly the case garbage collection exists for.
+        let pending = self.pending_tombstones.lock();
+        if !pending.is_empty() {
+            for p in &mut parts {
+                if let Some(extra) = pending.get(&(p.file_id, p.partition_id)) {
+                    // Saturating and clamped to the row count: a partition cannot
+                    // have more dead rows than rows, and a count above 1.0 would
+                    // make `garbage_ratio` nonsensical.
+                    p.tombstones = p.tombstones.saturating_add(*extra).min(p.row_count);
+                }
+            }
+        }
+        parts
+    }
+
+    /// Write accumulated tombstone counts into the manifest.
+    ///
+    /// Called at flush and before compaction. Batched rather than per-delete
+    /// because each manifest edit is an `fsync`.
+    fn persist_tombstones(&self) -> TxnResult<()> {
+        let drained: Vec<((u16, u16), u32)> = {
+            let mut pending = self.pending_tombstones.lock();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            pending.drain().collect()
+        };
+        for ((file_id, partition_id), extra) in drained {
+            let current = self.manifest.lock().as_ref().and_then(|m| {
+                m.get(file_id, partition_id)
+                    .map(|p| (p.tombstones, p.row_count))
+            });
+            // A partition that no longer exists (compacted away) has nothing to
+            // record. Dropping the count is correct: its rows are gone.
+            let Some((existing, row_count)) = current else {
+                continue;
+            };
+            self.record(ManifestEdit::SetTombstones {
+                file_id,
+                partition_id,
+                tombstones: existing.saturating_add(extra).min(row_count),
+            })?;
+        }
+        Ok(())
     }
 
     /// Apply an edit to the manifest, if one is enabled.
@@ -285,6 +355,10 @@ impl TxnManager {
         strategy: CompactionStrategy,
         write_options: WriteOptions,
     ) -> TxnResult<Vec<CompactionOutcome>> {
+        // Flush pending tombstone counts first, so the plan is computed from a
+        // manifest that reflects every delete so far.
+        self.persist_tombstones()?;
+
         let partitions = self.partitions();
         if partitions.is_empty() {
             return Ok(Vec::new());
@@ -349,12 +423,28 @@ impl TxnManager {
                 removes: outcome.removed.clone(),
             })?;
 
-            // Only now are the inputs safe to remove. A delete that fails is
-            // logged into the outcome by omission rather than aborting: the
-            // manifest no longer references the file, so it is already invisible
-            // to reads and is at worst leaked disk.
-            for path in &outcome.input_paths {
-                let _ = std::fs::remove_file(path);
+            // The merged output has no dead rows by construction, and the inputs
+            // no longer exist. Any tombstone count that accumulated for them
+            // during the merge would otherwise be attributed to a partition id
+            // that may later be reused.
+            {
+                let mut pending = self.pending_tombstones.lock();
+                for key in &outcome.removed {
+                    pending.remove(key);
+                }
+            }
+
+            // Only now are the inputs safe to remove. A failure here is not
+            // fatal — the manifest no longer names them, so they are already
+            // invisible to reads — but it IS reported, because an undeleted input
+            // is leaked disk and a leak nobody is told about is one nobody cleans
+            // up. On Windows this is routine: a live mmap holds the file and
+            // `remove_file` returns OS error 1224 until every reader is dropped.
+            let mut outcome = outcome;
+            for path in outcome.input_paths.clone() {
+                if std::fs::remove_file(&path).is_err() && path.exists() {
+                    outcome.undeleted.push(path);
+                }
             }
             outcomes.push(outcome);
         }
@@ -366,6 +456,10 @@ impl TxnManager {
         if rows.is_empty() {
             return Ok(None);
         }
+
+        // Persist tombstone counts alongside the flush — a natural batching point,
+        // and it keeps the manifest close to reality without an fsync per delete.
+        self.persist_tombstones()?;
 
         let file_id = self.next_file_id.load(Ordering::Relaxed);
         let partition_id = self.next_partition_id.fetch_add(1, Ordering::Relaxed);

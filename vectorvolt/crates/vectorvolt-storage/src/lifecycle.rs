@@ -205,43 +205,58 @@ impl CompactionStrategy {
     /// Enforced by tracking claimed ids, and asserted in the tests.
     pub fn plan(&self, partitions: &[PartitionMeta]) -> Vec<CompactionJob> {
         let mut jobs = Vec::new();
-        let mut claimed: Vec<(u16, u16)> = Vec::new();
 
-        // Garbage first: a partition that is mostly dead rows wastes I/O on every
-        // scan that touches it, and rewriting it is cheap because most of what it
-        // holds is discarded. Prioritised over routine merges for that reason.
-        let gt = self.garbage_threshold();
-        for p in partitions {
-            if p.garbage_ratio() > gt {
-                claimed.push((p.file_id, p.partition_id));
-                jobs.push(CompactionJob {
-                    inputs: vec![p.clone()],
-                    output_level: p.level,
-                    reason: CompactionReason::GarbageCollection,
-                });
-            }
-        }
-
-        let free: Vec<&PartitionMeta> = partitions
-            .iter()
-            .filter(|p| !claimed.contains(&(p.file_id, p.partition_id)))
-            .collect();
-
+        // Level and size passes run FIRST, garbage collection second.
+        //
+        // My first version had this the other way round, reasoning that a
+        // mostly-dead partition is the most urgent thing to rewrite. That was
+        // wrong, and two engine tests caught it: if a level merge is going to
+        // rewrite the partition anyway, collecting it separately produces TWO
+        // rewrites of the same bytes and leaves an extra partition behind. A
+        // 12-partition L0 merge with one dead row became a 1-partition GC job plus
+        // an 11-partition merge, where one 12-partition merge was correct.
+        //
+        // Garbage collection is therefore the fallback for partitions no other
+        // pass claimed — which is exactly the case it is genuinely for: a settled
+        // partition, in a level under budget, that has rotted.
         match self {
             CompactionStrategy::SizeTiered {
                 min_run,
                 max_run,
                 size_ratio,
                 ..
-            } => jobs.extend(Self::plan_size_tiered(
-                &free,
-                *min_run,
-                *max_run,
-                *size_ratio,
-            )),
-            CompactionStrategy::Leveled { l0_trigger, .. } => {
-                jobs.extend(self.plan_leveled(&free, *l0_trigger))
+            } => {
+                let all: Vec<&PartitionMeta> = partitions.iter().collect();
+                jobs.extend(Self::plan_size_tiered(
+                    &all,
+                    *min_run,
+                    *max_run,
+                    *size_ratio,
+                ));
             }
+            CompactionStrategy::Leveled { l0_trigger, .. } => {
+                let all: Vec<&PartitionMeta> = partitions.iter().collect();
+                jobs.extend(self.plan_leveled(&all, *l0_trigger));
+            }
+        }
+
+        let mut claimed: Vec<(u16, u16)> = jobs
+            .iter()
+            .flat_map(|j| j.inputs.iter().map(|p| (p.file_id, p.partition_id)))
+            .collect();
+
+        let gt = self.garbage_threshold();
+        for p in partitions {
+            let key = (p.file_id, p.partition_id);
+            if claimed.contains(&key) || p.garbage_ratio() <= gt {
+                continue;
+            }
+            claimed.push(key);
+            jobs.push(CompactionJob {
+                inputs: vec![p.clone()],
+                output_level: p.level,
+                reason: CompactionReason::GarbageCollection,
+            });
         }
         jobs
     }
@@ -407,6 +422,11 @@ pub struct RetentionPlan {
     pub delete: Vec<RetentionAction>,
     /// Selected by a rule but retained anyway, with the reason.
     pub retained: Vec<(PartitionMeta, RetentionVeto)>,
+    /// Files removed from the manifest whose deletion failed.
+    ///
+    /// Filled in by whoever executes the plan, not by `plan()` itself. Leaked
+    /// disk, not lost data: the manifest no longer names them.
+    pub undeleted: Vec<PathBuf>,
 }
 
 /// Why a selected partition was not deleted.

@@ -18,6 +18,7 @@
 
 use tempfile::TempDir;
 use vectorvolt_engine::{Durability, EngineOptions, TableEngine};
+use vectorvolt_storage::CompactionStrategy;
 
 /// Non-durable options, for tests that are not about durability.
 fn fast() -> EngineOptions {
@@ -154,10 +155,36 @@ fn compaction_reclaims_deleted_rows() {
     }
 }
 
+/// Reclaiming from a single partition is now POLICY, not automatic.
+///
+/// This used to compact whenever any row was deleted, because the old
+/// implementation merged everything unconditionally. Compaction is now planned by
+/// `CompactionStrategy`, and garbage collection fires only above
+/// `garbage_threshold` — rewriting a whole partition to reclaim one row of a
+/// thousand is not obviously worth the I/O, and the engine should not decide that
+/// for a caller.
+///
+/// So the threshold is set explicitly here. The behaviour being tested — that the
+/// single-partition path is not skipped — is unchanged; what changed is that the
+/// caller now says how eager reclaim should be.
 #[test]
 fn compaction_reclaims_from_a_single_partition() {
-    // The "already one partition" early-return must not skip tombstone reclaim.
-    let (engine, _dir) = make_engine(1_000_000);
+    let dir = TempDir::new().unwrap();
+    let engine = TableEngine::open_with(
+        vec!["id".into(), "price".into(), "qty".into()],
+        dir.path(),
+        EngineOptions::new(1_000_000)
+            .with_durability(Durability::WriteOnly)
+            .with_compaction_strategy(CompactionStrategy::Leveled {
+                l0_trigger: 4,
+                level_multiplier: 10,
+                l1_bytes: 64 * 1024 * 1024,
+                // Reclaim as soon as anything is dead.
+                garbage_threshold: 0.0,
+            }),
+    )
+    .unwrap();
+    let _dir = dir;
     for i in 1..=5u64 {
         engine.insert(i, vec![i, i * 100, i * 7]).unwrap();
     }
@@ -273,7 +300,17 @@ fn compaction_deletes_the_old_partition_files() {
     insert_one_per_partition(&engine, 8);
 
     let data_dir = dir.path().join("data");
-    let before = std::fs::read_dir(&data_dir).unwrap().count();
+    // Count .vvsst specifically. The data directory also holds MANIFEST, and an
+    // entry count would silently conflate the two — the assertion message always
+    // claimed to be about partitions, so now it is.
+    let count_vvsst = |d: &std::path::Path| {
+        std::fs::read_dir(d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "vvsst"))
+            .count()
+    };
+    let before = count_vvsst(&data_dir);
     assert_eq!(before, 8, "setup: expected 8 .vvsst files");
 
     engine

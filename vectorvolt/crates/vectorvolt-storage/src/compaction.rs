@@ -102,6 +102,17 @@ pub struct CompactionOutcome {
     pub rows_out: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// Input files the caller tried to delete and could not.
+    ///
+    /// Populated by the caller, not the executor. Not an error — the manifest no
+    /// longer names them, so they are invisible to reads — but they are leaked
+    /// disk, and a leak nobody is told about is one nobody cleans up.
+    ///
+    /// This is routine on **Windows**, where a live memory mapping holds the file
+    /// open and `remove_file` fails with OS error 1224 until every reader is
+    /// dropped. A caller holding `PartitionReader`s must release them before
+    /// compacting, or every compaction leaks its inputs.
+    pub undeleted: Vec<PathBuf>,
 }
 
 impl CompactionOutcome {
@@ -314,6 +325,7 @@ pub fn execute_job<L: Liveness>(
         rows_out,
         bytes_in,
         bytes_out,
+        undeleted: Vec::new(),
     })
 }
 
