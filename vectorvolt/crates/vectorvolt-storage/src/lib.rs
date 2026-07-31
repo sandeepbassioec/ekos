@@ -17,11 +17,17 @@
 pub mod bitpack;
 pub mod column;
 pub mod format;
+pub mod lifecycle;
 pub mod partition;
 pub mod reader;
 pub mod writer;
 
 pub use column::ColumnValues;
+pub use lifecycle::{
+    CompactionJob, CompactionReason, CompactionStrategy, PartitionMeta, RetentionAction,
+    RetentionPlan, RetentionPolicy, RetentionRule, RetentionVeto, VerifyFinding, VerifyReport,
+    verify_partitions,
+};
 pub use partition::MicroPartition;
 pub use reader::PartitionReader;
 pub use writer::{Compression, WriteOptions, write_partition, write_partition_with};
