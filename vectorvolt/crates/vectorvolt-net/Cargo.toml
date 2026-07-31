@@ -1,0 +1,16 @@
+[package]
+name        = "vectorvolt-net"
+description = "VectorVolt wire protocol, TCP server, and client — Layer 7"
+version.workspace   = true
+authors.workspace   = true
+edition.workspace   = true
+license.workspace   = true
+repository.workspace = true
+
+[dependencies]
+vectorvolt-engine  = { workspace = true }
+thiserror  = { workspace = true }
+crc32fast  = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

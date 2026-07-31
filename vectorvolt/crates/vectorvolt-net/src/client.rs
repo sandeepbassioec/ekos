@@ -1,0 +1,170 @@
+//! [`Client`] — a blocking client for the VectorVolt wire protocol (VV-NET-006).
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+use crate::protocol::{HEADER_SIZE, Header, Request, Response, encode_request, verify_payload};
+use crate::{NetError, NetResult};
+
+/// A connection to a VectorVolt server.
+///
+/// Blocking and single-threaded by design: one request, one response. The
+/// protocol supports pipelining via `request_id`, but a client that pipelines has
+/// to manage outstanding requests, and that belongs in the SDK rather than here.
+/// This is the smallest thing that can talk to the server correctly.
+pub struct Client {
+    stream: TcpStream,
+    next_id: u64,
+}
+
+impl Client {
+    pub fn connect(addr: impl ToSocketAddrs) -> NetResult<Self> {
+        let stream = TcpStream::connect(addr)?;
+        // Nagle off for the same reason the server disables it: a request/response
+        // protocol has nothing to coalesce, and the delay lands on every call.
+        let _ = stream.set_nodelay(true);
+        Ok(Client { stream, next_id: 1 })
+    }
+
+    /// Connect with a timeout, so an unreachable host fails fast instead of
+    /// waiting out the OS default (which can be over a minute).
+    pub fn connect_timeout(addr: SocketAddr, timeout: Duration) -> NetResult<Self> {
+        let stream = TcpStream::connect_timeout(&addr, timeout)?;
+        let _ = stream.set_nodelay(true);
+        Ok(Client { stream, next_id: 1 })
+    }
+
+    /// Bound how long a single call may block.
+    pub fn set_timeout(&self, timeout: Option<Duration>) -> NetResult<()> {
+        self.stream.set_read_timeout(timeout)?;
+        self.stream.set_write_timeout(timeout)?;
+        Ok(())
+    }
+
+    pub fn local_addr(&self) -> NetResult<SocketAddr> {
+        Ok(self.stream.local_addr()?)
+    }
+
+    /// Send a request and wait for its response.
+    ///
+    /// The returned frame's `request_id` is checked against the one sent. On a
+    /// strictly sequential connection a mismatch should be impossible — which is
+    /// exactly why it is worth checking: if it ever happens, the stream has
+    /// desynchronised and every subsequent response would be attributed to the
+    /// wrong call. Failing loudly beats returning another request's answer.
+    pub fn call(&mut self, req: &Request) -> NetResult<Response> {
+        let id = self.next_id;
+        // Wrapping rather than overflowing. Reaching 2^64 requests on one
+        // connection is not going to happen, but a panic in a client library is a
+        // worse answer than reusing an id that has long since been answered.
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+
+        let frame = encode_request(id, req)?;
+        self.stream.write_all(&frame)?;
+        self.stream.flush()?;
+
+        let mut header_buf = [0u8; HEADER_SIZE];
+        self.stream.read_exact(&mut header_buf)?;
+        let header = Header::decode(&header_buf)?;
+
+        let mut payload = vec![0u8; header.payload_len as usize];
+        if header.payload_len > 0 {
+            self.stream.read_exact(&mut payload)?;
+        }
+        verify_payload(&header, &payload)?;
+
+        if header.request_id != id {
+            return Err(NetError::Malformed(
+                "response request_id does not match the request; the stream has desynchronised",
+            ));
+        }
+        Response::decode(header.opcode, &payload)
+    }
+
+    // ── Convenience wrappers ──────────────────────────────────────────────────
+
+    pub fn ping(&mut self) -> NetResult<()> {
+        match self.call(&Request::Ping)? {
+            Response::Pong => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `Ok(None)` when the key does not exist — a normal outcome, not an error.
+    pub fn get(&mut self, pk: u64) -> NetResult<Option<Vec<u64>>> {
+        match self.call(&Request::Get { pk })? {
+            Response::Row { values } => Ok(Some(values)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn insert(&mut self, pk: u64, values: Vec<u64>) -> NetResult<()> {
+        match self.call(&Request::Insert { pk, values })? {
+            Response::Ok { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `Ok(false)` when there was nothing to delete.
+    pub fn delete(&mut self, pk: u64) -> NetResult<bool> {
+        match self.call(&Request::Delete { pk })? {
+            Response::Ok { affected } => Ok(affected > 0),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `limit` of 0 means unlimited.
+    pub fn range_scan(
+        &mut self,
+        col: u32,
+        lo: u64,
+        hi: u64,
+        limit: u32,
+    ) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::RangeScan { col, lo, hi, limit })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn flush(&mut self) -> NetResult<()> {
+        match self.call(&Request::Flush)? {
+            Response::Ok { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Rows kept by the compaction, or 0 if there was nothing to do.
+    pub fn compact(&mut self) -> NetResult<u64> {
+        match self.call(&Request::Compact)? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `(rows, partitions, bytes)`.
+    pub fn stats(&mut self) -> NetResult<(u64, u64, u64)> {
+        match self.call(&Request::Stats)? {
+            Response::Stats {
+                rows,
+                partitions,
+                bytes,
+            } => Ok((rows, partitions, bytes)),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
+/// Turn an unexpected response into an error.
+///
+/// A server `Error` response keeps its message, because that is the whole reason
+/// the server sent one. Anything else means the two sides disagree about the
+/// protocol, which is worth saying differently.
+fn unexpected(r: Response) -> NetError {
+    match r {
+        Response::Error { code, message } => NetError::Engine(format!("[{code}] {message}")),
+        other => NetError::Engine(format!("unexpected response: {other:?}")),
+    }
+}
