@@ -24,7 +24,7 @@ pub mod writer;
 pub use column::ColumnValues;
 pub use partition::MicroPartition;
 pub use reader::PartitionReader;
-pub use writer::write_partition;
+pub use writer::{Compression, WriteOptions, write_partition, write_partition_with};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 

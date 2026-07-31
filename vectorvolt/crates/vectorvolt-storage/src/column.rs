@@ -390,40 +390,55 @@ impl ColumnValues {
 
     /// Decode all rows into a flat `Vec<u64>` (allocates).
     pub fn to_raw_vec(&self) -> Vec<u64> {
+        let mut out = Vec::with_capacity(self.row_count());
+        self.decode_into(&mut out);
+        out
+    }
+
+    /// Decode every row, appending into `out` after clearing it.
+    ///
+    /// The allocation-reusing form of [`to_raw_vec`](Self::to_raw_vec). A scan
+    /// over many partitions can keep one buffer alive instead of allocating and
+    /// freeing a `Vec<u64>` per partition, which for a 4096-row column is a 32 KiB
+    /// allocation per partition per query.
+    pub fn decode_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.reserve(self.row_count());
+        self.decode_append(out)
+    }
+
+    fn decode_append(&self, out: &mut Vec<u64>) {
         match self {
-            ColumnValues::Raw(v) => v.clone(),
+            ColumnValues::Raw(v) => out.extend_from_slice(v),
             ColumnValues::DictEncoded { dict, indices } => {
-                indices.iter().map(|&i| dict[i as usize]).collect()
+                out.extend(indices.iter().map(|&i| dict[i as usize]))
             }
             ColumnValues::Rle { values, run_ends } => {
-                let mut out = Vec::with_capacity(self.row_count());
                 let mut start = 0usize;
                 for (k, &end) in run_ends.iter().enumerate() {
                     let end = end as usize;
                     out.extend(std::iter::repeat_n(values[k], end - start));
                     start = end;
                 }
-                out
             }
+            // Unpacking straight into `out` rather than via `unpack_all` avoids a
+            // second full-column Vec: the old path allocated the offsets, then
+            // allocated again to add the base.
             ColumnValues::Frame {
                 base,
                 bit_width,
                 packed,
                 row_count,
-            } => bitpack::unpack_all(packed, *bit_width, *row_count)
-                .into_iter()
-                .map(|o| base + o)
-                .collect(),
+            } => out
+                .extend((0..*row_count).map(|i| base + bitpack::unpack_one(packed, *bit_width, i))),
             ColumnValues::BlockedFrame {
                 block_bases,
                 bit_width,
                 packed,
                 row_count,
-            } => bitpack::unpack_all(packed, *bit_width, *row_count)
-                .into_iter()
-                .enumerate()
-                .map(|(i, o)| block_bases[i / FRAME_BLOCK] + o)
-                .collect(),
+            } => out.extend((0..*row_count).map(|i| {
+                block_bases[i / FRAME_BLOCK] + bitpack::unpack_one(packed, *bit_width, i)
+            })),
         }
     }
 
