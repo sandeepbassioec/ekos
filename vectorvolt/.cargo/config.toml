@@ -9,3 +9,20 @@ linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\To
 # Windows SDK and MSVC runtime libs — required when not launched from
 # "Developer PowerShell for VS 2022".
 LIB = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64"
+
+# C compiler and headers, for crates with a C component (`ring`, and anything
+# else pulled in through `cc`). LIB and the linker above are enough for pure-Rust
+# crates, which is why this gap went unnoticed until `rustls` was added.
+#
+# Without CC and INCLUDE, a C build fails with:
+#   fatal error C1083: Cannot open include file: 'stddef.h'
+# which looks like a missing toolchain and is not — it is a toolchain the process
+# cannot see because the environment was never set up.
+#
+# NOTE: there are two Visual Studio installs on this machine. VS **2022
+# Professional** is the one with a complete C++ toolset; the VS 2026 Enterprise
+# install at `...\Microsoft Visual Studio\18\Enterprise` has `bin` and `lib` but
+# NO `include` directory and no `vcvarsall.bat`. Pointing at 2026 fails. All paths
+# here are deliberately the 2022 ones.
+CC = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe"
+INCLUDE = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC\\14.44.35207\\include;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\um;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\shared"
