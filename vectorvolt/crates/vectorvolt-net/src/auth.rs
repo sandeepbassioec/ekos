@@ -51,6 +51,51 @@ pub const RESPONSE_LEN: usize = 32;
 /// per attempt.
 pub const MAX_AUTH_ATTEMPTS: u32 = 3;
 
+/// What an authenticated key is allowed to do (VV-SEC-004).
+///
+/// A total order rather than a permission set: each level contains the one below
+/// it. Independent flags would be more expressive and would also make it possible
+/// to configure "may compact but may not read", which is not a coherent thing to
+/// want and would be a footgun rather than a feature.
+///
+/// The split is by BLAST RADIUS, not by verb:
+///
+/// | Scope | May do | Why the line is here |
+/// |---|---|---|
+/// | `ReadOnly` | Get, RangeScan, Stats | Cannot change or destroy anything |
+/// | `ReadWrite` | + Insert, Delete | Changes rows; a mistake is recoverable per row |
+/// | `Admin` | + Flush, Compact | Rewrites and deletes FILES; a mistake is not row-scoped |
+///
+/// Compact is the reason `Admin` exists. It rewrites every partition in a job and
+/// deletes the originals — a single call from a misconfigured client can rewrite a
+/// whole table. That is not something an ordinary writer credential should be able
+/// to trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Scope {
+    /// Read data. The safe default for a new credential.
+    #[default]
+    ReadOnly,
+    /// Read and modify rows.
+    ReadWrite,
+    /// Everything, including operations that rewrite or delete files.
+    Admin,
+}
+
+impl Scope {
+    /// True if this scope permits everything `required` needs.
+    pub fn allows(self, required: Scope) -> bool {
+        self >= required
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::ReadOnly => "read-only",
+            Scope::ReadWrite => "read-write",
+            Scope::Admin => "admin",
+        }
+    }
+}
+
 /// A shared secret.
 ///
 /// `Debug` is implemented manually to print nothing. Secrets end up in logs
@@ -103,6 +148,11 @@ pub enum AuthError {
     NoChallenge,
     #[error("too many failed attempts")]
     TooManyAttempts,
+    #[error("operation requires {required} access; this key has {held}")]
+    InsufficientScope {
+        required: &'static str,
+        held: &'static str,
+    },
 }
 
 /// Who may connect.
@@ -114,7 +164,7 @@ pub enum AuthError {
 /// rather than leaving it implicit.
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
-    credentials: HashMap<String, Secret>,
+    credentials: HashMap<String, (Secret, Scope)>,
 }
 
 impl AuthConfig {
@@ -123,8 +173,22 @@ impl AuthConfig {
         Self::default()
     }
 
+    /// Add a key. Defaults to [`Scope::ReadOnly`] — the least-privilege default,
+    /// so forgetting to specify a scope under-grants rather than over-grants.
     pub fn with_key(mut self, key_id: impl Into<String>, secret: Secret) -> Self {
-        self.credentials.insert(key_id.into(), secret);
+        self.credentials
+            .insert(key_id.into(), (secret, Scope::ReadOnly));
+        self
+    }
+
+    /// Add a key with an explicit scope.
+    pub fn with_scoped_key(
+        mut self,
+        key_id: impl Into<String>,
+        secret: Secret,
+        scope: Scope,
+    ) -> Self {
+        self.credentials.insert(key_id.into(), (secret, scope));
         self
     }
 
@@ -132,7 +196,7 @@ impl AuthConfig {
         !self.credentials.is_empty()
     }
 
-    fn secret_for(&self, key_id: &str) -> Option<&Secret> {
+    fn entry_for(&self, key_id: &str) -> Option<&(Secret, Scope)> {
         self.credentials.get(key_id)
     }
 }
@@ -173,6 +237,7 @@ pub struct AuthState {
     authenticated: bool,
     attempts: u32,
     key_id: Option<String>,
+    scope: Scope,
 }
 
 impl AuthState {
@@ -186,6 +251,14 @@ impl AuthState {
             authenticated: !config.is_enabled(),
             attempts: 0,
             key_id: None,
+            // With auth disabled every connection is already authorised, so it
+            // gets full access — anything less would break the embedded case while
+            // providing no security, since there is nobody to distinguish.
+            scope: if config.is_enabled() {
+                Scope::ReadOnly
+            } else {
+                Scope::Admin
+            },
         }
     }
 
@@ -196,6 +269,29 @@ impl AuthState {
     /// The authenticated key id, for audit logging.
     pub fn key_id(&self) -> Option<&str> {
         self.key_id.as_deref()
+    }
+
+    /// What this connection is allowed to do.
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    /// Check the connection may perform an operation needing `required`.
+    ///
+    /// The error names both what was needed and what is held. An authorisation
+    /// failure is almost always a misconfiguration rather than an attack, and
+    /// "forbidden" with no detail turns a one-minute fix into an afternoon. It
+    /// leaks only the caller's OWN scope, which they can determine anyway by
+    /// trying operations.
+    pub fn require(&self, required: Scope) -> Result<(), AuthError> {
+        if self.scope.allows(required) {
+            Ok(())
+        } else {
+            Err(AuthError::InsufficientScope {
+                required: required.as_str(),
+                held: self.scope.as_str(),
+            })
+        }
     }
 
     /// Issue a fresh challenge, replacing any previous one.
@@ -238,10 +334,10 @@ impl AuthState {
             return Err(AuthError::NoChallenge);
         };
 
-        let known = config.secret_for(key_id);
+        let known = config.entry_for(key_id);
         // A fixed dummy so the unknown-key path does the same work.
-        let dummy = Secret(vec![0u8; Secret::MIN_LEN]);
-        let secret = known.unwrap_or(&dummy);
+        let dummy = (Secret(vec![0u8; Secret::MIN_LEN]), Scope::ReadOnly);
+        let (secret, scope) = known.unwrap_or(&dummy);
         let expected = compute_response(secret, &nonce);
 
         let matches: bool = expected.ct_eq(response).into();
@@ -256,6 +352,7 @@ impl AuthState {
         self.challenge = None;
         self.authenticated = true;
         self.key_id = Some(key_id.to_string());
+        self.scope = *scope;
         Ok(())
     }
 

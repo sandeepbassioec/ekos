@@ -30,7 +30,7 @@ pub mod client;
 pub mod protocol;
 pub mod server;
 
-pub use auth::{AuthConfig, AuthError, AuthState, Secret};
+pub use auth::{AuthConfig, AuthError, AuthState, Scope, Secret};
 pub use client::Client;
 pub use protocol::{Header, OpCode, Request, Response};
 pub use server::{Server, ServerConfig};
@@ -96,4 +96,10 @@ pub mod error_code {
     pub const UNAUTHENTICATED: u16 = 6;
     /// Authentication failed.
     pub const AUTH_FAILED: u16 = 7;
+    /// Authenticated, but this key lacks the required scope.
+    ///
+    /// Distinct from UNAUTHENTICATED on purpose: "log in" and "you cannot do this"
+    /// need different responses from a client, and conflating them sends operators
+    /// hunting for a credential problem that does not exist.
+    pub const FORBIDDEN: u16 = 8;
 }
