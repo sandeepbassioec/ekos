@@ -24,7 +24,10 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use vectorvolt_index::{CuckooFilter, CuckooMap, RowDescriptor, SecondaryIndex, ZoneMap};
 use vectorvolt_storage::{ColumnValues, MicroPartition, write_partition};
-use vectorvolt_storage::{Manifest, ManifestEdit, ManifestRecovery, PartitionMeta};
+use vectorvolt_storage::{
+    CompactionOptions, CompactionOutcome, CompactionStrategy, Liveness, Manifest, ManifestEdit,
+    ManifestRecovery, PartitionMeta, RowLocation, WriteOptions,
+};
 pub use vectorvolt_wal::WalTip;
 use vectorvolt_wal::{SyncCommitter, SyncStats, WalWriter};
 
@@ -253,6 +256,111 @@ impl TxnManager {
         }
     }
 
+    /// Plan and run compaction, returning what each job did.
+    ///
+    /// The full loop: plan from the manifest, merge, swap the manifest, delete the
+    /// inputs. Requires a manifest — without one there is no level, size, or
+    /// tombstone information to plan from, so this returns an empty vector rather
+    /// than guessing.
+    ///
+    /// ## Ordering, and why it is this way
+    ///
+    /// Per job: **write the merged file, then swap the manifest, then delete the
+    /// inputs.** Each step is durable before the next begins, so every crash point
+    /// leaves a recoverable state:
+    ///
+    /// - crash after the write: an orphan file, invisible to the manifest;
+    /// - crash after the swap: orphan *inputs*, also invisible;
+    /// - crash after the deletes: nothing to clean up.
+    ///
+    /// Every failure leaks disk. None loses a row, and none duplicates one. The
+    /// swap is a single [`ManifestEdit::Replace`] record so it cannot tear halfway
+    /// and leave both the inputs and the output live at once.
+    ///
+    /// A failed job does not abort the run — later jobs are independent, and one
+    /// unreadable partition should not stop the rest of compaction. Failures are
+    /// returned so the caller can see them.
+    pub fn run_compaction(
+        &self,
+        strategy: CompactionStrategy,
+        write_options: WriteOptions,
+    ) -> TxnResult<Vec<CompactionOutcome>> {
+        let partitions = self.partitions();
+        if partitions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // A WORM-locked partition must not be rewritten: the hold applies to those
+        // bytes, and compaction destroys them. Filtered before planning rather
+        // than after, so a locked partition is never even considered.
+        let eligible: Vec<PartitionMeta> = partitions
+            .iter()
+            .filter(|p| !p.worm_locked)
+            .cloned()
+            .collect();
+        let jobs = strategy.plan(&eligible);
+
+        let mut outcomes = Vec::new();
+        for job in jobs {
+            let file_id = self.next_file_id.load(Ordering::Relaxed);
+            let partition_id = self.next_partition_id.fetch_add(1, Ordering::Relaxed);
+            let opts = CompactionOptions {
+                output_dir: self.flush_dir.clone(),
+                output_file_id: file_id,
+                output_partition_id: partition_id,
+                write_options,
+                now_millis: now_millis(),
+            };
+
+            let liveness = IndexLiveness { txn: self };
+            let outcome = vectorvolt_storage::execute_job(&job, &self.schema, &liveness, &opts)?;
+
+            // Re-point the PK index at the merged partition BEFORE the manifest
+            // swap makes it the live one.
+            //
+            // Compaction moves every surviving row to a new
+            // (file_id, partition_id, row_offset). An index still holding the old
+            // coordinates addresses rows in a file that is about to be deleted —
+            // so every point lookup for a compacted key would fail or, worse, read
+            // a stale offset in a recycled id. This is the step whose absence makes
+            // compaction silently destructive rather than merely wasteful.
+            {
+                let mut idx = self.pk_index.write();
+                for (row_offset, pk) in outcome.output_pks.iter().enumerate() {
+                    let _ = idx.insert(
+                        *pk,
+                        RowDescriptor::new(file_id, partition_id, row_offset as u32),
+                    );
+                }
+            }
+            // The merged partition's key range, so range scans can still prune it.
+            if !outcome.output_pks.is_empty() {
+                self.zone_map.write().set(
+                    partition_id,
+                    outcome.output.min_key,
+                    outcome.output.max_key,
+                );
+            }
+
+            // Manifest swap: one record, so recovery sees the old set or the new
+            // set and never both.
+            self.record(ManifestEdit::Replace {
+                adds: vec![outcome.output.clone()],
+                removes: outcome.removed.clone(),
+            })?;
+
+            // Only now are the inputs safe to remove. A delete that fails is
+            // logged into the outcome by omission rather than aborting: the
+            // manifest no longer references the file, so it is already invisible
+            // to reads and is at worst leaked disk.
+            for path in &outcome.input_paths {
+                let _ = std::fs::remove_file(path);
+            }
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+
     pub fn flush(&self) -> TxnResult<Option<FlushResult>> {
         let rows = self.write_buf.lock().drain();
         if rows.is_empty() {
@@ -412,4 +520,27 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Liveness backed by the PK index.
+///
+/// A row is live only if the index still points at *that exact location*. That
+/// covers both failure modes in one check: a deleted row has no index entry, and a
+/// superseded row has an entry pointing somewhere newer. Comparing only the PK
+/// would keep stale copies alive forever.
+struct IndexLiveness<'a> {
+    txn: &'a TxnManager,
+}
+
+impl Liveness for IndexLiveness<'_> {
+    fn is_live(&self, pk: u64, at: RowLocation) -> bool {
+        match self.txn.pk_index.read().get(pk) {
+            Some(desc) => {
+                desc.file_id() == at.file_id
+                    && desc.partition_id() == at.partition_id
+                    && desc.row_offset() == at.row_offset
+            }
+            None => false,
+        }
+    }
 }
