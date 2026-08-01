@@ -1,5 +1,15 @@
 # EKOS Volume 07 — EKR Viewer Family + Cryptographic-Expiration Enforcement + Viewer Monetization
 
+> **⚠️ SCOPE ADDENDUM (2026-08-01):** The title of this volume ("Viewer Family") reflects
+> the original framing — EKR as a document viewer — which is **accurate but incomplete**.
+> EKR is ALSO the **universal application runtime platform**: users subscribe to Knowledge
+> Packages inside EKR and run full enterprise applications without installation. The Viewer
+> Family (specifications in this volume: Electron/WASM/mobile cross-platform surface,
+> Cryptographic Expiration, tiers, monetization) is the **delivery vehicle** for that
+> runtime. See **`ESCS-SUPPLEMENT.md` §10** (EKOS-ESCS-034 through EKOS-ESCS-046) for the
+> full Application Deployment & Subscription Platform specification. Nothing in this volume
+> is invalidated; the scope is extended.
+
 > **Status:** ✅ Done · **Requirement count:** 99 · **Generated:** 2026-06-30 (Opus)
 > **Sources mined:** `EKR_Research.txt` (cross-platform free viewer, capabilities/
 > limitations, authentication, offline ABAC engine, self-destruct viewer execution,

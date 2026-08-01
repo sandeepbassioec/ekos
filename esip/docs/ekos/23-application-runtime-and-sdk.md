@@ -1,5 +1,20 @@
 # EKOS Volume 23 — EKOS Application Runtime & SDK
 
+> **⚠️ ESCS ADDENDUM (2026-08-01):** This volume's concepts map directly to the
+> **Application Deployment & Subscription Platform** formalized in ESCS §10:
+> - **EKRA manifest** (§2) = **Application Manifest** (ESCS-014, ESCS-015, ESCS-016)
+> - **Application Bundles** (§2-§3) = **Knowledge Packages** (ESCS-034, ESCS-037)
+> - **Application Runtime** (§4) = **EKR as application runtime** (ESCS-035, ESCS-045)
+> - **App Store** (§5) = **Knowledge Package Registry** (ESCS-038, ESCS-040)
+> - **App longevity** (§6) = **Transparent package updates** (ESCS-041)
+> - **Enterprise Studio** (§8) = **developer = manifest author** (ESCS-044)
+> - **All-surface delivery** = **one manifest → all surfaces** (ESCS-046)
+>
+> The ESCS spec extends this volume by formalizing the Subscribe model (ESCS-040) where
+> users subscribe inside EKR and the Projection Runtime renders on demand — no
+> installation. See [ESCS-SUPPLEMENT.md §10](ESCS-SUPPLEMENT.md) for the full spec and
+> [Traceability Matrix](ESCS-SUPPLEMENT.md#11-traceability-matrix) rows ESCS-034…ESCS-046.
+
 > **Status:** ✅ Done · **Requirement count:** 58 · **Generated:** 2026-07-01 (Opus)
 > **Gap-closure #6** (cross-architect review). The **user-space application layer** —
 > where full **applications** (not just widgets) run on EKOS. **Apps, not widgets:** a

@@ -77,8 +77,18 @@ from specification to code — and the guard against both over-engineering and n
 | **E14 · KWR** | workforce layer (reserved) | deferred | Vol 26 |
 | **E15 · Sustainability tooling** | dependency automation + fitness functions | **P1 (early!)**, ongoing | A09 |
 | **E16 · Deployment** | single managed region → scale-with-adoption | P1→ | A08 |
+| **E17 · Knowledge Package Registry** | publisher signing, registry service, CCR enforcement, package versioning + delta distribution | P2 | ESCS-038; Vol 06 §4.11/§3; A08 |
+| **E18 · EKR Application Runtime + Subscribe Model** | extend EKR beyond viewer: subscribe to Knowledge Packages, Projection Runtime renders apps on demand, entitlement management, transparent updates | P2/P3 | ESCS-034/035/040/041/045/046; Vol 23 §4-§5; Vol 07 |
 
-*Source:* A02 coverage map; A10 sequence; A09.
+> **E9 scope extension (ESCS addendum 2026-08-01):** E9 "`.ekr` + Viewer (Reader)" now
+> explicitly includes the Knowledge Package **publishing pipeline** (the author side of
+> E17) and the EKR distribution model (Vol 07 §6). The full subscribe-and-run experience
+> is E18. E17/E18 are separated from E9 because they require the Compiler (E11) and App
+> Runtime (E12) to be far enough along. Dependency order: E9 → E11 → E12 → E17 → E18.
+> *See:* [ESCS-SUPPLEMENT.md §10](../ESCS-SUPPLEMENT.md) + Traceability Matrix rows
+> ESCS-034…ESCS-046.
+
+*Source:* A02 coverage map; A10 sequence; A09; ESCS-SUPPLEMENT.md §10 (2026-08-01).
 
 ---
 

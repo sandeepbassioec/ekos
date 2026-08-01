@@ -1,5 +1,15 @@
 # EKOS Volume 06 — `.ekr` Knowledge Runtime Package & Format
 
+> **⚠️ ESCS ADDENDUM (2026-08-01):** The `.ekr` bundle format defined in this volume is
+> the **underlying packaging machinery** for the **Knowledge Package** concept formalized
+> by ESCS-034. The "Bundle Store / Registry" (§4.11) and "Publishing Pipeline" (§3) map
+> directly to the **Knowledge Package Registry** (ESCS-038) and **Application Manifest →
+> Knowledge Package compilation** (ESCS-037). The no-source-code-ships constraint
+> (ESCS-042) is enforced by the format-secrecy / anti-RE requirements in §25. See
+> [ESCS-SUPPLEMENT.md §10](ESCS-SUPPLEMENT.md) for the full Application Deployment &
+> Subscription Platform spec; see [Traceability Matrix](ESCS-SUPPLEMENT.md#11-traceability-matrix)
+> rows ESCS-034, ESCS-037, ESCS-038, ESCS-041, ESCS-042 for the precise mapping.
+
 > **Status:** ✅ Done · **Requirement count:** 104 · **Generated:** 2026-06-30 (Opus)
 > **Sources mined:** `EKR_Research.txt` (format, container, AES-256-GCM/DRM, layered
 > multi-recipient PII encryption, self-destruct, copy-proofing, format secrecy),
