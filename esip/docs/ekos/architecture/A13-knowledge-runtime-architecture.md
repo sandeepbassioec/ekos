@@ -1,5 +1,22 @@
 # EKOS Architecture — A13: Knowledge Runtime Architecture
 
+> **⚠️ ESCS ADDENDUM (2026-08-01):** The ESCS formalization (see
+> [ESCS-SUPPLEMENT.md §10](../ESCS-SUPPLEMENT.md)) changes the runtime's role beyond
+> executing mutations on a graph:
+> - **ESCS-043 (SDLC change):** A13 must now account for the Application Manifest →
+>   Knowledge Package compilation path. The Projection Runtime is not just a rendering
+>   layer — it is the **application execution environment** that replaces the traditional
+>   "install a binary" model. The sequence: Manifest authored → Compiled (E11) → Published
+>   to Registry (E17) → User subscribes in EKR → Projection Runtime renders app on demand.
+> - **ESCS-044 (developer = manifest author):** The App SDK (E12) should surface manifest
+>   authoring as the primary developer workflow — not writing code against syscalls.
+> - **ESCS-045 (EKR = common runtime environment):** A13's runtime architecture is the
+>   implementation of ESCS-045. Document this section as the "EKR runtime contract" that
+>   every Knowledge Package and Living Application executes within.
+> - **ESCS-046 (one manifest → all surfaces):** The Projection Runtime's multi-surface
+>   dispatch is the architectural expression of this requirement. A13 §4 (Projection
+>   dispatch) should be updated to reflect this when E11 begins.
+
 > **Status:** ✅ Done · **Generated:** 2026-07-03
 > Synthesises [Book 2](../BOOK-2-KNOWLEDGE-OBJECT-COMPUTATIONAL-MODEL.md) (computational
 > model), [Vol 18](../18-knowledge-kernel.md) (Knowledge Kernel), [Vol 22](../22-knowledge-os-apis-syscall-layer.md)

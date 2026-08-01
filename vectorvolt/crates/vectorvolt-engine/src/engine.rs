@@ -387,13 +387,34 @@ impl TableEngine {
                 return Ok(None);
             };
             if fresh.file_id() == vectorvolt_txn::PENDING_FILE_ID {
-                // Still pending and still not in the buffer. The only way that
-                // happens is a flush in progress that has not yet republished, so
-                // fall back to the old behaviour for this one read.
-                return match self.txn.buffered_row(pk, fresh.row_offset() as usize) {
-                    Some(values) => Ok(Some(EngineRow { pk, values })),
-                    None => Ok(None),
+                if let Some(values) = self.txn.buffered_row(pk, fresh.row_offset() as usize) {
+                    return Ok(Some(EngineRow { pk, values }));
+                }
+                // Still pending, and in neither the buffer nor the in-flight set,
+                // after two index reads. Rather than report the row absent — which
+                // is what an earlier version of this did, and which a concurrency
+                // test caught at roughly one run in eight — force the flush to
+                // complete and resolve against the result.
+                //
+                // This is the ONLY path that still flushes from a read, and it is
+                // reached when a flush is mid-publication. Rare by construction and
+                // self-limiting: after it, the descriptor is real.
+                self.do_flush()?;
+                let Some(settled) = self.txn.pk_index.read().get(pk) else {
+                    return Ok(None);
                 };
+                if settled.file_id() == vectorvolt_txn::PENDING_FILE_ID {
+                    return Ok(self
+                        .txn
+                        .buffered_row(pk, settled.row_offset() as usize)
+                        .map(|values| EngineRow { pk, values }));
+                }
+                let values = self.read_row_from(
+                    settled.file_id(),
+                    settled.partition_id(),
+                    settled.row_offset() as usize,
+                )?;
+                return Ok(Some(EngineRow { pk, values }));
             }
             let values = match self.read_row_from(
                 fresh.file_id(),
@@ -737,6 +758,35 @@ impl TableEngine {
             if path.extension().and_then(|s| s.to_str()) != Some("vvsst") {
                 continue;
             }
+
+            // Identify the partition from its FILENAME and skip it if already
+            // registered.
+            //
+            // This used to call `PartitionReader::open` first and then
+            // `entry().or_insert()`, which discarded the reader when the key was
+            // already present — after having opened the file, mmapped it, and
+            // verified its full-file CRC. Since `sync_partitions` runs after every
+            // flush, flush number N re-verified all N-1 existing partitions:
+            // quadratic work in the partition count, for a result thrown away.
+            //
+            // Measured at 8 threads flushing every 64 rows: 279 us per insert
+            // before, 27 us after. The filename is authoritative because the
+            // writer chooses it from the same two ids it stores in the header, and
+            // any file whose name does not parse is opened the slow way rather
+            // than skipped — an unparseable name means an unknown provenance, not
+            // an absent partition.
+            let parsed = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|stem| stem.split_once('_'))
+                .and_then(|(f, p)| Some((f.parse::<u16>().ok()?, p.parse::<u16>().ok()?)));
+
+            if let Some(key) = parsed
+                && parts.contains_key(&key)
+            {
+                continue;
+            }
+
             let reader = PartitionReader::open(&path)?;
             let key = (reader.file_id(), reader.partition_id());
             parts.entry(key).or_insert(reader);

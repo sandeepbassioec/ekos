@@ -13,11 +13,23 @@ EKOS is not a tool or a platform — it is a new software category: a unified,
 versioned **semantic knowledge graph** where the entire software lifecycle (and
 beyond) lives as interactive, traceable, AI-powered **widgets** instead of dead
 documents. Knowledge is packaged into a portable, cryptographically-sealed
-**`.ekr` Knowledge Runtime Package** that opens in a free, cross-platform
-**Viewer** (the "Adobe Reader of enterprise knowledge"), powered by a promptless
-**hybrid ambient AI**, governed by **policy-as-code**, and traded in a
-**knowledge economy**. ESIP (the current React app at `C:\VectorVolt\esip`) is an
-early partial implementation of ONE pillar — the Widget Engine / designer.
+**`.ekr` Knowledge Runtime Package** and published to a **Knowledge Package
+Registry**. Users subscribe to packages inside **EKR (Enterprise Knowledge
+Repository)** — the universal application runtime that replaces both traditional
+installed software and bespoke SaaS: no code ships to the user, no installation
+occurs, the Projection Runtime inside EKR renders the application on demand.
+This changes the application development landscape entirely: developers author
+**Application Manifests** and **Capabilities** (semantic, implementation-free),
+compile them to Knowledge Packages, publish once, and every subscriber receives
+updates automatically — Living Applications and Living Documents generated from
+the same knowledge source. EKR is powered by a promptless **hybrid ambient AI**,
+governed by **policy-as-code**, traded in a **knowledge economy**, and
+**free to every user** (the "App Store for enterprise knowledge"). The platform
+embodies **Enterprise Semantic Computing (ESC)** — a paradigm where business
+intent flows through semantic compilation into deterministic execution, producing
+interchangeable projections across any surface. ESIP (the current React app at
+`C:\VectorVolt\esip`) is an early partial implementation of ONE pillar — the
+Widget Engine / designer.
 
 ---
 
@@ -35,6 +47,7 @@ Located in `C:\VectorVolt\esip\`. Research was done DeepSeek → Gemini → Chat
 | `ResumeCommunityBuilderPaymentsPrompt.txt` | 10, 11, 12, 13 | Living resume, communities, P2P sessions, Stripe/escrow economy. |
 | `PendingESIPResearchToMakeIt100Percent.txt` | (cross-check) | Earlier "pending to 100%" list — reconcile against new volumes. |
 | (existing) `docs/architecture-suite/` 26-vol catalog | cross-ref | The older EA-suite catalog (~4,845 reqs). EKOS supersedes/absorbs its scope; mine it, don't duplicate. |
+| `C:\VectorVolt\docs\ekos-application-platform.txt` | ESCS supplement | Formal ESCS spec — Enterprise Meaning, EKR shell, Application Manifest, Persistence Contracts, Storage Planner, ESC computing model. See ESCS-SUPPLEMENT.md. |
 
 ---
 
@@ -211,6 +224,29 @@ Each volume is written as `NN-<slug>.md` in this folder, containing:
   calls (Vol 01) only. User is <$50 remaining as of 2026-06-30.
 - **Never** re-read full source files each session — Grep the relevant slice.
 - One volume per session. Stop and checkpoint after each.
+
+---
+
+---
+
+## 🔬 ESCS FORMALIZATION (2026-08-01) — enterprise semantic computing spec
+
+New research in `C:\VectorVolt\docs\ekos-application-platform.txt` (636KB) introduces
+the formal **Enterprise Semantic Computing Specification (ESCS)**. This is a
+formalization pass within the Feature Freeze (ADR-018) — no new pillars, only precision.
+Key additions: (1) **ESC** as the official category name with a formal 7-step computing
+model chain; (2) **Enterprise Meaning**, a sub-atomic layer more primitive than the
+Knowledge Atom, sitting below the Knowledge Kernel (Vol 18); (3) **EKR** formally
+redefined as the universal interaction shell (not just file format + viewer family),
+capable of projecting documents, apps, APIs, voice, and conversational AI from one
+knowledge source; (4) **Application Manifest Specification** — applications described by
+semantic manifests, not source code; (5) **Capability Structure** formalized with 8
+sections including Intent, Interaction Contract, Persistence Contracts, and Projection
+Hints; (6) **Persistence Engine** formalized with Persistence Contracts, a Storage
+Planner, and 8 pluggable Storage Providers; (7) **Living Application** elevated as a
+first-class concept alongside Living Document; and (8) **Enterprise Studio** named as the
+formal authoring IDE with 10 workspaces. Full detail in **`ESCS-SUPPLEMENT.md`**
+(EKOS-ESCS-001 through EKOS-ESCS-033, ~33 requirements).
 
 ---
 

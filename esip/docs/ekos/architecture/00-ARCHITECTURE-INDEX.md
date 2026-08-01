@@ -98,6 +98,16 @@ deployment/patent analysis, implementation checklist.
 - ESIP SAFe Step 7 metrics (pending from previous session)
 - **VectorVolt Phase 1 (Rust)** ← NEXT MAJOR MILESTONE
 
+---
+
+## 📝 ESCS Formalization Note (2026-08-01)
+
+New research in `C:\VectorVolt\docs\ekos-application-platform.txt` introduces the formal ESCS spec. Key architectural impacts:
+- **EKR expanded**: now formally the "universal interaction shell" (not just file format + viewer) — this reinforces A15 (Runtime Distribution) and A13 (Knowledge Runtime) but extends EKR's scope.
+- **Enterprise Meaning layer**: sub-atomic layer below Knowledge Kernel — refines A02 (Logical Architecture) layer model.
+- **Persistence Engine formalization**: Persistence Contracts + Storage Planner formalize what A04 describes as polyglot CQRS.
+- See `../ESCS-SUPPLEMENT.md` for full net-new concepts.
+
 > A03 deliberately uses **EKOS's own Trade-off methodology** (the catalog's Solution-
 > Design/Trade-off widget thinking) to pick technology — eating our own dog food.
 

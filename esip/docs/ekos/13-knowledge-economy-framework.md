@@ -1,5 +1,14 @@
 # EKOS Volume 13 — Knowledge Economy Framework
 
+> **⚠️ ESCS ADDENDUM (2026-08-01):** The marketplace/commercial layer defined in this
+> volume is the **monetization overlay** on top of the **Knowledge Package Registry**
+> (ESCS-038). Specifically, ESCS-039 formalizes the requirement that the registry MUST
+> support a commercial layer (subscription fees, pay-per-use, revenue sharing for package
+> authors) — the mechanics (Stripe Connect/Treasury, escrow, payouts, reputation) live
+> here in Vol 13. This volume's "Viewer-Pro economics" also extends to application
+> subscriptions in EKR. See [ESCS-SUPPLEMENT.md](ESCS-SUPPLEMENT.md) row ESCS-039 in the
+> [Traceability Matrix](ESCS-SUPPLEMENT.md#11-traceability-matrix).
+
 > **Status:** ✅ Done · **Requirement count:** 82 · **Generated:** 2026-06-30 (Opus)
 > **Sources mined:** `ResumeCommunityBuilderPaymentsPrompt.txt` (DeepSeek expert
 > monetization, Stripe flow, fee structure, float interest, dispute), **`Gemini`
