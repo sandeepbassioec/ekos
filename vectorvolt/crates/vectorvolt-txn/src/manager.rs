@@ -539,18 +539,33 @@ impl TxnManager {
             mp.push_column(name.clone(), encoded)?;
         }
 
-        // Write .vvsst file.
+        // Write .vvsst file — via a temp path, renamed into place atomically.
         //
         // The directory is created here rather than assumed. Previously a manager
         // pointed at a non-existent flush_dir failed at flush time with a bare
         // NotFound, and once enable_manifest started calling create_dir_all,
         // whether flush worked at all depended on whether a manifest was enabled —
         // an unrelated setting silently changing a core operation.
+        //
+        // The temp-then-rename pattern closes the race with `sync_partitions`.
+        // That function opens every `.vvsst` file it finds in the directory.
+        // `File::create` makes the file visible to `read_dir` IMMEDIATELY — before
+        // `write_partition` has written even the magic bytes. A concurrent
+        // `sync_partitions` call (triggered by another thread's completed flush)
+        // would therefore open the half-empty file and return `InvalidMagic`.
+        // Writing to `{filename}.tmp` first and renaming atomically into the final
+        // name means a `.vvsst` file only appears in the directory once it is
+        // fully written.  `sync_partitions` skips `.tmp` files (wrong extension).
         std::fs::create_dir_all(&self.flush_dir)?;
         let filename = format!("{file_id:05}_{partition_id:05}.vvsst");
+        let tmp_filename = format!("{file_id:05}_{partition_id:05}.vvsst.tmp");
         let path = self.flush_dir.join(&filename);
-        let mut file = std::fs::File::create(&path)?;
-        write_partition(&mut file, &mp)?;
+        let tmp_path = self.flush_dir.join(&tmp_filename);
+        {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            write_partition(&mut file, &mp)?;
+        } // file closed before rename — kernel buffer visible to other opens
+        std::fs::rename(&tmp_path, &path)?;
 
         // WAL checkpoint record.
         let ckpt = format!(
