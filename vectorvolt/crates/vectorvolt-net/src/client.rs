@@ -360,6 +360,14 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Update an existing row. Returns an error if `pk` does not exist.
+    pub fn update(&mut self, pk: u64, values: Vec<u64>) -> NetResult<()> {
+        match self.call(&Request::Update { pk, values })? {
+            Response::Ok { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

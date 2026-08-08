@@ -99,6 +99,8 @@ pub enum OpCode {
     Upsert = 22,
     /// Fetch multiple rows by primary key in one round trip.
     GetMany = 23,
+    /// Update an existing row; error if the primary key is not found.
+    Update = 24,
     // Responses
     Pong = 129,
     Row = 130,
@@ -153,6 +155,7 @@ impl OpCode {
             21 => RollbackTxn,
             22 => Upsert,
             23 => GetMany,
+            24 => Update,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -342,6 +345,11 @@ pub enum Request {
     /// Missing keys are silently omitted from the response.
     GetMany {
         pks: Vec<u64>,
+    },
+    /// Update an existing row. Returns an error if `pk` is not found.
+    Update {
+        pk: u64,
+        values: Vec<u64>,
     },
 }
 
@@ -567,6 +575,7 @@ impl Request {
             Request::RollbackTxn { .. } => OpCode::RollbackTxn,
             Request::Upsert { .. } => OpCode::Upsert,
             Request::GetMany { .. } => OpCode::GetMany,
+            Request::Update { .. } => OpCode::Update,
         }
     }
 
@@ -641,6 +650,10 @@ impl Request {
                 for pk in pks {
                     w.u64(*pk);
                 }
+            }
+            Request::Update { pk, values } => {
+                w.u64(*pk);
+                w.u64s(values)?;
             }
         }
         Ok(w.0)
@@ -727,6 +740,10 @@ impl Request {
                 }
                 Request::GetMany { pks }
             }
+            OpCode::Update => Request::Update {
+                pk: r.u64()?,
+                values: r.u64s()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -1028,6 +1045,14 @@ mod tests {
             Request::GetMany {
                 pks: vec![1, 2, u64::MAX],
             },
+            Request::Update {
+                pk: 1,
+                values: vec![1, 42],
+            },
+            Request::Update {
+                pk: u64::MAX,
+                values: vec![],
+            },
         ]
     }
 
@@ -1315,7 +1340,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=23 {
+                for op in 1u8..=24 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

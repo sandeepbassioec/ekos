@@ -203,6 +203,15 @@ pub enum ConnectCommand {
         #[arg(required = true)]
         pks: Vec<u64>,
     },
+
+    /// Update an existing row. Errors if the primary key is not found.
+    Update {
+        /// Primary key.
+        pk: u64,
+        /// New column values in schema order (excluding pk).
+        #[arg(num_args = 0..)]
+        values: Vec<u64>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -419,6 +428,13 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .upsert(pk, values)
                 .with_context(|| format!("upsert pk={pk}"))?;
             println!("upserted pk={pk}");
+        }
+
+        ConnectCommand::Update { pk, values } => {
+            client
+                .update(pk, values)
+                .with_context(|| format!("update pk={pk}"))?;
+            println!("updated pk={pk}");
         }
 
         ConnectCommand::GetMany { pks } => {

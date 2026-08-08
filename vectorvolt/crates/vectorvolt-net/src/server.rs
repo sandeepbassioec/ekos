@@ -429,7 +429,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
         | Request::BatchDelete { .. }
-        | Request::Upsert { .. } => Scope::ReadWrite,
+        | Request::Upsert { .. }
+        | Request::Update { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -726,6 +727,21 @@ fn serve_request(
             }
             Response::RowSet { entries }
         }
+
+        Request::Update { pk, values } => match engine.get(pk) {
+            Ok(None) => Response::Error {
+                code: error_code::NOT_FOUND,
+                message: format!("pk={pk} not found"),
+            },
+            Err(e) => engine_error(e),
+            Ok(Some(_)) => {
+                let _ = engine.delete(pk);
+                match engine.insert(pk, values) {
+                    Ok(_) => Response::Ok { affected: 1 },
+                    Err(e) => engine_error(e),
+                }
+            }
+        },
 
         Request::Stats => {
             let s = engine.stats();
