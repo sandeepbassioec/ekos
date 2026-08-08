@@ -119,6 +119,8 @@ pub enum OpCode {
     MinMax = 32,
     /// Sum a column's values over a pk range (saturating at u64::MAX).
     Sum = 33,
+    /// Fetch a row by PK and atomically delete it.
+    GetAndDelete = 34,
     // Responses
     Pong = 129,
     Row = 130,
@@ -189,6 +191,7 @@ impl OpCode {
             31 => ScanKeys,
             32 => MinMax,
             33 => Sum,
+            34 => GetAndDelete,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -450,6 +453,12 @@ pub enum Request {
         lo: u64,
         hi: u64,
     },
+    /// Fetch the row with primary key `pk` and atomically delete it.
+    ///
+    /// Returns `Row { values }` if found and deletes, `NotFound` if absent.
+    GetAndDelete {
+        pk: u64,
+    },
 }
 
 /// A server response.
@@ -698,6 +707,7 @@ impl Request {
             Request::ScanKeys { .. } => OpCode::ScanKeys,
             Request::MinMax { .. } => OpCode::MinMax,
             Request::Sum { .. } => OpCode::Sum,
+            Request::GetAndDelete { .. } => OpCode::GetAndDelete,
         }
     }
 
@@ -730,7 +740,7 @@ impl Request {
                 w.u32(n);
                 w.0.extend_from_slice(response);
             }
-            Request::Get { pk } | Request::Delete { pk } => {
+            Request::Get { pk } | Request::Delete { pk } | Request::GetAndDelete { pk } => {
                 w.u64(*pk);
             }
             Request::Insert { pk, values } => {
@@ -934,6 +944,7 @@ impl Request {
                 lo: r.u64()?,
                 hi: r.u64()?,
             },
+            OpCode::GetAndDelete => Request::GetAndDelete { pk: r.u64()? },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -1338,6 +1349,8 @@ mod tests {
                 lo: 10,
                 hi: 50,
             },
+            Request::GetAndDelete { pk: 0 },
+            Request::GetAndDelete { pk: u64::MAX - 1 },
         ]
     }
 
@@ -1643,7 +1656,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=33 {
+                for op in 1u8..=34 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

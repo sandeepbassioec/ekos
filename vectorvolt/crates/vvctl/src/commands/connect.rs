@@ -277,6 +277,14 @@ pub enum ConnectCommand {
     /// Print the column names for the currently selected table.
     DescribeTable,
 
+    /// Fetch and atomically delete the row with the given primary key.
+    ///
+    /// Prints the row values if found, or "(not found)" if absent.
+    GetAndDelete {
+        /// Primary key of the row to fetch and delete.
+        pk: u64,
+    },
+
     /// Update multiple existing rows in a single round trip. Rows not found are skipped.
     ///
     /// Rows are specified as `pk:v1,v2,...` pairs separated by spaces.
@@ -599,6 +607,19 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 println!("exists: {name}");
             } else {
                 println!("not found: {name}");
+            }
+        }
+
+        ConnectCommand::GetAndDelete { pk } => {
+            match client
+                .get_and_delete(pk)
+                .with_context(|| format!("get-and-delete pk={pk}"))?
+            {
+                None => println!("(not found)"),
+                Some(values) => {
+                    let s: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+                    println!("{}", s.join(", "));
+                }
             }
         }
 

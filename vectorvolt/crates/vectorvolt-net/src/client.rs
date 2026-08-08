@@ -420,6 +420,17 @@ impl Client {
         }
     }
 
+    /// Atomically fetch and delete the row with primary key `pk`.
+    ///
+    /// Returns `Some(values)` if the row existed, `None` if absent.
+    pub fn get_and_delete(&mut self, pk: u64) -> NetResult<Option<Vec<u64>>> {
+        match self.call(&Request::GetAndDelete { pk })? {
+            Response::Row { values } => Ok(Some(values)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Return the `(min, max, count)` of column `col` over rows where the pk falls in `[lo, hi]`.
     ///
     /// Returns `None` when no rows match the range.
