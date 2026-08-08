@@ -378,6 +378,16 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Count rows where column `col` value falls in `[lo, hi]` (both inclusive).
+    ///
+    /// `col = 0` counts by primary key range; higher indices count by non-pk columns.
+    pub fn count(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::Count { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

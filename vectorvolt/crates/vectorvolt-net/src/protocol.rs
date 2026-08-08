@@ -103,6 +103,8 @@ pub enum OpCode {
     Update = 24,
     /// Delete all rows from the selected table.
     Truncate = 25,
+    /// Count rows where column `col` falls in `[lo, hi]`.
+    Count = 26,
     // Responses
     Pong = 129,
     Row = 130,
@@ -159,6 +161,7 @@ impl OpCode {
             23 => GetMany,
             24 => Update,
             25 => Truncate,
+            26 => Count,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -358,6 +361,14 @@ pub enum Request {
     ///
     /// Returns `Ok { affected }` where `affected` is the number of rows removed.
     Truncate,
+    /// Count rows where column `col` value falls in `[lo, hi]` (both inclusive).
+    ///
+    /// Returns `Ok { affected }` where `affected` is the matching row count.
+    Count {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
 }
 
 /// A server response.
@@ -584,6 +595,7 @@ impl Request {
             Request::GetMany { .. } => OpCode::GetMany,
             Request::Update { .. } => OpCode::Update,
             Request::Truncate => OpCode::Truncate,
+            Request::Count { .. } => OpCode::Count,
         }
     }
 
@@ -664,6 +676,9 @@ impl Request {
                 w.u64s(values)?;
             }
             Request::Truncate => {}
+            Request::Count { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
+            }
         }
         Ok(w.0)
     }
@@ -754,6 +769,11 @@ impl Request {
                 values: r.u64s()?,
             },
             OpCode::Truncate => Request::Truncate,
+            OpCode::Count => Request::Count {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -1064,6 +1084,16 @@ mod tests {
                 values: vec![],
             },
             Request::Truncate,
+            Request::Count {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+            },
+            Request::Count {
+                col: 3,
+                lo: 100,
+                hi: 200,
+            },
         ]
     }
 
@@ -1351,7 +1381,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=25 {
+                for op in 1u8..=26 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

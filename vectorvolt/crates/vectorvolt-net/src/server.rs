@@ -424,7 +424,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::SecondaryLookup { .. }
         | Request::FkExists { .. }
         | Request::ListTables
-        | Request::GetMany { .. } => Scope::ReadOnly,
+        | Request::GetMany { .. }
+        | Request::Count { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -728,6 +729,13 @@ fn serve_request(
             }
             Response::RowSet { entries }
         }
+
+        Request::Count { col, lo, hi } => match engine.scan(col as usize, lo, hi) {
+            Ok(rows) => Response::Ok {
+                affected: rows.len() as u64,
+            },
+            Err(e) => engine_error(e),
+        },
 
         Request::Truncate => {
             // scan() auto-flushes the write buffer before reading partitions,

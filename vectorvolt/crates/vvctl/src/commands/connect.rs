@@ -215,6 +215,19 @@ pub enum ConnectCommand {
 
     /// Delete all rows from the selected table.
     Truncate,
+
+    /// Count rows where column `col` value falls in `[lo, hi]` (both inclusive).
+    Count {
+        /// Column index (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Minimum value (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Maximum value (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -443,6 +456,13 @@ pub fn run(args: ConnectArgs) -> Result<()> {
         ConnectCommand::Truncate => {
             let deleted = client.truncate().with_context(|| "truncate")?;
             println!("truncated — {deleted} row(s) removed");
+        }
+
+        ConnectCommand::Count { col, lo, hi } => {
+            let n = client
+                .count(col, lo, hi)
+                .with_context(|| format!("count col={col} [{lo},{hi}]"))?;
+            println!("{n}");
         }
 
         ConnectCommand::GetMany { pks } => {
