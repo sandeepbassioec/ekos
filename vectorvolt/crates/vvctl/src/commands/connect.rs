@@ -285,6 +285,18 @@ pub enum ConnectCommand {
         pk: u64,
     },
 
+    /// Atomically add `delta` to a column value. Prints the new value or "(not found)".
+    Increment {
+        /// Primary key of the row to update.
+        pk: u64,
+        /// Column index to increment (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Amount to add (saturating at u64::MAX).
+        #[arg(long, default_value = "1")]
+        delta: u64,
+    },
+
     /// Update multiple existing rows in a single round trip. Rows not found are skipped.
     ///
     /// Rows are specified as `pk:v1,v2,...` pairs separated by spaces.
@@ -607,6 +619,16 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 println!("exists: {name}");
             } else {
                 println!("not found: {name}");
+            }
+        }
+
+        ConnectCommand::Increment { pk, col, delta } => {
+            match client
+                .increment(pk, col, delta)
+                .with_context(|| format!("increment pk={pk} col={col} delta={delta}"))?
+            {
+                None => println!("(not found)"),
+                Some(new_val) => println!("{new_val}"),
             }
         }
 

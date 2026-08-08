@@ -120,4 +120,6 @@ pub mod error_code {
     pub const NO_TXN: u16 = 13;
     /// The provided txn_id does not match the active transaction.
     pub const TXN_ID_MISMATCH: u16 = 14;
+    /// A request argument is out of range or otherwise invalid.
+    pub const INVALID_ARGUMENT: u16 = 15;
 }

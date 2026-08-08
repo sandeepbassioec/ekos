@@ -420,6 +420,17 @@ impl Client {
         }
     }
 
+    /// Atomically add `delta` to column `col` of the row at `pk` (saturating at `u64::MAX`).
+    ///
+    /// Returns `Some(new_value)` if the row existed, `None` if absent.
+    pub fn increment(&mut self, pk: u64, col: u32, delta: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::Increment { pk, col, delta })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Atomically fetch and delete the row with primary key `pk`.
     ///
     /// Returns `Some(values)` if the row existed, `None` if absent.

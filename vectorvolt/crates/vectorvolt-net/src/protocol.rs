@@ -121,6 +121,8 @@ pub enum OpCode {
     Sum = 33,
     /// Fetch a row by PK and atomically delete it.
     GetAndDelete = 34,
+    /// Atomically add `delta` to column `col` of the row at `pk` (saturating at u64::MAX).
+    Increment = 35,
     // Responses
     Pong = 129,
     Row = 130,
@@ -192,6 +194,7 @@ impl OpCode {
             32 => MinMax,
             33 => Sum,
             34 => GetAndDelete,
+            35 => Increment,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -459,6 +462,14 @@ pub enum Request {
     GetAndDelete {
         pk: u64,
     },
+    /// Add `delta` to column `col` of the row at `pk` (saturating at `u64::MAX`).
+    ///
+    /// Returns `Ok { affected: new_value }` if found, `NotFound` if absent.
+    Increment {
+        pk: u64,
+        col: u32,
+        delta: u64,
+    },
 }
 
 /// A server response.
@@ -708,6 +719,7 @@ impl Request {
             Request::MinMax { .. } => OpCode::MinMax,
             Request::Sum { .. } => OpCode::Sum,
             Request::GetAndDelete { .. } => OpCode::GetAndDelete,
+            Request::Increment { .. } => OpCode::Increment,
         }
     }
 
@@ -742,6 +754,9 @@ impl Request {
             }
             Request::Get { pk } | Request::Delete { pk } | Request::GetAndDelete { pk } => {
                 w.u64(*pk);
+            }
+            Request::Increment { pk, col, delta } => {
+                w.u64(*pk).u32(*col).u64(*delta);
             }
             Request::Insert { pk, values } => {
                 w.u64(*pk);
@@ -945,6 +960,11 @@ impl Request {
                 hi: r.u64()?,
             },
             OpCode::GetAndDelete => Request::GetAndDelete { pk: r.u64()? },
+            OpCode::Increment => Request::Increment {
+                pk: r.u64()?,
+                col: r.u32()?,
+                delta: r.u64()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -1351,6 +1371,16 @@ mod tests {
             },
             Request::GetAndDelete { pk: 0 },
             Request::GetAndDelete { pk: u64::MAX - 1 },
+            Request::Increment {
+                pk: 1,
+                col: 0,
+                delta: 1,
+            },
+            Request::Increment {
+                pk: u64::MAX - 1,
+                col: 3,
+                delta: u64::MAX,
+            },
         ]
     }
 
@@ -1656,7 +1686,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=34 {
+                for op in 1u8..=35 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
