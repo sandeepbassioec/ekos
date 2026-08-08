@@ -147,6 +147,8 @@ pub enum OpCode {
     Top = 46,
     /// Return the bottom-N rows by column value (lowest first).
     Bottom = 47,
+    /// Exact primary-key existence check (not probabilistic).
+    PkExists = 48,
     // Responses
     Pong = 129,
     Row = 130,
@@ -231,6 +233,7 @@ impl OpCode {
             45 => BatchSetField,
             46 => Top,
             47 => Bottom,
+            48 => PkExists,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -606,6 +609,13 @@ pub enum Request {
         hi: u64,
         n: u32,
     },
+    /// Exact primary-key existence check.
+    ///
+    /// Unlike `FkExists` (which uses a probabilistic bloom filter), this queries
+    /// the engine directly. Returns `Exists { found }`.
+    PkExists {
+        pk: u64,
+    },
 }
 
 /// A server response.
@@ -868,6 +878,7 @@ impl Request {
             Request::BatchSetField { .. } => OpCode::BatchSetField,
             Request::Top { .. } => OpCode::Top,
             Request::Bottom { .. } => OpCode::Bottom,
+            Request::PkExists { .. } => OpCode::PkExists,
         }
     }
 
@@ -907,7 +918,10 @@ impl Request {
                 w.u32(n);
                 w.0.extend_from_slice(response);
             }
-            Request::Get { pk } | Request::Delete { pk } | Request::GetAndDelete { pk } => {
+            Request::Get { pk }
+            | Request::Delete { pk }
+            | Request::GetAndDelete { pk }
+            | Request::PkExists { pk } => {
                 w.u64(*pk);
             }
             Request::Increment { pk, col, delta } | Request::DecrementClamp { pk, col, delta } => {
@@ -1181,6 +1195,7 @@ impl Request {
                 lo: r.u64()?,
                 hi: r.u64()?,
             },
+            OpCode::PkExists => Request::PkExists { pk: r.u64()? },
             OpCode::Top => Request::Top {
                 col: r.u32()?,
                 lo: r.u64()?,
@@ -1768,6 +1783,8 @@ mod tests {
                 hi: 50,
                 n: 0,
             },
+            Request::PkExists { pk: 0 },
+            Request::PkExists { pk: u64::MAX - 1 },
         ]
     }
 
@@ -2073,7 +2090,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=47 {
+                for op in 1u8..=48 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

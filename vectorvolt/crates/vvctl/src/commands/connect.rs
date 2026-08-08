@@ -372,6 +372,15 @@ pub enum ConnectCommand {
         hi: u64,
     },
 
+    /// Exact primary-key existence check (non-probabilistic).
+    ///
+    /// Prints "exists: <pk>" or "not found: <pk>".
+    PkExists {
+        /// Primary key to look up.
+        #[arg(long)]
+        pk: u64,
+    },
+
     /// Return the top-N rows by column value (highest first) in [lo, hi].
     ///
     /// n=0 returns all matching rows.
@@ -921,6 +930,17 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             {
                 None => println!("not found"),
                 Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
+            }
+        }
+
+        ConnectCommand::PkExists { pk } => {
+            let found = client
+                .pk_exists(pk)
+                .with_context(|| format!("pk-exists pk={pk}"))?;
+            if found {
+                println!("exists: {pk}");
+            } else {
+                println!("not found: {pk}");
             }
         }
 

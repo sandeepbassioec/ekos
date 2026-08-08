@@ -430,6 +430,16 @@ impl Client {
         }
     }
 
+    /// Exact primary-key existence check.
+    ///
+    /// Unlike `fk_exists` (probabilistic bloom filter), this queries the engine directly.
+    pub fn pk_exists(&mut self, pk: u64) -> NetResult<bool> {
+        match self.call(&Request::PkExists { pk })? {
+            Response::Exists { found } => Ok(found),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Return the top-N rows (highest `col` value) in `[lo, hi]`, sorted descending.
     ///
     /// `n = 0` returns all matching rows.

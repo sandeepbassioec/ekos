@@ -432,7 +432,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::MinMax { .. }
         | Request::Sum { .. }
         | Request::Top { .. }
-        | Request::Bottom { .. } => Scope::ReadOnly,
+        | Request::Bottom { .. }
+        | Request::PkExists { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -913,6 +914,14 @@ fn serve_request(
             let limit = if n == 0 { sorted.len() } else { n as usize };
             let rows = sorted.into_iter().take(limit).map(|r| r.values).collect();
             Response::Rows { rows }
+        }
+
+        Request::PkExists { pk } => {
+            let found = match engine.get(pk) {
+                Ok(v) => v.is_some(),
+                Err(_) => false,
+            };
+            Response::Exists { found }
         }
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {
