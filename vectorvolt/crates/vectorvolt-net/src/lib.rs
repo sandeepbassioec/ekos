@@ -34,8 +34,9 @@ pub mod tls;
 pub use auth::{AuthConfig, AuthError, AuthState, Scope, Secret};
 pub use client::Client;
 pub use protocol::{Header, OpCode, Request, Response};
-pub use server::{Server, ServerConfig};
+pub use server::{Server, ServerConfig, ServerStats};
 pub use tls::{ClientTlsConfig, ServerTlsConfig};
+pub use vectorvolt_engine::TableRegistry;
 
 /// Errors from framing, parsing, or transport.
 #[derive(Debug, thiserror::Error)]
@@ -107,4 +108,10 @@ pub mod error_code {
     /// need different responses from a client, and conflating them sends operators
     /// hunting for a credential problem that does not exist.
     pub const FORBIDDEN: u16 = 8;
+    /// No table has been selected on this connection.
+    pub const NOT_SELECTED: u16 = 9;
+    /// Named table not found in the registry.
+    pub const TABLE_NOT_FOUND: u16 = 10;
+    /// Named table already exists.
+    pub const TABLE_EXISTS: u16 = 11;
 }

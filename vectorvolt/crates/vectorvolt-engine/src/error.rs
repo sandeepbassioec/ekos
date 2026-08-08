@@ -21,6 +21,18 @@ pub enum EngineError {
 
     #[error("column index {col_idx} out of range (schema has {col_count} columns)")]
     ColOutOfRange { col_idx: usize, col_count: usize },
+
+    #[error("table '{0}' not found")]
+    TableNotFound(String),
+
+    #[error("table '{0}' already exists")]
+    TableAlreadyExists(String),
+
+    #[error("invalid table name: {0}")]
+    InvalidTableName(String),
+
+    #[error("no table selected — send UseTable first")]
+    NoTableSelected,
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
