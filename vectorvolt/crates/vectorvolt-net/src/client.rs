@@ -399,6 +399,16 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Update multiple existing rows in one round trip.
+    ///
+    /// Returns `(succeeded, skipped)` where `skipped` counts keys not found.
+    pub fn batch_update(&mut self, rows: Vec<(u64, Vec<u64>)>) -> NetResult<(u32, u32)> {
+        match self.call(&Request::BatchUpdate { rows })? {
+            Response::BatchResult { succeeded, skipped } => Ok((succeeded, skipped)),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

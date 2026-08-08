@@ -107,6 +107,8 @@ pub enum OpCode {
     Count = 26,
     /// Insert-or-replace multiple rows in a single round trip.
     BatchUpsert = 27,
+    /// Update multiple existing rows in a single round trip.
+    BatchUpdate = 28,
     // Responses
     Pong = 129,
     Row = 130,
@@ -165,6 +167,7 @@ impl OpCode {
             25 => Truncate,
             26 => Count,
             27 => BatchUpsert,
+            28 => BatchUpdate,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -377,6 +380,13 @@ pub enum Request {
     /// Each row is processed as an independent upsert (delete-then-insert).
     /// Returns `Ok { affected }` equal to the number of rows submitted.
     BatchUpsert {
+        rows: Vec<(u64, Vec<u64>)>,
+    },
+    /// Update multiple existing rows in a single round trip.
+    ///
+    /// Rows whose primary key is not found are silently skipped.
+    /// Returns `BatchResult { succeeded, skipped }`.
+    BatchUpdate {
         rows: Vec<(u64, Vec<u64>)>,
     },
 }
@@ -607,6 +617,7 @@ impl Request {
             Request::Truncate => OpCode::Truncate,
             Request::Count { .. } => OpCode::Count,
             Request::BatchUpsert { .. } => OpCode::BatchUpsert,
+            Request::BatchUpdate { .. } => OpCode::BatchUpdate,
         }
     }
 
@@ -690,9 +701,9 @@ impl Request {
             Request::Count { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
             }
-            Request::BatchUpsert { rows } => {
+            Request::BatchUpsert { rows } | Request::BatchUpdate { rows } => {
                 let n = u32::try_from(rows.len())
-                    .map_err(|_| NetError::Malformed("too many rows in BatchUpsert"))?;
+                    .map_err(|_| NetError::Malformed("too many rows in batch"))?;
                 w.u32(n);
                 for (pk, values) in rows {
                     w.u64(*pk);
@@ -794,7 +805,7 @@ impl Request {
                 lo: r.u64()?,
                 hi: r.u64()?,
             },
-            OpCode::BatchUpsert => {
+            OpCode::BatchUpsert | OpCode::BatchUpdate => {
                 let n = r.u32()? as usize;
                 let max_possible = (r.b.len() - r.at) / 8;
                 if n > max_possible {
@@ -806,7 +817,11 @@ impl Request {
                     let values = r.u64s()?;
                     rows.push((pk, values));
                 }
-                Request::BatchUpsert { rows }
+                if opcode == OpCode::BatchUpsert {
+                    Request::BatchUpsert { rows }
+                } else {
+                    Request::BatchUpdate { rows }
+                }
             }
             other => return Err(NetError::NotARequest(other as u8)),
         };
@@ -1132,6 +1147,10 @@ mod tests {
             Request::BatchUpsert {
                 rows: vec![(1, vec![1, 10]), (2, vec![2, 20]), (u64::MAX, vec![])],
             },
+            Request::BatchUpdate { rows: vec![] },
+            Request::BatchUpdate {
+                rows: vec![(1, vec![1, 99]), (u64::MAX, vec![0])],
+            },
         ]
     }
 
@@ -1419,7 +1438,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=27 {
+                for op in 1u8..=28 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
