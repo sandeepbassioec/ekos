@@ -123,6 +123,8 @@ pub enum OpCode {
     GetAndDelete = 34,
     /// Atomically add `delta` to column `col` of the row at `pk` (saturating at u64::MAX).
     Increment = 35,
+    /// Conditional update: set `values[col]` to `replacement` iff it currently equals `expected`.
+    CompareAndSwap = 36,
     // Responses
     Pong = 129,
     Row = 130,
@@ -195,6 +197,7 @@ impl OpCode {
             33 => Sum,
             34 => GetAndDelete,
             35 => Increment,
+            36 => CompareAndSwap,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -470,6 +473,15 @@ pub enum Request {
         col: u32,
         delta: u64,
     },
+    /// Set `values[col]` to `replacement` iff it currently equals `expected`.
+    ///
+    /// Returns `Ok { affected: 1 }` on swap, `Ok { affected: 0 }` on mismatch, `NotFound` if absent.
+    CompareAndSwap {
+        pk: u64,
+        col: u32,
+        expected: u64,
+        replacement: u64,
+    },
 }
 
 /// A server response.
@@ -720,6 +732,7 @@ impl Request {
             Request::Sum { .. } => OpCode::Sum,
             Request::GetAndDelete { .. } => OpCode::GetAndDelete,
             Request::Increment { .. } => OpCode::Increment,
+            Request::CompareAndSwap { .. } => OpCode::CompareAndSwap,
         }
     }
 
@@ -757,6 +770,14 @@ impl Request {
             }
             Request::Increment { pk, col, delta } => {
                 w.u64(*pk).u32(*col).u64(*delta);
+            }
+            Request::CompareAndSwap {
+                pk,
+                col,
+                expected,
+                replacement,
+            } => {
+                w.u64(*pk).u32(*col).u64(*expected).u64(*replacement);
             }
             Request::Insert { pk, values } => {
                 w.u64(*pk);
@@ -964,6 +985,12 @@ impl Request {
                 pk: r.u64()?,
                 col: r.u32()?,
                 delta: r.u64()?,
+            },
+            OpCode::CompareAndSwap => Request::CompareAndSwap {
+                pk: r.u64()?,
+                col: r.u32()?,
+                expected: r.u64()?,
+                replacement: r.u64()?,
             },
             other => return Err(NetError::NotARequest(other as u8)),
         };
@@ -1381,6 +1408,18 @@ mod tests {
                 col: 3,
                 delta: u64::MAX,
             },
+            Request::CompareAndSwap {
+                pk: 1,
+                col: 0,
+                expected: 0,
+                replacement: 1,
+            },
+            Request::CompareAndSwap {
+                pk: u64::MAX - 1,
+                col: 2,
+                expected: u64::MAX,
+                replacement: 0,
+            },
         ]
     }
 
@@ -1686,7 +1725,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=35 {
+                for op in 1u8..=36 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

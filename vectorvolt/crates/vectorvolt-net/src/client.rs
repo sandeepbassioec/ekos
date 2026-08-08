@@ -431,6 +431,28 @@ impl Client {
         }
     }
 
+    /// Conditional update: set `values[col]` to `replacement` iff it currently equals `expected`.
+    ///
+    /// Returns `Some(true)` on swap, `Some(false)` on mismatch, `None` if row absent.
+    pub fn compare_and_swap(
+        &mut self,
+        pk: u64,
+        col: u32,
+        expected: u64,
+        replacement: u64,
+    ) -> NetResult<Option<bool>> {
+        match self.call(&Request::CompareAndSwap {
+            pk,
+            col,
+            expected,
+            replacement,
+        })? {
+            Response::Ok { affected } => Ok(Some(affected == 1)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Atomically fetch and delete the row with primary key `pk`.
     ///
     /// Returns `Some(values)` if the row existed, `None` if absent.

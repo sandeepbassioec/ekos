@@ -285,6 +285,21 @@ pub enum ConnectCommand {
         pk: u64,
     },
 
+    /// Conditional update: set a column to `replacement` iff it equals `expected`.
+    ///
+    /// Prints "swapped", "no-match", or "(not found)".
+    CompareAndSwap {
+        /// Primary key of the row.
+        pk: u64,
+        /// Column index to compare and swap (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Value to compare against.
+        expected: u64,
+        /// Value to write if the comparison succeeds.
+        replacement: u64,
+    },
+
     /// Atomically add `delta` to a column value. Prints the new value or "(not found)".
     Increment {
         /// Primary key of the row to update.
@@ -619,6 +634,24 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 println!("exists: {name}");
             } else {
                 println!("not found: {name}");
+            }
+        }
+
+        ConnectCommand::CompareAndSwap {
+            pk,
+            col,
+            expected,
+            replacement,
+        } => {
+            match client
+                .compare_and_swap(pk, col, expected, replacement)
+                .with_context(|| {
+                    format!("compare-and-swap pk={pk} col={col} expected={expected} replacement={replacement}")
+                })?
+            {
+                None => println!("(not found)"),
+                Some(true) => println!("swapped"),
+                Some(false) => println!("no-match"),
             }
         }
 
