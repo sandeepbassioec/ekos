@@ -226,6 +226,19 @@ pub enum ConnectCommand {
         rows: Vec<String>,
     },
 
+    /// Return the min, max, and count of a column over a pk range.
+    MinMax {
+        /// Column index (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
     /// Range scan returning only primary keys. Same filter semantics as `scan`.
     ScanKeys {
         /// Column index to filter on (0 = pk).
@@ -530,6 +543,18 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .batch_upsert(parsed)
                 .with_context(|| "batch-upsert")?;
             println!("batch-upsert: {n} row(s) submitted — {affected} applied");
+        }
+
+        ConnectCommand::MinMax { col, lo, hi } => {
+            match client
+                .min_max(col, lo, hi)
+                .with_context(|| format!("min-max col={col} [{lo},{hi}]"))?
+            {
+                None => println!("(no rows in range)"),
+                Some((min, max, count)) => {
+                    println!("min={min}  max={max}  count={count}");
+                }
+            }
         }
 
         ConnectCommand::ScanKeys { col, lo, hi, limit } => {

@@ -428,7 +428,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::Count { .. }
         | Request::DescribeTable
         | Request::TableExists { .. }
-        | Request::ScanKeys { .. } => Scope::ReadOnly,
+        | Request::ScanKeys { .. }
+        | Request::MinMax { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -672,6 +673,29 @@ fn serve_request(
                 Response::Rows { rows }
             }
             Err(e) => engine_error(e),
+        },
+
+        Request::MinMax { col, lo, hi } => match engine.scan(col as usize, lo, hi) {
+            Err(e) => engine_error(e),
+            Ok(rows) => {
+                if rows.is_empty() {
+                    return Response::NotFound;
+                }
+                let col_idx = col as usize;
+                let mut min = u64::MAX;
+                let mut max = 0u64;
+                let count = rows.len() as u64;
+                for row in &rows {
+                    let v = row.values[col_idx];
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
+                }
+                Response::MinMaxResult { min, max, count }
+            }
         },
 
         Request::ScanKeys { col, lo, hi, limit } => match engine.scan(col as usize, lo, hi) {

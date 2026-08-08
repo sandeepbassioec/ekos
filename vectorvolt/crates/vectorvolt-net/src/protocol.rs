@@ -115,6 +115,8 @@ pub enum OpCode {
     TableExists = 30,
     /// Range scan returning only primary keys (no values).
     ScanKeys = 31,
+    /// Return the min, max, and count of a column value over a pk range.
+    MinMax = 32,
     // Responses
     Pong = 129,
     Row = 130,
@@ -139,6 +141,8 @@ pub enum OpCode {
     Schema = 143,
     /// Response to `ScanKeys` — primary keys only.
     Keys = 144,
+    /// Response to `MinMax` — min, max, and row count for the scanned column.
+    MinMaxResult = 145,
 }
 
 impl OpCode {
@@ -181,6 +185,7 @@ impl OpCode {
             29 => DescribeTable,
             30 => TableExists,
             31 => ScanKeys,
+            32 => MinMax,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -197,6 +202,7 @@ impl OpCode {
             142 => RowSet,
             143 => Schema,
             144 => Keys,
+            145 => MinMaxResult,
             other => return Err(NetError::UnknownOpcode(other)),
         })
     }
@@ -424,6 +430,15 @@ pub enum Request {
         hi: u64,
         limit: u32,
     },
+    /// Return the min, max, and count of column `col` over the pk range `[lo, hi]`.
+    ///
+    /// Returns `MinMaxResult { min, max, count }` if any rows match,
+    /// or `NotFound` if the range is empty.
+    MinMax {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
 }
 
 /// A server response.
@@ -485,6 +500,12 @@ pub enum Response {
     /// Response to `ScanKeys` — primary keys only, in scan order.
     Keys {
         pks: Vec<u64>,
+    },
+    /// Response to `MinMax` — min, max, and matching row count for the column.
+    MinMaxResult {
+        min: u64,
+        max: u64,
+        count: u64,
     },
 }
 
@@ -664,6 +685,7 @@ impl Request {
             Request::DescribeTable => OpCode::DescribeTable,
             Request::TableExists { .. } => OpCode::TableExists,
             Request::ScanKeys { .. } => OpCode::ScanKeys,
+            Request::MinMax { .. } => OpCode::MinMax,
         }
     }
 
@@ -681,6 +703,9 @@ impl Request {
             }
             Request::ScanKeys { col, lo, hi, limit } => {
                 w.u32(*col).u64(*lo).u64(*hi).u32(*limit);
+            }
+            Request::MinMax { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
             }
             Request::Auth { key_id, response } => {
                 let k = key_id.as_bytes();
@@ -887,6 +912,11 @@ impl Request {
                 hi: r.u64()?,
                 limit: r.u32()?,
             },
+            OpCode::MinMax => Request::MinMax {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -913,6 +943,7 @@ impl Response {
             Response::RowSet { .. } => OpCode::RowSet,
             Response::Schema { .. } => OpCode::Schema,
             Response::Keys { .. } => OpCode::Keys,
+            Response::MinMaxResult { .. } => OpCode::MinMaxResult,
         }
     }
 
@@ -987,6 +1018,9 @@ impl Response {
                 for pk in pks {
                     w.u64(*pk);
                 }
+            }
+            Response::MinMaxResult { min, max, count } => {
+                w.u64(*min).u64(*max).u64(*count);
             }
         }
         Ok(w.0)
@@ -1069,6 +1103,11 @@ impl Response {
                 }
                 Response::Keys { pks }
             }
+            OpCode::MinMaxResult => Response::MinMaxResult {
+                min: r.u64()?,
+                max: r.u64()?,
+                count: r.u64()?,
+            },
             other => return Err(NetError::NotAResponse(other as u8)),
         };
         r.finish()?;
@@ -1262,6 +1301,16 @@ mod tests {
                 hi: 200,
                 limit: 50,
             },
+            Request::MinMax {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+            },
+            Request::MinMax {
+                col: 1,
+                lo: 100,
+                hi: 200,
+            },
         ]
     }
 
@@ -1322,7 +1371,17 @@ mod tests {
             },
             Response::Keys { pks: vec![] },
             Response::Keys {
-                pks: vec![1, 2, u64::MAX],
+                pks: vec![1, 2, u64::MAX - 1],
+            },
+            Response::MinMaxResult {
+                min: 0,
+                max: 0,
+                count: 1,
+            },
+            Response::MinMaxResult {
+                min: 1,
+                max: u64::MAX - 1,
+                count: 1000,
             },
         ]
     }
@@ -1557,12 +1616,12 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=31 {
+                for op in 1u8..=32 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
                 }
-                for op in 129u8..=144 {
+                for op in 129u8..=145 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Response::decode(o, &buf);
                     }

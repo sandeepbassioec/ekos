@@ -410,6 +410,17 @@ impl Client {
         }
     }
 
+    /// Return the `(min, max, count)` of column `col` over rows where the pk falls in `[lo, hi]`.
+    ///
+    /// Returns `None` when no rows match the range.
+    pub fn min_max(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<(u64, u64, u64)>> {
+        match self.call(&Request::MinMax { col, lo, hi })? {
+            Response::MinMaxResult { min, max, count } => Ok(Some((min, max, count))),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Range scan returning only primary keys (no column values).
     ///
     /// `limit` of 0 means unlimited. Cheaper than `range_scan` when only keys are needed.
