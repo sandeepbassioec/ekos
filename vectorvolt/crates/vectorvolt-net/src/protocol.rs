@@ -77,6 +77,24 @@ pub enum OpCode {
     Auth = 10,
     SecondaryLookup = 11,
     FkExists = 12,
+    /// Set the active table for this connection.
+    UseTable = 13,
+    /// Create a new table with the given schema.
+    CreateTable = 14,
+    /// Deregister a table from the catalog (data directory is not deleted).
+    DropTable = 15,
+    /// List all registered table names.
+    ListTables = 16,
+    /// Insert multiple rows in a single round trip.
+    BatchInsert = 17,
+    /// Delete multiple rows by primary key in a single round trip.
+    BatchDelete = 18,
+    /// Begin a server-side transaction on this connection.
+    BeginTxn = 19,
+    /// Commit the active transaction, applying all buffered ops atomically.
+    CommitTxn = 20,
+    /// Roll back the active transaction, discarding all buffered ops.
+    RollbackTxn = 21,
     // Responses
     Pong = 129,
     Row = 130,
@@ -87,6 +105,14 @@ pub enum OpCode {
     Error = 135,
     Challenge = 136,
     Exists = 137,
+    /// The server accepted a `UseTable` or `CreateTable` — table is now selected.
+    TableSelected = 138,
+    /// Response to `ListTables`.
+    TableList = 139,
+    /// Response to `BatchInsert` or `BatchDelete`.
+    BatchResult = 140,
+    /// Response to `BeginTxn` — carries the new transaction ID.
+    TxnStarted = 141,
 }
 
 impl OpCode {
@@ -110,6 +136,15 @@ impl OpCode {
             10 => Auth,
             11 => SecondaryLookup,
             12 => FkExists,
+            13 => UseTable,
+            14 => CreateTable,
+            15 => DropTable,
+            16 => ListTables,
+            17 => BatchInsert,
+            18 => BatchDelete,
+            19 => BeginTxn,
+            20 => CommitTxn,
+            21 => RollbackTxn,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -119,6 +154,10 @@ impl OpCode {
             135 => Error,
             136 => Challenge,
             137 => Exists,
+            138 => TableSelected,
+            139 => TableList,
+            140 => BatchResult,
+            141 => TxnStarted,
             other => return Err(NetError::UnknownOpcode(other)),
         })
     }
@@ -237,6 +276,51 @@ pub enum Request {
     FkExists {
         value: u64,
     },
+    /// Select the active table for this connection. All subsequent data
+    /// operations (Get, Insert, Scan, …) operate on the selected table.
+    UseTable {
+        name: String,
+    },
+    /// Create a new table with the given column schema and select it.
+    CreateTable {
+        name: String,
+        /// Column names in schema order. Column 0 is always the primary key.
+        schema: Vec<String>,
+    },
+    /// Remove a table from the catalog. The data directory is NOT deleted.
+    DropTable {
+        name: String,
+    },
+    /// List all registered table names.
+    ListTables,
+    /// Insert multiple rows in a single round trip.
+    ///
+    /// Each entry is `(pk, values)`. Duplicate-key rows are silently skipped;
+    /// the server returns how many succeeded and how many were skipped.
+    BatchInsert {
+        rows: Vec<(u64, Vec<u64>)>,
+    },
+    /// Delete multiple rows by primary key in a single round trip.
+    ///
+    /// Missing keys are silently skipped; the server returns how many rows
+    /// were actually deleted.
+    BatchDelete {
+        pks: Vec<u64>,
+    },
+    /// Begin a server-side transaction on this connection.
+    ///
+    /// Subsequent `Insert` and `Delete` requests are buffered until
+    /// `CommitTxn` (applied atomically) or `RollbackTxn` (discarded).
+    /// Only one transaction may be active at a time per connection.
+    BeginTxn,
+    /// Commit the active transaction, applying all buffered ops to the engine.
+    CommitTxn {
+        txn_id: u64,
+    },
+    /// Discard all buffered ops for the active transaction.
+    RollbackTxn {
+        txn_id: u64,
+    },
 }
 
 /// A server response.
@@ -270,6 +354,23 @@ pub enum Response {
     Exists {
         found: bool,
     },
+    /// The server accepted `UseTable` or `CreateTable`; the table is selected.
+    TableSelected,
+    /// Response to `ListTables`.
+    TableList {
+        names: Vec<String>,
+    },
+    /// Response to `BatchInsert` or `BatchDelete`.
+    BatchResult {
+        /// Rows successfully written or deleted.
+        succeeded: u32,
+        /// Rows skipped (duplicate key for insert, missing key for delete).
+        skipped: u32,
+    },
+    /// Response to `BeginTxn` — the client must echo `txn_id` in CommitTxn/RollbackTxn.
+    TxnStarted {
+        txn_id: u64,
+    },
 }
 
 /// A small write cursor. Every field is appended little-endian.
@@ -296,6 +397,21 @@ impl W {
         self.u32(n);
         for v in vs {
             self.u64(*v);
+        }
+        Ok(self)
+    }
+    fn string(&mut self, s: &str) -> NetResult<&mut Self> {
+        let b = s.as_bytes();
+        let n = u32::try_from(b.len()).map_err(|_| NetError::Malformed("string too long"))?;
+        self.u32(n);
+        self.0.extend_from_slice(b);
+        Ok(self)
+    }
+    fn strings(&mut self, ss: &[String]) -> NetResult<&mut Self> {
+        let n = u32::try_from(ss.len()).map_err(|_| NetError::Malformed("too many strings"))?;
+        self.u32(n);
+        for s in ss {
+            self.string(s)?;
         }
         Ok(self)
     }
@@ -371,6 +487,21 @@ impl<'a> R<'a> {
         let bytes = self.take(n)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| NetError::Malformed("string is not UTF-8"))
     }
+    fn strings(&mut self) -> NetResult<Vec<String>> {
+        let n = self.u32()? as usize;
+        // Each string costs at least 4 bytes (length prefix).
+        let max_possible = (self.b.len() - self.at) / 4;
+        if n > max_possible {
+            return Err(NetError::Malformed(
+                "declared more strings than the payload holds",
+            ));
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.string()?);
+        }
+        Ok(out)
+    }
     /// Error if anything is left over.
     ///
     /// Trailing bytes mean the sender and this decoder disagree about the message,
@@ -399,6 +530,15 @@ impl Request {
             Request::Auth { .. } => OpCode::Auth,
             Request::SecondaryLookup { .. } => OpCode::SecondaryLookup,
             Request::FkExists { .. } => OpCode::FkExists,
+            Request::UseTable { .. } => OpCode::UseTable,
+            Request::CreateTable { .. } => OpCode::CreateTable,
+            Request::DropTable { .. } => OpCode::DropTable,
+            Request::ListTables => OpCode::ListTables,
+            Request::BatchInsert { .. } => OpCode::BatchInsert,
+            Request::BatchDelete { .. } => OpCode::BatchDelete,
+            Request::BeginTxn => OpCode::BeginTxn,
+            Request::CommitTxn { .. } => OpCode::CommitTxn,
+            Request::RollbackTxn { .. } => OpCode::RollbackTxn,
         }
     }
 
@@ -434,6 +574,34 @@ impl Request {
             Request::FkExists { value } => {
                 w.u64(*value);
             }
+            Request::UseTable { name } | Request::DropTable { name } => {
+                w.string(name)?;
+            }
+            Request::CreateTable { name, schema } => {
+                w.string(name)?.strings(schema)?;
+            }
+            Request::ListTables => {}
+            Request::BatchInsert { rows } => {
+                let n = u32::try_from(rows.len())
+                    .map_err(|_| NetError::Malformed("too many rows in BatchInsert"))?;
+                w.u32(n);
+                for (pk, values) in rows {
+                    w.u64(*pk);
+                    w.u64s(values)?;
+                }
+            }
+            Request::BatchDelete { pks } => {
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many keys in BatchDelete"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+            }
+            Request::BeginTxn => {}
+            Request::CommitTxn { txn_id } | Request::RollbackTxn { txn_id } => {
+                w.u64(*txn_id);
+            }
         }
         Ok(w.0)
     }
@@ -467,6 +635,42 @@ impl Request {
                 value: r.u64()?,
             },
             OpCode::FkExists => Request::FkExists { value: r.u64()? },
+            OpCode::UseTable => Request::UseTable { name: r.string()? },
+            OpCode::CreateTable => Request::CreateTable {
+                name: r.string()?,
+                schema: r.strings()?,
+            },
+            OpCode::DropTable => Request::DropTable { name: r.string()? },
+            OpCode::ListTables => Request::ListTables,
+            OpCode::BatchInsert => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more rows than payload holds"));
+                }
+                let mut rows = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let pk = r.u64()?;
+                    let values = r.u64s()?;
+                    rows.push((pk, values));
+                }
+                Request::BatchInsert { rows }
+            }
+            OpCode::BatchDelete => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more keys than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchDelete { pks }
+            }
+            OpCode::BeginTxn => Request::BeginTxn,
+            OpCode::CommitTxn => Request::CommitTxn { txn_id: r.u64()? },
+            OpCode::RollbackTxn => Request::RollbackTxn { txn_id: r.u64()? },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -486,6 +690,10 @@ impl Response {
             Response::Challenge { .. } => OpCode::Challenge,
             Response::Error { .. } => OpCode::Error,
             Response::Exists { .. } => OpCode::Exists,
+            Response::TableSelected => OpCode::TableSelected,
+            Response::TableList { .. } => OpCode::TableList,
+            Response::BatchResult { .. } => OpCode::BatchResult,
+            Response::TxnStarted { .. } => OpCode::TxnStarted,
         }
     }
 
@@ -531,6 +739,16 @@ impl Response {
             Response::Exists { found } => {
                 w.0.push(if *found { 1 } else { 0 });
             }
+            Response::TableSelected => {}
+            Response::TableList { names } => {
+                w.strings(names)?;
+            }
+            Response::BatchResult { succeeded, skipped } => {
+                w.u32(*succeeded).u32(*skipped);
+            }
+            Response::TxnStarted { txn_id } => {
+                w.u64(*txn_id);
+            }
         }
         Ok(w.0)
     }
@@ -572,6 +790,15 @@ impl Response {
                 let byte = r.take(1)?[0];
                 Response::Exists { found: byte != 0 }
             }
+            OpCode::TableSelected => Response::TableSelected,
+            OpCode::TableList => Response::TableList {
+                names: r.strings()?,
+            },
+            OpCode::BatchResult => Response::BatchResult {
+                succeeded: r.u32()?,
+                skipped: r.u32()?,
+            },
+            OpCode::TxnStarted => Response::TxnStarted { txn_id: r.u64()? },
             other => return Err(NetError::NotAResponse(other as u8)),
         };
         r.finish()?;
@@ -679,6 +906,34 @@ mod tests {
             },
             Request::FkExists { value: 0 },
             Request::FkExists { value: u64::MAX },
+            Request::UseTable {
+                name: "default".into(),
+            },
+            Request::CreateTable {
+                name: "orders".into(),
+                schema: vec!["pk".into(), "amount".into(), "customer_id".into()],
+            },
+            Request::CreateTable {
+                name: "t".into(),
+                schema: vec![],
+            },
+            Request::DropTable {
+                name: "orders".into(),
+            },
+            Request::ListTables,
+            Request::BatchInsert { rows: vec![] },
+            Request::BatchInsert {
+                rows: vec![(1, vec![1, 10]), (2, vec![2, 20]), (u64::MAX, vec![])],
+            },
+            Request::BatchDelete { pks: vec![] },
+            Request::BatchDelete {
+                pks: vec![1, 2, u64::MAX],
+            },
+            Request::BeginTxn,
+            Request::CommitTxn { txn_id: 1 },
+            Request::CommitTxn { txn_id: u64::MAX },
+            Request::RollbackTxn { txn_id: 1 },
+            Request::RollbackTxn { txn_id: u64::MAX },
         ]
     }
 
@@ -714,6 +969,21 @@ mod tests {
             },
             Response::Exists { found: false },
             Response::Exists { found: true },
+            Response::TableSelected,
+            Response::TableList { names: vec![] },
+            Response::TableList {
+                names: vec!["default".into(), "orders".into(), "products".into()],
+            },
+            Response::BatchResult {
+                succeeded: 0,
+                skipped: 0,
+            },
+            Response::BatchResult {
+                succeeded: 1000,
+                skipped: 3,
+            },
+            Response::TxnStarted { txn_id: 0 },
+            Response::TxnStarted { txn_id: u64::MAX },
         ]
     }
 
@@ -947,12 +1217,12 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=12 {
+                for op in 1u8..=21 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
                 }
-                for op in 129u8..=137 {
+                for op in 129u8..=141 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Response::decode(o, &buf);
                     }

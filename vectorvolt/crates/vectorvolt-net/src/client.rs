@@ -290,6 +290,56 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Insert multiple rows in one round-trip.
+    ///
+    /// Returns `(succeeded, skipped)` where `skipped` counts rows the server
+    /// could not insert (e.g. an engine error on that row).
+    pub fn batch_insert(&mut self, rows: Vec<(u64, Vec<u64>)>) -> NetResult<(u32, u32)> {
+        match self.call(&Request::BatchInsert { rows })? {
+            Response::BatchResult { succeeded, skipped } => Ok((succeeded, skipped)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Delete multiple rows by primary key in one round-trip.
+    ///
+    /// Returns `(succeeded, skipped)` where `skipped` counts keys not found.
+    pub fn batch_delete(&mut self, pks: Vec<u64>) -> NetResult<(u32, u32)> {
+        match self.call(&Request::BatchDelete { pks })? {
+            Response::BatchResult { succeeded, skipped } => Ok((succeeded, skipped)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Begin a server-side transaction on this connection.
+    ///
+    /// Returns the `txn_id` that must be passed to [`commit_txn`](Self::commit_txn)
+    /// or [`rollback_txn`](Self::rollback_txn).
+    pub fn begin_txn(&mut self) -> NetResult<u64> {
+        match self.call(&Request::BeginTxn)? {
+            Response::TxnStarted { txn_id } => Ok(txn_id),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Commit the active transaction.
+    ///
+    /// Returns the number of operations applied.
+    pub fn commit_txn(&mut self, txn_id: u64) -> NetResult<u64> {
+        match self.call(&Request::CommitTxn { txn_id })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Roll back the active transaction, discarding all buffered ops.
+    pub fn rollback_txn(&mut self, txn_id: u64) -> NetResult<()> {
+        match self.call(&Request::RollbackTxn { txn_id })? {
+            Response::Ok { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

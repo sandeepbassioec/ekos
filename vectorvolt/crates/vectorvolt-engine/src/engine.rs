@@ -108,6 +108,12 @@ pub struct EngineOptions {
     pub write_options: WriteOptions,
 }
 
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self::new(1_000_000)
+    }
+}
+
 impl EngineOptions {
     pub fn new(flush_threshold: usize) -> Self {
         EngineOptions {
