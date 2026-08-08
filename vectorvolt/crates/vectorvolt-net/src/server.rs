@@ -449,7 +449,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::PopMax { .. }
         | Request::MultiSet { .. }
         | Request::DecrementClamp { .. }
-        | Request::GetOrInsert { .. } => Scope::ReadWrite,
+        | Request::GetOrInsert { .. }
+        | Request::BatchSetField { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -866,6 +867,27 @@ fn serve_request(
                 Err(e) => engine_error(e),
             },
         },
+
+        Request::BatchSetField { col, value, pks } => {
+            let col_idx = col as usize;
+            let mut count = 0u64;
+            for pk in pks {
+                match engine.get(pk) {
+                    Err(_) | Ok(None) => {}
+                    Ok(Some(row)) => {
+                        if col_idx >= row.values.len() {
+                            continue;
+                        }
+                        let mut values = row.values;
+                        values[col_idx] = value;
+                        if engine.delete(pk).is_ok() && engine.insert(pk, values).is_ok() {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {
             Ok(_) => Response::Ok { affected: 1 },

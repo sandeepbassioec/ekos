@@ -430,6 +430,16 @@ impl Client {
         }
     }
 
+    /// Set column `col` to `value` across all given PKs in one round trip.
+    ///
+    /// Missing PKs are silently skipped. Returns the number of rows updated.
+    pub fn batch_set_field(&mut self, col: u32, value: u64, pks: Vec<u64>) -> NetResult<u64> {
+        match self.call(&Request::BatchSetField { col, value, pks })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Return the existing row if found, else insert the provided values and return them.
     ///
     /// Always succeeds: returns the current row (existing or freshly inserted).

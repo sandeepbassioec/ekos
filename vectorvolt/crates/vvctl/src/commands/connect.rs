@@ -372,6 +372,21 @@ pub enum ConnectCommand {
         hi: u64,
     },
 
+    /// Set the same column to the same value across many rows in one round trip.
+    ///
+    /// Prints the count of updated rows.
+    BatchSetField {
+        /// Column index to set.
+        #[arg(long)]
+        col: u32,
+        /// Value to write into the column.
+        #[arg(long)]
+        value: u64,
+        /// Primary keys of rows to update.
+        #[arg(required = true)]
+        pks: Vec<u64>,
+    },
+
     /// Return existing row or insert-and-return provided values.
     ///
     /// Prints the row (existing or newly inserted).
@@ -877,6 +892,13 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 None => println!("not found"),
                 Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
             }
+        }
+
+        ConnectCommand::BatchSetField { col, value, pks } => {
+            let count = client
+                .batch_set_field(col, value, pks)
+                .with_context(|| format!("batch-set-field col={col} value={value}"))?;
+            println!("{count} row(s) updated");
         }
 
         ConnectCommand::GetOrInsert { pk, values } => {

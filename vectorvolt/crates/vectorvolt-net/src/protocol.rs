@@ -141,6 +141,8 @@ pub enum OpCode {
     DecrementClamp = 43,
     /// Return existing row or insert-and-return provided values.
     GetOrInsert = 44,
+    /// Set the same column to the same value across many rows in one round trip.
+    BatchSetField = 45,
     // Responses
     Pong = 129,
     Row = 130,
@@ -222,6 +224,7 @@ impl OpCode {
             42 => MultiSet,
             43 => DecrementClamp,
             44 => GetOrInsert,
+            45 => BatchSetField,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -570,6 +573,15 @@ pub enum Request {
         pk: u64,
         values: Vec<u64>,
     },
+    /// Set the same column to the same value across multiple rows in one round trip.
+    ///
+    /// Missing keys are silently skipped. Returns `Ok { affected: count }` where
+    /// `count` is the number of rows actually updated.
+    BatchSetField {
+        col: u32,
+        value: u64,
+        pks: Vec<u64>,
+    },
 }
 
 /// A server response.
@@ -829,6 +841,7 @@ impl Request {
             Request::MultiSet { .. } => OpCode::MultiSet,
             Request::DecrementClamp { .. } => OpCode::DecrementClamp,
             Request::GetOrInsert { .. } => OpCode::GetOrInsert,
+            Request::BatchSetField { .. } => OpCode::BatchSetField,
         }
     }
 
@@ -944,6 +957,15 @@ impl Request {
             Request::Truncate => {}
             Request::Count { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::BatchSetField { col, value, pks } => {
+                w.u32(*col).u64(*value);
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many pks in BatchSetField"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
             }
             Request::MultiSet { pk, pairs } => {
                 w.u64(*pk);
@@ -1130,6 +1152,20 @@ impl Request {
                 lo: r.u64()?,
                 hi: r.u64()?,
             },
+            OpCode::BatchSetField => {
+                let col = r.u32()?;
+                let value = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more pks than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchSetField { col, value, pks }
+            }
             OpCode::GetOrInsert => Request::GetOrInsert {
                 pk: r.u64()?,
                 values: r.u64s()?,
@@ -1657,6 +1693,16 @@ mod tests {
                 pk: u64::MAX - 1,
                 values: vec![],
             },
+            Request::BatchSetField {
+                col: 1,
+                value: 42,
+                pks: vec![1, 2, 3],
+            },
+            Request::BatchSetField {
+                col: 0,
+                value: 0,
+                pks: vec![],
+            },
         ]
     }
 
@@ -1962,7 +2008,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=44 {
+                for op in 1u8..=45 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
