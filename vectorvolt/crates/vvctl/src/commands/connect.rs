@@ -226,6 +226,22 @@ pub enum ConnectCommand {
         rows: Vec<String>,
     },
 
+    /// Range scan returning only primary keys. Same filter semantics as `scan`.
+    ScanKeys {
+        /// Column index to filter on (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+        /// Maximum rows to return (0 = unlimited).
+        #[arg(long, default_value = "0")]
+        limit: u32,
+    },
+
     /// Check whether a named table exists in the server catalog.
     TableExists {
         /// Table name to look up.
@@ -514,6 +530,20 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .batch_upsert(parsed)
                 .with_context(|| "batch-upsert")?;
             println!("batch-upsert: {n} row(s) submitted — {affected} applied");
+        }
+
+        ConnectCommand::ScanKeys { col, lo, hi, limit } => {
+            let pks = client
+                .scan_keys(col, lo, hi, limit)
+                .with_context(|| format!("scan-keys col={col} [{lo},{hi}]"))?;
+            if pks.is_empty() {
+                println!("(no keys)");
+            } else {
+                for pk in &pks {
+                    println!("{pk}");
+                }
+                println!("\n{} key(s)", pks.len());
+            }
         }
 
         ConnectCommand::TableExists { name } => {

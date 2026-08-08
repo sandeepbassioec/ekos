@@ -410,6 +410,16 @@ impl Client {
         }
     }
 
+    /// Range scan returning only primary keys (no column values).
+    ///
+    /// `limit` of 0 means unlimited. Cheaper than `range_scan` when only keys are needed.
+    pub fn scan_keys(&mut self, col: u32, lo: u64, hi: u64, limit: u32) -> NetResult<Vec<u64>> {
+        match self.call(&Request::ScanKeys { col, lo, hi, limit })? {
+            Response::Keys { pks } => Ok(pks),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Check whether a named table exists in the server catalog.
     ///
     /// Does not require a table to be selected first.

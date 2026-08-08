@@ -427,7 +427,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::GetMany { .. }
         | Request::Count { .. }
         | Request::DescribeTable
-        | Request::TableExists { .. } => Scope::ReadOnly,
+        | Request::TableExists { .. }
+        | Request::ScanKeys { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -669,6 +670,21 @@ fn serve_request(
                         .collect()
                 };
                 Response::Rows { rows }
+            }
+            Err(e) => engine_error(e),
+        },
+
+        Request::ScanKeys { col, lo, hi, limit } => match engine.scan(col as usize, lo, hi) {
+            Ok(rows) => {
+                let pks: Vec<u64> = if limit == 0 {
+                    rows.into_iter().map(|r| r.values[0]).collect()
+                } else {
+                    rows.into_iter()
+                        .take(limit as usize)
+                        .map(|r| r.values[0])
+                        .collect()
+                };
+                Response::Keys { pks }
             }
             Err(e) => engine_error(e),
         },

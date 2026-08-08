@@ -113,6 +113,8 @@ pub enum OpCode {
     DescribeTable = 29,
     /// Check whether a named table exists in the catalog.
     TableExists = 30,
+    /// Range scan returning only primary keys (no values).
+    ScanKeys = 31,
     // Responses
     Pong = 129,
     Row = 130,
@@ -135,6 +137,8 @@ pub enum OpCode {
     RowSet = 142,
     /// Response to `DescribeTable` — the column names for the selected table.
     Schema = 143,
+    /// Response to `ScanKeys` — primary keys only.
+    Keys = 144,
 }
 
 impl OpCode {
@@ -176,6 +180,7 @@ impl OpCode {
             28 => BatchUpdate,
             29 => DescribeTable,
             30 => TableExists,
+            31 => ScanKeys,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -191,6 +196,7 @@ impl OpCode {
             141 => TxnStarted,
             142 => RowSet,
             143 => Schema,
+            144 => Keys,
             other => return Err(NetError::UnknownOpcode(other)),
         })
     }
@@ -408,6 +414,16 @@ pub enum Request {
     TableExists {
         name: String,
     },
+    /// Range scan returning only primary keys (no column values).
+    ///
+    /// Same filter semantics as `RangeScan`: column `col`, range `[lo, hi]`,
+    /// optional `limit` (0 = unlimited). Returns `Keys { pks }`.
+    ScanKeys {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        limit: u32,
+    },
 }
 
 /// A server response.
@@ -465,6 +481,10 @@ pub enum Response {
     /// Response to `DescribeTable` — column names in schema order.
     Schema {
         columns: Vec<String>,
+    },
+    /// Response to `ScanKeys` — primary keys only, in scan order.
+    Keys {
+        pks: Vec<u64>,
     },
 }
 
@@ -643,6 +663,7 @@ impl Request {
             Request::BatchUpdate { .. } => OpCode::BatchUpdate,
             Request::DescribeTable => OpCode::DescribeTable,
             Request::TableExists { .. } => OpCode::TableExists,
+            Request::ScanKeys { .. } => OpCode::ScanKeys,
         }
     }
 
@@ -657,6 +678,9 @@ impl Request {
             | Request::DescribeTable => {}
             Request::TableExists { name } => {
                 w.string(name)?;
+            }
+            Request::ScanKeys { col, lo, hi, limit } => {
+                w.u32(*col).u64(*lo).u64(*hi).u32(*limit);
             }
             Request::Auth { key_id, response } => {
                 let k = key_id.as_bytes();
@@ -857,6 +881,12 @@ impl Request {
             }
             OpCode::DescribeTable => Request::DescribeTable,
             OpCode::TableExists => Request::TableExists { name: r.string()? },
+            OpCode::ScanKeys => Request::ScanKeys {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                limit: r.u32()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -882,6 +912,7 @@ impl Response {
             Response::TxnStarted { .. } => OpCode::TxnStarted,
             Response::RowSet { .. } => OpCode::RowSet,
             Response::Schema { .. } => OpCode::Schema,
+            Response::Keys { .. } => OpCode::Keys,
         }
     }
 
@@ -948,6 +979,14 @@ impl Response {
             }
             Response::Schema { columns } => {
                 w.strings(columns)?;
+            }
+            Response::Keys { pks } => {
+                let n =
+                    u32::try_from(pks.len()).map_err(|_| NetError::Malformed("too many keys"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
             }
         }
         Ok(w.0)
@@ -1018,6 +1057,18 @@ impl Response {
             OpCode::Schema => Response::Schema {
                 columns: r.strings()?,
             },
+            OpCode::Keys => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more keys than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Response::Keys { pks }
+            }
             other => return Err(NetError::NotAResponse(other as u8)),
         };
         r.finish()?;
@@ -1199,6 +1250,18 @@ mod tests {
             Request::TableExists {
                 name: String::new(),
             },
+            Request::ScanKeys {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+                limit: 0,
+            },
+            Request::ScanKeys {
+                col: 2,
+                lo: 100,
+                hi: 200,
+                limit: 50,
+            },
         ]
     }
 
@@ -1256,6 +1319,10 @@ mod tests {
             Response::Schema { columns: vec![] },
             Response::Schema {
                 columns: vec!["pk".into(), "name".into(), "score".into()],
+            },
+            Response::Keys { pks: vec![] },
+            Response::Keys {
+                pks: vec![1, 2, u64::MAX],
             },
         ]
     }
@@ -1490,12 +1557,12 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=30 {
+                for op in 1u8..=31 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
                 }
-                for op in 129u8..=143 {
+                for op in 129u8..=144 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Response::decode(o, &buf);
                     }
