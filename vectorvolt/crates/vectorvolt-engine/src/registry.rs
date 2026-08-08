@@ -15,12 +15,18 @@
 //!
 //! ```text
 //! base_dir/
-//!   default/       ← the "default" table, auto-created by new_with_default()
+//!   default/
+//!     schema.txt    ← column names, one per line
+//!     wal/
+//!     *.vvsst
 //!   orders/
-//!   products/
+//!     schema.txt
+//!     …
 //! ```
 //!
-//! The directory is created on first use of each table.
+//! `schema.txt` is the catalog marker: its presence means the table exists, its
+//! absence (or removal by `drop_table`) means it has been dropped. Subdirectories
+//! without a `schema.txt` are ignored on `open()`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,6 +35,9 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::{EngineOptions, EngineResult, TableEngine};
+
+/// Filename written inside every table's directory to record its schema.
+pub const SCHEMA_FILE: &str = "schema.txt";
 
 /// Maximum table-name length, in bytes.
 pub const MAX_TABLE_NAME: usize = 64;
@@ -58,6 +67,20 @@ fn validate_name(name: &str) -> EngineResult<()> {
     Ok(())
 }
 
+fn write_schema(dir: &std::path::Path, schema: &[String]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(SCHEMA_FILE), schema.join("\n"))
+}
+
+fn read_schema(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let raw = std::fs::read_to_string(dir.join(SCHEMA_FILE))?;
+    Ok(raw
+        .lines()
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
 // ── TableRegistry ─────────────────────────────────────────────────────────────
 
 /// A catalog of named [`TableEngine`] instances backed by a base directory.
@@ -68,13 +91,57 @@ pub struct TableRegistry {
 }
 
 impl TableRegistry {
-    /// Create an empty registry. Tables are opened/created lazily.
+    /// Create an empty in-memory registry backed by `base_dir`.
+    ///
+    /// Does NOT scan the directory — use [`open`](Self::open) to restore persisted tables.
     pub fn new(base_dir: impl Into<PathBuf>, options: EngineOptions) -> Self {
         TableRegistry {
             base_dir: base_dir.into(),
             options,
             tables: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Open a registry by scanning `base_dir` for persisted tables.
+    ///
+    /// Every subdirectory containing a `schema.txt` is opened as a table. Subdirs
+    /// without one are silently skipped (they may be temp files or orphaned data
+    /// from a `drop_table`). Returns the first engine error encountered, if any.
+    pub fn open(base_dir: impl Into<PathBuf>, options: EngineOptions) -> EngineResult<Self> {
+        let base_dir = base_dir.into();
+        let mut map = HashMap::new();
+
+        if base_dir.is_dir() {
+            for entry in std::fs::read_dir(&base_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let schema_path = path.join(SCHEMA_FILE);
+                if !schema_path.exists() {
+                    continue;
+                }
+                // The subdir name is the table name. Silently skip anything that
+                // fails our naming rules (could be system dirs like `.git`).
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_owned(),
+                    None => continue,
+                };
+                if validate_name(&name).is_err() {
+                    continue;
+                }
+                let schema = read_schema(&path)?;
+                let engine = Arc::new(TableEngine::open_with(schema, &path, options)?);
+                map.insert(name, engine);
+            }
+        }
+
+        Ok(TableRegistry {
+            base_dir,
+            options,
+            tables: RwLock::new(map),
+        })
     }
 
     /// Create a registry with a pre-opened engine registered as `"default"`.
@@ -91,8 +158,9 @@ impl TableRegistry {
         }
     }
 
-    /// Create a table with the given schema and open it.
+    /// Create a table with the given schema, persist it, and open it.
     ///
+    /// Writes `<base_dir>/<name>/schema.txt` so the table survives a restart.
     /// Returns `Err(TableAlreadyExists)` if the name is already registered.
     pub fn create_table(&self, name: &str, schema: Vec<String>) -> EngineResult<Arc<TableEngine>> {
         use crate::EngineError;
@@ -104,6 +172,10 @@ impl TableRegistry {
         }
 
         let dir = self.base_dir.join(name);
+        // Write schema.txt before opening the engine: if the engine open fails,
+        // the schema file stays on disk and will be picked up by `open()` on the
+        // next restart — which is fine, the engine will just start empty.
+        write_schema(&dir, &schema)?;
         let engine = Arc::new(TableEngine::open_with(schema, &dir, self.options)?);
         tables.insert(name.into(), Arc::clone(&engine));
         Ok(engine)
@@ -119,9 +191,12 @@ impl TableRegistry {
             .ok_or_else(|| EngineError::TableNotFound(name.into()))
     }
 
-    /// Drop a table: remove it from the registry (in-memory only).
+    /// Drop a table: remove it from the registry and delete its `schema.txt`.
     ///
-    /// The table's data directory is NOT deleted — that is an operator decision.
+    /// The rest of the table's data directory is NOT deleted — that is an
+    /// operator decision. Removing `schema.txt` is enough to prevent `open()`
+    /// from restoring the table on the next server restart.
+    ///
     /// Returns `Err(TableNotFound)` if the name is not registered.
     pub fn drop_table(&self, name: &str) -> EngineResult<()> {
         use crate::EngineError;
@@ -129,6 +204,9 @@ impl TableRegistry {
         if tables.remove(name).is_none() {
             return Err(EngineError::TableNotFound(name.into()));
         }
+        // Best-effort: remove schema.txt so the table is not re-opened on restart.
+        let schema_path = self.base_dir.join(name).join(SCHEMA_FILE);
+        let _ = std::fs::remove_file(schema_path);
         Ok(())
     }
 
