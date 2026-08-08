@@ -368,6 +368,16 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Delete all rows from the selected table.
+    ///
+    /// Returns the number of rows that were removed.
+    pub fn truncate(&mut self) -> NetResult<u64> {
+        match self.call(&Request::Truncate)? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

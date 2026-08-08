@@ -212,6 +212,9 @@ pub enum ConnectCommand {
         #[arg(num_args = 0..)]
         values: Vec<u64>,
     },
+
+    /// Delete all rows from the selected table.
+    Truncate,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -435,6 +438,11 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .update(pk, values)
                 .with_context(|| format!("update pk={pk}"))?;
             println!("updated pk={pk}");
+        }
+
+        ConnectCommand::Truncate => {
+            let deleted = client.truncate().with_context(|| "truncate")?;
+            println!("truncated — {deleted} row(s) removed");
         }
 
         ConnectCommand::GetMany { pks } => {
