@@ -226,17 +226,37 @@ impl TableEngine {
         let rows_on_disk: u64 = partitions.values().map(|r| r.row_count() as u64).sum();
         txn.rebuild_pk_index_from_partitions(&partitions)?;
 
-        // Replay WAL delete records so deletes made in previous sessions survive
-        // restart.  Insert records are skipped — their rows are already in
-        // partition files (we flush every CLI insert) or are lost pending data
-        // (acceptable Phase 2 limitation).
-        // Read-only replay: this reader never writes, so fsync is irrelevant here.
+        // Phase 4 WAL recovery: replay all mutations that are not yet in an SST.
+        //
+        // Processing order matters: Insert and Delete records are replayed in WAL
+        // sequence order so re-inserts after deletes and interleaved mutations
+        // converge to the correct state.
+        //
+        // Insert: if the pk is already in pk_index (rebuilt from SST above), the
+        // row reached an SST before the crash — skip it.  Otherwise call
+        // replay_insert(), which populates the write buffer and in-memory indexes
+        // exactly as a fresh insert would but without writing to the WAL again.
+        //
+        // Delete: unconditionally remove from pk_index.  A delete for a row that
+        // was already removed (e.g. compaction raced with the delete) is a no-op.
+        //
+        // Checkpoint / flush strings: Mutation::decode returns Err, so they fall
+        // through silently.  Torn frames at the WAL tail are also ignored — a torn
+        // tail is a normal consequence of an unclean shutdown; the WAL verifier
+        // handles them when WalReader::read_all stops at the first decode error.
         let wal_cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
         if let Ok(frames) = WalReader::open(wal_cfg).read_all() {
-            let mut idx = txn.pk_index.write();
             for frame in frames {
-                if let Ok(Mutation::Delete { pk }) = Mutation::decode(&frame.payload) {
-                    idx.remove(pk);
+                match Mutation::decode(&frame.payload) {
+                    Ok(Mutation::Insert { pk, values }) => {
+                        if txn.pk_index.read().get(pk).is_none() {
+                            let _ = txn.replay_insert(pk, values);
+                        }
+                    }
+                    Ok(Mutation::Delete { pk }) => {
+                        txn.pk_index.write().remove(pk);
+                    }
+                    Err(_) => {}
                 }
             }
         }
