@@ -445,7 +445,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::SetField { .. }
         | Request::InsertIfAbsent { .. }
         | Request::DeleteRange { .. }
-        | Request::PopMin { .. } => Scope::ReadWrite,
+        | Request::PopMin { .. }
+        | Request::PopMax { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -768,15 +769,40 @@ fn serve_request(
                 Ok(r) => r,
                 Err(e) => return engine_error(e),
             };
-            let min_row = match rows.into_iter().min_by_key(|r| r.values[col as usize]) {
-                None => return Response::NotFound,
-                Some(r) => r,
+            let mut sorted = rows;
+            sorted.sort_by_key(|r| r.values[col as usize]);
+            let mut found = None;
+            for row in sorted {
+                let pk = row.values[0];
+                if engine.delete(pk).is_ok() {
+                    found = Some(row.values);
+                    break;
+                }
+            }
+            match found {
+                None => Response::NotFound,
+                Some(values) => Response::Row { values },
+            }
+        }
+
+        Request::PopMax { col, lo, hi } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
             };
-            let pk = min_row.values[0];
-            let values = min_row.values;
-            match engine.delete(pk) {
-                Ok(_) => Response::Row { values },
-                Err(e) => engine_error(e),
+            let mut sorted = rows;
+            sorted.sort_by_key(|r| std::cmp::Reverse(r.values[col as usize]));
+            let mut found = None;
+            for row in sorted {
+                let pk = row.values[0];
+                if engine.delete(pk).is_ok() {
+                    found = Some(row.values);
+                    break;
+                }
+            }
+            match found {
+                None => Response::NotFound,
+                Some(values) => Response::Row { values },
             }
         }
 

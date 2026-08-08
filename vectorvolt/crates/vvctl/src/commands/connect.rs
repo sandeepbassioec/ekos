@@ -386,6 +386,21 @@ pub enum ConnectCommand {
         #[arg(long, default_value = "18446744073709551615")]
         hi: u64,
     },
+
+    /// Atomically fetch and delete the row with the maximum column value in [lo, hi].
+    ///
+    /// Prints the row values or "not found".
+    PopMax {
+        /// Column index to scan and rank on (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -809,6 +824,16 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             match client
                 .pop_min(col, lo, hi)
                 .with_context(|| format!("pop-min col={col} [{lo},{hi}]"))?
+            {
+                None => println!("not found"),
+                Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
+            }
+        }
+
+        ConnectCommand::PopMax { col, lo, hi } => {
+            match client
+                .pop_max(col, lo, hi)
+                .with_context(|| format!("pop-max col={col} [{lo},{hi}]"))?
             {
                 None => println!("not found"),
                 Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
