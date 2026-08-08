@@ -285,6 +285,43 @@ pub enum ConnectCommand {
         pk: u64,
     },
 
+    /// Delete all rows where column `col` falls in `[lo, hi]`. Prints the deleted count.
+    DeleteRange {
+        /// Column index to filter on (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
+    /// Insert a row only if the primary key is not already present.
+    ///
+    /// Prints "inserted" or "already exists".
+    InsertIfAbsent {
+        /// Primary key for the new row.
+        pk: u64,
+        /// Column values in schema order (excluding pk).
+        #[arg(num_args = 0..)]
+        values: Vec<u64>,
+    },
+
+    /// Set a single column of an existing row without supplying other column values.
+    ///
+    /// Prints "updated" or "(not found)".
+    SetField {
+        /// Primary key of the row.
+        pk: u64,
+        /// Column index to set (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// New value for the column.
+        value: u64,
+    },
+
     /// Conditional update: set a column to `replacement` iff it equals `expected`.
     ///
     /// Prints "swapped", "no-match", or "(not found)".
@@ -634,6 +671,35 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 println!("exists: {name}");
             } else {
                 println!("not found: {name}");
+            }
+        }
+
+        ConnectCommand::DeleteRange { col, lo, hi } => {
+            let count = client
+                .delete_range(col, lo, hi)
+                .with_context(|| format!("delete-range col={col} [{lo},{hi}]"))?;
+            println!("{count} row(s) deleted");
+        }
+
+        ConnectCommand::InsertIfAbsent { pk, values } => {
+            let inserted = client
+                .insert_if_absent(pk, values)
+                .with_context(|| format!("insert-if-absent pk={pk}"))?;
+            if inserted {
+                println!("inserted");
+            } else {
+                println!("already exists");
+            }
+        }
+
+        ConnectCommand::SetField { pk, col, value } => {
+            let updated = client
+                .set_field(pk, col, value)
+                .with_context(|| format!("set-field pk={pk} col={col} value={value}"))?;
+            if updated {
+                println!("updated");
+            } else {
+                println!("(not found)");
             }
         }
 

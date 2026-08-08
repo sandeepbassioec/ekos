@@ -420,6 +420,37 @@ impl Client {
         }
     }
 
+    /// Delete all rows where column `col` falls in `[lo, hi]`.
+    ///
+    /// Returns the number of rows deleted.
+    pub fn delete_range(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::DeleteRange { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Insert a row only if the primary key is not already present.
+    ///
+    /// Returns `true` if inserted, `false` if the key already existed.
+    pub fn insert_if_absent(&mut self, pk: u64, values: Vec<u64>) -> NetResult<bool> {
+        match self.call(&Request::InsertIfAbsent { pk, values })? {
+            Response::Ok { affected } => Ok(affected == 1),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Set a single column of an existing row to `value` without supplying other columns.
+    ///
+    /// Returns `true` if found and updated, `false` (as `NotFound`) mapped to `None`.
+    pub fn set_field(&mut self, pk: u64, col: u32, value: u64) -> NetResult<bool> {
+        match self.call(&Request::SetField { pk, col, value })? {
+            Response::Ok { .. } => Ok(true),
+            Response::NotFound => Ok(false),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Atomically add `delta` to column `col` of the row at `pk` (saturating at `u64::MAX`).
     ///
     /// Returns `Some(new_value)` if the row existed, `None` if absent.

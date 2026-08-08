@@ -125,6 +125,12 @@ pub enum OpCode {
     Increment = 35,
     /// Conditional update: set `values[col]` to `replacement` iff it currently equals `expected`.
     CompareAndSwap = 36,
+    /// Set a single column of an existing row without providing all other column values.
+    SetField = 37,
+    /// Insert a row only if the primary key is not already present.
+    InsertIfAbsent = 38,
+    /// Delete all rows where column `col` falls in `[lo, hi]`.
+    DeleteRange = 39,
     // Responses
     Pong = 129,
     Row = 130,
@@ -198,6 +204,9 @@ impl OpCode {
             34 => GetAndDelete,
             35 => Increment,
             36 => CompareAndSwap,
+            37 => SetField,
+            38 => InsertIfAbsent,
+            39 => DeleteRange,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -482,6 +491,29 @@ pub enum Request {
         expected: u64,
         replacement: u64,
     },
+    /// Set a single column of an existing row to `value` without supplying other columns.
+    ///
+    /// Returns `Ok { affected: 1 }` if found, `NotFound` if absent.
+    SetField {
+        pk: u64,
+        col: u32,
+        value: u64,
+    },
+    /// Insert a row only if the primary key is not already present.
+    ///
+    /// Returns `Ok { affected: 1 }` on insert, `Ok { affected: 0 }` if already present.
+    InsertIfAbsent {
+        pk: u64,
+        values: Vec<u64>,
+    },
+    /// Delete all rows where column `col` falls in `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: count }` with the number of rows deleted.
+    DeleteRange {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
 }
 
 /// A server response.
@@ -733,6 +765,9 @@ impl Request {
             Request::GetAndDelete { .. } => OpCode::GetAndDelete,
             Request::Increment { .. } => OpCode::Increment,
             Request::CompareAndSwap { .. } => OpCode::CompareAndSwap,
+            Request::SetField { .. } => OpCode::SetField,
+            Request::InsertIfAbsent { .. } => OpCode::InsertIfAbsent,
+            Request::DeleteRange { .. } => OpCode::DeleteRange,
         }
     }
 
@@ -751,7 +786,9 @@ impl Request {
             Request::ScanKeys { col, lo, hi, limit } => {
                 w.u32(*col).u64(*lo).u64(*hi).u32(*limit);
             }
-            Request::MinMax { col, lo, hi } | Request::Sum { col, lo, hi } => {
+            Request::MinMax { col, lo, hi }
+            | Request::Sum { col, lo, hi }
+            | Request::DeleteRange { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
             }
             Request::Auth { key_id, response } => {
@@ -779,7 +816,10 @@ impl Request {
             } => {
                 w.u64(*pk).u32(*col).u64(*expected).u64(*replacement);
             }
-            Request::Insert { pk, values } => {
+            Request::SetField { pk, col, value } => {
+                w.u64(*pk).u32(*col).u64(*value);
+            }
+            Request::Insert { pk, values } | Request::InsertIfAbsent { pk, values } => {
                 w.u64(*pk);
                 w.u64s(values)?;
             }
@@ -991,6 +1031,20 @@ impl Request {
                 col: r.u32()?,
                 expected: r.u64()?,
                 replacement: r.u64()?,
+            },
+            OpCode::SetField => Request::SetField {
+                pk: r.u64()?,
+                col: r.u32()?,
+                value: r.u64()?,
+            },
+            OpCode::InsertIfAbsent => Request::InsertIfAbsent {
+                pk: r.u64()?,
+                values: r.u64s()?,
+            },
+            OpCode::DeleteRange => Request::DeleteRange {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
             },
             other => return Err(NetError::NotARequest(other as u8)),
         };
@@ -1420,6 +1474,34 @@ mod tests {
                 expected: u64::MAX,
                 replacement: 0,
             },
+            Request::SetField {
+                pk: 1,
+                col: 0,
+                value: 42,
+            },
+            Request::SetField {
+                pk: u64::MAX - 1,
+                col: 1,
+                value: u64::MAX,
+            },
+            Request::InsertIfAbsent {
+                pk: 1,
+                values: vec![1, 2],
+            },
+            Request::InsertIfAbsent {
+                pk: u64::MAX - 1,
+                values: vec![],
+            },
+            Request::DeleteRange {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+            },
+            Request::DeleteRange {
+                col: 1,
+                lo: 10,
+                hi: 50,
+            },
         ]
     }
 
@@ -1725,7 +1807,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=36 {
+                for op in 1u8..=39 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

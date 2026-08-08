@@ -441,7 +441,10 @@ fn required_scope(req: &Request) -> Scope {
         | Request::BatchUpdate { .. }
         | Request::GetAndDelete { .. }
         | Request::Increment { .. }
-        | Request::CompareAndSwap { .. } => Scope::ReadWrite,
+        | Request::CompareAndSwap { .. }
+        | Request::SetField { .. }
+        | Request::InsertIfAbsent { .. }
+        | Request::DeleteRange { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -711,6 +714,53 @@ fn serve_request(
                 }
             }
         },
+
+        Request::SetField { pk, col, value } => match engine.get(pk) {
+            Ok(None) => Response::NotFound,
+            Err(e) => engine_error(e),
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: "column index out of range".to_string(),
+                    };
+                }
+                let mut values = row.values;
+                values[col_idx] = value;
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: 1 },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::InsertIfAbsent { pk, values } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(Some(_)) => Response::Ok { affected: 0 },
+            Ok(None) => match engine.insert(pk, values) {
+                Ok(_) => Response::Ok { affected: 1 },
+                Err(e) => engine_error(e),
+            },
+        },
+
+        Request::DeleteRange { col, lo, hi } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let pks: Vec<u64> = rows.into_iter().map(|r| r.values[0]).collect();
+            let mut count = 0u64;
+            for pk in pks {
+                if engine.delete(pk).is_ok() {
+                    count += 1;
+                }
+            }
+            Response::Ok { affected: count }
+        }
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {
             Ok(_) => Response::Ok { affected: 1 },
