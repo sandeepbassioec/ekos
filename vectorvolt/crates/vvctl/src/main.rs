@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
-use commands::{bench, hal, store, table, wal};
+use commands::{bench, connect, hal, serve, store, table, wal};
 use store::OutputFormat;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,7 +32,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Table read/write commands (Phase 2 engine).
+    /// Start a VectorVolt table server (opens a table and listens for connections).
+    Serve(serve::ServeArgs),
+
+    /// Send a single command to a running VectorVolt server.
+    Connect(connect::ConnectArgs),
+
+    /// Table read/write commands (in-process, no server required).
     #[command(subcommand)]
     Table(table::TableCommand),
 
@@ -134,6 +140,10 @@ fn main() -> Result<()> {
     let fmt = cli.output;
 
     match cli.command {
+        Commands::Serve(args) => serve::run(args)?,
+
+        Commands::Connect(args) => connect::run(args)?,
+
         Commands::Table(cmd) => table::run(cmd)?,
 
         Commands::Bench(args) => bench::run(args)?,
