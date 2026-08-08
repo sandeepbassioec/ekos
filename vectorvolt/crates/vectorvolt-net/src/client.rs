@@ -410,6 +410,16 @@ impl Client {
         }
     }
 
+    /// Sum column `col` values over pk range `[lo, hi]` (saturating at `u64::MAX`).
+    ///
+    /// Returns 0 for an empty range.
+    pub fn sum(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::Sum { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Return the `(min, max, count)` of column `col` over rows where the pk falls in `[lo, hi]`.
     ///
     /// Returns `None` when no rows match the range.

@@ -226,6 +226,19 @@ pub enum ConnectCommand {
         rows: Vec<String>,
     },
 
+    /// Sum a column's values over a pk range (saturating at u64::MAX).
+    Sum {
+        /// Column index (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
     /// Return the min, max, and count of a column over a pk range.
     MinMax {
         /// Column index (0 = pk).
@@ -543,6 +556,13 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .batch_upsert(parsed)
                 .with_context(|| "batch-upsert")?;
             println!("batch-upsert: {n} row(s) submitted — {affected} applied");
+        }
+
+        ConnectCommand::Sum { col, lo, hi } => {
+            let total = client
+                .sum(col, lo, hi)
+                .with_context(|| format!("sum col={col} [{lo},{hi}]"))?;
+            println!("{total}");
         }
 
         ConnectCommand::MinMax { col, lo, hi } => {

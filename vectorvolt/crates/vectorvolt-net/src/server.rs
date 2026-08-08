@@ -429,7 +429,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::DescribeTable
         | Request::TableExists { .. }
         | Request::ScanKeys { .. }
-        | Request::MinMax { .. } => Scope::ReadOnly,
+        | Request::MinMax { .. }
+        | Request::Sum { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -673,6 +674,17 @@ fn serve_request(
                 Response::Rows { rows }
             }
             Err(e) => engine_error(e),
+        },
+
+        Request::Sum { col, lo, hi } => match engine.scan(col as usize, lo, hi) {
+            Err(e) => engine_error(e),
+            Ok(rows) => {
+                let col_idx = col as usize;
+                let total = rows
+                    .iter()
+                    .fold(0u64, |acc, row| acc.saturating_add(row.values[col_idx]));
+                Response::Ok { affected: total }
+            }
         },
 
         Request::MinMax { col, lo, hi } => match engine.scan(col as usize, lo, hi) {

@@ -117,6 +117,8 @@ pub enum OpCode {
     ScanKeys = 31,
     /// Return the min, max, and count of a column value over a pk range.
     MinMax = 32,
+    /// Sum a column's values over a pk range (saturating at u64::MAX).
+    Sum = 33,
     // Responses
     Pong = 129,
     Row = 130,
@@ -186,6 +188,7 @@ impl OpCode {
             30 => TableExists,
             31 => ScanKeys,
             32 => MinMax,
+            33 => Sum,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -439,6 +442,14 @@ pub enum Request {
         lo: u64,
         hi: u64,
     },
+    /// Sum column `col` values over pk range `[lo, hi]` (saturating at `u64::MAX`).
+    ///
+    /// Returns `Ok { affected: sum }`. Empty range returns `Ok { affected: 0 }`.
+    Sum {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
 }
 
 /// A server response.
@@ -686,6 +697,7 @@ impl Request {
             Request::TableExists { .. } => OpCode::TableExists,
             Request::ScanKeys { .. } => OpCode::ScanKeys,
             Request::MinMax { .. } => OpCode::MinMax,
+            Request::Sum { .. } => OpCode::Sum,
         }
     }
 
@@ -704,7 +716,7 @@ impl Request {
             Request::ScanKeys { col, lo, hi, limit } => {
                 w.u32(*col).u64(*lo).u64(*hi).u32(*limit);
             }
-            Request::MinMax { col, lo, hi } => {
+            Request::MinMax { col, lo, hi } | Request::Sum { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
             }
             Request::Auth { key_id, response } => {
@@ -913,6 +925,11 @@ impl Request {
                 limit: r.u32()?,
             },
             OpCode::MinMax => Request::MinMax {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::Sum => Request::Sum {
                 col: r.u32()?,
                 lo: r.u64()?,
                 hi: r.u64()?,
@@ -1311,6 +1328,16 @@ mod tests {
                 lo: 100,
                 hi: 200,
             },
+            Request::Sum {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+            },
+            Request::Sum {
+                col: 1,
+                lo: 10,
+                hi: 50,
+            },
         ]
     }
 
@@ -1616,7 +1643,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=32 {
+                for op in 1u8..=33 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
