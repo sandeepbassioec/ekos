@@ -109,6 +109,8 @@ pub enum OpCode {
     BatchUpsert = 27,
     /// Update multiple existing rows in a single round trip.
     BatchUpdate = 28,
+    /// Return the column schema for the currently selected table.
+    DescribeTable = 29,
     // Responses
     Pong = 129,
     Row = 130,
@@ -129,6 +131,8 @@ pub enum OpCode {
     TxnStarted = 141,
     /// Response to `GetMany` — only found rows, each with its pk.
     RowSet = 142,
+    /// Response to `DescribeTable` — the column names for the selected table.
+    Schema = 143,
 }
 
 impl OpCode {
@@ -168,6 +172,7 @@ impl OpCode {
             26 => Count,
             27 => BatchUpsert,
             28 => BatchUpdate,
+            29 => DescribeTable,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -182,6 +187,7 @@ impl OpCode {
             140 => BatchResult,
             141 => TxnStarted,
             142 => RowSet,
+            143 => Schema,
             other => return Err(NetError::UnknownOpcode(other)),
         })
     }
@@ -389,6 +395,10 @@ pub enum Request {
     BatchUpdate {
         rows: Vec<(u64, Vec<u64>)>,
     },
+    /// Return the column names for the currently selected table.
+    ///
+    /// Returns `Schema { columns }`. Requires a table to be selected first.
+    DescribeTable,
 }
 
 /// A server response.
@@ -442,6 +452,10 @@ pub enum Response {
     /// Response to `GetMany` — found rows only, each entry is `(pk, values)`.
     RowSet {
         entries: Vec<(u64, Vec<u64>)>,
+    },
+    /// Response to `DescribeTable` — column names in schema order.
+    Schema {
+        columns: Vec<String>,
     },
 }
 
@@ -618,14 +632,19 @@ impl Request {
             Request::Count { .. } => OpCode::Count,
             Request::BatchUpsert { .. } => OpCode::BatchUpsert,
             Request::BatchUpdate { .. } => OpCode::BatchUpdate,
+            Request::DescribeTable => OpCode::DescribeTable,
         }
     }
 
     pub fn encode_payload(&self) -> NetResult<Vec<u8>> {
         let mut w = W::new();
         match self {
-            Request::Ping | Request::Flush | Request::Compact | Request::Stats | Request::Hello => {
-            }
+            Request::Ping
+            | Request::Flush
+            | Request::Compact
+            | Request::Stats
+            | Request::Hello
+            | Request::DescribeTable => {}
             Request::Auth { key_id, response } => {
                 let k = key_id.as_bytes();
                 let n =
@@ -823,6 +842,7 @@ impl Request {
                     Request::BatchUpdate { rows }
                 }
             }
+            OpCode::DescribeTable => Request::DescribeTable,
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -847,6 +867,7 @@ impl Response {
             Response::BatchResult { .. } => OpCode::BatchResult,
             Response::TxnStarted { .. } => OpCode::TxnStarted,
             Response::RowSet { .. } => OpCode::RowSet,
+            Response::Schema { .. } => OpCode::Schema,
         }
     }
 
@@ -910,6 +931,9 @@ impl Response {
                     w.u64(*pk);
                     w.u64s(values)?;
                 }
+            }
+            Response::Schema { columns } => {
+                w.strings(columns)?;
             }
         }
         Ok(w.0)
@@ -977,6 +1001,9 @@ impl Response {
                 }
                 Response::RowSet { entries }
             }
+            OpCode::Schema => Response::Schema {
+                columns: r.strings()?,
+            },
             other => return Err(NetError::NotAResponse(other as u8)),
         };
         r.finish()?;
@@ -1151,6 +1178,7 @@ mod tests {
             Request::BatchUpdate {
                 rows: vec![(1, vec![1, 99]), (u64::MAX, vec![0])],
             },
+            Request::DescribeTable,
         ]
     }
 
@@ -1204,6 +1232,10 @@ mod tests {
             Response::RowSet { entries: vec![] },
             Response::RowSet {
                 entries: vec![(1, vec![1, 10]), (2, vec![2, 20])],
+            },
+            Response::Schema { columns: vec![] },
+            Response::Schema {
+                columns: vec!["pk".into(), "name".into(), "score".into()],
             },
         ]
     }
@@ -1438,12 +1470,12 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=28 {
+                for op in 1u8..=29 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
                 }
-                for op in 129u8..=142 {
+                for op in 129u8..=143 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Response::decode(o, &buf);
                     }

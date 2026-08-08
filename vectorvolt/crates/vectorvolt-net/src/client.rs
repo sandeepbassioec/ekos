@@ -409,6 +409,14 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Return the column names for the currently selected table.
+    pub fn describe_table(&mut self) -> NetResult<Vec<String>> {
+        match self.call(&Request::DescribeTable)? {
+            Response::Schema { columns } => Ok(columns),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

@@ -425,7 +425,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::FkExists { .. }
         | Request::ListTables
         | Request::GetMany { .. }
-        | Request::Count { .. } => Scope::ReadOnly,
+        | Request::Count { .. }
+        | Request::DescribeTable => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -812,6 +813,10 @@ fn serve_request(
                 bytes,
             }
         }
+
+        Request::DescribeTable => Response::Schema {
+            columns: engine.schema.clone(),
+        },
 
         // Handled by auth gate or the catalog/txn blocks above.
         Request::Hello

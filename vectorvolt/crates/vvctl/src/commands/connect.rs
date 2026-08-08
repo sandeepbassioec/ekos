@@ -226,6 +226,9 @@ pub enum ConnectCommand {
         rows: Vec<String>,
     },
 
+    /// Print the column names for the currently selected table.
+    DescribeTable,
+
     /// Update multiple existing rows in a single round trip. Rows not found are skipped.
     ///
     /// Rows are specified as `pk:v1,v2,...` pairs separated by spaces.
@@ -505,6 +508,17 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .batch_upsert(parsed)
                 .with_context(|| "batch-upsert")?;
             println!("batch-upsert: {n} row(s) submitted — {affected} applied");
+        }
+
+        ConnectCommand::DescribeTable => {
+            let columns = client.describe_table().with_context(|| "describe-table")?;
+            if columns.is_empty() {
+                println!("(no columns)");
+            } else {
+                for (i, col) in columns.iter().enumerate() {
+                    println!("[{i}] {col}");
+                }
+            }
         }
 
         ConnectCommand::BatchUpdate { rows: raw } => {
