@@ -665,6 +665,54 @@ impl TxnManager {
 
     // ── Recovery ───────────────────────────────────────────────────────────────
 
+    /// Re-apply a WAL Insert mutation during crash recovery WITHOUT writing to
+    /// the WAL again.
+    ///
+    /// This is the WAL replay path: called by `TableEngine::open_with` for every
+    /// Insert frame whose PK is not yet reflected in a partition file. It does
+    /// everything `insert()` does except step 1 (WAL append), so recovered rows
+    /// are immediately readable via `get()` and reachable via the secondary index.
+    ///
+    /// The caller is responsible for the existence check: only call this when
+    /// `pk_index.get(pk).is_none()`, because `replay_insert` will insert a
+    /// PENDING descriptor and fail if the pk is already mapped.
+    pub fn replay_insert(&self, pk: u64, values: Vec<u64>) -> TxnResult<()> {
+        if values.len() != self.schema.len() {
+            return Err(TxnError::SchemaMismatch {
+                expected: self.schema.len(),
+                got: values.len(),
+            });
+        }
+
+        // SecondaryIndex — one entry per non-PK column.
+        {
+            let mut sec = self.secondary_index.write();
+            for (col_idx, &val) in values.iter().enumerate().skip(1) {
+                sec.insert(col_value_hash(col_idx, val), pk as u32);
+            }
+        }
+
+        // CuckooFilter.
+        self.fk_filter.write().insert(pk)?;
+
+        // Write buffer + pk_index under ONE lock acquisition (same ordering as
+        // `insert` to avoid ABBA deadlocks).
+        let full = {
+            let mut buf = self.write_buf.lock();
+            let buf_offset = buf.len() as u32;
+            self.pk_index
+                .write()
+                .insert(pk, RowDescriptor::new(PENDING_FILE_ID, 0, buf_offset))?;
+            buf.push(pk, values)
+        };
+
+        if full {
+            self.flush()?;
+        }
+
+        Ok(())
+    }
+
     /// Rebuild the pk_index and CuckooFilter from a set of already-loaded
     /// PartitionReaders.  Call this after `with_starting_partition` when
     /// re-opening a table that has existing `.vvsst` files on disk so that
