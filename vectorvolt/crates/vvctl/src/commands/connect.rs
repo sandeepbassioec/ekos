@@ -372,6 +372,18 @@ pub enum ConnectCommand {
         hi: u64,
     },
 
+    /// Return existing row or insert-and-return provided values.
+    ///
+    /// Prints the row (existing or newly inserted).
+    GetOrInsert {
+        /// Primary key.
+        #[arg(long)]
+        pk: u64,
+        /// Column values for the row if it needs to be created.
+        #[arg(required = true)]
+        values: Vec<u64>,
+    },
+
     /// Subtract delta from a column, clamping at 0 (saturating subtract).
     ///
     /// Prints the new value or "not found".
@@ -865,6 +877,13 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 None => println!("not found"),
                 Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
             }
+        }
+
+        ConnectCommand::GetOrInsert { pk, values } => {
+            let row = client
+                .get_or_insert(pk, values)
+                .with_context(|| format!("get-or-insert pk={pk}"))?;
+            println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
         }
 
         ConnectCommand::DecrementClamp { pk, col, delta } => {

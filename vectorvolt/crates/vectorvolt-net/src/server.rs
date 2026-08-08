@@ -448,7 +448,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::PopMin { .. }
         | Request::PopMax { .. }
         | Request::MultiSet { .. }
-        | Request::DecrementClamp { .. } => Scope::ReadWrite,
+        | Request::DecrementClamp { .. }
+        | Request::GetOrInsert { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -855,6 +856,15 @@ fn serve_request(
                     },
                 }
             }
+        },
+
+        Request::GetOrInsert { pk, values } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(Some(row)) => Response::Row { values: row.values },
+            Ok(None) => match engine.insert(pk, values.clone()) {
+                Ok(_) => Response::Row { values },
+                Err(e) => engine_error(e),
+            },
         },
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {

@@ -430,6 +430,16 @@ impl Client {
         }
     }
 
+    /// Return the existing row if found, else insert the provided values and return them.
+    ///
+    /// Always succeeds: returns the current row (existing or freshly inserted).
+    pub fn get_or_insert(&mut self, pk: u64, values: Vec<u64>) -> NetResult<Vec<u64>> {
+        match self.call(&Request::GetOrInsert { pk, values })? {
+            Response::Row { values } => Ok(values),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Subtract `delta` from column `col`, clamping at 0 (saturating_sub).
     ///
     /// Returns `Some(new_value)` if found, `None` if absent.

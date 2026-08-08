@@ -139,6 +139,8 @@ pub enum OpCode {
     MultiSet = 42,
     /// Subtract `delta` from a column, clamping at 0 (saturating_sub).
     DecrementClamp = 43,
+    /// Return existing row or insert-and-return provided values.
+    GetOrInsert = 44,
     // Responses
     Pong = 129,
     Row = 130,
@@ -219,6 +221,7 @@ impl OpCode {
             41 => PopMax,
             42 => MultiSet,
             43 => DecrementClamp,
+            44 => GetOrInsert,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -559,6 +562,14 @@ pub enum Request {
         col: u32,
         delta: u64,
     },
+    /// Return the existing row if found, else insert and return the provided values.
+    ///
+    /// Always returns `Row { values }` — either the pre-existing row or the freshly
+    /// inserted one. Never returns `NotFound`.
+    GetOrInsert {
+        pk: u64,
+        values: Vec<u64>,
+    },
 }
 
 /// A server response.
@@ -817,6 +828,7 @@ impl Request {
             Request::PopMax { .. } => OpCode::PopMax,
             Request::MultiSet { .. } => OpCode::MultiSet,
             Request::DecrementClamp { .. } => OpCode::DecrementClamp,
+            Request::GetOrInsert { .. } => OpCode::GetOrInsert,
         }
     }
 
@@ -870,7 +882,9 @@ impl Request {
             Request::SetField { pk, col, value } => {
                 w.u64(*pk).u32(*col).u64(*value);
             }
-            Request::Insert { pk, values } | Request::InsertIfAbsent { pk, values } => {
+            Request::Insert { pk, values }
+            | Request::InsertIfAbsent { pk, values }
+            | Request::GetOrInsert { pk, values } => {
                 w.u64(*pk);
                 w.u64s(values)?;
             }
@@ -1115,6 +1129,10 @@ impl Request {
                 col: r.u32()?,
                 lo: r.u64()?,
                 hi: r.u64()?,
+            },
+            OpCode::GetOrInsert => Request::GetOrInsert {
+                pk: r.u64()?,
+                values: r.u64s()?,
             },
             OpCode::DecrementClamp => Request::DecrementClamp {
                 pk: r.u64()?,
@@ -1631,6 +1649,14 @@ mod tests {
                 col: 3,
                 delta: u64::MAX,
             },
+            Request::GetOrInsert {
+                pk: 1,
+                values: vec![1, 42],
+            },
+            Request::GetOrInsert {
+                pk: u64::MAX - 1,
+                values: vec![],
+            },
         ]
     }
 
@@ -1936,7 +1962,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=43 {
+                for op in 1u8..=44 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
