@@ -430,7 +430,9 @@ fn required_scope(req: &Request) -> Scope {
         | Request::TableExists { .. }
         | Request::ScanKeys { .. }
         | Request::MinMax { .. }
-        | Request::Sum { .. } => Scope::ReadOnly,
+        | Request::Sum { .. }
+        | Request::Top { .. }
+        | Request::Bottom { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -887,6 +889,30 @@ fn serve_request(
                 }
             }
             Response::Ok { affected: count }
+        }
+
+        Request::Top { col, lo, hi, n } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut sorted = rows;
+            sorted.sort_by_key(|r| std::cmp::Reverse(r.values[col as usize]));
+            let limit = if n == 0 { sorted.len() } else { n as usize };
+            let rows = sorted.into_iter().take(limit).map(|r| r.values).collect();
+            Response::Rows { rows }
+        }
+
+        Request::Bottom { col, lo, hi, n } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut sorted = rows;
+            sorted.sort_by_key(|r| r.values[col as usize]);
+            let limit = if n == 0 { sorted.len() } else { n as usize };
+            let rows = sorted.into_iter().take(limit).map(|r| r.values).collect();
+            Response::Rows { rows }
         }
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {

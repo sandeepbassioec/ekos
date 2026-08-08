@@ -143,6 +143,10 @@ pub enum OpCode {
     GetOrInsert = 44,
     /// Set the same column to the same value across many rows in one round trip.
     BatchSetField = 45,
+    /// Return the top-N rows by column value (highest first).
+    Top = 46,
+    /// Return the bottom-N rows by column value (lowest first).
+    Bottom = 47,
     // Responses
     Pong = 129,
     Row = 130,
@@ -225,6 +229,8 @@ impl OpCode {
             43 => DecrementClamp,
             44 => GetOrInsert,
             45 => BatchSetField,
+            46 => Top,
+            47 => Bottom,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -582,6 +588,24 @@ pub enum Request {
         value: u64,
         pks: Vec<u64>,
     },
+    /// Return the top-N rows (highest `col` value) in `[lo, hi]`, sorted descending.
+    ///
+    /// `n = 0` returns all matching rows. Returns `Rows { rows }`.
+    Top {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        n: u32,
+    },
+    /// Return the bottom-N rows (lowest `col` value) in `[lo, hi]`, sorted ascending.
+    ///
+    /// `n = 0` returns all matching rows. Returns `Rows { rows }`.
+    Bottom {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        n: u32,
+    },
 }
 
 /// A server response.
@@ -842,6 +866,8 @@ impl Request {
             Request::DecrementClamp { .. } => OpCode::DecrementClamp,
             Request::GetOrInsert { .. } => OpCode::GetOrInsert,
             Request::BatchSetField { .. } => OpCode::BatchSetField,
+            Request::Top { .. } => OpCode::Top,
+            Request::Bottom { .. } => OpCode::Bottom,
         }
     }
 
@@ -859,6 +885,9 @@ impl Request {
             }
             Request::ScanKeys { col, lo, hi, limit } => {
                 w.u32(*col).u64(*lo).u64(*hi).u32(*limit);
+            }
+            Request::Top { col, lo, hi, n } | Request::Bottom { col, lo, hi, n } => {
+                w.u32(*col).u64(*lo).u64(*hi).u32(*n);
             }
             Request::MinMax { col, lo, hi }
             | Request::Sum { col, lo, hi }
@@ -1151,6 +1180,18 @@ impl Request {
                 col: r.u32()?,
                 lo: r.u64()?,
                 hi: r.u64()?,
+            },
+            OpCode::Top => Request::Top {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                n: r.u32()?,
+            },
+            OpCode::Bottom => Request::Bottom {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                n: r.u32()?,
             },
             OpCode::BatchSetField => {
                 let col = r.u32()?;
@@ -1703,6 +1744,30 @@ mod tests {
                 value: 0,
                 pks: vec![],
             },
+            Request::Top {
+                col: 1,
+                lo: 0,
+                hi: u64::MAX,
+                n: 5,
+            },
+            Request::Top {
+                col: 0,
+                lo: 10,
+                hi: 50,
+                n: 0,
+            },
+            Request::Bottom {
+                col: 1,
+                lo: 0,
+                hi: u64::MAX,
+                n: 5,
+            },
+            Request::Bottom {
+                col: 0,
+                lo: 10,
+                hi: 50,
+                n: 0,
+            },
         ]
     }
 
@@ -2008,7 +2073,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=45 {
+                for op in 1u8..=47 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

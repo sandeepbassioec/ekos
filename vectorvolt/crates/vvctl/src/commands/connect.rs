@@ -372,6 +372,36 @@ pub enum ConnectCommand {
         hi: u64,
     },
 
+    /// Return the top-N rows by column value (highest first) in [lo, hi].
+    ///
+    /// n=0 returns all matching rows.
+    Top {
+        #[arg(long, default_value = "0")]
+        col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+        /// Number of rows to return (0 = all).
+        #[arg(long, default_value = "10")]
+        n: u32,
+    },
+
+    /// Return the bottom-N rows by column value (lowest first) in [lo, hi].
+    ///
+    /// n=0 returns all matching rows.
+    Bottom {
+        #[arg(long, default_value = "0")]
+        col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+        /// Number of rows to return (0 = all).
+        #[arg(long, default_value = "10")]
+        n: u32,
+    },
+
     /// Set the same column to the same value across many rows in one round trip.
     ///
     /// Prints the count of updated rows.
@@ -891,6 +921,32 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             {
                 None => println!("not found"),
                 Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
+            }
+        }
+
+        ConnectCommand::Top { col, lo, hi, n } => {
+            let rows = client
+                .top(col, lo, hi, n)
+                .with_context(|| format!("top col={col} [{lo},{hi}] n={n}"))?;
+            if rows.is_empty() {
+                println!("(empty)");
+            } else {
+                for row in &rows {
+                    println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
+                }
+            }
+        }
+
+        ConnectCommand::Bottom { col, lo, hi, n } => {
+            let rows = client
+                .bottom(col, lo, hi, n)
+                .with_context(|| format!("bottom col={col} [{lo},{hi}] n={n}"))?;
+            if rows.is_empty() {
+                println!("(empty)");
+            } else {
+                for row in &rows {
+                    println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
+                }
             }
         }
 

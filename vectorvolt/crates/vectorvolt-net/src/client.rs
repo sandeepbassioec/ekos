@@ -430,6 +430,26 @@ impl Client {
         }
     }
 
+    /// Return the top-N rows (highest `col` value) in `[lo, hi]`, sorted descending.
+    ///
+    /// `n = 0` returns all matching rows.
+    pub fn top(&mut self, col: u32, lo: u64, hi: u64, n: u32) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::Top { col, lo, hi, n })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Return the bottom-N rows (lowest `col` value) in `[lo, hi]`, sorted ascending.
+    ///
+    /// `n = 0` returns all matching rows.
+    pub fn bottom(&mut self, col: u32, lo: u64, hi: u64, n: u32) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::Bottom { col, lo, hi, n })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Set column `col` to `value` across all given PKs in one round trip.
     ///
     /// Missing PKs are silently skipped. Returns the number of rows updated.
