@@ -65,12 +65,20 @@ pub struct ServeArgs {
     pub key: Option<PathBuf>,
 }
 
-pub fn run(args: ServeArgs) -> Result<()> {
+/// Everything needed to run the server, extracted so tests can bind without blocking.
+pub struct BoundServer {
+    pub server: Server,
+    pub auth: AuthConfig,
+    pub schema: Vec<String>,
+    pub tls_enabled: bool,
+    pub engine: Arc<TableEngine>,
+}
+
+pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
     // ── Schema / table setup ──────────────────────────────────────────────────
     let schema_path = args.dir.join(SCHEMA_FILE);
 
     let schema: Vec<String> = if schema_path.exists() {
-        // Existing table — read schema from disk.
         std::fs::read_to_string(&schema_path)
             .with_context(|| format!("read {}", schema_path.display()))?
             .lines()
@@ -78,7 +86,6 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .filter(|s| !s.is_empty())
             .collect()
     } else {
-        // New table — require --columns.
         if args.columns.is_empty() {
             bail!(
                 "no table found at {} — pass --columns to create one",
@@ -94,7 +101,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
             args.dir.display(),
             args.columns.join(", ")
         );
-        args.columns
+        args.columns.clone()
     };
 
     let engine = Arc::new(
@@ -108,7 +115,6 @@ pub fn run(args: ServeArgs) -> Result<()> {
             || "secret must be a hex string (e.g. produced by `openssl rand -hex 32`)",
         )?;
         let secret = Secret::new(bytes).with_context(|| "invalid secret")?;
-        // Grant ReadWrite so the key can insert/delete as well as read.
         AuthConfig::disabled().with_scoped_key(args.key_id.clone(), secret, Scope::ReadWrite)
     } else {
         AuthConfig::disabled()
@@ -116,9 +122,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     // ── TLS ───────────────────────────────────────────────────────────────────
     let tls_enabled = args.cert.is_some();
-    let tls = match (args.cert, args.key) {
+    let tls = match (&args.cert, &args.key) {
         (Some(cert), Some(key)) => {
-            let tls = ServerTlsConfig::from_files(&cert, &key)
+            let tls = ServerTlsConfig::from_files(cert, key)
                 .with_context(|| "load TLS certificate / key")?;
             Some(tls)
         }
@@ -135,6 +141,24 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     let server =
         Server::bind(Arc::clone(&engine), config).with_context(|| format!("bind {}", args.addr))?;
+
+    Ok(BoundServer {
+        server,
+        auth,
+        schema,
+        tls_enabled,
+        engine,
+    })
+}
+
+pub fn run(args: ServeArgs) -> Result<()> {
+    let BoundServer {
+        server,
+        auth,
+        schema,
+        tls_enabled,
+        engine,
+    } = bind(&args)?;
 
     let local = server.local_addr()?;
     let stats = server.stats();
