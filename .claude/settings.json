@@ -46,8 +46,15 @@
             "PowerShell(rustc *)",
 
             "PowerShell(cd C:\\VectorVolt\\vectorvolt; cargo *)",
+            "PowerShell(cd C:\\VectorVolt\\vectorvolt; git *)",
             "PowerShell(cd C:\\VectorVolt\\ekos; cargo *)",
+            "PowerShell(cd C:\\VectorVolt\\ekos; git *)",
             "PowerShell(cd C:\\VectorVolt; cargo *)",
+            "PowerShell(cd C:\\VectorVolt; git *)",
+            "PowerShell(cd C:\\VectorVolt; Get-ChildItem *)",
+            "PowerShell(cd C:\\VectorVolt; gh *)",
+            "PowerShell(cd C:\\VectorVolt\\vectorvolt; Get-ChildItem *)",
+            "PowerShell(cd C:\\VectorVolt\\vectorvolt; Get-Content *)",
 
             "PowerShell(git status *)",
             "PowerShell(git log *)",
