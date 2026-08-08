@@ -103,6 +103,28 @@ pub enum OpCode {
     Update = 24,
     /// Delete all rows from the selected table.
     Truncate = 25,
+    /// Count rows where column `col` falls in `[lo, hi]`.
+    Count = 26,
+    /// Insert-or-replace multiple rows in a single round trip.
+    BatchUpsert = 27,
+    /// Update multiple existing rows in a single round trip.
+    BatchUpdate = 28,
+    /// Return the column schema for the currently selected table.
+    DescribeTable = 29,
+    /// Check whether a named table exists in the catalog.
+    TableExists = 30,
+    /// Range scan returning only primary keys (no values).
+    ScanKeys = 31,
+    /// Return the min, max, and count of a column value over a pk range.
+    MinMax = 32,
+    /// Sum a column's values over a pk range (saturating at u64::MAX).
+    Sum = 33,
+    /// Fetch a row by PK and atomically delete it.
+    GetAndDelete = 34,
+    /// Atomically add `delta` to column `col` of the row at `pk` (saturating at u64::MAX).
+    Increment = 35,
+    /// Conditional update: set `values[col]` to `replacement` iff it currently equals `expected`.
+    CompareAndSwap = 36,
     // Responses
     Pong = 129,
     Row = 130,
@@ -123,6 +145,12 @@ pub enum OpCode {
     TxnStarted = 141,
     /// Response to `GetMany` — only found rows, each with its pk.
     RowSet = 142,
+    /// Response to `DescribeTable` — the column names for the selected table.
+    Schema = 143,
+    /// Response to `ScanKeys` — primary keys only.
+    Keys = 144,
+    /// Response to `MinMax` — min, max, and row count for the scanned column.
+    MinMaxResult = 145,
 }
 
 impl OpCode {
@@ -159,6 +187,17 @@ impl OpCode {
             23 => GetMany,
             24 => Update,
             25 => Truncate,
+            26 => Count,
+            27 => BatchUpsert,
+            28 => BatchUpdate,
+            29 => DescribeTable,
+            30 => TableExists,
+            31 => ScanKeys,
+            32 => MinMax,
+            33 => Sum,
+            34 => GetAndDelete,
+            35 => Increment,
+            36 => CompareAndSwap,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -173,6 +212,9 @@ impl OpCode {
             140 => BatchResult,
             141 => TxnStarted,
             142 => RowSet,
+            143 => Schema,
+            144 => Keys,
+            145 => MinMaxResult,
             other => return Err(NetError::UnknownOpcode(other)),
         })
     }
@@ -358,6 +400,88 @@ pub enum Request {
     ///
     /// Returns `Ok { affected }` where `affected` is the number of rows removed.
     Truncate,
+    /// Count rows where column `col` value falls in `[lo, hi]` (both inclusive).
+    ///
+    /// Returns `Ok { affected }` where `affected` is the matching row count.
+    Count {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Insert-or-replace multiple rows in a single round trip.
+    ///
+    /// Each row is processed as an independent upsert (delete-then-insert).
+    /// Returns `Ok { affected }` equal to the number of rows submitted.
+    BatchUpsert {
+        rows: Vec<(u64, Vec<u64>)>,
+    },
+    /// Update multiple existing rows in a single round trip.
+    ///
+    /// Rows whose primary key is not found are silently skipped.
+    /// Returns `BatchResult { succeeded, skipped }`.
+    BatchUpdate {
+        rows: Vec<(u64, Vec<u64>)>,
+    },
+    /// Return the column names for the currently selected table.
+    ///
+    /// Returns `Schema { columns }`. Requires a table to be selected first.
+    DescribeTable,
+    /// Check whether a named table exists in the server catalog.
+    ///
+    /// Returns `Exists { found }`. Does not require a table to be selected.
+    TableExists {
+        name: String,
+    },
+    /// Range scan returning only primary keys (no column values).
+    ///
+    /// Same filter semantics as `RangeScan`: column `col`, range `[lo, hi]`,
+    /// optional `limit` (0 = unlimited). Returns `Keys { pks }`.
+    ScanKeys {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        limit: u32,
+    },
+    /// Return the min, max, and count of column `col` over the pk range `[lo, hi]`.
+    ///
+    /// Returns `MinMaxResult { min, max, count }` if any rows match,
+    /// or `NotFound` if the range is empty.
+    MinMax {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Sum column `col` values over pk range `[lo, hi]` (saturating at `u64::MAX`).
+    ///
+    /// Returns `Ok { affected: sum }`. Empty range returns `Ok { affected: 0 }`.
+    Sum {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Fetch the row with primary key `pk` and atomically delete it.
+    ///
+    /// Returns `Row { values }` if found and deletes, `NotFound` if absent.
+    GetAndDelete {
+        pk: u64,
+    },
+    /// Add `delta` to column `col` of the row at `pk` (saturating at `u64::MAX`).
+    ///
+    /// Returns `Ok { affected: new_value }` if found, `NotFound` if absent.
+    Increment {
+        pk: u64,
+        col: u32,
+        delta: u64,
+    },
+    /// Set `values[col]` to `replacement` iff it currently equals `expected`.
+    ///
+    /// Returns `Ok { affected: 1 }` on swap, `Ok { affected: 0 }` on mismatch, `NotFound` if absent.
+    CompareAndSwap {
+        pk: u64,
+        col: u32,
+        expected: u64,
+        replacement: u64,
+    },
 }
 
 /// A server response.
@@ -411,6 +535,20 @@ pub enum Response {
     /// Response to `GetMany` — found rows only, each entry is `(pk, values)`.
     RowSet {
         entries: Vec<(u64, Vec<u64>)>,
+    },
+    /// Response to `DescribeTable` — column names in schema order.
+    Schema {
+        columns: Vec<String>,
+    },
+    /// Response to `ScanKeys` — primary keys only, in scan order.
+    Keys {
+        pks: Vec<u64>,
+    },
+    /// Response to `MinMax` — min, max, and matching row count for the column.
+    MinMaxResult {
+        min: u64,
+        max: u64,
+        count: u64,
     },
 }
 
@@ -584,13 +722,37 @@ impl Request {
             Request::GetMany { .. } => OpCode::GetMany,
             Request::Update { .. } => OpCode::Update,
             Request::Truncate => OpCode::Truncate,
+            Request::Count { .. } => OpCode::Count,
+            Request::BatchUpsert { .. } => OpCode::BatchUpsert,
+            Request::BatchUpdate { .. } => OpCode::BatchUpdate,
+            Request::DescribeTable => OpCode::DescribeTable,
+            Request::TableExists { .. } => OpCode::TableExists,
+            Request::ScanKeys { .. } => OpCode::ScanKeys,
+            Request::MinMax { .. } => OpCode::MinMax,
+            Request::Sum { .. } => OpCode::Sum,
+            Request::GetAndDelete { .. } => OpCode::GetAndDelete,
+            Request::Increment { .. } => OpCode::Increment,
+            Request::CompareAndSwap { .. } => OpCode::CompareAndSwap,
         }
     }
 
     pub fn encode_payload(&self) -> NetResult<Vec<u8>> {
         let mut w = W::new();
         match self {
-            Request::Ping | Request::Flush | Request::Compact | Request::Stats | Request::Hello => {
+            Request::Ping
+            | Request::Flush
+            | Request::Compact
+            | Request::Stats
+            | Request::Hello
+            | Request::DescribeTable => {}
+            Request::TableExists { name } => {
+                w.string(name)?;
+            }
+            Request::ScanKeys { col, lo, hi, limit } => {
+                w.u32(*col).u64(*lo).u64(*hi).u32(*limit);
+            }
+            Request::MinMax { col, lo, hi } | Request::Sum { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
             }
             Request::Auth { key_id, response } => {
                 let k = key_id.as_bytes();
@@ -603,8 +765,19 @@ impl Request {
                 w.u32(n);
                 w.0.extend_from_slice(response);
             }
-            Request::Get { pk } | Request::Delete { pk } => {
+            Request::Get { pk } | Request::Delete { pk } | Request::GetAndDelete { pk } => {
                 w.u64(*pk);
+            }
+            Request::Increment { pk, col, delta } => {
+                w.u64(*pk).u32(*col).u64(*delta);
+            }
+            Request::CompareAndSwap {
+                pk,
+                col,
+                expected,
+                replacement,
+            } => {
+                w.u64(*pk).u32(*col).u64(*expected).u64(*replacement);
             }
             Request::Insert { pk, values } => {
                 w.u64(*pk);
@@ -664,6 +837,18 @@ impl Request {
                 w.u64s(values)?;
             }
             Request::Truncate => {}
+            Request::Count { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::BatchUpsert { rows } | Request::BatchUpdate { rows } => {
+                let n = u32::try_from(rows.len())
+                    .map_err(|_| NetError::Malformed("too many rows in batch"))?;
+                w.u32(n);
+                for (pk, values) in rows {
+                    w.u64(*pk);
+                    w.u64s(values)?;
+                }
+            }
         }
         Ok(w.0)
     }
@@ -754,6 +939,59 @@ impl Request {
                 values: r.u64s()?,
             },
             OpCode::Truncate => Request::Truncate,
+            OpCode::Count => Request::Count {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::BatchUpsert | OpCode::BatchUpdate => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more rows than payload holds"));
+                }
+                let mut rows = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let pk = r.u64()?;
+                    let values = r.u64s()?;
+                    rows.push((pk, values));
+                }
+                if opcode == OpCode::BatchUpsert {
+                    Request::BatchUpsert { rows }
+                } else {
+                    Request::BatchUpdate { rows }
+                }
+            }
+            OpCode::DescribeTable => Request::DescribeTable,
+            OpCode::TableExists => Request::TableExists { name: r.string()? },
+            OpCode::ScanKeys => Request::ScanKeys {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                limit: r.u32()?,
+            },
+            OpCode::MinMax => Request::MinMax {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::Sum => Request::Sum {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::GetAndDelete => Request::GetAndDelete { pk: r.u64()? },
+            OpCode::Increment => Request::Increment {
+                pk: r.u64()?,
+                col: r.u32()?,
+                delta: r.u64()?,
+            },
+            OpCode::CompareAndSwap => Request::CompareAndSwap {
+                pk: r.u64()?,
+                col: r.u32()?,
+                expected: r.u64()?,
+                replacement: r.u64()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -778,6 +1016,9 @@ impl Response {
             Response::BatchResult { .. } => OpCode::BatchResult,
             Response::TxnStarted { .. } => OpCode::TxnStarted,
             Response::RowSet { .. } => OpCode::RowSet,
+            Response::Schema { .. } => OpCode::Schema,
+            Response::Keys { .. } => OpCode::Keys,
+            Response::MinMaxResult { .. } => OpCode::MinMaxResult,
         }
     }
 
@@ -841,6 +1082,20 @@ impl Response {
                     w.u64(*pk);
                     w.u64s(values)?;
                 }
+            }
+            Response::Schema { columns } => {
+                w.strings(columns)?;
+            }
+            Response::Keys { pks } => {
+                let n =
+                    u32::try_from(pks.len()).map_err(|_| NetError::Malformed("too many keys"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+            }
+            Response::MinMaxResult { min, max, count } => {
+                w.u64(*min).u64(*max).u64(*count);
             }
         }
         Ok(w.0)
@@ -908,6 +1163,26 @@ impl Response {
                 }
                 Response::RowSet { entries }
             }
+            OpCode::Schema => Response::Schema {
+                columns: r.strings()?,
+            },
+            OpCode::Keys => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more keys than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Response::Keys { pks }
+            }
+            OpCode::MinMaxResult => Response::MinMaxResult {
+                min: r.u64()?,
+                max: r.u64()?,
+                count: r.u64()?,
+            },
             other => return Err(NetError::NotAResponse(other as u8)),
         };
         r.finish()?;
@@ -1064,6 +1339,87 @@ mod tests {
                 values: vec![],
             },
             Request::Truncate,
+            Request::Count {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+            },
+            Request::Count {
+                col: 3,
+                lo: 100,
+                hi: 200,
+            },
+            Request::BatchUpsert { rows: vec![] },
+            Request::BatchUpsert {
+                rows: vec![(1, vec![1, 10]), (2, vec![2, 20]), (u64::MAX, vec![])],
+            },
+            Request::BatchUpdate { rows: vec![] },
+            Request::BatchUpdate {
+                rows: vec![(1, vec![1, 99]), (u64::MAX, vec![0])],
+            },
+            Request::DescribeTable,
+            Request::TableExists {
+                name: "default".into(),
+            },
+            Request::TableExists {
+                name: String::new(),
+            },
+            Request::ScanKeys {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+                limit: 0,
+            },
+            Request::ScanKeys {
+                col: 2,
+                lo: 100,
+                hi: 200,
+                limit: 50,
+            },
+            Request::MinMax {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+            },
+            Request::MinMax {
+                col: 1,
+                lo: 100,
+                hi: 200,
+            },
+            Request::Sum {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+            },
+            Request::Sum {
+                col: 1,
+                lo: 10,
+                hi: 50,
+            },
+            Request::GetAndDelete { pk: 0 },
+            Request::GetAndDelete { pk: u64::MAX - 1 },
+            Request::Increment {
+                pk: 1,
+                col: 0,
+                delta: 1,
+            },
+            Request::Increment {
+                pk: u64::MAX - 1,
+                col: 3,
+                delta: u64::MAX,
+            },
+            Request::CompareAndSwap {
+                pk: 1,
+                col: 0,
+                expected: 0,
+                replacement: 1,
+            },
+            Request::CompareAndSwap {
+                pk: u64::MAX - 1,
+                col: 2,
+                expected: u64::MAX,
+                replacement: 0,
+            },
         ]
     }
 
@@ -1117,6 +1473,24 @@ mod tests {
             Response::RowSet { entries: vec![] },
             Response::RowSet {
                 entries: vec![(1, vec![1, 10]), (2, vec![2, 20])],
+            },
+            Response::Schema { columns: vec![] },
+            Response::Schema {
+                columns: vec!["pk".into(), "name".into(), "score".into()],
+            },
+            Response::Keys { pks: vec![] },
+            Response::Keys {
+                pks: vec![1, 2, u64::MAX - 1],
+            },
+            Response::MinMaxResult {
+                min: 0,
+                max: 0,
+                count: 1,
+            },
+            Response::MinMaxResult {
+                min: 1,
+                max: u64::MAX - 1,
+                count: 1000,
             },
         ]
     }
@@ -1351,12 +1725,12 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=25 {
+                for op in 1u8..=36 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
                 }
-                for op in 129u8..=142 {
+                for op in 129u8..=145 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Response::decode(o, &buf);
                     }

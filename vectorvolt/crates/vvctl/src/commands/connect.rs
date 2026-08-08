@@ -215,6 +215,125 @@ pub enum ConnectCommand {
 
     /// Delete all rows from the selected table.
     Truncate,
+
+    /// Insert or replace multiple rows in a single round trip.
+    ///
+    /// Rows are specified as `pk:v1,v2,...` pairs separated by spaces.
+    /// Example: `batch-upsert 1:10,20 2:30,40`
+    BatchUpsert {
+        /// Rows in `pk:v1,v2,...` format.
+        #[arg(required = true)]
+        rows: Vec<String>,
+    },
+
+    /// Sum a column's values over a pk range (saturating at u64::MAX).
+    Sum {
+        /// Column index (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
+    /// Return the min, max, and count of a column over a pk range.
+    MinMax {
+        /// Column index (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
+    /// Range scan returning only primary keys. Same filter semantics as `scan`.
+    ScanKeys {
+        /// Column index to filter on (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+        /// Maximum rows to return (0 = unlimited).
+        #[arg(long, default_value = "0")]
+        limit: u32,
+    },
+
+    /// Check whether a named table exists in the server catalog.
+    TableExists {
+        /// Table name to look up.
+        name: String,
+    },
+
+    /// Print the column names for the currently selected table.
+    DescribeTable,
+
+    /// Fetch and atomically delete the row with the given primary key.
+    ///
+    /// Prints the row values if found, or "(not found)" if absent.
+    GetAndDelete {
+        /// Primary key of the row to fetch and delete.
+        pk: u64,
+    },
+
+    /// Conditional update: set a column to `replacement` iff it equals `expected`.
+    ///
+    /// Prints "swapped", "no-match", or "(not found)".
+    CompareAndSwap {
+        /// Primary key of the row.
+        pk: u64,
+        /// Column index to compare and swap (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Value to compare against.
+        expected: u64,
+        /// Value to write if the comparison succeeds.
+        replacement: u64,
+    },
+
+    /// Atomically add `delta` to a column value. Prints the new value or "(not found)".
+    Increment {
+        /// Primary key of the row to update.
+        pk: u64,
+        /// Column index to increment (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Amount to add (saturating at u64::MAX).
+        #[arg(long, default_value = "1")]
+        delta: u64,
+    },
+
+    /// Update multiple existing rows in a single round trip. Rows not found are skipped.
+    ///
+    /// Rows are specified as `pk:v1,v2,...` pairs separated by spaces.
+    /// Example: `batch-update 1:10,20 2:30,40`
+    BatchUpdate {
+        /// Rows in `pk:v1,v2,...` format.
+        #[arg(required = true)]
+        rows: Vec<String>,
+    },
+
+    /// Count rows where column `col` value falls in `[lo, hi]` (both inclusive).
+    Count {
+        /// Column index (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Minimum value (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Maximum value (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -443,6 +562,166 @@ pub fn run(args: ConnectArgs) -> Result<()> {
         ConnectCommand::Truncate => {
             let deleted = client.truncate().with_context(|| "truncate")?;
             println!("truncated — {deleted} row(s) removed");
+        }
+
+        ConnectCommand::BatchUpsert { rows: raw } => {
+            let mut parsed: Vec<(u64, Vec<u64>)> = Vec::with_capacity(raw.len());
+            for s in &raw {
+                let (pk_str, vals_str) = s.split_once(':').with_context(|| {
+                    format!("batch-upsert row '{s}' must be in pk:v1,v2,... format")
+                })?;
+                let pk: u64 = pk_str
+                    .parse()
+                    .with_context(|| format!("pk '{pk_str}' is not a valid u64"))?;
+                let values: Vec<u64> = if vals_str.is_empty() {
+                    vec![]
+                } else {
+                    vals_str
+                        .split(',')
+                        .map(|v| {
+                            v.parse::<u64>()
+                                .with_context(|| format!("value '{v}' is not a valid u64"))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+                parsed.push((pk, values));
+            }
+            let n = parsed.len();
+            let affected = client
+                .batch_upsert(parsed)
+                .with_context(|| "batch-upsert")?;
+            println!("batch-upsert: {n} row(s) submitted — {affected} applied");
+        }
+
+        ConnectCommand::Sum { col, lo, hi } => {
+            let total = client
+                .sum(col, lo, hi)
+                .with_context(|| format!("sum col={col} [{lo},{hi}]"))?;
+            println!("{total}");
+        }
+
+        ConnectCommand::MinMax { col, lo, hi } => {
+            match client
+                .min_max(col, lo, hi)
+                .with_context(|| format!("min-max col={col} [{lo},{hi}]"))?
+            {
+                None => println!("(no rows in range)"),
+                Some((min, max, count)) => {
+                    println!("min={min}  max={max}  count={count}");
+                }
+            }
+        }
+
+        ConnectCommand::ScanKeys { col, lo, hi, limit } => {
+            let pks = client
+                .scan_keys(col, lo, hi, limit)
+                .with_context(|| format!("scan-keys col={col} [{lo},{hi}]"))?;
+            if pks.is_empty() {
+                println!("(no keys)");
+            } else {
+                for pk in &pks {
+                    println!("{pk}");
+                }
+                println!("\n{} key(s)", pks.len());
+            }
+        }
+
+        ConnectCommand::TableExists { name } => {
+            let found = client
+                .table_exists(&name)
+                .with_context(|| format!("table-exists {name}"))?;
+            if found {
+                println!("exists: {name}");
+            } else {
+                println!("not found: {name}");
+            }
+        }
+
+        ConnectCommand::CompareAndSwap {
+            pk,
+            col,
+            expected,
+            replacement,
+        } => {
+            match client
+                .compare_and_swap(pk, col, expected, replacement)
+                .with_context(|| {
+                    format!("compare-and-swap pk={pk} col={col} expected={expected} replacement={replacement}")
+                })?
+            {
+                None => println!("(not found)"),
+                Some(true) => println!("swapped"),
+                Some(false) => println!("no-match"),
+            }
+        }
+
+        ConnectCommand::Increment { pk, col, delta } => {
+            match client
+                .increment(pk, col, delta)
+                .with_context(|| format!("increment pk={pk} col={col} delta={delta}"))?
+            {
+                None => println!("(not found)"),
+                Some(new_val) => println!("{new_val}"),
+            }
+        }
+
+        ConnectCommand::GetAndDelete { pk } => {
+            match client
+                .get_and_delete(pk)
+                .with_context(|| format!("get-and-delete pk={pk}"))?
+            {
+                None => println!("(not found)"),
+                Some(values) => {
+                    let s: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+                    println!("{}", s.join(", "));
+                }
+            }
+        }
+
+        ConnectCommand::DescribeTable => {
+            let columns = client.describe_table().with_context(|| "describe-table")?;
+            if columns.is_empty() {
+                println!("(no columns)");
+            } else {
+                for (i, col) in columns.iter().enumerate() {
+                    println!("[{i}] {col}");
+                }
+            }
+        }
+
+        ConnectCommand::BatchUpdate { rows: raw } => {
+            let mut parsed: Vec<(u64, Vec<u64>)> = Vec::with_capacity(raw.len());
+            for s in &raw {
+                let (pk_str, vals_str) = s.split_once(':').with_context(|| {
+                    format!("batch-update row '{s}' must be in pk:v1,v2,... format")
+                })?;
+                let pk: u64 = pk_str
+                    .parse()
+                    .with_context(|| format!("pk '{pk_str}' is not a valid u64"))?;
+                let values: Vec<u64> = if vals_str.is_empty() {
+                    vec![]
+                } else {
+                    vals_str
+                        .split(',')
+                        .map(|v| {
+                            v.parse::<u64>()
+                                .with_context(|| format!("value '{v}' is not a valid u64"))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+                parsed.push((pk, values));
+            }
+            let (succeeded, skipped) = client
+                .batch_update(parsed)
+                .with_context(|| "batch-update")?;
+            println!("batch-update: {succeeded} updated, {skipped} skipped (not found)");
+        }
+
+        ConnectCommand::Count { col, lo, hi } => {
+            let n = client
+                .count(col, lo, hi)
+                .with_context(|| format!("count col={col} [{lo},{hi}]"))?;
+            println!("{n}");
         }
 
         ConnectCommand::GetMany { pks } => {

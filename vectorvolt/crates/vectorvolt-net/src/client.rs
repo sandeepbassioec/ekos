@@ -378,6 +378,130 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Count rows where column `col` value falls in `[lo, hi]` (both inclusive).
+    ///
+    /// `col = 0` counts by primary key range; higher indices count by non-pk columns.
+    pub fn count(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::Count { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Insert-or-replace multiple rows in one round trip.
+    ///
+    /// Returns the number of rows submitted (all are applied — there is no
+    /// per-row skip count because upsert never fails on a duplicate key).
+    pub fn batch_upsert(&mut self, rows: Vec<(u64, Vec<u64>)>) -> NetResult<u64> {
+        match self.call(&Request::BatchUpsert { rows })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Update multiple existing rows in one round trip.
+    ///
+    /// Returns `(succeeded, skipped)` where `skipped` counts keys not found.
+    pub fn batch_update(&mut self, rows: Vec<(u64, Vec<u64>)>) -> NetResult<(u32, u32)> {
+        match self.call(&Request::BatchUpdate { rows })? {
+            Response::BatchResult { succeeded, skipped } => Ok((succeeded, skipped)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Sum column `col` values over pk range `[lo, hi]` (saturating at `u64::MAX`).
+    ///
+    /// Returns 0 for an empty range.
+    pub fn sum(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::Sum { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Atomically add `delta` to column `col` of the row at `pk` (saturating at `u64::MAX`).
+    ///
+    /// Returns `Some(new_value)` if the row existed, `None` if absent.
+    pub fn increment(&mut self, pk: u64, col: u32, delta: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::Increment { pk, col, delta })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Conditional update: set `values[col]` to `replacement` iff it currently equals `expected`.
+    ///
+    /// Returns `Some(true)` on swap, `Some(false)` on mismatch, `None` if row absent.
+    pub fn compare_and_swap(
+        &mut self,
+        pk: u64,
+        col: u32,
+        expected: u64,
+        replacement: u64,
+    ) -> NetResult<Option<bool>> {
+        match self.call(&Request::CompareAndSwap {
+            pk,
+            col,
+            expected,
+            replacement,
+        })? {
+            Response::Ok { affected } => Ok(Some(affected == 1)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Atomically fetch and delete the row with primary key `pk`.
+    ///
+    /// Returns `Some(values)` if the row existed, `None` if absent.
+    pub fn get_and_delete(&mut self, pk: u64) -> NetResult<Option<Vec<u64>>> {
+        match self.call(&Request::GetAndDelete { pk })? {
+            Response::Row { values } => Ok(Some(values)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Return the `(min, max, count)` of column `col` over rows where the pk falls in `[lo, hi]`.
+    ///
+    /// Returns `None` when no rows match the range.
+    pub fn min_max(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<(u64, u64, u64)>> {
+        match self.call(&Request::MinMax { col, lo, hi })? {
+            Response::MinMaxResult { min, max, count } => Ok(Some((min, max, count))),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Range scan returning only primary keys (no column values).
+    ///
+    /// `limit` of 0 means unlimited. Cheaper than `range_scan` when only keys are needed.
+    pub fn scan_keys(&mut self, col: u32, lo: u64, hi: u64, limit: u32) -> NetResult<Vec<u64>> {
+        match self.call(&Request::ScanKeys { col, lo, hi, limit })? {
+            Response::Keys { pks } => Ok(pks),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Check whether a named table exists in the server catalog.
+    ///
+    /// Does not require a table to be selected first.
+    pub fn table_exists(&mut self, name: impl Into<String>) -> NetResult<bool> {
+        match self.call(&Request::TableExists { name: name.into() })? {
+            Response::Exists { found } => Ok(found),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Return the column names for the currently selected table.
+    pub fn describe_table(&mut self) -> NetResult<Vec<String>> {
+        match self.call(&Request::DescribeTable)? {
+            Response::Schema { columns } => Ok(columns),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

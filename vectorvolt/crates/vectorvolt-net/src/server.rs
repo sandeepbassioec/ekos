@@ -424,13 +424,24 @@ fn required_scope(req: &Request) -> Scope {
         | Request::SecondaryLookup { .. }
         | Request::FkExists { .. }
         | Request::ListTables
-        | Request::GetMany { .. } => Scope::ReadOnly,
+        | Request::GetMany { .. }
+        | Request::Count { .. }
+        | Request::DescribeTable
+        | Request::TableExists { .. }
+        | Request::ScanKeys { .. }
+        | Request::MinMax { .. }
+        | Request::Sum { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
         | Request::BatchDelete { .. }
         | Request::Upsert { .. }
-        | Request::Update { .. } => Scope::ReadWrite,
+        | Request::Update { .. }
+        | Request::BatchUpsert { .. }
+        | Request::BatchUpdate { .. }
+        | Request::GetAndDelete { .. }
+        | Request::Increment { .. }
+        | Request::CompareAndSwap { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -516,6 +527,12 @@ fn serve_request(
         Request::ListTables => {
             return Response::TableList {
                 names: registry.list_tables(),
+            };
+        }
+
+        Request::TableExists { name } => {
+            return Response::Exists {
+                found: registry.get(&name).is_ok(),
             };
         }
 
@@ -630,6 +647,71 @@ fn serve_request(
             Err(e) => engine_error(e),
         },
 
+        Request::GetAndDelete { pk } => match engine.get(pk) {
+            Ok(None) => Response::NotFound,
+            Err(e) => engine_error(e),
+            Ok(Some(row)) => {
+                let values = row.values;
+                let _ = engine.delete(pk);
+                Response::Row { values }
+            }
+        },
+
+        Request::Increment { pk, col, delta } => match engine.get(pk) {
+            Ok(None) => Response::NotFound,
+            Err(e) => engine_error(e),
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: "column index out of range".to_string(),
+                    };
+                }
+                let mut values = row.values;
+                values[col_idx] = values[col_idx].saturating_add(delta);
+                let new_val = values[col_idx];
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::CompareAndSwap {
+            pk,
+            col,
+            expected,
+            replacement,
+        } => match engine.get(pk) {
+            Ok(None) => Response::NotFound,
+            Err(e) => engine_error(e),
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: "column index out of range".to_string(),
+                    };
+                }
+                if row.values[col_idx] != expected {
+                    return Response::Ok { affected: 0 };
+                }
+                let mut values = row.values;
+                values[col_idx] = replacement;
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: 1 },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
         Request::Insert { pk, values } => match engine.insert(pk, values) {
             Ok(_) => Response::Ok { affected: 1 },
             Err(e) => engine_error(e),
@@ -658,6 +740,55 @@ fn serve_request(
                         .collect()
                 };
                 Response::Rows { rows }
+            }
+            Err(e) => engine_error(e),
+        },
+
+        Request::Sum { col, lo, hi } => match engine.scan(col as usize, lo, hi) {
+            Err(e) => engine_error(e),
+            Ok(rows) => {
+                let col_idx = col as usize;
+                let total = rows
+                    .iter()
+                    .fold(0u64, |acc, row| acc.saturating_add(row.values[col_idx]));
+                Response::Ok { affected: total }
+            }
+        },
+
+        Request::MinMax { col, lo, hi } => match engine.scan(col as usize, lo, hi) {
+            Err(e) => engine_error(e),
+            Ok(rows) => {
+                if rows.is_empty() {
+                    return Response::NotFound;
+                }
+                let col_idx = col as usize;
+                let mut min = u64::MAX;
+                let mut max = 0u64;
+                let count = rows.len() as u64;
+                for row in &rows {
+                    let v = row.values[col_idx];
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
+                }
+                Response::MinMaxResult { min, max, count }
+            }
+        },
+
+        Request::ScanKeys { col, lo, hi, limit } => match engine.scan(col as usize, lo, hi) {
+            Ok(rows) => {
+                let pks: Vec<u64> = if limit == 0 {
+                    rows.into_iter().map(|r| r.values[0]).collect()
+                } else {
+                    rows.into_iter()
+                        .take(limit as usize)
+                        .map(|r| r.values[0])
+                        .collect()
+                };
+                Response::Keys { pks }
             }
             Err(e) => engine_error(e),
         },
@@ -729,6 +860,39 @@ fn serve_request(
             Response::RowSet { entries }
         }
 
+        Request::BatchUpsert { rows } => {
+            let count = rows.len() as u64;
+            for (pk, values) in rows {
+                let _ = engine.delete(pk);
+                let _ = engine.insert(pk, values);
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::BatchUpdate { rows } => {
+            let mut succeeded: u32 = 0;
+            let mut skipped: u32 = 0;
+            for (pk, values) in rows {
+                match engine.get(pk) {
+                    Ok(None) => skipped = skipped.saturating_add(1),
+                    Err(_) => skipped = skipped.saturating_add(1),
+                    Ok(Some(_)) => {
+                        let _ = engine.delete(pk);
+                        let _ = engine.insert(pk, values);
+                        succeeded = succeeded.saturating_add(1);
+                    }
+                }
+            }
+            Response::BatchResult { succeeded, skipped }
+        }
+
+        Request::Count { col, lo, hi } => match engine.scan(col as usize, lo, hi) {
+            Ok(rows) => Response::Ok {
+                affected: rows.len() as u64,
+            },
+            Err(e) => engine_error(e),
+        },
+
         Request::Truncate => {
             // scan() auto-flushes the write buffer before reading partitions,
             // so this captures all live rows. We delete each, then flush the
@@ -777,6 +941,10 @@ fn serve_request(
             }
         }
 
+        Request::DescribeTable => Response::Schema {
+            columns: engine.schema.clone(),
+        },
+
         // Handled by auth gate or the catalog/txn blocks above.
         Request::Hello
         | Request::Auth { .. }
@@ -785,6 +953,7 @@ fn serve_request(
         | Request::CreateTable { .. }
         | Request::DropTable { .. }
         | Request::ListTables
+        | Request::TableExists { .. }
         | Request::BeginTxn
         | Request::CommitTxn { .. }
         | Request::RollbackTxn { .. } => Response::Error {
