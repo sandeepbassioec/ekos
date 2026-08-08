@@ -101,6 +101,8 @@ pub enum OpCode {
     GetMany = 23,
     /// Update an existing row; error if the primary key is not found.
     Update = 24,
+    /// Delete all rows from the selected table.
+    Truncate = 25,
     // Responses
     Pong = 129,
     Row = 130,
@@ -156,6 +158,7 @@ impl OpCode {
             22 => Upsert,
             23 => GetMany,
             24 => Update,
+            25 => Truncate,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -351,6 +354,10 @@ pub enum Request {
         pk: u64,
         values: Vec<u64>,
     },
+    /// Delete all rows from the selected table.
+    ///
+    /// Returns `Ok { affected }` where `affected` is the number of rows removed.
+    Truncate,
 }
 
 /// A server response.
@@ -576,6 +583,7 @@ impl Request {
             Request::Upsert { .. } => OpCode::Upsert,
             Request::GetMany { .. } => OpCode::GetMany,
             Request::Update { .. } => OpCode::Update,
+            Request::Truncate => OpCode::Truncate,
         }
     }
 
@@ -655,6 +663,7 @@ impl Request {
                 w.u64(*pk);
                 w.u64s(values)?;
             }
+            Request::Truncate => {}
         }
         Ok(w.0)
     }
@@ -744,6 +753,7 @@ impl Request {
                 pk: r.u64()?,
                 values: r.u64s()?,
             },
+            OpCode::Truncate => Request::Truncate,
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -1053,6 +1063,7 @@ mod tests {
                 pk: u64::MAX,
                 values: vec![],
             },
+            Request::Truncate,
         ]
     }
 
@@ -1340,7 +1351,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=24 {
+                for op in 1u8..=25 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

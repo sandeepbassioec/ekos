@@ -435,7 +435,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::Compact
         | Request::UseTable { .. }
         | Request::CreateTable { .. }
-        | Request::DropTable { .. } => Scope::Admin,
+        | Request::DropTable { .. }
+        | Request::Truncate => Scope::Admin,
         Request::BeginTxn | Request::CommitTxn { .. } | Request::RollbackTxn { .. } => {
             Scope::ReadWrite
         }
@@ -726,6 +727,29 @@ fn serve_request(
                 }
             }
             Response::RowSet { entries }
+        }
+
+        Request::Truncate => {
+            // scan() auto-flushes the write buffer before reading partitions,
+            // so this captures all live rows. We delete each, then flush the
+            // tombstones and compact to merge them with the insert records —
+            // without compact, tombstones sit in a separate partition and scan
+            // would still return the original insert rows on subsequent calls.
+            match engine.scan(0, 0, u64::MAX) {
+                Err(e) => engine_error(e),
+                Ok(rows) => {
+                    let pks: Vec<u64> = rows.into_iter().map(|r| r.values[0]).collect();
+                    let count = pks.len() as u64;
+                    for pk in &pks {
+                        let _ = engine.delete(*pk);
+                    }
+                    // Flush tombstones into a partition, then compact to
+                    // physically remove all rows from storage.
+                    let _ = engine.flush();
+                    let _ = engine.compact();
+                    Response::Ok { affected: count }
+                }
+            }
         }
 
         Request::Update { pk, values } => match engine.get(pk) {
