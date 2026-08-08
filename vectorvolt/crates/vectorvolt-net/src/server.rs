@@ -444,7 +444,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::CompareAndSwap { .. }
         | Request::SetField { .. }
         | Request::InsertIfAbsent { .. }
-        | Request::DeleteRange { .. } => Scope::ReadWrite,
+        | Request::DeleteRange { .. }
+        | Request::PopMin { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -760,6 +761,23 @@ fn serve_request(
                 }
             }
             Response::Ok { affected: count }
+        }
+
+        Request::PopMin { col, lo, hi } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let min_row = match rows.into_iter().min_by_key(|r| r.values[col as usize]) {
+                None => return Response::NotFound,
+                Some(r) => r,
+            };
+            let pk = min_row.values[0];
+            let values = min_row.values;
+            match engine.delete(pk) {
+                Ok(_) => Response::Row { values },
+                Err(e) => engine_error(e),
+            }
         }
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {

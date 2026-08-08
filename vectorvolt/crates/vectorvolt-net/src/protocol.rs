@@ -131,6 +131,8 @@ pub enum OpCode {
     InsertIfAbsent = 38,
     /// Delete all rows where column `col` falls in `[lo, hi]`.
     DeleteRange = 39,
+    /// Fetch and atomically delete the row with the minimum column value in `[lo, hi]`.
+    PopMin = 40,
     // Responses
     Pong = 129,
     Row = 130,
@@ -207,6 +209,7 @@ impl OpCode {
             37 => SetField,
             38 => InsertIfAbsent,
             39 => DeleteRange,
+            40 => PopMin,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -514,6 +517,14 @@ pub enum Request {
         lo: u64,
         hi: u64,
     },
+    /// Fetch and atomically delete the row whose column `col` has the minimum
+    /// value in `[lo, hi]`. Returns `Row { values }` (pk is `values[0]`) if
+    /// found, `NotFound` if the range is empty.
+    PopMin {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
 }
 
 /// A server response.
@@ -768,6 +779,7 @@ impl Request {
             Request::SetField { .. } => OpCode::SetField,
             Request::InsertIfAbsent { .. } => OpCode::InsertIfAbsent,
             Request::DeleteRange { .. } => OpCode::DeleteRange,
+            Request::PopMin { .. } => OpCode::PopMin,
         }
     }
 
@@ -788,7 +800,8 @@ impl Request {
             }
             Request::MinMax { col, lo, hi }
             | Request::Sum { col, lo, hi }
-            | Request::DeleteRange { col, lo, hi } => {
+            | Request::DeleteRange { col, lo, hi }
+            | Request::PopMin { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
             }
             Request::Auth { key_id, response } => {
@@ -1042,6 +1055,11 @@ impl Request {
                 values: r.u64s()?,
             },
             OpCode::DeleteRange => Request::DeleteRange {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::PopMin => Request::PopMin {
                 col: r.u32()?,
                 lo: r.u64()?,
                 hi: r.u64()?,
@@ -1502,6 +1520,16 @@ mod tests {
                 lo: 10,
                 hi: 50,
             },
+            Request::PopMin {
+                col: 0,
+                lo: 0,
+                hi: u64::MAX,
+            },
+            Request::PopMin {
+                col: 1,
+                lo: 10,
+                hi: 50,
+            },
         ]
     }
 
@@ -1807,7 +1835,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=39 {
+                for op in 1u8..=40 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

@@ -420,6 +420,16 @@ impl Client {
         }
     }
 
+    /// Fetch and atomically delete the row with the minimum column `col` value
+    /// in `[lo, hi]`. Returns the full row (pk is `values[0]`) or `None` if empty.
+    pub fn pop_min(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<Vec<u64>>> {
+        match self.call(&Request::PopMin { col, lo, hi })? {
+            Response::Row { values } => Ok(Some(values)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Delete all rows where column `col` falls in `[lo, hi]`.
     ///
     /// Returns the number of rows deleted.
