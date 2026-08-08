@@ -285,6 +285,17 @@ pub enum ConnectCommand {
         pk: u64,
     },
 
+    /// Insert a row only if the primary key is not already present.
+    ///
+    /// Prints "inserted" or "already exists".
+    InsertIfAbsent {
+        /// Primary key for the new row.
+        pk: u64,
+        /// Column values in schema order (excluding pk).
+        #[arg(num_args = 0..)]
+        values: Vec<u64>,
+    },
+
     /// Set a single column of an existing row without supplying other column values.
     ///
     /// Prints "updated" or "(not found)".
@@ -647,6 +658,17 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 println!("exists: {name}");
             } else {
                 println!("not found: {name}");
+            }
+        }
+
+        ConnectCommand::InsertIfAbsent { pk, values } => {
+            let inserted = client
+                .insert_if_absent(pk, values)
+                .with_context(|| format!("insert-if-absent pk={pk}"))?;
+            if inserted {
+                println!("inserted");
+            } else {
+                println!("already exists");
             }
         }
 

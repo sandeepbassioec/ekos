@@ -442,7 +442,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::GetAndDelete { .. }
         | Request::Increment { .. }
         | Request::CompareAndSwap { .. }
-        | Request::SetField { .. } => Scope::ReadWrite,
+        | Request::SetField { .. }
+        | Request::InsertIfAbsent { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -734,6 +735,15 @@ fn serve_request(
                     },
                 }
             }
+        },
+
+        Request::InsertIfAbsent { pk, values } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(Some(_)) => Response::Ok { affected: 0 },
+            Ok(None) => match engine.insert(pk, values) {
+                Ok(_) => Response::Ok { affected: 1 },
+                Err(e) => engine_error(e),
+            },
         },
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {

@@ -420,6 +420,16 @@ impl Client {
         }
     }
 
+    /// Insert a row only if the primary key is not already present.
+    ///
+    /// Returns `true` if inserted, `false` if the key already existed.
+    pub fn insert_if_absent(&mut self, pk: u64, values: Vec<u64>) -> NetResult<bool> {
+        match self.call(&Request::InsertIfAbsent { pk, values })? {
+            Response::Ok { affected } => Ok(affected == 1),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Set a single column of an existing row to `value` without supplying other columns.
     ///
     /// Returns `true` if found and updated, `false` (as `NotFound`) mapped to `None`.

@@ -127,6 +127,8 @@ pub enum OpCode {
     CompareAndSwap = 36,
     /// Set a single column of an existing row without providing all other column values.
     SetField = 37,
+    /// Insert a row only if the primary key is not already present.
+    InsertIfAbsent = 38,
     // Responses
     Pong = 129,
     Row = 130,
@@ -201,6 +203,7 @@ impl OpCode {
             35 => Increment,
             36 => CompareAndSwap,
             37 => SetField,
+            38 => InsertIfAbsent,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -493,6 +496,13 @@ pub enum Request {
         col: u32,
         value: u64,
     },
+    /// Insert a row only if the primary key is not already present.
+    ///
+    /// Returns `Ok { affected: 1 }` on insert, `Ok { affected: 0 }` if already present.
+    InsertIfAbsent {
+        pk: u64,
+        values: Vec<u64>,
+    },
 }
 
 /// A server response.
@@ -745,6 +755,7 @@ impl Request {
             Request::Increment { .. } => OpCode::Increment,
             Request::CompareAndSwap { .. } => OpCode::CompareAndSwap,
             Request::SetField { .. } => OpCode::SetField,
+            Request::InsertIfAbsent { .. } => OpCode::InsertIfAbsent,
         }
     }
 
@@ -794,7 +805,7 @@ impl Request {
             Request::SetField { pk, col, value } => {
                 w.u64(*pk).u32(*col).u64(*value);
             }
-            Request::Insert { pk, values } => {
+            Request::Insert { pk, values } | Request::InsertIfAbsent { pk, values } => {
                 w.u64(*pk);
                 w.u64s(values)?;
             }
@@ -1011,6 +1022,10 @@ impl Request {
                 pk: r.u64()?,
                 col: r.u32()?,
                 value: r.u64()?,
+            },
+            OpCode::InsertIfAbsent => Request::InsertIfAbsent {
+                pk: r.u64()?,
+                values: r.u64s()?,
             },
             other => return Err(NetError::NotARequest(other as u8)),
         };
@@ -1450,6 +1465,14 @@ mod tests {
                 col: 1,
                 value: u64::MAX,
             },
+            Request::InsertIfAbsent {
+                pk: 1,
+                values: vec![1, 2],
+            },
+            Request::InsertIfAbsent {
+                pk: u64::MAX - 1,
+                values: vec![],
+            },
         ]
     }
 
@@ -1755,7 +1778,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=37 {
+                for op in 1u8..=38 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
