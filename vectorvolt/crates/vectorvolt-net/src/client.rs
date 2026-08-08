@@ -349,6 +349,25 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Fetch multiple rows by primary key in one round trip.
+    ///
+    /// Returns only found rows as `(pk, values)` pairs. Missing keys are
+    /// silently omitted — the caller can diff against the input list.
+    pub fn get_many(&mut self, pks: Vec<u64>) -> NetResult<Vec<(u64, Vec<u64>)>> {
+        match self.call(&Request::GetMany { pks })? {
+            Response::RowSet { entries } => Ok(entries),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Update an existing row. Returns an error if `pk` does not exist.
+    pub fn update(&mut self, pk: u64, values: Vec<u64>) -> NetResult<()> {
+        match self.call(&Request::Update { pk, values })? {
+            Response::Ok { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

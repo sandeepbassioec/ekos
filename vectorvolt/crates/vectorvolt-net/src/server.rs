@@ -423,12 +423,14 @@ fn required_scope(req: &Request) -> Scope {
         | Request::Stats
         | Request::SecondaryLookup { .. }
         | Request::FkExists { .. }
-        | Request::ListTables => Scope::ReadOnly,
+        | Request::ListTables
+        | Request::GetMany { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
         | Request::BatchDelete { .. }
-        | Request::Upsert { .. } => Scope::ReadWrite,
+        | Request::Upsert { .. }
+        | Request::Update { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -715,6 +717,31 @@ fn serve_request(
                 Err(e) => engine_error(e),
             }
         }
+
+        Request::GetMany { pks } => {
+            let mut entries: Vec<(u64, Vec<u64>)> = Vec::with_capacity(pks.len());
+            for pk in pks {
+                if let Ok(Some(row)) = engine.get(pk) {
+                    entries.push((pk, row.values));
+                }
+            }
+            Response::RowSet { entries }
+        }
+
+        Request::Update { pk, values } => match engine.get(pk) {
+            Ok(None) => Response::Error {
+                code: error_code::NOT_FOUND,
+                message: format!("pk={pk} not found"),
+            },
+            Err(e) => engine_error(e),
+            Ok(Some(_)) => {
+                let _ = engine.delete(pk);
+                match engine.insert(pk, values) {
+                    Ok(_) => Response::Ok { affected: 1 },
+                    Err(e) => engine_error(e),
+                }
+            }
+        },
 
         Request::Stats => {
             let s = engine.stats();
