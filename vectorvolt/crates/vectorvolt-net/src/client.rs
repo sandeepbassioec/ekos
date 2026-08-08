@@ -340,6 +340,15 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Insert-or-replace: if a row with `pk` exists it is deleted first, then
+    /// the new row is inserted. Never returns a duplicate-key error.
+    pub fn upsert(&mut self, pk: u64, values: Vec<u64>) -> NetResult<()> {
+        match self.call(&Request::Upsert { pk, values })? {
+            Response::Ok { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.
