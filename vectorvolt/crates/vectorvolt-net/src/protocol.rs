@@ -111,6 +111,8 @@ pub enum OpCode {
     BatchUpdate = 28,
     /// Return the column schema for the currently selected table.
     DescribeTable = 29,
+    /// Check whether a named table exists in the catalog.
+    TableExists = 30,
     // Responses
     Pong = 129,
     Row = 130,
@@ -173,6 +175,7 @@ impl OpCode {
             27 => BatchUpsert,
             28 => BatchUpdate,
             29 => DescribeTable,
+            30 => TableExists,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -399,6 +402,12 @@ pub enum Request {
     ///
     /// Returns `Schema { columns }`. Requires a table to be selected first.
     DescribeTable,
+    /// Check whether a named table exists in the server catalog.
+    ///
+    /// Returns `Exists { found }`. Does not require a table to be selected.
+    TableExists {
+        name: String,
+    },
 }
 
 /// A server response.
@@ -633,6 +642,7 @@ impl Request {
             Request::BatchUpsert { .. } => OpCode::BatchUpsert,
             Request::BatchUpdate { .. } => OpCode::BatchUpdate,
             Request::DescribeTable => OpCode::DescribeTable,
+            Request::TableExists { .. } => OpCode::TableExists,
         }
     }
 
@@ -645,6 +655,9 @@ impl Request {
             | Request::Stats
             | Request::Hello
             | Request::DescribeTable => {}
+            Request::TableExists { name } => {
+                w.string(name)?;
+            }
             Request::Auth { key_id, response } => {
                 let k = key_id.as_bytes();
                 let n =
@@ -843,6 +856,7 @@ impl Request {
                 }
             }
             OpCode::DescribeTable => Request::DescribeTable,
+            OpCode::TableExists => Request::TableExists { name: r.string()? },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -1179,6 +1193,12 @@ mod tests {
                 rows: vec![(1, vec![1, 99]), (u64::MAX, vec![0])],
             },
             Request::DescribeTable,
+            Request::TableExists {
+                name: "default".into(),
+            },
+            Request::TableExists {
+                name: String::new(),
+            },
         ]
     }
 
@@ -1470,7 +1490,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=29 {
+                for op in 1u8..=30 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

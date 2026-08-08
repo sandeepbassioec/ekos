@@ -410,6 +410,16 @@ impl Client {
         }
     }
 
+    /// Check whether a named table exists in the server catalog.
+    ///
+    /// Does not require a table to be selected first.
+    pub fn table_exists(&mut self, name: impl Into<String>) -> NetResult<bool> {
+        match self.call(&Request::TableExists { name: name.into() })? {
+            Response::Exists { found } => Ok(found),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Return the column names for the currently selected table.
     pub fn describe_table(&mut self) -> NetResult<Vec<String>> {
         match self.call(&Request::DescribeTable)? {

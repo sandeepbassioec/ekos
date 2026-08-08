@@ -226,6 +226,12 @@ pub enum ConnectCommand {
         rows: Vec<String>,
     },
 
+    /// Check whether a named table exists in the server catalog.
+    TableExists {
+        /// Table name to look up.
+        name: String,
+    },
+
     /// Print the column names for the currently selected table.
     DescribeTable,
 
@@ -508,6 +514,17 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .batch_upsert(parsed)
                 .with_context(|| "batch-upsert")?;
             println!("batch-upsert: {n} row(s) submitted — {affected} applied");
+        }
+
+        ConnectCommand::TableExists { name } => {
+            let found = client
+                .table_exists(&name)
+                .with_context(|| format!("table-exists {name}"))?;
+            if found {
+                println!("exists: {name}");
+            } else {
+                println!("not found: {name}");
+            }
         }
 
         ConnectCommand::DescribeTable => {

@@ -426,7 +426,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::ListTables
         | Request::GetMany { .. }
         | Request::Count { .. }
-        | Request::DescribeTable => Scope::ReadOnly,
+        | Request::DescribeTable
+        | Request::TableExists { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -520,6 +521,12 @@ fn serve_request(
         Request::ListTables => {
             return Response::TableList {
                 names: registry.list_tables(),
+            };
+        }
+
+        Request::TableExists { name } => {
+            return Response::Exists {
+                found: registry.get(&name).is_ok(),
             };
         }
 
@@ -826,6 +833,7 @@ fn serve_request(
         | Request::CreateTable { .. }
         | Request::DropTable { .. }
         | Request::ListTables
+        | Request::TableExists { .. }
         | Request::BeginTxn
         | Request::CommitTxn { .. }
         | Request::RollbackTxn { .. } => Response::Error {
