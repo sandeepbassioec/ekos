@@ -430,6 +430,17 @@ impl Client {
         }
     }
 
+    /// Set multiple `(col, value)` pairs on an existing row atomically.
+    ///
+    /// Returns `true` if found and updated, `false` if the pk was absent.
+    pub fn multi_set(&mut self, pk: u64, pairs: Vec<(u32, u64)>) -> NetResult<bool> {
+        match self.call(&Request::MultiSet { pk, pairs })? {
+            Response::Ok { .. } => Ok(true),
+            Response::NotFound => Ok(false),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Fetch and atomically delete the row with the maximum column `col` value
     /// in `[lo, hi]`. Returns the full row (pk is `values[0]`) or `None` if empty.
     pub fn pop_max(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<Vec<u64>>> {

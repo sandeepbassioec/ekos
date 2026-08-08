@@ -401,6 +401,18 @@ pub enum ConnectCommand {
         #[arg(long, default_value = "18446744073709551615")]
         hi: u64,
     },
+
+    /// Set multiple columns of an existing row atomically.
+    ///
+    /// Pairs are given as `col:value` arguments, e.g. `1:42 2:99`.
+    MultiSet {
+        /// Primary key of the row to update.
+        #[arg(long)]
+        pk: u64,
+        /// Column-value pairs in `col:value` format (e.g. `1:42`).
+        #[arg(required = true)]
+        pairs: Vec<String>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -837,6 +849,26 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             {
                 None => println!("not found"),
                 Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
+            }
+        }
+
+        ConnectCommand::MultiSet { pk, pairs } => {
+            let mut parsed = Vec::with_capacity(pairs.len());
+            for s in &pairs {
+                let (col_str, val_str) = s.split_once(':').with_context(|| {
+                    format!("pair '{s}' must be col:value")
+                })?;
+                let col: u32 = col_str.parse().with_context(|| format!("invalid column '{col_str}'"))?;
+                let value: u64 = val_str.parse().with_context(|| format!("invalid value '{val_str}'"))?;
+                parsed.push((col, value));
+            }
+            let updated = client
+                .multi_set(pk, parsed)
+                .with_context(|| format!("multi-set pk={pk}"))?;
+            if updated {
+                println!("updated");
+            } else {
+                println!("not found");
             }
         }
 

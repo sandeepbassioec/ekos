@@ -135,6 +135,8 @@ pub enum OpCode {
     PopMin = 40,
     /// Fetch and atomically delete the row with the maximum column value in `[lo, hi]`.
     PopMax = 41,
+    /// Set multiple `(col, value)` pairs on an existing row atomically.
+    MultiSet = 42,
     // Responses
     Pong = 129,
     Row = 130,
@@ -213,6 +215,7 @@ impl OpCode {
             39 => DeleteRange,
             40 => PopMin,
             41 => PopMax,
+            42 => MultiSet,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -536,6 +539,15 @@ pub enum Request {
         lo: u64,
         hi: u64,
     },
+    /// Set multiple columns of an existing row in one round trip.
+    ///
+    /// `pairs` is a list of `(col_index, new_value)`. The row is fetched,
+    /// all listed columns are updated, then the row is re-inserted atomically.
+    /// Returns `Ok { affected: 1 }` if found, `NotFound` if absent.
+    MultiSet {
+        pk: u64,
+        pairs: Vec<(u32, u64)>,
+    },
 }
 
 /// A server response.
@@ -792,6 +804,7 @@ impl Request {
             Request::DeleteRange { .. } => OpCode::DeleteRange,
             Request::PopMin { .. } => OpCode::PopMin,
             Request::PopMax { .. } => OpCode::PopMax,
+            Request::MultiSet { .. } => OpCode::MultiSet,
         }
     }
 
@@ -905,6 +918,15 @@ impl Request {
             Request::Truncate => {}
             Request::Count { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::MultiSet { pk, pairs } => {
+                w.u64(*pk);
+                let n = u32::try_from(pairs.len())
+                    .map_err(|_| NetError::Malformed("too many pairs in MultiSet"))?;
+                w.u32(n);
+                for (col, value) in pairs {
+                    w.u32(*col).u64(*value);
+                }
             }
             Request::BatchUpsert { rows } | Request::BatchUpdate { rows } => {
                 let n = u32::try_from(rows.len())
@@ -1082,6 +1104,22 @@ impl Request {
                 lo: r.u64()?,
                 hi: r.u64()?,
             },
+            OpCode::MultiSet => {
+                let pk = r.u64()?;
+                let n = r.u32()? as usize;
+                // Each pair is 4+8=12 bytes.
+                let max_possible = (r.b.len() - r.at) / 12;
+                if n > max_possible {
+                    return Err(NetError::Malformed(
+                        "declared more pairs than payload holds",
+                    ));
+                }
+                let mut pairs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pairs.push((r.u32()?, r.u64()?));
+                }
+                Request::MultiSet { pk, pairs }
+            }
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -1558,6 +1596,14 @@ mod tests {
                 lo: 10,
                 hi: 50,
             },
+            Request::MultiSet {
+                pk: 1,
+                pairs: vec![(0, 99), (1, 42)],
+            },
+            Request::MultiSet {
+                pk: u64::MAX - 1,
+                pairs: vec![],
+            },
         ]
     }
 
@@ -1863,7 +1909,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=41 {
+                for op in 1u8..=42 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

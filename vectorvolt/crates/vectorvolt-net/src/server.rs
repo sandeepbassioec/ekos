@@ -446,7 +446,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::InsertIfAbsent { .. }
         | Request::DeleteRange { .. }
         | Request::PopMin { .. }
-        | Request::PopMax { .. } => Scope::ReadWrite,
+        | Request::PopMax { .. }
+        | Request::MultiSet { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -805,6 +806,31 @@ fn serve_request(
                 Some(values) => Response::Row { values },
             }
         }
+
+        Request::MultiSet { pk, pairs } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let mut values = row.values;
+                for (col, value) in &pairs {
+                    let idx = *col as usize;
+                    if idx >= values.len() {
+                        return Response::Error {
+                            code: error_code::INVALID_ARGUMENT,
+                            message: format!("column index {idx} out of range"),
+                        };
+                    }
+                    values[idx] = *value;
+                }
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: 1 },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {
             Ok(_) => Response::Ok { affected: 1 },
