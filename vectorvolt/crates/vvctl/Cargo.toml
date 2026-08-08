@@ -12,6 +12,13 @@ homepage.workspace   = true
 name = "vvctl"
 path = "src/main.rs"
 
+[lib]
+name = "vvctl"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [dependencies]
 vectorvolt-wal    = { path = "../vectorvolt-wal" }
 vectorvolt-store  = { path = "../vectorvolt-store" }

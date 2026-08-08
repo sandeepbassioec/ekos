@@ -2,9 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-mod commands;
-use commands::{bench, connect, hal, serve, store, table, wal};
 use store::OutputFormat;
+use vvctl::commands::{bench, connect, hal, serve, store, table, wal};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOMEPAGE: &str = "https://workerruntime.com";
