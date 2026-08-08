@@ -388,6 +388,17 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Insert-or-replace multiple rows in one round trip.
+    ///
+    /// Returns the number of rows submitted (all are applied — there is no
+    /// per-row skip count because upsert never fails on a duplicate key).
+    pub fn batch_upsert(&mut self, rows: Vec<(u64, Vec<u64>)>) -> NetResult<u64> {
+        match self.call(&Request::BatchUpsert { rows })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

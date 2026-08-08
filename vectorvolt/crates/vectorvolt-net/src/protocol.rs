@@ -105,6 +105,8 @@ pub enum OpCode {
     Truncate = 25,
     /// Count rows where column `col` falls in `[lo, hi]`.
     Count = 26,
+    /// Insert-or-replace multiple rows in a single round trip.
+    BatchUpsert = 27,
     // Responses
     Pong = 129,
     Row = 130,
@@ -162,6 +164,7 @@ impl OpCode {
             24 => Update,
             25 => Truncate,
             26 => Count,
+            27 => BatchUpsert,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -368,6 +371,13 @@ pub enum Request {
         col: u32,
         lo: u64,
         hi: u64,
+    },
+    /// Insert-or-replace multiple rows in a single round trip.
+    ///
+    /// Each row is processed as an independent upsert (delete-then-insert).
+    /// Returns `Ok { affected }` equal to the number of rows submitted.
+    BatchUpsert {
+        rows: Vec<(u64, Vec<u64>)>,
     },
 }
 
@@ -596,6 +606,7 @@ impl Request {
             Request::Update { .. } => OpCode::Update,
             Request::Truncate => OpCode::Truncate,
             Request::Count { .. } => OpCode::Count,
+            Request::BatchUpsert { .. } => OpCode::BatchUpsert,
         }
     }
 
@@ -678,6 +689,15 @@ impl Request {
             Request::Truncate => {}
             Request::Count { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::BatchUpsert { rows } => {
+                let n = u32::try_from(rows.len())
+                    .map_err(|_| NetError::Malformed("too many rows in BatchUpsert"))?;
+                w.u32(n);
+                for (pk, values) in rows {
+                    w.u64(*pk);
+                    w.u64s(values)?;
+                }
             }
         }
         Ok(w.0)
@@ -774,6 +794,20 @@ impl Request {
                 lo: r.u64()?,
                 hi: r.u64()?,
             },
+            OpCode::BatchUpsert => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more rows than payload holds"));
+                }
+                let mut rows = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let pk = r.u64()?;
+                    let values = r.u64s()?;
+                    rows.push((pk, values));
+                }
+                Request::BatchUpsert { rows }
+            }
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -1094,6 +1128,10 @@ mod tests {
                 lo: 100,
                 hi: 200,
             },
+            Request::BatchUpsert { rows: vec![] },
+            Request::BatchUpsert {
+                rows: vec![(1, vec![1, 10]), (2, vec![2, 20]), (u64::MAX, vec![])],
+            },
         ]
     }
 
@@ -1381,7 +1419,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=26 {
+                for op in 1u8..=27 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

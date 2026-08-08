@@ -216,6 +216,16 @@ pub enum ConnectCommand {
     /// Delete all rows from the selected table.
     Truncate,
 
+    /// Insert or replace multiple rows in a single round trip.
+    ///
+    /// Rows are specified as `pk:v1,v2,...` pairs separated by spaces.
+    /// Example: `batch-upsert 1:10,20 2:30,40`
+    BatchUpsert {
+        /// Rows in `pk:v1,v2,...` format.
+        #[arg(required = true)]
+        rows: Vec<String>,
+    },
+
     /// Count rows where column `col` value falls in `[lo, hi]` (both inclusive).
     Count {
         /// Column index (0 = pk).
@@ -456,6 +466,35 @@ pub fn run(args: ConnectArgs) -> Result<()> {
         ConnectCommand::Truncate => {
             let deleted = client.truncate().with_context(|| "truncate")?;
             println!("truncated — {deleted} row(s) removed");
+        }
+
+        ConnectCommand::BatchUpsert { rows: raw } => {
+            let mut parsed: Vec<(u64, Vec<u64>)> = Vec::with_capacity(raw.len());
+            for s in &raw {
+                let (pk_str, vals_str) = s.split_once(':').with_context(|| {
+                    format!("batch-upsert row '{s}' must be in pk:v1,v2,... format")
+                })?;
+                let pk: u64 = pk_str
+                    .parse()
+                    .with_context(|| format!("pk '{pk_str}' is not a valid u64"))?;
+                let values: Vec<u64> = if vals_str.is_empty() {
+                    vec![]
+                } else {
+                    vals_str
+                        .split(',')
+                        .map(|v| {
+                            v.parse::<u64>()
+                                .with_context(|| format!("value '{v}' is not a valid u64"))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+                parsed.push((pk, values));
+            }
+            let n = parsed.len();
+            let affected = client
+                .batch_upsert(parsed)
+                .with_context(|| "batch-upsert")?;
+            println!("batch-upsert: {n} row(s) submitted — {affected} applied");
         }
 
         ConnectCommand::Count { col, lo, hi } => {

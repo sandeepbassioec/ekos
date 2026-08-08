@@ -431,7 +431,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::BatchInsert { .. }
         | Request::BatchDelete { .. }
         | Request::Upsert { .. }
-        | Request::Update { .. } => Scope::ReadWrite,
+        | Request::Update { .. }
+        | Request::BatchUpsert { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -728,6 +729,15 @@ fn serve_request(
                 }
             }
             Response::RowSet { entries }
+        }
+
+        Request::BatchUpsert { rows } => {
+            let count = rows.len() as u64;
+            for (pk, values) in rows {
+                let _ = engine.delete(pk);
+                let _ = engine.insert(pk, values);
+            }
+            Response::Ok { affected: count }
         }
 
         Request::Count { col, lo, hi } => match engine.scan(col as usize, lo, hi) {
