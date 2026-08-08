@@ -95,6 +95,8 @@ pub enum OpCode {
     CommitTxn = 20,
     /// Roll back the active transaction, discarding all buffered ops.
     RollbackTxn = 21,
+    /// Insert or replace a row (delete existing, then insert).
+    Upsert = 22,
     // Responses
     Pong = 129,
     Row = 130,
@@ -145,6 +147,7 @@ impl OpCode {
             19 => BeginTxn,
             20 => CommitTxn,
             21 => RollbackTxn,
+            22 => Upsert,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -320,6 +323,13 @@ pub enum Request {
     /// Discard all buffered ops for the active transaction.
     RollbackTxn {
         txn_id: u64,
+    },
+    /// Insert-or-replace: delete the existing row (if any), then insert.
+    ///
+    /// Never returns a duplicate-key error. Always returns `Ok { affected: 1 }`.
+    Upsert {
+        pk: u64,
+        values: Vec<u64>,
     },
 }
 
@@ -539,6 +549,7 @@ impl Request {
             Request::BeginTxn => OpCode::BeginTxn,
             Request::CommitTxn { .. } => OpCode::CommitTxn,
             Request::RollbackTxn { .. } => OpCode::RollbackTxn,
+            Request::Upsert { .. } => OpCode::Upsert,
         }
     }
 
@@ -601,6 +612,10 @@ impl Request {
             Request::BeginTxn => {}
             Request::CommitTxn { txn_id } | Request::RollbackTxn { txn_id } => {
                 w.u64(*txn_id);
+            }
+            Request::Upsert { pk, values } => {
+                w.u64(*pk);
+                w.u64s(values)?;
             }
         }
         Ok(w.0)
@@ -671,6 +686,10 @@ impl Request {
             OpCode::BeginTxn => Request::BeginTxn,
             OpCode::CommitTxn => Request::CommitTxn { txn_id: r.u64()? },
             OpCode::RollbackTxn => Request::RollbackTxn { txn_id: r.u64()? },
+            OpCode::Upsert => Request::Upsert {
+                pk: r.u64()?,
+                values: r.u64s()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -934,6 +953,14 @@ mod tests {
             Request::CommitTxn { txn_id: u64::MAX },
             Request::RollbackTxn { txn_id: 1 },
             Request::RollbackTxn { txn_id: u64::MAX },
+            Request::Upsert {
+                pk: 5,
+                values: vec![],
+            },
+            Request::Upsert {
+                pk: u64::MAX,
+                values: vec![0, 1, u64::MAX],
+            },
         ]
     }
 
@@ -1217,7 +1244,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=21 {
+                for op in 1u8..=22 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

@@ -185,6 +185,15 @@ pub enum ConnectCommand {
         /// Transaction ID returned by begin-txn.
         txn_id: u64,
     },
+
+    /// Insert or replace a row (delete existing row if present, then insert).
+    Upsert {
+        /// Primary key.
+        pk: u64,
+        /// Column values in schema order (excluding pk).
+        #[arg(num_args = 0..)]
+        values: Vec<u64>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -394,6 +403,13 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .rollback_txn(txn_id)
                 .with_context(|| format!("rollback-txn txn-id={txn_id}"))?;
             println!("rolled back txn-id={txn_id}");
+        }
+
+        ConnectCommand::Upsert { pk, values } => {
+            client
+                .upsert(pk, values)
+                .with_context(|| format!("upsert pk={pk}"))?;
+            println!("upserted pk={pk}");
         }
     }
 

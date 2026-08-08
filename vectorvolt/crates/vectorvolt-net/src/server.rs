@@ -427,7 +427,8 @@ fn required_scope(req: &Request) -> Scope {
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
-        | Request::BatchDelete { .. } => Scope::ReadWrite,
+        | Request::BatchDelete { .. }
+        | Request::Upsert { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -704,6 +705,15 @@ fn serve_request(
                 }
             }
             Response::BatchResult { succeeded, skipped }
+        }
+
+        Request::Upsert { pk, values } => {
+            // Delete silently (row may not exist), then insert.
+            let _ = engine.delete(pk);
+            match engine.insert(pk, values) {
+                Ok(_) => Response::Ok { affected: 1 },
+                Err(e) => engine_error(e),
+            }
         }
 
         Request::Stats => {
