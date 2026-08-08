@@ -444,7 +444,10 @@ fn required_scope(req: &Request) -> Scope {
         | Request::CompareAndSwap { .. }
         | Request::SetField { .. }
         | Request::InsertIfAbsent { .. }
-        | Request::DeleteRange { .. } => Scope::ReadWrite,
+        | Request::DeleteRange { .. }
+        | Request::PopMin { .. }
+        | Request::PopMax { .. }
+        | Request::MultiSet { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -761,6 +764,73 @@ fn serve_request(
             }
             Response::Ok { affected: count }
         }
+
+        Request::PopMin { col, lo, hi } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut sorted = rows;
+            sorted.sort_by_key(|r| r.values[col as usize]);
+            let mut found = None;
+            for row in sorted {
+                let pk = row.values[0];
+                if engine.delete(pk).is_ok() {
+                    found = Some(row.values);
+                    break;
+                }
+            }
+            match found {
+                None => Response::NotFound,
+                Some(values) => Response::Row { values },
+            }
+        }
+
+        Request::PopMax { col, lo, hi } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut sorted = rows;
+            sorted.sort_by_key(|r| std::cmp::Reverse(r.values[col as usize]));
+            let mut found = None;
+            for row in sorted {
+                let pk = row.values[0];
+                if engine.delete(pk).is_ok() {
+                    found = Some(row.values);
+                    break;
+                }
+            }
+            match found {
+                None => Response::NotFound,
+                Some(values) => Response::Row { values },
+            }
+        }
+
+        Request::MultiSet { pk, pairs } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let mut values = row.values;
+                for (col, value) in &pairs {
+                    let idx = *col as usize;
+                    if idx >= values.len() {
+                        return Response::Error {
+                            code: error_code::INVALID_ARGUMENT,
+                            message: format!("column index {idx} out of range"),
+                        };
+                    }
+                    values[idx] = *value;
+                }
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: 1 },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {
             Ok(_) => Response::Ok { affected: 1 },

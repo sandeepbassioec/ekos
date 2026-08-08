@@ -371,6 +371,48 @@ pub enum ConnectCommand {
         #[arg(long, default_value = "18446744073709551615")]
         hi: u64,
     },
+
+    /// Atomically fetch and delete the row with the minimum column value in [lo, hi].
+    ///
+    /// Prints the row values or "not found".
+    PopMin {
+        /// Column index to scan and rank on (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
+    /// Atomically fetch and delete the row with the maximum column value in [lo, hi].
+    ///
+    /// Prints the row values or "not found".
+    PopMax {
+        /// Column index to scan and rank on (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
+    /// Set multiple columns of an existing row atomically.
+    ///
+    /// Pairs are given as `col:value` arguments, e.g. `1:42 2:99`.
+    MultiSet {
+        /// Primary key of the row to update.
+        #[arg(long)]
+        pk: u64,
+        /// Column-value pairs in `col:value` format (e.g. `1:42`).
+        #[arg(required = true)]
+        pairs: Vec<String>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -788,6 +830,46 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .count(col, lo, hi)
                 .with_context(|| format!("count col={col} [{lo},{hi}]"))?;
             println!("{n}");
+        }
+
+        ConnectCommand::PopMin { col, lo, hi } => {
+            match client
+                .pop_min(col, lo, hi)
+                .with_context(|| format!("pop-min col={col} [{lo},{hi}]"))?
+            {
+                None => println!("not found"),
+                Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
+            }
+        }
+
+        ConnectCommand::PopMax { col, lo, hi } => {
+            match client
+                .pop_max(col, lo, hi)
+                .with_context(|| format!("pop-max col={col} [{lo},{hi}]"))?
+            {
+                None => println!("not found"),
+                Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
+            }
+        }
+
+        ConnectCommand::MultiSet { pk, pairs } => {
+            let mut parsed = Vec::with_capacity(pairs.len());
+            for s in &pairs {
+                let (col_str, val_str) = s.split_once(':').with_context(|| {
+                    format!("pair '{s}' must be col:value")
+                })?;
+                let col: u32 = col_str.parse().with_context(|| format!("invalid column '{col_str}'"))?;
+                let value: u64 = val_str.parse().with_context(|| format!("invalid value '{val_str}'"))?;
+                parsed.push((col, value));
+            }
+            let updated = client
+                .multi_set(pk, parsed)
+                .with_context(|| format!("multi-set pk={pk}"))?;
+            if updated {
+                println!("updated");
+            } else {
+                println!("not found");
+            }
         }
 
         ConnectCommand::GetMany { pks } => {
