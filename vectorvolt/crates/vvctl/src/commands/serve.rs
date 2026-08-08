@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use vectorvolt_engine::TableEngine;
+use vectorvolt_engine::{EngineOptions, TableEngine, TableRegistry};
 use vectorvolt_net::tls::ServerTlsConfig;
 use vectorvolt_net::{AuthConfig, Scope, Secret, Server, ServerConfig};
 
@@ -63,51 +63,99 @@ pub struct ServeArgs {
     /// PEM private-key file for TLS.
     #[arg(long)]
     pub key: Option<PathBuf>,
+
+    /// Multi-table mode: `dir` is a catalog root, not a single table directory.
+    ///
+    /// All subdirectories of `dir` that contain a `schema.txt` are opened as
+    /// named tables. New tables can be created at runtime via `vvctl connect
+    /// create-table` and will persist across restarts.
+    ///
+    /// When this flag is set, `--columns` is ignored.
+    #[arg(long)]
+    pub multi: bool,
 }
 
 /// Everything needed to run the server, extracted so tests can bind without blocking.
 pub struct BoundServer {
     pub server: Server,
     pub auth: AuthConfig,
+    /// Single-table mode: the schema of the default table.
     pub schema: Vec<String>,
     pub tls_enabled: bool,
-    pub engine: Arc<TableEngine>,
+    /// Single-table mode: the opened engine (None in --multi mode).
+    pub engine: Option<Arc<TableEngine>>,
+    /// Multi-table mode: the opened registry (None in single-table mode).
+    pub registry: Option<Arc<TableRegistry>>,
 }
+
+type ServerBuilder = Box<dyn FnOnce(ServerConfig) -> Result<Server>>;
 
 pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
     // ── Schema / table setup ──────────────────────────────────────────────────
-    let schema_path = args.dir.join(SCHEMA_FILE);
-
-    let schema: Vec<String> = if schema_path.exists() {
-        std::fs::read_to_string(&schema_path)
-            .with_context(|| format!("read {}", schema_path.display()))?
-            .lines()
-            .map(str::to_owned)
-            .filter(|s| !s.is_empty())
-            .collect()
+    let (server_builder, schema, engine, registry) = if args.multi {
+        // Multi-table mode: open catalog root.
+        std::fs::create_dir_all(&args.dir)
+            .with_context(|| format!("create catalog root {}", args.dir.display()))?;
+        let opts = EngineOptions::new(FLUSH_THRESHOLD);
+        let reg = Arc::new(
+            TableRegistry::open(&args.dir, opts)
+                .with_context(|| format!("open catalog at {}", args.dir.display()))?,
+        );
+        let table_count = reg.list_tables().len();
+        eprintln!(
+            "catalog at {}  ({} table(s) restored)",
+            args.dir.display(),
+            table_count
+        );
+        let reg2 = Arc::clone(&reg);
+        (
+            Box::new(move |cfg| Server::bind_registry(reg2, cfg).with_context(|| "bind registry"))
+                as ServerBuilder,
+            vec![],
+            None,
+            Some(reg),
+        )
     } else {
-        if args.columns.is_empty() {
+        // Single-table (legacy) mode.
+        let schema_path = args.dir.join(SCHEMA_FILE);
+        let schema: Vec<String> = if schema_path.exists() {
+            std::fs::read_to_string(&schema_path)
+                .with_context(|| format!("read {}", schema_path.display()))?
+                .lines()
+                .map(str::to_owned)
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else if args.columns.is_empty() {
             bail!(
                 "no table found at {} — pass --columns to create one",
                 args.dir.display()
             );
-        }
-        std::fs::create_dir_all(&args.dir)
-            .with_context(|| format!("create dir {}", args.dir.display()))?;
-        std::fs::write(&schema_path, args.columns.join("\n"))
-            .with_context(|| "write schema.txt")?;
-        eprintln!(
-            "created table at {}  schema: {}",
-            args.dir.display(),
-            args.columns.join(", ")
+        } else {
+            std::fs::create_dir_all(&args.dir)
+                .with_context(|| format!("create dir {}", args.dir.display()))?;
+            std::fs::write(&schema_path, args.columns.join("\n"))
+                .with_context(|| "write schema.txt")?;
+            eprintln!(
+                "created table at {}  schema: {}",
+                args.dir.display(),
+                args.columns.join(", ")
+            );
+            args.columns.clone()
+        };
+        let eng = Arc::new(
+            TableEngine::open(schema.clone(), &args.dir, FLUSH_THRESHOLD)
+                .with_context(|| "open engine")?,
         );
-        args.columns.clone()
+        let eng2 = Arc::clone(&eng);
+        let addr = args.addr;
+        (
+            Box::new(move |cfg| Server::bind(eng2, cfg).with_context(|| format!("bind {}", addr)))
+                as ServerBuilder,
+            schema,
+            Some(eng),
+            None,
+        )
     };
-
-    let engine = Arc::new(
-        TableEngine::open(schema.clone(), &args.dir, FLUSH_THRESHOLD)
-            .with_context(|| "open engine")?,
-    );
 
     // ── Auth ──────────────────────────────────────────────────────────────────
     let auth = if let Some(hex) = &args.secret {
@@ -139,8 +187,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         config = config.with_tls(t);
     }
 
-    let server =
-        Server::bind(Arc::clone(&engine), config).with_context(|| format!("bind {}", args.addr))?;
+    let server = server_builder(config)?;
 
     Ok(BoundServer {
         server,
@@ -148,6 +195,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         schema,
         tls_enabled,
         engine,
+        registry,
     })
 }
 
@@ -158,6 +206,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         schema,
         tls_enabled,
         engine,
+        registry,
     } = bind(&args)?;
 
     let local = server.local_addr()?;
@@ -166,8 +215,21 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // ── Startup banner ────────────────────────────────────────────────────────
     eprintln!("VectorVolt server ready");
     eprintln!("  address   : {local}");
-    eprintln!("  table     : {}", args.dir.display());
-    eprintln!("  schema    : {}", schema.join(", "));
+    if args.multi {
+        eprintln!("  catalog   : {}", args.dir.display());
+        let names = registry
+            .as_ref()
+            .map(|r| r.list_tables())
+            .unwrap_or_default();
+        if names.is_empty() {
+            eprintln!("  tables    : (empty — use create-table to add one)");
+        } else {
+            eprintln!("  tables    : {}", names.join(", "));
+        }
+    } else {
+        eprintln!("  table     : {}", args.dir.display());
+        eprintln!("  schema    : {}", schema.join(", "));
+    }
     eprintln!(
         "  auth      : {}",
         if auth.is_enabled() {
@@ -187,10 +249,13 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     // Register a Ctrl-C handler so we can flush before exit.
     let shutdown_handle = server.shutdown_handle();
-    let engine_for_signal = Arc::clone(&engine);
     ctrlc::set_handler(move || {
         eprintln!("\nShutting down…");
-        if let Ok(Some(r)) = engine_for_signal.flush() {
+        // In single-table mode flush the one engine; in multi-table mode each
+        // table flushes itself when the Arc is dropped, so we just shutdown.
+        if let Some(ref eng) = engine
+            && let Ok(Some(r)) = eng.flush()
+        {
             eprintln!("  flushed {} buffered row(s)", r.row_count);
         }
         let c = stats

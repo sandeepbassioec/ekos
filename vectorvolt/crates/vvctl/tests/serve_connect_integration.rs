@@ -37,6 +37,7 @@ fn start_plain(dir: &TempDir) -> (SocketAddr, impl FnOnce()) {
         key_id: "default".into(),
         cert: None,
         key: None,
+        multi: false,
     };
 
     let bound = bind(&args).expect("bind");
@@ -65,6 +66,7 @@ fn start_authed(dir: &TempDir, secret_hex: &str) -> (SocketAddr, impl FnOnce()) 
         key_id: "k1".into(),
         cert: None,
         key: None,
+        multi: false,
     };
 
     let bound = bind(&args).expect("bind");
@@ -120,6 +122,7 @@ fn bind_creates_schema_file_for_new_table() {
         key_id: "default".into(),
         cert: None,
         key: None,
+        multi: false,
     };
     let bound = bind(&args).unwrap();
     bound.server.shutdown_handle().shutdown();
@@ -143,6 +146,7 @@ fn bind_reads_existing_schema_from_disk() {
         key_id: "default".into(),
         cert: None,
         key: None,
+        multi: false,
     };
     let bound = bind(&args).unwrap();
     bound.server.shutdown_handle().shutdown();
@@ -163,6 +167,7 @@ fn bind_fails_when_no_table_and_no_columns() {
         key_id: "default".into(),
         cert: None,
         key: None,
+        multi: false,
     };
     assert!(bind(&args).is_err());
 }
@@ -182,6 +187,7 @@ fn bind_fails_with_cert_but_no_key() {
         key_id: "default".into(),
         cert: Some(std::path::PathBuf::from("nonexistent.pem")),
         key: None,
+        multi: false,
     };
     assert!(bind(&args).is_err());
 }

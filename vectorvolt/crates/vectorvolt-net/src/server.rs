@@ -1,11 +1,11 @@
-//! [`Server`] — a TCP server over a [`TableEngine`] (VV-NET-004/005).
+//! [`Server`] — a TCP server over a [`TableRegistry`] (VV-NET-004/005).
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use vectorvolt_engine::TableEngine;
+use vectorvolt_engine::{TableEngine, TableRegistry};
 
 use crate::auth::{AuthConfig, AuthState, Scope};
 use crate::protocol::{HEADER_SIZE, Header, Request, Response, encode_response, verify_payload};
@@ -102,7 +102,7 @@ pub struct ServerStats {
 
 /// A running server.
 pub struct Server {
-    engine: Arc<TableEngine>,
+    registry: Arc<TableRegistry>,
     config: ServerConfig,
     listener: TcpListener,
     shutdown: Arc<AtomicBool>,
@@ -111,16 +111,21 @@ pub struct Server {
 }
 
 impl Server {
-    /// Bind the listener. Does not begin serving.
+    /// Single-table backward-compatible constructor.
     ///
-    /// Binding is separate from serving so a caller can learn the real address
-    /// before any client connects — which is what makes a test able to bind port 0
-    /// and then connect to whatever the OS chose, instead of guessing a port and
-    /// racing another test for it.
+    /// Wraps `engine` in a [`TableRegistry`] under the name `"default"` and
+    /// auto-selects it for every new connection. Existing callers and tests that
+    /// do not send `UseTable` continue to work unchanged.
     pub fn bind(engine: Arc<TableEngine>, config: ServerConfig) -> NetResult<Self> {
+        Self::bind_registry(Arc::new(TableRegistry::new_with_default(engine)), config)
+    }
+
+    /// Multi-table constructor. New connections auto-select `"default"` if the
+    /// registry contains it; otherwise the client must send `UseTable` first.
+    pub fn bind_registry(registry: Arc<TableRegistry>, config: ServerConfig) -> NetResult<Self> {
         let listener = TcpListener::bind(config.addr)?;
         Ok(Server {
-            engine,
+            registry,
             config,
             listener,
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -177,7 +182,7 @@ impl Server {
                 .fetch_add(1, Ordering::Relaxed);
             self.live.fetch_add(1, Ordering::AcqRel);
 
-            let engine = Arc::clone(&self.engine);
+            let registry = Arc::clone(&self.registry);
             let stats = Arc::clone(&self.stats);
             let live = Arc::clone(&self.live);
             let shutdown = Arc::clone(&self.shutdown);
@@ -190,7 +195,7 @@ impl Server {
                 // denial of service that costs the attacker a single socket.
                 match ServerConn::accept(stream, tls.as_ref()) {
                     Ok(conn) => {
-                        let _ = handle_connection(conn, &engine, &stats, &shutdown, &auth);
+                        let _ = handle_connection(conn, &registry, &stats, &shutdown, &auth);
                     }
                     Err(_) => {
                         stats.tls_handshake_failures.fetch_add(1, Ordering::Relaxed);
@@ -254,15 +259,16 @@ fn read_exact_or_eof<R: Read>(stream: &mut R, buf: &mut [u8]) -> NetResult<bool>
 
 fn handle_connection(
     mut stream: ServerConn,
-    engine: &TableEngine,
+    registry: &TableRegistry,
     stats: &ServerStats,
     shutdown: &AtomicBool,
     auth_config: &AuthConfig,
 ) -> NetResult<()> {
     let mut header_buf = [0u8; HEADER_SIZE];
-    // Auth state is per CONNECTION, not per process. Authenticating once must not
-    // authorise anyone else, and a new socket starts over.
+    // Auth state is per CONNECTION, not per process.
     let mut auth = AuthState::new(auth_config);
+    // Auto-select "default" if it exists, for backward compatibility.
+    let mut selected: Option<Arc<TableEngine>> = registry.get("default").ok();
 
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -272,10 +278,6 @@ fn handle_connection(
             return Ok(());
         }
 
-        // A bad header cannot be answered: without a valid request_id there is
-        // nothing to correlate a reply to, and the stream position is unknown, so
-        // anything after it would be parsed as a frame boundary that is not one.
-        // Closing is the only honest response.
         let header = match Header::decode(&header_buf) {
             Ok(h) => h,
             Err(e) => {
@@ -284,8 +286,6 @@ fn handle_connection(
             }
         };
 
-        // Allocation happens only after the header validated the length against
-        // MAX_PAYLOAD.
         let mut payload = vec![0u8; header.payload_len as usize];
         if header.payload_len > 0 && !read_exact_or_eof(&mut stream, &mut payload)? {
             return Err(NetError::Truncated {
@@ -294,18 +294,20 @@ fn handle_connection(
             });
         }
 
-        // From here the frame is well-formed enough to answer, so errors become
-        // responses rather than disconnections. A client that sends one bad
-        // request should learn why, not be dropped.
         let response = match verify_payload(&header, &payload)
             .and_then(|_| Request::decode(header.opcode, &payload))
         {
             Ok(req) => {
                 stats.requests_handled.fetch_add(1, Ordering::Relaxed);
-                match serve_authenticated(engine, req, &mut auth, auth_config, stats) {
+                match serve_authenticated(
+                    registry,
+                    &mut selected,
+                    req,
+                    &mut auth,
+                    auth_config,
+                    stats,
+                ) {
                     Ok(r) => r,
-                    // Lock-out: answer, then close. Replying first means the client
-                    // learns why instead of seeing an unexplained reset.
                     Err(r) => {
                         let frame = encode_response(header.request_id, &r)?;
                         stream.write_all(&frame)?;
@@ -331,21 +333,10 @@ fn handle_connection(
 
 /// Apply the authentication gate, then serve.
 ///
-/// `Err(response)` means "send this and close the connection" — used only for
-/// lock-out, where continuing to serve would defeat the attempt limit.
-///
-/// ## What an unauthenticated connection may do
-///
-/// Only `Hello`, `Auth`, and `Ping`. Everything else is refused.
-///
-/// `Ping` is allowed deliberately: a load balancer or health check needs to know
-/// the server is alive without holding credentials, and a liveness probe reveals
-/// nothing that a successful TCP connect does not already reveal. `Stats` is NOT
-/// allowed, even though it looks similarly harmless — row counts and byte totals
-/// are information about the data, and an unauthenticated peer should learn
-/// nothing about it.
+/// `Err(response)` means "send this and close the connection" (lock-out only).
 fn serve_authenticated(
-    engine: &TableEngine,
+    registry: &TableRegistry,
+    selected: &mut Option<Arc<TableEngine>>,
     req: Request,
     auth: &mut AuthState,
     config: &AuthConfig,
@@ -388,10 +379,6 @@ fn serve_authenticated(
             })
         }
         other => {
-            // Authorisation, after authentication. Enforced here rather than in
-            // `serve_request` so the check cannot be forgotten when an opcode is
-            // added: `required_scope` is exhaustive over `Request`, so a new
-            // variant fails to compile until someone decides what it costs.
             if let Err(e) = auth.require(required_scope(&other)) {
                 stats.forbidden_rejections.fetch_add(1, Ordering::Relaxed);
                 return Ok(Response::Error {
@@ -399,7 +386,7 @@ fn serve_authenticated(
                     message: e.to_string(),
                 });
             }
-            Ok(serve_request(engine, other))
+            Ok(serve_request(registry, selected, other))
         }
     }
 }
@@ -411,29 +398,110 @@ fn serve_authenticated(
 /// table is the wrong direction to fail in.
 fn required_scope(req: &Request) -> Scope {
     match req {
-        // Reads, plus Stats — it exposes row counts and byte totals, which is
-        // information about the data and so is not free.
         Request::Get { .. }
         | Request::RangeScan { .. }
         | Request::Stats
         | Request::SecondaryLookup { .. }
-        | Request::FkExists { .. } => Scope::ReadOnly,
-        // Row-scoped mutation.
+        | Request::FkExists { .. }
+        | Request::ListTables => Scope::ReadOnly,
         Request::Insert { .. } | Request::Delete { .. } => Scope::ReadWrite,
-        // File-scoped: Compact rewrites every partition in a job and deletes the
-        // originals, so one call from a misconfigured client can rewrite a whole
-        // table. Flush is included because it forces partition creation and is the
-        // same class of operational control.
-        Request::Flush | Request::Compact => Scope::Admin,
-        // Reached only through the auth gate above, which handles them first.
+        Request::Flush
+        | Request::Compact
+        | Request::UseTable { .. }
+        | Request::CreateTable { .. }
+        | Request::DropTable { .. } => Scope::Admin,
         Request::Ping | Request::Hello | Request::Auth { .. } => Scope::ReadOnly,
     }
 }
 
-fn serve_request(engine: &TableEngine, req: Request) -> Response {
+fn serve_request(
+    registry: &TableRegistry,
+    selected: &mut Option<Arc<TableEngine>>,
+    req: Request,
+) -> Response {
+    // Catalog operations — no selected table required.
     match req {
-        Request::Ping => Response::Pong,
+        Request::Ping => return Response::Pong,
 
+        Request::UseTable { name } => {
+            return match registry.get(&name) {
+                Ok(engine) => {
+                    *selected = Some(engine);
+                    Response::TableSelected
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    Response::Error {
+                        code: error_code::TABLE_NOT_FOUND,
+                        message: msg,
+                    }
+                }
+            };
+        }
+
+        Request::CreateTable { name, schema } => {
+            return match registry.create_table(&name, schema) {
+                Ok(engine) => {
+                    *selected = Some(engine);
+                    Response::TableSelected
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let code = if msg.contains("already exists") {
+                        error_code::TABLE_EXISTS
+                    } else {
+                        error_code::ENGINE
+                    };
+                    Response::Error { code, message: msg }
+                }
+            };
+        }
+
+        Request::DropTable { name } => {
+            // If the currently selected table is the one being dropped,
+            // check its name and deselect so subsequent data ops get NOT_SELECTED cleanly.
+            return match registry.drop_table(&name) {
+                Ok(()) => {
+                    // Deselect if the dropped table was the active one. We can't
+                    // compare Arc pointers (drop_table returns ()), so we ask the
+                    // registry whether the name is still there — it isn't, so any
+                    // selected engine whose name matched is now dangling from our
+                    // perspective. The simplest safe policy: always deselect after
+                    // a DropTable so the client must UseTable again.
+                    *selected = None;
+                    Response::Ok { affected: 0 }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    Response::Error {
+                        code: error_code::TABLE_NOT_FOUND,
+                        message: msg,
+                    }
+                }
+            };
+        }
+
+        Request::ListTables => {
+            return Response::TableList {
+                names: registry.list_tables(),
+            };
+        }
+
+        _ => {}
+    }
+
+    // Data operations — require a selected table.
+    let engine = match selected.as_deref() {
+        Some(e) => e,
+        None => {
+            return Response::Error {
+                code: error_code::NOT_SELECTED,
+                message: "no table selected — send UseTable first".into(),
+            };
+        }
+    };
+
+    match req {
         Request::Get { pk } => match engine.get(pk) {
             Ok(Some(row)) => Response::Row { values: row.values },
             Ok(None) => Response::NotFound,
@@ -447,9 +515,6 @@ fn serve_request(engine: &TableEngine, req: Request) -> Response {
 
         Request::Delete { pk } => match engine.delete(pk) {
             Ok(_) => Response::Ok { affected: 1 },
-            // A delete of a missing key is NOT an engine failure, it is a normal
-            // outcome, and it gets its own code so a client can tell "nothing to
-            // delete" from "the delete broke".
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("not found") || msg.contains("PkNotFound") {
@@ -462,8 +527,6 @@ fn serve_request(engine: &TableEngine, req: Request) -> Response {
 
         Request::RangeScan { col, lo, hi, limit } => match engine.scan(col as usize, lo, hi) {
             Ok(rows) => {
-                // limit 0 means "no limit" — a client asking for zero rows would
-                // simply not send the request.
                 let rows: Vec<Vec<u64>> = if limit == 0 {
                     rows.into_iter().map(|r| r.values).collect()
                 } else {
@@ -501,12 +564,6 @@ fn serve_request(engine: &TableEngine, req: Request) -> Response {
             found: engine.fk_exists(value),
         },
 
-        // Handled by the auth gate before reaching here.
-        Request::Hello | Request::Auth { .. } => Response::Error {
-            code: error_code::MALFORMED,
-            message: "auth messages are handled before dispatch".into(),
-        },
-
         Request::Stats => {
             let s = engine.stats();
             let bytes: u64 = engine.partition_meta().iter().map(|p| p.size_bytes).sum();
@@ -516,6 +573,18 @@ fn serve_request(engine: &TableEngine, req: Request) -> Response {
                 bytes,
             }
         }
+
+        // Handled by auth gate or the catalog block above.
+        Request::Hello
+        | Request::Auth { .. }
+        | Request::Ping
+        | Request::UseTable { .. }
+        | Request::CreateTable { .. }
+        | Request::DropTable { .. }
+        | Request::ListTables => Response::Error {
+            code: error_code::MALFORMED,
+            message: "unexpected dispatch".into(),
+        },
     }
 }
 

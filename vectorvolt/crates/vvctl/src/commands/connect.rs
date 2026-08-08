@@ -129,6 +129,30 @@ pub enum ConnectCommand {
         /// PK value to check.
         value: u64,
     },
+
+    /// Select the active table on this connection.
+    UseTable {
+        /// Table name.
+        name: String,
+    },
+
+    /// Create a new table and select it.
+    CreateTable {
+        /// Table name.
+        name: String,
+        /// Column names in schema order (first = primary key).
+        #[arg(long, num_args = 1..)]
+        columns: Vec<String>,
+    },
+
+    /// Drop a named table.
+    DropTable {
+        /// Table name.
+        name: String,
+    },
+
+    /// List all tables on the server.
+    ListTables,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -244,6 +268,41 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 println!("exists (pk={value} found — may be false positive)");
             } else {
                 println!("not found (pk={value})");
+            }
+        }
+
+        ConnectCommand::UseTable { name } => {
+            client
+                .use_table(&name)
+                .with_context(|| format!("use-table {name}"))?;
+            println!("ok — active table: {name}");
+        }
+
+        ConnectCommand::CreateTable { name, columns } => {
+            if columns.is_empty() {
+                bail!("--columns is required for create-table");
+            }
+            client
+                .create_table(&name, columns)
+                .with_context(|| format!("create-table {name}"))?;
+            println!("created and selected: {name}");
+        }
+
+        ConnectCommand::DropTable { name } => {
+            client
+                .drop_table(&name)
+                .with_context(|| format!("drop-table {name}"))?;
+            println!("dropped: {name}");
+        }
+
+        ConnectCommand::ListTables => {
+            let names = client.list_tables().with_context(|| "list-tables")?;
+            if names.is_empty() {
+                println!("(no tables)");
+            } else {
+                for n in &names {
+                    println!("{n}");
+                }
             }
         }
     }

@@ -254,6 +254,42 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Select the active table for this connection.
+    pub fn use_table(&mut self, name: impl Into<String>) -> NetResult<()> {
+        match self.call(&Request::UseTable { name: name.into() })? {
+            Response::TableSelected => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Create a new table and select it as the active table.
+    pub fn create_table(&mut self, name: impl Into<String>, schema: Vec<String>) -> NetResult<()> {
+        match self.call(&Request::CreateTable {
+            name: name.into(),
+            schema,
+        })? {
+            Response::TableSelected => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Drop a named table. The active table is cleared after this call
+    /// regardless of which table was selected.
+    pub fn drop_table(&mut self, name: impl Into<String>) -> NetResult<()> {
+        match self.call(&Request::DropTable { name: name.into() })? {
+            Response::Ok { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// List all table names known to the server.
+    pub fn list_tables(&mut self) -> NetResult<Vec<String>> {
+        match self.call(&Request::ListTables)? {
+            Response::TableList { names } => Ok(names),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.
