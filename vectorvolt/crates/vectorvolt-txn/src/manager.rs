@@ -242,6 +242,28 @@ impl TxnManager {
 
     // ── DELETE ─────────────────────────────────────────────────────────────────
 
+    /// All PKs whose column `col_idx` matches `value` via the SecondaryIndex.
+    ///
+    /// The index stores `pk as u32`; PKs > `u32::MAX` are not reachable this
+    /// way (pre-existing limitation of the index storage format).
+    /// Deleted rows remain in the index until compaction; callers that need a
+    /// live view should verify each returned PK with `pk_index`.
+    pub fn secondary_lookup_pks(&self, col_idx: usize, value: u64) -> Vec<u64> {
+        let hash = col_value_hash(col_idx, value);
+        self.secondary_index
+            .read()
+            .get_vec(hash)
+            .into_iter()
+            .map(|id| id as u64)
+            .collect()
+    }
+
+    /// Probabilistic FK existence check. Returns `true` when `value` was ever
+    /// inserted. False positive rate ≈ 0.78%; false negatives are impossible.
+    pub fn fk_check(&self, value: u64) -> bool {
+        self.fk_filter.read().contains(value)
+    }
+
     /// Remove a row from the in-memory index. WAL-logged.
     ///
     /// Returns `Err(PkNotFound)` if the pk does not exist in the CuckooMap.

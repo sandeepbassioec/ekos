@@ -114,6 +114,21 @@ pub enum ConnectCommand {
 
     /// Compact all partitions into one, removing deleted rows.
     Compact,
+
+    /// Secondary-index lookup: all rows where column `col_idx` equals `value`.
+    SecondaryLookup {
+        /// Column index to search (1 = first non-pk column).
+        #[arg(long, default_value = "1")]
+        col: u32,
+        /// Exact column value to look up.
+        value: u64,
+    },
+
+    /// Probabilistic FK existence check for a PK value.
+    FkExists {
+        /// PK value to check.
+        value: u64,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -201,6 +216,35 @@ pub fn run(args: ConnectArgs) -> Result<()> {
         ConnectCommand::Compact => {
             let kept = client.compact().with_context(|| "compact")?;
             println!("compact ok — {kept} row(s) kept");
+        }
+
+        ConnectCommand::SecondaryLookup { col, value } => {
+            let rows = client
+                .secondary_scan(col, value)
+                .with_context(|| format!("secondary-lookup col={col} value={value}"))?;
+            if rows.is_empty() {
+                println!("no matches for col[{col}] = {value}");
+            } else {
+                let col_count = rows[0].len();
+                let header: Vec<String> = (0..col_count).map(|i| format!("col[{i}]")).collect();
+                println!("{}", header.join("\t"));
+                for row in &rows {
+                    let line: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                    println!("{}", line.join("\t"));
+                }
+                println!("\n{} row(s)", rows.len());
+            }
+        }
+
+        ConnectCommand::FkExists { value } => {
+            let found = client
+                .fk_exists(value)
+                .with_context(|| format!("fk-exists value={value}"))?;
+            if found {
+                println!("exists (pk={value} found — may be false positive)");
+            } else {
+                println!("not found (pk={value})");
+            }
         }
     }
 

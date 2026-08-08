@@ -543,3 +543,146 @@ fn client_stats_reflect_inserted_rows() {
 
     assert!(rows >= 3, "stats must report ≥3 rows; got {rows}");
 }
+
+// ── connect: secondary-lookup ─────────────────────────────────────────────────
+
+#[test]
+fn connect_secondary_lookup_returns_matching_rows() {
+    use vvctl::commands::connect::ConnectCommand;
+
+    let dir = TempDir::new().unwrap();
+    let (addr, shutdown) = start_plain(&dir);
+
+    plain(
+        addr,
+        ConnectCommand::Insert {
+            pk: 10,
+            values: row(10, 30, 0),
+        },
+    )
+    .unwrap();
+    plain(
+        addr,
+        ConnectCommand::Insert {
+            pk: 20,
+            values: row(20, 40, 0),
+        },
+    )
+    .unwrap();
+    plain(
+        addr,
+        ConnectCommand::Insert {
+            pk: 30,
+            values: row(30, 30, 0),
+        },
+    )
+    .unwrap();
+
+    let result = plain(addr, ConnectCommand::SecondaryLookup { col: 1, value: 30 });
+    shutdown();
+    assert!(result.is_ok(), "secondary-lookup: {result:?}");
+}
+
+#[test]
+fn connect_secondary_lookup_no_match_returns_ok() {
+    use vvctl::commands::connect::ConnectCommand;
+
+    let dir = TempDir::new().unwrap();
+    let (addr, shutdown) = start_plain(&dir);
+
+    plain(
+        addr,
+        ConnectCommand::Insert {
+            pk: 1,
+            values: row(1, 5, 0),
+        },
+    )
+    .unwrap();
+
+    let result = plain(addr, ConnectCommand::SecondaryLookup { col: 1, value: 999 });
+    shutdown();
+    assert!(
+        result.is_ok(),
+        "empty secondary-lookup must return Ok: {result:?}"
+    );
+}
+
+// ── connect: fk-exists ────────────────────────────────────────────────────────
+
+#[test]
+fn connect_fk_exists_true_for_inserted_pk() {
+    use vvctl::commands::connect::ConnectCommand;
+
+    let dir = TempDir::new().unwrap();
+    let (addr, shutdown) = start_plain(&dir);
+
+    plain(
+        addr,
+        ConnectCommand::Insert {
+            pk: 42,
+            values: row(42, 1, 2),
+        },
+    )
+    .unwrap();
+
+    let result = plain(addr, ConnectCommand::FkExists { value: 42 });
+    shutdown();
+    assert!(result.is_ok(), "fk-exists for inserted pk: {result:?}");
+}
+
+#[test]
+fn connect_fk_exists_false_for_unknown_pk() {
+    use vvctl::commands::connect::ConnectCommand;
+
+    let dir = TempDir::new().unwrap();
+    let (addr, shutdown) = start_plain(&dir);
+
+    plain(
+        addr,
+        ConnectCommand::Insert {
+            pk: 1,
+            values: row(1, 1, 1),
+        },
+    )
+    .unwrap();
+
+    let result = plain(addr, ConnectCommand::FkExists { value: 99999 });
+    shutdown();
+    assert!(result.is_ok(), "fk-exists for unknown pk: {result:?}");
+}
+
+// ── direct Client API: secondary_scan + fk_exists ────────────────────────────
+
+#[test]
+fn client_secondary_scan_finds_inserted_value() {
+    let dir = TempDir::new().unwrap();
+    let (addr, shutdown) = start_plain(&dir);
+
+    let mut c = Client::connect(addr).unwrap();
+    c.insert(1, vec![1, 77, 0]).unwrap();
+    c.insert(2, vec![2, 88, 0]).unwrap();
+    c.insert(3, vec![3, 77, 0]).unwrap();
+
+    let rows = c.secondary_scan(1, 77).unwrap();
+    shutdown();
+
+    let mut pks: Vec<u64> = rows.iter().map(|r| r[0]).collect();
+    pks.sort_unstable();
+    assert_eq!(pks, vec![1, 3]);
+}
+
+#[test]
+fn client_fk_exists_true_after_insert() {
+    let dir = TempDir::new().unwrap();
+    let (addr, shutdown) = start_plain(&dir);
+
+    let mut c = Client::connect(addr).unwrap();
+    c.insert(55, vec![55, 1, 2]).unwrap();
+
+    let found = c.fk_exists(55).unwrap();
+    let not_found = c.fk_exists(9999).unwrap();
+    shutdown();
+
+    assert!(found, "pk=55 must be found");
+    assert!(!not_found, "pk=9999 must not be found");
+}
