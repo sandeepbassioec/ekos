@@ -290,6 +290,27 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Insert multiple rows in one round-trip.
+    ///
+    /// Returns `(succeeded, skipped)` where `skipped` counts rows the server
+    /// could not insert (e.g. an engine error on that row).
+    pub fn batch_insert(&mut self, rows: Vec<(u64, Vec<u64>)>) -> NetResult<(u32, u32)> {
+        match self.call(&Request::BatchInsert { rows })? {
+            Response::BatchResult { succeeded, skipped } => Ok((succeeded, skipped)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Delete multiple rows by primary key in one round-trip.
+    ///
+    /// Returns `(succeeded, skipped)` where `skipped` counts keys not found.
+    pub fn batch_delete(&mut self, pks: Vec<u64>) -> NetResult<(u32, u32)> {
+        match self.call(&Request::BatchDelete { pks })? {
+            Response::BatchResult { succeeded, skipped } => Ok((succeeded, skipped)),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

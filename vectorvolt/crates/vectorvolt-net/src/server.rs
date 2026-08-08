@@ -404,7 +404,10 @@ fn required_scope(req: &Request) -> Scope {
         | Request::SecondaryLookup { .. }
         | Request::FkExists { .. }
         | Request::ListTables => Scope::ReadOnly,
-        Request::Insert { .. } | Request::Delete { .. } => Scope::ReadWrite,
+        Request::Insert { .. }
+        | Request::Delete { .. }
+        | Request::BatchInsert { .. }
+        | Request::BatchDelete { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -563,6 +566,30 @@ fn serve_request(
         Request::FkExists { value } => Response::Exists {
             found: engine.fk_exists(value),
         },
+
+        Request::BatchInsert { rows } => {
+            let mut succeeded: u32 = 0;
+            let mut skipped: u32 = 0;
+            for (pk, values) in rows {
+                match engine.insert(pk, values) {
+                    Ok(_) => succeeded = succeeded.saturating_add(1),
+                    Err(_) => skipped = skipped.saturating_add(1),
+                }
+            }
+            Response::BatchResult { succeeded, skipped }
+        }
+
+        Request::BatchDelete { pks } => {
+            let mut succeeded: u32 = 0;
+            let mut skipped: u32 = 0;
+            for pk in pks {
+                match engine.delete(pk) {
+                    Ok(_) => succeeded = succeeded.saturating_add(1),
+                    Err(_) => skipped = skipped.saturating_add(1),
+                }
+            }
+            Response::BatchResult { succeeded, skipped }
+        }
 
         Request::Stats => {
             let s = engine.stats();

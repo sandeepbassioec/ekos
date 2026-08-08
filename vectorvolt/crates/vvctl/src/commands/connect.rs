@@ -153,6 +153,23 @@ pub enum ConnectCommand {
 
     /// List all tables on the server.
     ListTables,
+
+    /// Insert multiple rows in a single round-trip.
+    ///
+    /// Rows are specified as `pk:v1,v2,...` pairs separated by spaces.
+    /// Example: `batch-insert 1:10,20 2:30,40`
+    BatchInsert {
+        /// Rows in `pk:v1,v2,...` format.
+        #[arg(required = true)]
+        rows: Vec<String>,
+    },
+
+    /// Delete multiple rows by primary key in a single round-trip.
+    BatchDelete {
+        /// Primary keys to delete.
+        #[arg(required = true)]
+        pks: Vec<u64>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -304,6 +321,45 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                     println!("{n}");
                 }
             }
+        }
+
+        ConnectCommand::BatchInsert { rows: raw } => {
+            let mut parsed: Vec<(u64, Vec<u64>)> = Vec::with_capacity(raw.len());
+            for s in &raw {
+                let (pk_str, vals_str) = s.split_once(':').with_context(|| {
+                    format!("batch-insert row '{s}' must be in pk:v1,v2,... format")
+                })?;
+                let pk: u64 = pk_str
+                    .parse()
+                    .with_context(|| format!("pk '{pk_str}' is not a valid u64"))?;
+                let values: Vec<u64> = if vals_str.is_empty() {
+                    vec![]
+                } else {
+                    vals_str
+                        .split(',')
+                        .map(|v| {
+                            v.parse::<u64>()
+                                .with_context(|| format!("value '{v}' is not a valid u64"))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+                parsed.push((pk, values));
+            }
+            let n = parsed.len();
+            let (succeeded, skipped) = client
+                .batch_insert(parsed)
+                .with_context(|| "batch-insert")?;
+            println!(
+                "batch-insert: {n} row(s) submitted — {succeeded} succeeded, {skipped} skipped"
+            );
+        }
+
+        ConnectCommand::BatchDelete { pks } => {
+            let n = pks.len();
+            let (succeeded, skipped) = client.batch_delete(pks).with_context(|| "batch-delete")?;
+            println!(
+                "batch-delete: {n} pk(s) submitted — {succeeded} deleted, {skipped} not found"
+            );
         }
     }
 
