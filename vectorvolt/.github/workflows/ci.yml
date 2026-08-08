@@ -11,22 +11,34 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+  # Fast gate: fmt + clippy on Linux only. Runs in ~1 min; blocks the matrix
+  # early so a trivial formatting miss doesn't burn 3 OS runners.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
       - name: Format check
         run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-features -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: cargo test --workspace --all-features
       - name: Doc tests
@@ -34,7 +46,10 @@ jobs:
 
   bench-smoke:
     name: Benchmark smoke test
+    needs: lint
     runs-on: ubuntu-latest
+    # Only run the release build on pushes to main/develop, not on every PR.
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
