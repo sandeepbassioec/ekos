@@ -114,4 +114,10 @@ pub mod error_code {
     pub const TABLE_NOT_FOUND: u16 = 10;
     /// Named table already exists.
     pub const TABLE_EXISTS: u16 = 11;
+    /// A transaction is already active on this connection.
+    pub const TXN_ACTIVE: u16 = 12;
+    /// No transaction is active on this connection.
+    pub const NO_TXN: u16 = 13;
+    /// The provided txn_id does not match the active transaction.
+    pub const TXN_ID_MISMATCH: u16 = 14;
 }

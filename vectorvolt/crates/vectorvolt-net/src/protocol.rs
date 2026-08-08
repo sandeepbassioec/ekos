@@ -89,6 +89,12 @@ pub enum OpCode {
     BatchInsert = 17,
     /// Delete multiple rows by primary key in a single round trip.
     BatchDelete = 18,
+    /// Begin a server-side transaction on this connection.
+    BeginTxn = 19,
+    /// Commit the active transaction, applying all buffered ops atomically.
+    CommitTxn = 20,
+    /// Roll back the active transaction, discarding all buffered ops.
+    RollbackTxn = 21,
     // Responses
     Pong = 129,
     Row = 130,
@@ -105,6 +111,8 @@ pub enum OpCode {
     TableList = 139,
     /// Response to `BatchInsert` or `BatchDelete`.
     BatchResult = 140,
+    /// Response to `BeginTxn` — carries the new transaction ID.
+    TxnStarted = 141,
 }
 
 impl OpCode {
@@ -134,6 +142,9 @@ impl OpCode {
             16 => ListTables,
             17 => BatchInsert,
             18 => BatchDelete,
+            19 => BeginTxn,
+            20 => CommitTxn,
+            21 => RollbackTxn,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -146,6 +157,7 @@ impl OpCode {
             138 => TableSelected,
             139 => TableList,
             140 => BatchResult,
+            141 => TxnStarted,
             other => return Err(NetError::UnknownOpcode(other)),
         })
     }
@@ -295,6 +307,20 @@ pub enum Request {
     BatchDelete {
         pks: Vec<u64>,
     },
+    /// Begin a server-side transaction on this connection.
+    ///
+    /// Subsequent `Insert` and `Delete` requests are buffered until
+    /// `CommitTxn` (applied atomically) or `RollbackTxn` (discarded).
+    /// Only one transaction may be active at a time per connection.
+    BeginTxn,
+    /// Commit the active transaction, applying all buffered ops to the engine.
+    CommitTxn {
+        txn_id: u64,
+    },
+    /// Discard all buffered ops for the active transaction.
+    RollbackTxn {
+        txn_id: u64,
+    },
 }
 
 /// A server response.
@@ -340,6 +366,10 @@ pub enum Response {
         succeeded: u32,
         /// Rows skipped (duplicate key for insert, missing key for delete).
         skipped: u32,
+    },
+    /// Response to `BeginTxn` — the client must echo `txn_id` in CommitTxn/RollbackTxn.
+    TxnStarted {
+        txn_id: u64,
     },
 }
 
@@ -506,6 +536,9 @@ impl Request {
             Request::ListTables => OpCode::ListTables,
             Request::BatchInsert { .. } => OpCode::BatchInsert,
             Request::BatchDelete { .. } => OpCode::BatchDelete,
+            Request::BeginTxn => OpCode::BeginTxn,
+            Request::CommitTxn { .. } => OpCode::CommitTxn,
+            Request::RollbackTxn { .. } => OpCode::RollbackTxn,
         }
     }
 
@@ -564,6 +597,10 @@ impl Request {
                 for pk in pks {
                     w.u64(*pk);
                 }
+            }
+            Request::BeginTxn => {}
+            Request::CommitTxn { txn_id } | Request::RollbackTxn { txn_id } => {
+                w.u64(*txn_id);
             }
         }
         Ok(w.0)
@@ -631,6 +668,9 @@ impl Request {
                 }
                 Request::BatchDelete { pks }
             }
+            OpCode::BeginTxn => Request::BeginTxn,
+            OpCode::CommitTxn => Request::CommitTxn { txn_id: r.u64()? },
+            OpCode::RollbackTxn => Request::RollbackTxn { txn_id: r.u64()? },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -653,6 +693,7 @@ impl Response {
             Response::TableSelected => OpCode::TableSelected,
             Response::TableList { .. } => OpCode::TableList,
             Response::BatchResult { .. } => OpCode::BatchResult,
+            Response::TxnStarted { .. } => OpCode::TxnStarted,
         }
     }
 
@@ -705,6 +746,9 @@ impl Response {
             Response::BatchResult { succeeded, skipped } => {
                 w.u32(*succeeded).u32(*skipped);
             }
+            Response::TxnStarted { txn_id } => {
+                w.u64(*txn_id);
+            }
         }
         Ok(w.0)
     }
@@ -754,6 +798,7 @@ impl Response {
                 succeeded: r.u32()?,
                 skipped: r.u32()?,
             },
+            OpCode::TxnStarted => Response::TxnStarted { txn_id: r.u64()? },
             other => return Err(NetError::NotAResponse(other as u8)),
         };
         r.finish()?;
@@ -884,6 +929,11 @@ mod tests {
             Request::BatchDelete {
                 pks: vec![1, 2, u64::MAX],
             },
+            Request::BeginTxn,
+            Request::CommitTxn { txn_id: 1 },
+            Request::CommitTxn { txn_id: u64::MAX },
+            Request::RollbackTxn { txn_id: 1 },
+            Request::RollbackTxn { txn_id: u64::MAX },
         ]
     }
 
@@ -932,6 +982,8 @@ mod tests {
                 succeeded: 1000,
                 skipped: 3,
             },
+            Response::TxnStarted { txn_id: 0 },
+            Response::TxnStarted { txn_id: u64::MAX },
         ]
     }
 
@@ -1165,12 +1217,12 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=18 {
+                for op in 1u8..=21 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
                 }
-                for op in 129u8..=140 {
+                for op in 129u8..=141 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Response::decode(o, &buf);
                     }

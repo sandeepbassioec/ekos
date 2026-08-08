@@ -311,6 +311,35 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Begin a server-side transaction on this connection.
+    ///
+    /// Returns the `txn_id` that must be passed to [`commit_txn`](Self::commit_txn)
+    /// or [`rollback_txn`](Self::rollback_txn).
+    pub fn begin_txn(&mut self) -> NetResult<u64> {
+        match self.call(&Request::BeginTxn)? {
+            Response::TxnStarted { txn_id } => Ok(txn_id),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Commit the active transaction.
+    ///
+    /// Returns the number of operations applied.
+    pub fn commit_txn(&mut self, txn_id: u64) -> NetResult<u64> {
+        match self.call(&Request::CommitTxn { txn_id })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Roll back the active transaction, discarding all buffered ops.
+    pub fn rollback_txn(&mut self, txn_id: u64) -> NetResult<()> {
+        match self.call(&Request::RollbackTxn { txn_id })? {
+            Response::Ok { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

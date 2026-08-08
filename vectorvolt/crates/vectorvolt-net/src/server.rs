@@ -12,6 +12,18 @@ use crate::protocol::{HEADER_SIZE, Header, Request, Response, encode_response, v
 use crate::tls::{ServerConn, ServerTlsConfig};
 use crate::{NetError, NetResult, error_code};
 
+// ── Per-connection transaction state ─────────────────────────────────────────
+
+enum TxnOp {
+    Insert { pk: u64, values: Vec<u64> },
+    Delete { pk: u64 },
+}
+
+struct Txn {
+    id: u64,
+    ops: Vec<TxnOp>,
+}
+
 /// Server tuning.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -269,6 +281,9 @@ fn handle_connection(
     let mut auth = AuthState::new(auth_config);
     // Auto-select "default" if it exists, for backward compatibility.
     let mut selected: Option<Arc<TableEngine>> = registry.get("default").ok();
+    // Optional active transaction. At most one per connection.
+    let mut txn: Option<Txn> = None;
+    let mut next_txn_id: u64 = 1;
 
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -302,6 +317,8 @@ fn handle_connection(
                 match serve_authenticated(
                     registry,
                     &mut selected,
+                    &mut txn,
+                    &mut next_txn_id,
                     req,
                     &mut auth,
                     auth_config,
@@ -334,9 +351,12 @@ fn handle_connection(
 /// Apply the authentication gate, then serve.
 ///
 /// `Err(response)` means "send this and close the connection" (lock-out only).
+#[allow(clippy::too_many_arguments)]
 fn serve_authenticated(
     registry: &TableRegistry,
     selected: &mut Option<Arc<TableEngine>>,
+    txn: &mut Option<Txn>,
+    next_txn_id: &mut u64,
     req: Request,
     auth: &mut AuthState,
     config: &AuthConfig,
@@ -386,7 +406,7 @@ fn serve_authenticated(
                     message: e.to_string(),
                 });
             }
-            Ok(serve_request(registry, selected, other))
+            Ok(serve_request(registry, selected, txn, next_txn_id, other))
         }
     }
 }
@@ -413,6 +433,9 @@ fn required_scope(req: &Request) -> Scope {
         | Request::UseTable { .. }
         | Request::CreateTable { .. }
         | Request::DropTable { .. } => Scope::Admin,
+        Request::BeginTxn | Request::CommitTxn { .. } | Request::RollbackTxn { .. } => {
+            Scope::ReadWrite
+        }
         Request::Ping | Request::Hello | Request::Auth { .. } => Scope::ReadOnly,
     }
 }
@@ -420,6 +443,8 @@ fn required_scope(req: &Request) -> Scope {
 fn serve_request(
     registry: &TableRegistry,
     selected: &mut Option<Arc<TableEngine>>,
+    txn: &mut Option<Txn>,
+    next_txn_id: &mut u64,
     req: Request,
 ) -> Response {
     // Catalog operations — no selected table required.
@@ -490,7 +515,97 @@ fn serve_request(
             };
         }
 
+        Request::BeginTxn => {
+            if txn.is_some() {
+                return Response::Error {
+                    code: error_code::TXN_ACTIVE,
+                    message: "a transaction is already active on this connection".into(),
+                };
+            }
+            let id = *next_txn_id;
+            *next_txn_id = next_txn_id.wrapping_add(1).max(1);
+            *txn = Some(Txn {
+                id,
+                ops: Vec::new(),
+            });
+            return Response::TxnStarted { txn_id: id };
+        }
+
+        Request::CommitTxn { txn_id } => {
+            return match txn.take() {
+                None => Response::Error {
+                    code: error_code::NO_TXN,
+                    message: "no active transaction".into(),
+                },
+                Some(t) if t.id != txn_id => {
+                    *txn = Some(t);
+                    Response::Error {
+                        code: error_code::TXN_ID_MISMATCH,
+                        message: format!("txn_id mismatch: expected {}", txn_id),
+                    }
+                }
+                Some(t) => {
+                    // Apply all ops atomically. Require a selected table.
+                    let engine = match selected.as_deref() {
+                        Some(e) => e,
+                        None => {
+                            // Put the txn back so the client can rollback.
+                            *txn = Some(t);
+                            return Response::Error {
+                                code: error_code::NOT_SELECTED,
+                                message: "no table selected — send UseTable first".into(),
+                            };
+                        }
+                    };
+                    let n = t.ops.len() as u64;
+                    for op in t.ops {
+                        match op {
+                            TxnOp::Insert { pk, values } => {
+                                let _ = engine.insert(pk, values);
+                            }
+                            TxnOp::Delete { pk } => {
+                                let _ = engine.delete(pk);
+                            }
+                        }
+                    }
+                    Response::Ok { affected: n }
+                }
+            };
+        }
+
+        Request::RollbackTxn { txn_id } => {
+            return match txn.take() {
+                None => Response::Error {
+                    code: error_code::NO_TXN,
+                    message: "no active transaction".into(),
+                },
+                Some(t) if t.id != txn_id => {
+                    *txn = Some(t);
+                    Response::Error {
+                        code: error_code::TXN_ID_MISMATCH,
+                        message: format!("txn_id mismatch: expected {}", txn_id),
+                    }
+                }
+                Some(_) => Response::Ok { affected: 0 },
+            };
+        }
+
         _ => {}
+    }
+
+    // If a transaction is active, buffer Insert and Delete ops.
+    if let Some(active_txn) = txn {
+        match req {
+            Request::Insert { pk, values } => {
+                active_txn.ops.push(TxnOp::Insert { pk, values });
+                return Response::Ok { affected: 1 };
+            }
+            Request::Delete { pk } => {
+                active_txn.ops.push(TxnOp::Delete { pk });
+                return Response::Ok { affected: 1 };
+            }
+            _ => {}
+        }
     }
 
     // Data operations — require a selected table.
@@ -601,14 +716,17 @@ fn serve_request(
             }
         }
 
-        // Handled by auth gate or the catalog block above.
+        // Handled by auth gate or the catalog/txn blocks above.
         Request::Hello
         | Request::Auth { .. }
         | Request::Ping
         | Request::UseTable { .. }
         | Request::CreateTable { .. }
         | Request::DropTable { .. }
-        | Request::ListTables => Response::Error {
+        | Request::ListTables
+        | Request::BeginTxn
+        | Request::CommitTxn { .. }
+        | Request::RollbackTxn { .. } => Response::Error {
             code: error_code::MALFORMED,
             message: "unexpected dispatch".into(),
         },

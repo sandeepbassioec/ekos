@@ -170,6 +170,21 @@ pub enum ConnectCommand {
         #[arg(required = true)]
         pks: Vec<u64>,
     },
+
+    /// Begin a server-side transaction. Prints the txn-id to use with commit-txn/rollback-txn.
+    BeginTxn,
+
+    /// Commit the active transaction.
+    CommitTxn {
+        /// Transaction ID returned by begin-txn.
+        txn_id: u64,
+    },
+
+    /// Roll back the active transaction, discarding all buffered ops.
+    RollbackTxn {
+        /// Transaction ID returned by begin-txn.
+        txn_id: u64,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -360,6 +375,25 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             println!(
                 "batch-delete: {n} pk(s) submitted — {succeeded} deleted, {skipped} not found"
             );
+        }
+
+        ConnectCommand::BeginTxn => {
+            let txn_id = client.begin_txn().with_context(|| "begin-txn")?;
+            println!("txn started: txn-id={txn_id}");
+        }
+
+        ConnectCommand::CommitTxn { txn_id } => {
+            let affected = client
+                .commit_txn(txn_id)
+                .with_context(|| format!("commit-txn txn-id={txn_id}"))?;
+            println!("committed txn-id={txn_id} — {affected} op(s) applied");
+        }
+
+        ConnectCommand::RollbackTxn { txn_id } => {
+            client
+                .rollback_txn(txn_id)
+                .with_context(|| format!("rollback-txn txn-id={txn_id}"))?;
+            println!("rolled back txn-id={txn_id}");
         }
     }
 
