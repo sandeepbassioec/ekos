@@ -194,6 +194,15 @@ pub enum ConnectCommand {
         #[arg(num_args = 0..)]
         values: Vec<u64>,
     },
+
+    /// Fetch multiple rows by primary key in one round trip.
+    ///
+    /// Missing keys are silently omitted from the output.
+    GetMany {
+        /// Primary keys to fetch.
+        #[arg(required = true)]
+        pks: Vec<u64>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -410,6 +419,25 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .upsert(pk, values)
                 .with_context(|| format!("upsert pk={pk}"))?;
             println!("upserted pk={pk}");
+        }
+
+        ConnectCommand::GetMany { pks } => {
+            let n = pks.len();
+            let entries = client.get_many(pks).with_context(|| "get-many")?;
+            if entries.is_empty() {
+                println!("no rows found (queried {n} key(s))");
+            } else {
+                let col_count = entries[0].1.len();
+                let mut header = vec!["pk".to_string()];
+                header.extend((0..col_count).map(|i| format!("col[{i}]")));
+                println!("{}", header.join("\t"));
+                for (pk, values) in &entries {
+                    let mut row = vec![pk.to_string()];
+                    row.extend(values.iter().map(|v| v.to_string()));
+                    println!("{}", row.join("\t"));
+                }
+                println!("\n{} row(s) found of {n} requested", entries.len());
+            }
         }
     }
 

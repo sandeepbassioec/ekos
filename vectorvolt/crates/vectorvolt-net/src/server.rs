@@ -423,7 +423,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::Stats
         | Request::SecondaryLookup { .. }
         | Request::FkExists { .. }
-        | Request::ListTables => Scope::ReadOnly,
+        | Request::ListTables
+        | Request::GetMany { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -714,6 +715,16 @@ fn serve_request(
                 Ok(_) => Response::Ok { affected: 1 },
                 Err(e) => engine_error(e),
             }
+        }
+
+        Request::GetMany { pks } => {
+            let mut entries: Vec<(u64, Vec<u64>)> = Vec::with_capacity(pks.len());
+            for pk in pks {
+                if let Ok(Some(row)) = engine.get(pk) {
+                    entries.push((pk, row.values));
+                }
+            }
+            Response::RowSet { entries }
         }
 
         Request::Stats => {

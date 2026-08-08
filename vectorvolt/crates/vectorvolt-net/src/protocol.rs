@@ -97,6 +97,8 @@ pub enum OpCode {
     RollbackTxn = 21,
     /// Insert or replace a row (delete existing, then insert).
     Upsert = 22,
+    /// Fetch multiple rows by primary key in one round trip.
+    GetMany = 23,
     // Responses
     Pong = 129,
     Row = 130,
@@ -115,6 +117,8 @@ pub enum OpCode {
     BatchResult = 140,
     /// Response to `BeginTxn` — carries the new transaction ID.
     TxnStarted = 141,
+    /// Response to `GetMany` — only found rows, each with its pk.
+    RowSet = 142,
 }
 
 impl OpCode {
@@ -148,6 +152,7 @@ impl OpCode {
             20 => CommitTxn,
             21 => RollbackTxn,
             22 => Upsert,
+            23 => GetMany,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -161,6 +166,7 @@ impl OpCode {
             139 => TableList,
             140 => BatchResult,
             141 => TxnStarted,
+            142 => RowSet,
             other => return Err(NetError::UnknownOpcode(other)),
         })
     }
@@ -331,6 +337,12 @@ pub enum Request {
         pk: u64,
         values: Vec<u64>,
     },
+    /// Fetch multiple rows by primary key in one round trip.
+    ///
+    /// Missing keys are silently omitted from the response.
+    GetMany {
+        pks: Vec<u64>,
+    },
 }
 
 /// A server response.
@@ -380,6 +392,10 @@ pub enum Response {
     /// Response to `BeginTxn` — the client must echo `txn_id` in CommitTxn/RollbackTxn.
     TxnStarted {
         txn_id: u64,
+    },
+    /// Response to `GetMany` — found rows only, each entry is `(pk, values)`.
+    RowSet {
+        entries: Vec<(u64, Vec<u64>)>,
     },
 }
 
@@ -550,6 +566,7 @@ impl Request {
             Request::CommitTxn { .. } => OpCode::CommitTxn,
             Request::RollbackTxn { .. } => OpCode::RollbackTxn,
             Request::Upsert { .. } => OpCode::Upsert,
+            Request::GetMany { .. } => OpCode::GetMany,
         }
     }
 
@@ -616,6 +633,14 @@ impl Request {
             Request::Upsert { pk, values } => {
                 w.u64(*pk);
                 w.u64s(values)?;
+            }
+            Request::GetMany { pks } => {
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many keys in GetMany"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
             }
         }
         Ok(w.0)
@@ -690,6 +715,18 @@ impl Request {
                 pk: r.u64()?,
                 values: r.u64s()?,
             },
+            OpCode::GetMany => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more keys than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::GetMany { pks }
+            }
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -713,6 +750,7 @@ impl Response {
             Response::TableList { .. } => OpCode::TableList,
             Response::BatchResult { .. } => OpCode::BatchResult,
             Response::TxnStarted { .. } => OpCode::TxnStarted,
+            Response::RowSet { .. } => OpCode::RowSet,
         }
     }
 
@@ -768,6 +806,15 @@ impl Response {
             Response::TxnStarted { txn_id } => {
                 w.u64(*txn_id);
             }
+            Response::RowSet { entries } => {
+                let n = u32::try_from(entries.len())
+                    .map_err(|_| NetError::Malformed("too many entries in RowSet"))?;
+                w.u32(n);
+                for (pk, values) in entries {
+                    w.u64(*pk);
+                    w.u64s(values)?;
+                }
+            }
         }
         Ok(w.0)
     }
@@ -818,6 +865,22 @@ impl Response {
                 skipped: r.u32()?,
             },
             OpCode::TxnStarted => Response::TxnStarted { txn_id: r.u64()? },
+            OpCode::RowSet => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 4;
+                if n > max_possible {
+                    return Err(NetError::Malformed(
+                        "declared more entries than the payload holds",
+                    ));
+                }
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let pk = r.u64()?;
+                    let values = r.u64s()?;
+                    entries.push((pk, values));
+                }
+                Response::RowSet { entries }
+            }
             other => return Err(NetError::NotAResponse(other as u8)),
         };
         r.finish()?;
@@ -961,6 +1024,10 @@ mod tests {
                 pk: u64::MAX,
                 values: vec![0, 1, u64::MAX],
             },
+            Request::GetMany { pks: vec![] },
+            Request::GetMany {
+                pks: vec![1, 2, u64::MAX],
+            },
         ]
     }
 
@@ -1011,6 +1078,10 @@ mod tests {
             },
             Response::TxnStarted { txn_id: 0 },
             Response::TxnStarted { txn_id: u64::MAX },
+            Response::RowSet { entries: vec![] },
+            Response::RowSet {
+                entries: vec![(1, vec![1, 10]), (2, vec![2, 20])],
+            },
         ]
     }
 
@@ -1244,12 +1315,12 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=22 {
+                for op in 1u8..=23 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
                 }
-                for op in 129u8..=141 {
+                for op in 129u8..=142 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Response::decode(o, &buf);
                     }
