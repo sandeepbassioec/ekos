@@ -707,6 +707,29 @@ impl TableEngine {
         self.txn.commit_stats()
     }
 
+    /// Return all rows where column `col_idx` equals `value`.
+    ///
+    /// Uses the in-memory `SecondaryIndex` maintained by the write path.
+    /// Deleted rows that remain in the index (compaction has not yet run) are
+    /// silently filtered: if `get(pk)` returns `None`, the row is skipped.
+    pub fn secondary_scan(&self, col_idx: u32, value: u64) -> EngineResult<Vec<Vec<u64>>> {
+        let pks = self.txn.secondary_lookup_pks(col_idx as usize, value);
+        let mut rows = Vec::new();
+        for pk in pks {
+            if let Some(row) = self.get(pk)? {
+                rows.push(row.values);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Probabilistic check: was `value` ever inserted as a PK?
+    ///
+    /// False positive rate ≈ 0.78%; false negatives are impossible.
+    pub fn fk_exists(&self, value: u64) -> bool {
+        self.txn.fk_check(value)
+    }
+
     /// Snapshot of current engine state (non-flushing).
     pub fn stats(&self) -> EngineStats {
         EngineStats {

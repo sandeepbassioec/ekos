@@ -234,6 +234,26 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// All rows where column `col_idx` equals `value` (secondary-index lookup).
+    ///
+    /// Returns `Vec<Vec<u64>>` where each inner vec is a full row (all columns).
+    /// Deleted rows are silently excluded server-side.
+    pub fn secondary_scan(&mut self, col_idx: u32, value: u64) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::SecondaryLookup { col_idx, value })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Probabilistic FK existence check. `true` if `value` was ever inserted as
+    /// a PK. False positive rate ≈ 0.78%; false negatives are impossible.
+    pub fn fk_exists(&mut self, value: u64) -> NetResult<bool> {
+        match self.call(&Request::FkExists { value })? {
+            Response::Exists { found } => Ok(found),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

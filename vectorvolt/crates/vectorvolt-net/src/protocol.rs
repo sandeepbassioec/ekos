@@ -75,6 +75,8 @@ pub enum OpCode {
     Stats = 8,
     Hello = 9,
     Auth = 10,
+    SecondaryLookup = 11,
+    FkExists = 12,
     // Responses
     Pong = 129,
     Row = 130,
@@ -84,6 +86,7 @@ pub enum OpCode {
     StatsReply = 134,
     Error = 135,
     Challenge = 136,
+    Exists = 137,
 }
 
 impl OpCode {
@@ -105,6 +108,8 @@ impl OpCode {
             8 => Stats,
             9 => Hello,
             10 => Auth,
+            11 => SecondaryLookup,
+            12 => FkExists,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -113,6 +118,7 @@ impl OpCode {
             134 => StatsReply,
             135 => Error,
             136 => Challenge,
+            137 => Exists,
             other => return Err(NetError::UnknownOpcode(other)),
         })
     }
@@ -222,6 +228,15 @@ pub enum Request {
         key_id: String,
         response: Vec<u8>,
     },
+    /// Secondary-index lookup: all rows where column `col_idx` equals `value`.
+    SecondaryLookup {
+        col_idx: u32,
+        value: u64,
+    },
+    /// Probabilistic FK existence check for a PK value.
+    FkExists {
+        value: u64,
+    },
 }
 
 /// A server response.
@@ -250,6 +265,10 @@ pub enum Response {
     /// A per-connection nonce to authenticate against.
     Challenge {
         nonce: Vec<u8>,
+    },
+    /// Result of a `FkExists` request.
+    Exists {
+        found: bool,
     },
 }
 
@@ -378,6 +397,8 @@ impl Request {
             Request::Stats => OpCode::Stats,
             Request::Hello => OpCode::Hello,
             Request::Auth { .. } => OpCode::Auth,
+            Request::SecondaryLookup { .. } => OpCode::SecondaryLookup,
+            Request::FkExists { .. } => OpCode::FkExists,
         }
     }
 
@@ -407,6 +428,12 @@ impl Request {
             Request::RangeScan { col, lo, hi, limit } => {
                 w.u32(*col).u64(*lo).u64(*hi).u32(*limit);
             }
+            Request::SecondaryLookup { col_idx, value } => {
+                w.u32(*col_idx).u64(*value);
+            }
+            Request::FkExists { value } => {
+                w.u64(*value);
+            }
         }
         Ok(w.0)
     }
@@ -435,6 +462,11 @@ impl Request {
                 hi: r.u64()?,
                 limit: r.u32()?,
             },
+            OpCode::SecondaryLookup => Request::SecondaryLookup {
+                col_idx: r.u32()?,
+                value: r.u64()?,
+            },
+            OpCode::FkExists => Request::FkExists { value: r.u64()? },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -453,6 +485,7 @@ impl Response {
             Response::Stats { .. } => OpCode::StatsReply,
             Response::Challenge { .. } => OpCode::Challenge,
             Response::Error { .. } => OpCode::Error,
+            Response::Exists { .. } => OpCode::Exists,
         }
     }
 
@@ -495,6 +528,9 @@ impl Response {
                 w.u32(n);
                 w.0.extend_from_slice(b);
             }
+            Response::Exists { found } => {
+                w.0.push(if *found { 1 } else { 0 });
+            }
         }
         Ok(w.0)
     }
@@ -532,6 +568,10 @@ impl Response {
                 code: r.u16()?,
                 message: r.string()?,
             },
+            OpCode::Exists => {
+                let byte = r.take(1)?[0];
+                Response::Exists { found: byte != 0 }
+            }
             other => return Err(NetError::NotAResponse(other as u8)),
         };
         r.finish()?;
@@ -629,6 +669,16 @@ mod tests {
                 hi: 5,
                 limit: u32::MAX,
             },
+            Request::SecondaryLookup {
+                col_idx: 0,
+                value: 0,
+            },
+            Request::SecondaryLookup {
+                col_idx: u32::MAX,
+                value: u64::MAX,
+            },
+            Request::FkExists { value: 0 },
+            Request::FkExists { value: u64::MAX },
         ]
     }
 
@@ -662,6 +712,8 @@ mod tests {
                 code: u16::MAX,
                 message: "something went wrong — with unicode: 日本語".into(),
             },
+            Response::Exists { found: false },
+            Response::Exists { found: true },
         ]
     }
 
@@ -895,12 +947,12 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=8 {
+                for op in 1u8..=12 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
                 }
-                for op in 129u8..=135 {
+                for op in 129u8..=137 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Response::decode(o, &buf);
                     }

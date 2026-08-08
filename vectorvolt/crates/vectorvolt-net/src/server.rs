@@ -413,7 +413,11 @@ fn required_scope(req: &Request) -> Scope {
     match req {
         // Reads, plus Stats — it exposes row counts and byte totals, which is
         // information about the data and so is not free.
-        Request::Get { .. } | Request::RangeScan { .. } | Request::Stats => Scope::ReadOnly,
+        Request::Get { .. }
+        | Request::RangeScan { .. }
+        | Request::Stats
+        | Request::SecondaryLookup { .. }
+        | Request::FkExists { .. } => Scope::ReadOnly,
         // Row-scoped mutation.
         Request::Insert { .. } | Request::Delete { .. } => Scope::ReadWrite,
         // File-scoped: Compact rewrites every partition in a job and deletes the
@@ -484,6 +488,17 @@ fn serve_request(engine: &TableEngine, req: Request) -> Response {
             },
             Ok(None) => Response::Ok { affected: 0 },
             Err(e) => engine_error(e),
+        },
+
+        Request::SecondaryLookup { col_idx, value } => {
+            match engine.secondary_scan(col_idx, value) {
+                Ok(rows) => Response::Rows { rows },
+                Err(e) => engine_error(e),
+            }
+        }
+
+        Request::FkExists { value } => Response::Exists {
+            found: engine.fk_exists(value),
         },
 
         // Handled by the auth gate before reaching here.
