@@ -441,7 +441,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::BatchUpdate { .. }
         | Request::GetAndDelete { .. }
         | Request::Increment { .. }
-        | Request::CompareAndSwap { .. } => Scope::ReadWrite,
+        | Request::CompareAndSwap { .. }
+        | Request::SetField { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -702,6 +703,29 @@ fn serve_request(
                 }
                 let mut values = row.values;
                 values[col_idx] = replacement;
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: 1 },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::SetField { pk, col, value } => match engine.get(pk) {
+            Ok(None) => Response::NotFound,
+            Err(e) => engine_error(e),
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: "column index out of range".to_string(),
+                    };
+                }
+                let mut values = row.values;
+                values[col_idx] = value;
                 match engine.delete(pk) {
                     Err(e) => engine_error(e),
                     Ok(_) => match engine.insert(pk, values) {

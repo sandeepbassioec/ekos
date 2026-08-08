@@ -125,6 +125,8 @@ pub enum OpCode {
     Increment = 35,
     /// Conditional update: set `values[col]` to `replacement` iff it currently equals `expected`.
     CompareAndSwap = 36,
+    /// Set a single column of an existing row without providing all other column values.
+    SetField = 37,
     // Responses
     Pong = 129,
     Row = 130,
@@ -198,6 +200,7 @@ impl OpCode {
             34 => GetAndDelete,
             35 => Increment,
             36 => CompareAndSwap,
+            37 => SetField,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -482,6 +485,14 @@ pub enum Request {
         expected: u64,
         replacement: u64,
     },
+    /// Set a single column of an existing row to `value` without supplying other columns.
+    ///
+    /// Returns `Ok { affected: 1 }` if found, `NotFound` if absent.
+    SetField {
+        pk: u64,
+        col: u32,
+        value: u64,
+    },
 }
 
 /// A server response.
@@ -733,6 +744,7 @@ impl Request {
             Request::GetAndDelete { .. } => OpCode::GetAndDelete,
             Request::Increment { .. } => OpCode::Increment,
             Request::CompareAndSwap { .. } => OpCode::CompareAndSwap,
+            Request::SetField { .. } => OpCode::SetField,
         }
     }
 
@@ -778,6 +790,9 @@ impl Request {
                 replacement,
             } => {
                 w.u64(*pk).u32(*col).u64(*expected).u64(*replacement);
+            }
+            Request::SetField { pk, col, value } => {
+                w.u64(*pk).u32(*col).u64(*value);
             }
             Request::Insert { pk, values } => {
                 w.u64(*pk);
@@ -991,6 +1006,11 @@ impl Request {
                 col: r.u32()?,
                 expected: r.u64()?,
                 replacement: r.u64()?,
+            },
+            OpCode::SetField => Request::SetField {
+                pk: r.u64()?,
+                col: r.u32()?,
+                value: r.u64()?,
             },
             other => return Err(NetError::NotARequest(other as u8)),
         };
@@ -1420,6 +1440,16 @@ mod tests {
                 expected: u64::MAX,
                 replacement: 0,
             },
+            Request::SetField {
+                pk: 1,
+                col: 0,
+                value: 42,
+            },
+            Request::SetField {
+                pk: u64::MAX - 1,
+                col: 1,
+                value: u64::MAX,
+            },
         ]
     }
 
@@ -1725,7 +1755,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=36 {
+                for op in 1u8..=37 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

@@ -420,6 +420,17 @@ impl Client {
         }
     }
 
+    /// Set a single column of an existing row to `value` without supplying other columns.
+    ///
+    /// Returns `true` if found and updated, `false` (as `NotFound`) mapped to `None`.
+    pub fn set_field(&mut self, pk: u64, col: u32, value: u64) -> NetResult<bool> {
+        match self.call(&Request::SetField { pk, col, value })? {
+            Response::Ok { .. } => Ok(true),
+            Response::NotFound => Ok(false),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Atomically add `delta` to column `col` of the row at `pk` (saturating at `u64::MAX`).
     ///
     /// Returns `Some(new_value)` if the row existed, `None` if absent.

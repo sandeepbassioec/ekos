@@ -285,6 +285,19 @@ pub enum ConnectCommand {
         pk: u64,
     },
 
+    /// Set a single column of an existing row without supplying other column values.
+    ///
+    /// Prints "updated" or "(not found)".
+    SetField {
+        /// Primary key of the row.
+        pk: u64,
+        /// Column index to set (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// New value for the column.
+        value: u64,
+    },
+
     /// Conditional update: set a column to `replacement` iff it equals `expected`.
     ///
     /// Prints "swapped", "no-match", or "(not found)".
@@ -634,6 +647,17 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 println!("exists: {name}");
             } else {
                 println!("not found: {name}");
+            }
+        }
+
+        ConnectCommand::SetField { pk, col, value } => {
+            let updated = client
+                .set_field(pk, col, value)
+                .with_context(|| format!("set-field pk={pk} col={col} value={value}"))?;
+            if updated {
+                println!("updated");
+            } else {
+                println!("(not found)");
             }
         }
 
