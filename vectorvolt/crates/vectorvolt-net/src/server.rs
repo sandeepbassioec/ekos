@@ -443,7 +443,8 @@ fn required_scope(req: &Request) -> Scope {
         | Request::Increment { .. }
         | Request::CompareAndSwap { .. }
         | Request::SetField { .. }
-        | Request::InsertIfAbsent { .. } => Scope::ReadWrite,
+        | Request::InsertIfAbsent { .. }
+        | Request::DeleteRange { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -745,6 +746,22 @@ fn serve_request(
                 Err(e) => engine_error(e),
             },
         },
+
+        Request::DeleteRange { col, lo, hi } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let pks: Vec<u64> = rows.into_iter().map(|r| r.values[0]).collect();
+            let mut count = 0u64;
+            for pk in pks {
+                match engine.delete(pk) {
+                    Ok(_) => count += 1,
+                    Err(_) => {} // already deleted (tombstone still visible pre-compact)
+                }
+            }
+            Response::Ok { affected: count }
+        }
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {
             Ok(_) => Response::Ok { affected: 1 },

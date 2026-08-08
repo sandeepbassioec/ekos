@@ -420,6 +420,16 @@ impl Client {
         }
     }
 
+    /// Delete all rows where column `col` falls in `[lo, hi]`.
+    ///
+    /// Returns the number of rows deleted.
+    pub fn delete_range(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::DeleteRange { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Insert a row only if the primary key is not already present.
     ///
     /// Returns `true` if inserted, `false` if the key already existed.

@@ -285,6 +285,19 @@ pub enum ConnectCommand {
         pk: u64,
     },
 
+    /// Delete all rows where column `col` falls in `[lo, hi]`. Prints the deleted count.
+    DeleteRange {
+        /// Column index to filter on (0 = pk).
+        #[arg(long, default_value = "0")]
+        col: u32,
+        /// Lower bound (inclusive).
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        /// Upper bound (inclusive).
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
     /// Insert a row only if the primary key is not already present.
     ///
     /// Prints "inserted" or "already exists".
@@ -659,6 +672,13 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             } else {
                 println!("not found: {name}");
             }
+        }
+
+        ConnectCommand::DeleteRange { col, lo, hi } => {
+            let count = client
+                .delete_range(col, lo, hi)
+                .with_context(|| format!("delete-range col={col} [{lo},{hi}]"))?;
+            println!("{count} row(s) deleted");
         }
 
         ConnectCommand::InsertIfAbsent { pk, values } => {
