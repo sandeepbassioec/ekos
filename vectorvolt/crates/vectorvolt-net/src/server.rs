@@ -755,9 +755,8 @@ fn serve_request(
             let pks: Vec<u64> = rows.into_iter().map(|r| r.values[0]).collect();
             let mut count = 0u64;
             for pk in pks {
-                match engine.delete(pk) {
-                    Ok(_) => count += 1,
-                    Err(_) => {} // already deleted (tombstone still visible pre-compact)
+                if engine.delete(pk).is_ok() {
+                    count += 1;
                 }
             }
             Response::Ok { affected: count }
