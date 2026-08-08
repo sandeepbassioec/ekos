@@ -137,6 +137,18 @@ pub enum OpCode {
     PopMax = 41,
     /// Set multiple `(col, value)` pairs on an existing row atomically.
     MultiSet = 42,
+    /// Subtract `delta` from a column, clamping at 0 (saturating_sub).
+    DecrementClamp = 43,
+    /// Return existing row or insert-and-return provided values.
+    GetOrInsert = 44,
+    /// Set the same column to the same value across many rows in one round trip.
+    BatchSetField = 45,
+    /// Return the top-N rows by column value (highest first).
+    Top = 46,
+    /// Return the bottom-N rows by column value (lowest first).
+    Bottom = 47,
+    /// Exact primary-key existence check (not probabilistic).
+    PkExists = 48,
     // Responses
     Pong = 129,
     Row = 130,
@@ -216,6 +228,12 @@ impl OpCode {
             40 => PopMin,
             41 => PopMax,
             42 => MultiSet,
+            43 => DecrementClamp,
+            44 => GetOrInsert,
+            45 => BatchSetField,
+            46 => Top,
+            47 => Bottom,
+            48 => PkExists,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -548,6 +566,56 @@ pub enum Request {
         pk: u64,
         pairs: Vec<(u32, u64)>,
     },
+    /// Subtract `delta` from column `col` of the row at `pk`, clamping at 0.
+    ///
+    /// Returns `Ok { affected: new_value }` if found, `NotFound` if absent.
+    DecrementClamp {
+        pk: u64,
+        col: u32,
+        delta: u64,
+    },
+    /// Return the existing row if found, else insert and return the provided values.
+    ///
+    /// Always returns `Row { values }` — either the pre-existing row or the freshly
+    /// inserted one. Never returns `NotFound`.
+    GetOrInsert {
+        pk: u64,
+        values: Vec<u64>,
+    },
+    /// Set the same column to the same value across multiple rows in one round trip.
+    ///
+    /// Missing keys are silently skipped. Returns `Ok { affected: count }` where
+    /// `count` is the number of rows actually updated.
+    BatchSetField {
+        col: u32,
+        value: u64,
+        pks: Vec<u64>,
+    },
+    /// Return the top-N rows (highest `col` value) in `[lo, hi]`, sorted descending.
+    ///
+    /// `n = 0` returns all matching rows. Returns `Rows { rows }`.
+    Top {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        n: u32,
+    },
+    /// Return the bottom-N rows (lowest `col` value) in `[lo, hi]`, sorted ascending.
+    ///
+    /// `n = 0` returns all matching rows. Returns `Rows { rows }`.
+    Bottom {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        n: u32,
+    },
+    /// Exact primary-key existence check.
+    ///
+    /// Unlike `FkExists` (which uses a probabilistic bloom filter), this queries
+    /// the engine directly. Returns `Exists { found }`.
+    PkExists {
+        pk: u64,
+    },
 }
 
 /// A server response.
@@ -805,6 +873,12 @@ impl Request {
             Request::PopMin { .. } => OpCode::PopMin,
             Request::PopMax { .. } => OpCode::PopMax,
             Request::MultiSet { .. } => OpCode::MultiSet,
+            Request::DecrementClamp { .. } => OpCode::DecrementClamp,
+            Request::GetOrInsert { .. } => OpCode::GetOrInsert,
+            Request::BatchSetField { .. } => OpCode::BatchSetField,
+            Request::Top { .. } => OpCode::Top,
+            Request::Bottom { .. } => OpCode::Bottom,
+            Request::PkExists { .. } => OpCode::PkExists,
         }
     }
 
@@ -822,6 +896,9 @@ impl Request {
             }
             Request::ScanKeys { col, lo, hi, limit } => {
                 w.u32(*col).u64(*lo).u64(*hi).u32(*limit);
+            }
+            Request::Top { col, lo, hi, n } | Request::Bottom { col, lo, hi, n } => {
+                w.u32(*col).u64(*lo).u64(*hi).u32(*n);
             }
             Request::MinMax { col, lo, hi }
             | Request::Sum { col, lo, hi }
@@ -841,10 +918,13 @@ impl Request {
                 w.u32(n);
                 w.0.extend_from_slice(response);
             }
-            Request::Get { pk } | Request::Delete { pk } | Request::GetAndDelete { pk } => {
+            Request::Get { pk }
+            | Request::Delete { pk }
+            | Request::GetAndDelete { pk }
+            | Request::PkExists { pk } => {
                 w.u64(*pk);
             }
-            Request::Increment { pk, col, delta } => {
+            Request::Increment { pk, col, delta } | Request::DecrementClamp { pk, col, delta } => {
                 w.u64(*pk).u32(*col).u64(*delta);
             }
             Request::CompareAndSwap {
@@ -858,7 +938,9 @@ impl Request {
             Request::SetField { pk, col, value } => {
                 w.u64(*pk).u32(*col).u64(*value);
             }
-            Request::Insert { pk, values } | Request::InsertIfAbsent { pk, values } => {
+            Request::Insert { pk, values }
+            | Request::InsertIfAbsent { pk, values }
+            | Request::GetOrInsert { pk, values } => {
                 w.u64(*pk);
                 w.u64s(values)?;
             }
@@ -918,6 +1000,15 @@ impl Request {
             Request::Truncate => {}
             Request::Count { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::BatchSetField { col, value, pks } => {
+                w.u32(*col).u64(*value);
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many pks in BatchSetField"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
             }
             Request::MultiSet { pk, pairs } => {
                 w.u64(*pk);
@@ -1103,6 +1194,42 @@ impl Request {
                 col: r.u32()?,
                 lo: r.u64()?,
                 hi: r.u64()?,
+            },
+            OpCode::PkExists => Request::PkExists { pk: r.u64()? },
+            OpCode::Top => Request::Top {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                n: r.u32()?,
+            },
+            OpCode::Bottom => Request::Bottom {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                n: r.u32()?,
+            },
+            OpCode::BatchSetField => {
+                let col = r.u32()?;
+                let value = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more pks than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchSetField { col, value, pks }
+            }
+            OpCode::GetOrInsert => Request::GetOrInsert {
+                pk: r.u64()?,
+                values: r.u64s()?,
+            },
+            OpCode::DecrementClamp => Request::DecrementClamp {
+                pk: r.u64()?,
+                col: r.u32()?,
+                delta: r.u64()?,
             },
             OpCode::MultiSet => {
                 let pk = r.u64()?;
@@ -1604,6 +1731,60 @@ mod tests {
                 pk: u64::MAX - 1,
                 pairs: vec![],
             },
+            Request::DecrementClamp {
+                pk: 1,
+                col: 0,
+                delta: 1,
+            },
+            Request::DecrementClamp {
+                pk: u64::MAX - 1,
+                col: 3,
+                delta: u64::MAX,
+            },
+            Request::GetOrInsert {
+                pk: 1,
+                values: vec![1, 42],
+            },
+            Request::GetOrInsert {
+                pk: u64::MAX - 1,
+                values: vec![],
+            },
+            Request::BatchSetField {
+                col: 1,
+                value: 42,
+                pks: vec![1, 2, 3],
+            },
+            Request::BatchSetField {
+                col: 0,
+                value: 0,
+                pks: vec![],
+            },
+            Request::Top {
+                col: 1,
+                lo: 0,
+                hi: u64::MAX,
+                n: 5,
+            },
+            Request::Top {
+                col: 0,
+                lo: 10,
+                hi: 50,
+                n: 0,
+            },
+            Request::Bottom {
+                col: 1,
+                lo: 0,
+                hi: u64::MAX,
+                n: 5,
+            },
+            Request::Bottom {
+                col: 0,
+                lo: 10,
+                hi: 50,
+                n: 0,
+            },
+            Request::PkExists { pk: 0 },
+            Request::PkExists { pk: u64::MAX - 1 },
         ]
     }
 
@@ -1909,7 +2090,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=42 {
+                for op in 1u8..=48 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

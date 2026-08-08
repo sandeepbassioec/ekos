@@ -430,7 +430,10 @@ fn required_scope(req: &Request) -> Scope {
         | Request::TableExists { .. }
         | Request::ScanKeys { .. }
         | Request::MinMax { .. }
-        | Request::Sum { .. } => Scope::ReadOnly,
+        | Request::Sum { .. }
+        | Request::Top { .. }
+        | Request::Bottom { .. }
+        | Request::PkExists { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -447,7 +450,10 @@ fn required_scope(req: &Request) -> Scope {
         | Request::DeleteRange { .. }
         | Request::PopMin { .. }
         | Request::PopMax { .. }
-        | Request::MultiSet { .. } => Scope::ReadWrite,
+        | Request::MultiSet { .. }
+        | Request::DecrementClamp { .. }
+        | Request::GetOrInsert { .. }
+        | Request::BatchSetField { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -831,6 +837,92 @@ fn serve_request(
                 }
             }
         },
+
+        Request::DecrementClamp { pk, col, delta } => match engine.get(pk) {
+            Ok(None) => Response::NotFound,
+            Err(e) => engine_error(e),
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: "column index out of range".to_string(),
+                    };
+                }
+                let mut values = row.values;
+                values[col_idx] = values[col_idx].saturating_sub(delta);
+                let new_val = values[col_idx];
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::GetOrInsert { pk, values } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(Some(row)) => Response::Row { values: row.values },
+            Ok(None) => match engine.insert(pk, values.clone()) {
+                Ok(_) => Response::Row { values },
+                Err(e) => engine_error(e),
+            },
+        },
+
+        Request::BatchSetField { col, value, pks } => {
+            let col_idx = col as usize;
+            let mut count = 0u64;
+            for pk in pks {
+                match engine.get(pk) {
+                    Err(_) | Ok(None) => {}
+                    Ok(Some(row)) => {
+                        if col_idx >= row.values.len() {
+                            continue;
+                        }
+                        let mut values = row.values;
+                        values[col_idx] = value;
+                        if engine.delete(pk).is_ok() && engine.insert(pk, values).is_ok() {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::Top { col, lo, hi, n } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut sorted = rows;
+            sorted.sort_by_key(|r| std::cmp::Reverse(r.values[col as usize]));
+            let limit = if n == 0 { sorted.len() } else { n as usize };
+            let rows = sorted.into_iter().take(limit).map(|r| r.values).collect();
+            Response::Rows { rows }
+        }
+
+        Request::Bottom { col, lo, hi, n } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut sorted = rows;
+            sorted.sort_by_key(|r| r.values[col as usize]);
+            let limit = if n == 0 { sorted.len() } else { n as usize };
+            let rows = sorted.into_iter().take(limit).map(|r| r.values).collect();
+            Response::Rows { rows }
+        }
+
+        Request::PkExists { pk } => {
+            let found = match engine.get(pk) {
+                Ok(v) => v.is_some(),
+                Err(_) => false,
+            };
+            Response::Exists { found }
+        }
 
         Request::Insert { pk, values } => match engine.insert(pk, values) {
             Ok(_) => Response::Ok { affected: 1 },

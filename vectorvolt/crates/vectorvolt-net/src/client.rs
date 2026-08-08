@@ -430,6 +430,67 @@ impl Client {
         }
     }
 
+    /// Exact primary-key existence check.
+    ///
+    /// Unlike `fk_exists` (probabilistic bloom filter), this queries the engine directly.
+    pub fn pk_exists(&mut self, pk: u64) -> NetResult<bool> {
+        match self.call(&Request::PkExists { pk })? {
+            Response::Exists { found } => Ok(found),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Return the top-N rows (highest `col` value) in `[lo, hi]`, sorted descending.
+    ///
+    /// `n = 0` returns all matching rows.
+    pub fn top(&mut self, col: u32, lo: u64, hi: u64, n: u32) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::Top { col, lo, hi, n })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Return the bottom-N rows (lowest `col` value) in `[lo, hi]`, sorted ascending.
+    ///
+    /// `n = 0` returns all matching rows.
+    pub fn bottom(&mut self, col: u32, lo: u64, hi: u64, n: u32) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::Bottom { col, lo, hi, n })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Set column `col` to `value` across all given PKs in one round trip.
+    ///
+    /// Missing PKs are silently skipped. Returns the number of rows updated.
+    pub fn batch_set_field(&mut self, col: u32, value: u64, pks: Vec<u64>) -> NetResult<u64> {
+        match self.call(&Request::BatchSetField { col, value, pks })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Return the existing row if found, else insert the provided values and return them.
+    ///
+    /// Always succeeds: returns the current row (existing or freshly inserted).
+    pub fn get_or_insert(&mut self, pk: u64, values: Vec<u64>) -> NetResult<Vec<u64>> {
+        match self.call(&Request::GetOrInsert { pk, values })? {
+            Response::Row { values } => Ok(values),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Subtract `delta` from column `col`, clamping at 0 (saturating_sub).
+    ///
+    /// Returns `Some(new_value)` if found, `None` if absent.
+    pub fn decrement_clamp(&mut self, pk: u64, col: u32, delta: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::DecrementClamp { pk, col, delta })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Set multiple `(col, value)` pairs on an existing row atomically.
     ///
     /// Returns `true` if found and updated, `false` if the pk was absent.

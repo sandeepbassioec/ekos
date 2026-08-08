@@ -372,6 +372,87 @@ pub enum ConnectCommand {
         hi: u64,
     },
 
+    /// Exact primary-key existence check (non-probabilistic).
+    ///
+    /// Prints "exists: <pk>" or "not found: <pk>".
+    PkExists {
+        /// Primary key to look up.
+        #[arg(long)]
+        pk: u64,
+    },
+
+    /// Return the top-N rows by column value (highest first) in [lo, hi].
+    ///
+    /// n=0 returns all matching rows.
+    Top {
+        #[arg(long, default_value = "0")]
+        col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+        /// Number of rows to return (0 = all).
+        #[arg(long, default_value = "10")]
+        n: u32,
+    },
+
+    /// Return the bottom-N rows by column value (lowest first) in [lo, hi].
+    ///
+    /// n=0 returns all matching rows.
+    Bottom {
+        #[arg(long, default_value = "0")]
+        col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+        /// Number of rows to return (0 = all).
+        #[arg(long, default_value = "10")]
+        n: u32,
+    },
+
+    /// Set the same column to the same value across many rows in one round trip.
+    ///
+    /// Prints the count of updated rows.
+    BatchSetField {
+        /// Column index to set.
+        #[arg(long)]
+        col: u32,
+        /// Value to write into the column.
+        #[arg(long)]
+        value: u64,
+        /// Primary keys of rows to update.
+        #[arg(required = true)]
+        pks: Vec<u64>,
+    },
+
+    /// Return existing row or insert-and-return provided values.
+    ///
+    /// Prints the row (existing or newly inserted).
+    GetOrInsert {
+        /// Primary key.
+        #[arg(long)]
+        pk: u64,
+        /// Column values for the row if it needs to be created.
+        #[arg(required = true)]
+        values: Vec<u64>,
+    },
+
+    /// Subtract delta from a column, clamping at 0 (saturating subtract).
+    ///
+    /// Prints the new value or "not found".
+    DecrementClamp {
+        /// Primary key.
+        #[arg(long)]
+        pk: u64,
+        /// Column index.
+        #[arg(long)]
+        col: u32,
+        /// Amount to subtract.
+        #[arg(long)]
+        delta: u64,
+    },
+
     /// Atomically fetch and delete the row with the minimum column value in [lo, hi].
     ///
     /// Prints the row values or "not found".
@@ -849,6 +930,67 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             {
                 None => println!("not found"),
                 Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
+            }
+        }
+
+        ConnectCommand::PkExists { pk } => {
+            let found = client
+                .pk_exists(pk)
+                .with_context(|| format!("pk-exists pk={pk}"))?;
+            if found {
+                println!("exists: {pk}");
+            } else {
+                println!("not found: {pk}");
+            }
+        }
+
+        ConnectCommand::Top { col, lo, hi, n } => {
+            let rows = client
+                .top(col, lo, hi, n)
+                .with_context(|| format!("top col={col} [{lo},{hi}] n={n}"))?;
+            if rows.is_empty() {
+                println!("(empty)");
+            } else {
+                for row in &rows {
+                    println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
+                }
+            }
+        }
+
+        ConnectCommand::Bottom { col, lo, hi, n } => {
+            let rows = client
+                .bottom(col, lo, hi, n)
+                .with_context(|| format!("bottom col={col} [{lo},{hi}] n={n}"))?;
+            if rows.is_empty() {
+                println!("(empty)");
+            } else {
+                for row in &rows {
+                    println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
+                }
+            }
+        }
+
+        ConnectCommand::BatchSetField { col, value, pks } => {
+            let count = client
+                .batch_set_field(col, value, pks)
+                .with_context(|| format!("batch-set-field col={col} value={value}"))?;
+            println!("{count} row(s) updated");
+        }
+
+        ConnectCommand::GetOrInsert { pk, values } => {
+            let row = client
+                .get_or_insert(pk, values)
+                .with_context(|| format!("get-or-insert pk={pk}"))?;
+            println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
+        }
+
+        ConnectCommand::DecrementClamp { pk, col, delta } => {
+            match client
+                .decrement_clamp(pk, col, delta)
+                .with_context(|| format!("decrement-clamp pk={pk} col={col} delta={delta}"))?
+            {
+                None => println!("not found"),
+                Some(v) => println!("{v}"),
             }
         }
 
