@@ -372,6 +372,21 @@ pub enum ConnectCommand {
         hi: u64,
     },
 
+    /// Subtract delta from a column, clamping at 0 (saturating subtract).
+    ///
+    /// Prints the new value or "not found".
+    DecrementClamp {
+        /// Primary key.
+        #[arg(long)]
+        pk: u64,
+        /// Column index.
+        #[arg(long)]
+        col: u32,
+        /// Amount to subtract.
+        #[arg(long)]
+        delta: u64,
+    },
+
     /// Atomically fetch and delete the row with the minimum column value in [lo, hi].
     ///
     /// Prints the row values or "not found".
@@ -849,6 +864,16 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             {
                 None => println!("not found"),
                 Some(values) => println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t")),
+            }
+        }
+
+        ConnectCommand::DecrementClamp { pk, col, delta } => {
+            match client
+                .decrement_clamp(pk, col, delta)
+                .with_context(|| format!("decrement-clamp pk={pk} col={col} delta={delta}"))?
+            {
+                None => println!("not found"),
+                Some(v) => println!("{v}"),
             }
         }
 

@@ -137,6 +137,8 @@ pub enum OpCode {
     PopMax = 41,
     /// Set multiple `(col, value)` pairs on an existing row atomically.
     MultiSet = 42,
+    /// Subtract `delta` from a column, clamping at 0 (saturating_sub).
+    DecrementClamp = 43,
     // Responses
     Pong = 129,
     Row = 130,
@@ -216,6 +218,7 @@ impl OpCode {
             40 => PopMin,
             41 => PopMax,
             42 => MultiSet,
+            43 => DecrementClamp,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -548,6 +551,14 @@ pub enum Request {
         pk: u64,
         pairs: Vec<(u32, u64)>,
     },
+    /// Subtract `delta` from column `col` of the row at `pk`, clamping at 0.
+    ///
+    /// Returns `Ok { affected: new_value }` if found, `NotFound` if absent.
+    DecrementClamp {
+        pk: u64,
+        col: u32,
+        delta: u64,
+    },
 }
 
 /// A server response.
@@ -805,6 +816,7 @@ impl Request {
             Request::PopMin { .. } => OpCode::PopMin,
             Request::PopMax { .. } => OpCode::PopMax,
             Request::MultiSet { .. } => OpCode::MultiSet,
+            Request::DecrementClamp { .. } => OpCode::DecrementClamp,
         }
     }
 
@@ -844,7 +856,7 @@ impl Request {
             Request::Get { pk } | Request::Delete { pk } | Request::GetAndDelete { pk } => {
                 w.u64(*pk);
             }
-            Request::Increment { pk, col, delta } => {
+            Request::Increment { pk, col, delta } | Request::DecrementClamp { pk, col, delta } => {
                 w.u64(*pk).u32(*col).u64(*delta);
             }
             Request::CompareAndSwap {
@@ -1103,6 +1115,11 @@ impl Request {
                 col: r.u32()?,
                 lo: r.u64()?,
                 hi: r.u64()?,
+            },
+            OpCode::DecrementClamp => Request::DecrementClamp {
+                pk: r.u64()?,
+                col: r.u32()?,
+                delta: r.u64()?,
             },
             OpCode::MultiSet => {
                 let pk = r.u64()?;
@@ -1604,6 +1621,16 @@ mod tests {
                 pk: u64::MAX - 1,
                 pairs: vec![],
             },
+            Request::DecrementClamp {
+                pk: 1,
+                col: 0,
+                delta: 1,
+            },
+            Request::DecrementClamp {
+                pk: u64::MAX - 1,
+                col: 3,
+                delta: u64::MAX,
+            },
         ]
     }
 
@@ -1909,7 +1936,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=42 {
+                for op in 1u8..=43 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

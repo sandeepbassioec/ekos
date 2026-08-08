@@ -430,6 +430,17 @@ impl Client {
         }
     }
 
+    /// Subtract `delta` from column `col`, clamping at 0 (saturating_sub).
+    ///
+    /// Returns `Some(new_value)` if found, `None` if absent.
+    pub fn decrement_clamp(&mut self, pk: u64, col: u32, delta: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::DecrementClamp { pk, col, delta })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Set multiple `(col, value)` pairs on an existing row atomically.
     ///
     /// Returns `true` if found and updated, `false` if the pk was absent.
