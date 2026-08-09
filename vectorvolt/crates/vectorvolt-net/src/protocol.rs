@@ -149,6 +149,104 @@ pub enum OpCode {
     Bottom = 47,
     /// Exact primary-key existence check (not probabilistic).
     PkExists = 48,
+    /// Atomically increment multiple `(col, delta)` pairs on one row (saturating at u64::MAX).
+    ///
+    /// Returns `Row { new_values }` with the full updated row, or `NotFound`.
+    IncrementMulti = 49,
+    /// Copy the row at `src_pk` to `dst_pk` (insert-or-replace).
+    ///
+    /// Returns `Ok { affected: 1 }` if `src_pk` exists, `NotFound` otherwise.
+    CopyRow = 50,
+    /// Swap the value of column `col` between `pk1` and `pk2`.
+    ///
+    /// Returns `Ok { affected: 2 }` if both pks exist, `NotFound` otherwise.
+    SwapField = 51,
+    /// Clamp column `col` of row `pk` into `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: new_value }` if found, `NotFound` if absent.
+    Clamp = 52,
+    /// Return `[sum, count]` for column `col` over the scan range `[lo, hi]`.
+    ///
+    /// Returns `Row { values: [sum, count] }`, or `NotFound` if no rows match.
+    Average = 53,
+    /// Delete the row at `pk` only when `values[col] == value`.
+    ///
+    /// Returns `Ok { affected: 1 }` if deleted, `Ok { affected: 0 }` on mismatch, `NotFound` if absent.
+    DeleteIf = 54,
+    /// Set `values[col]` to `new_value` only if it currently equals `expected`.
+    ///
+    /// Returns `Ok { affected: 1 }` on update, `Ok { affected: 0 }` on mismatch, `NotFound` if absent.
+    SetFieldIf = 55,
+    /// Return the 0-based rank of `pk`'s column `col` value within `[lo, hi]`.
+    ///
+    /// Rank = count of rows in the range whose column value is strictly less.
+    /// Returns `Ok { affected: rank }` if `pk` is found in the range, `NotFound` otherwise.
+    RankOf = 56,
+    /// Return the value at the Nth percentile of column `col` in `[lo, hi]`.
+    ///
+    /// `pct` is 0–100 inclusive. Returns `Ok { affected: value }` or `NotFound` if empty.
+    Percentile = 57,
+    /// Sum multiple column values of a single row.
+    ///
+    /// Returns `Ok { affected: sum }` (saturating) or `NotFound`.
+    SumFields = 58,
+    /// Return the maximum across multiple column values of a single row.
+    ///
+    /// Returns `Ok { affected: max }` or `NotFound`.
+    MaxField = 59,
+    /// Range scan with an additional equality filter on a second column.
+    ///
+    /// Scan `scan_col` in `[lo, hi]`; keep rows where `filter_col == filter_val`.
+    /// Returns `Rows { rows }`.
+    FilterScan = 60,
+    /// Increment the same column by `delta` across many rows in one round trip.
+    ///
+    /// Missing pks are silently skipped. Returns `Ok { affected: count }`.
+    BatchIncrementField = 61,
+    /// Count distinct values of column `col` in scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: count }`.
+    CountDistinct = 62,
+    /// Return the median value of column `col` in `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: value }` or `NotFound` if empty.
+    Median = 63,
+    /// Delete each pk in the list only if `values[col] == value`.
+    ///
+    /// Returns `Ok { affected: deleted_count }`.
+    BatchDeleteIf = 64,
+    /// Check multiple primary keys for existence in one round trip.
+    ///
+    /// Returns `Ok { affected: count }` where `count` is the number of pks that exist.
+    BatchPkExists = 65,
+    /// Range scan on `scan_col` in `[lo, hi]` keeping rows where `filter_col` in `[filter_lo, filter_hi]`.
+    ///
+    /// Returns `Rows { rows }`.
+    FieldBetween = 66,
+    /// Minimum value of column `col` over scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: min }` or `NotFound` if empty.
+    ScalarMin = 67,
+    /// Maximum value of column `col` over scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: max }` or `NotFound` if empty.
+    ScalarMax = 68,
+    /// Return only the listed columns of a single row.
+    ///
+    /// Returns `Row { values }` with one entry per requested col, or `NotFound`.
+    MultiGet = 69,
+    /// Add `delta` to column `col` if `pk` exists; otherwise insert `values` (with `values[col]` as initial).
+    ///
+    /// Returns `Ok { affected: new_value }`.
+    IncrementOrInsert = 70,
+    /// Set column `col` to 0 for every row in scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: count }`.
+    ZeroField = 71,
+    /// Paginated range scan: skip `offset` rows then return up to `limit`.
+    ///
+    /// Returns `Rows { rows }`.
+    ScanPage = 72,
     // Responses
     Pong = 129,
     Row = 130,
@@ -234,6 +332,30 @@ impl OpCode {
             46 => Top,
             47 => Bottom,
             48 => PkExists,
+            49 => IncrementMulti,
+            50 => CopyRow,
+            51 => SwapField,
+            52 => Clamp,
+            53 => Average,
+            54 => DeleteIf,
+            55 => SetFieldIf,
+            56 => RankOf,
+            57 => Percentile,
+            58 => SumFields,
+            59 => MaxField,
+            60 => FilterScan,
+            61 => BatchIncrementField,
+            62 => CountDistinct,
+            63 => Median,
+            64 => BatchDeleteIf,
+            65 => BatchPkExists,
+            66 => FieldBetween,
+            67 => ScalarMin,
+            68 => ScalarMax,
+            69 => MultiGet,
+            70 => IncrementOrInsert,
+            71 => ZeroField,
+            72 => ScanPage,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -616,6 +738,171 @@ pub enum Request {
     PkExists {
         pk: u64,
     },
+    /// Atomically increment multiple `(col, delta)` pairs on one row.
+    ///
+    /// Returns `Row { new_values }` or `NotFound`.
+    IncrementMulti {
+        pk: u64,
+        pairs: Vec<(u32, u64)>,
+    },
+    /// Copy the row at `src_pk` to `dst_pk` (upsert semantics).
+    ///
+    /// Returns `Ok { affected: 1 }` or `NotFound`.
+    CopyRow {
+        src_pk: u64,
+        dst_pk: u64,
+    },
+    /// Swap column `col` value between `pk1` and `pk2`.
+    ///
+    /// Returns `Ok { affected: 2 }` or `NotFound` if either pk is absent.
+    SwapField {
+        pk1: u64,
+        pk2: u64,
+        col: u32,
+    },
+    /// Clamp column `col` of row `pk` into `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: new_value }` or `NotFound`.
+    Clamp {
+        pk: u64,
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Return sum and count of column `col` over scan range `[lo, hi]`.
+    ///
+    /// Returns `Row { values: [sum, count] }` or `NotFound` if no rows match.
+    Average {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Delete the row at `pk` only if `values[col] == value`.
+    ///
+    /// Returns `Ok { 1 }` if deleted, `Ok { 0 }` on mismatch, `NotFound` if absent.
+    DeleteIf {
+        pk: u64,
+        col: u32,
+        value: u64,
+    },
+    /// Set `values[col]` to `new_value` only if it currently equals `expected`.
+    ///
+    /// Returns `Ok { 1 }` on update, `Ok { 0 }` on mismatch, `NotFound` if absent.
+    SetFieldIf {
+        pk: u64,
+        col: u32,
+        expected: u64,
+        new_value: u64,
+    },
+    /// 0-based rank of `pk`'s `col` value among rows in scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { rank }` if `pk` is present in the range, `NotFound` otherwise.
+    RankOf {
+        pk: u64,
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Return the value at the Nth percentile of column `col` in `[lo, hi]`.
+    Percentile {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        pct: u32,
+    },
+    /// Sum listed columns of a single row.
+    SumFields {
+        pk: u64,
+        cols: Vec<u32>,
+    },
+    /// Return the maximum across listed columns of a single row.
+    MaxField {
+        pk: u64,
+        cols: Vec<u32>,
+    },
+    /// Range scan on `scan_col` in `[lo, hi]` filtered to rows where `filter_col == filter_val`.
+    FilterScan {
+        scan_col: u32,
+        lo: u64,
+        hi: u64,
+        filter_col: u32,
+        filter_val: u64,
+    },
+    /// Increment column `col` by `delta` across all listed pks (saturating).
+    BatchIncrementField {
+        col: u32,
+        delta: u64,
+        pks: Vec<u64>,
+    },
+    /// Count distinct values of column `col` in scan range `[lo, hi]`.
+    CountDistinct {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Median of column `col` in `[lo, hi]`.
+    Median {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Delete each pk only if `values[col] == value`.
+    BatchDeleteIf {
+        col: u32,
+        value: u64,
+        pks: Vec<u64>,
+    },
+    /// Check multiple primary keys for existence; returns the count that exist.
+    BatchPkExists {
+        pks: Vec<u64>,
+    },
+    /// Range scan on `scan_col` in `[lo, hi]`, keeping rows where `filter_col` in `[filter_lo, filter_hi]`.
+    FieldBetween {
+        scan_col: u32,
+        lo: u64,
+        hi: u64,
+        filter_col: u32,
+        filter_lo: u64,
+        filter_hi: u64,
+    },
+    /// Minimum value of column `col` over scan range `[lo, hi]`.
+    ScalarMin {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Maximum value of column `col` over scan range `[lo, hi]`.
+    ScalarMax {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Return only listed columns of a single row.
+    MultiGet {
+        pk: u64,
+        cols: Vec<u32>,
+    },
+    /// Increment `col` by `delta` if `pk` exists; otherwise insert `values`.
+    IncrementOrInsert {
+        pk: u64,
+        col: u32,
+        delta: u64,
+        values: Vec<u64>,
+    },
+    /// Set column `col` to 0 for all rows in scan range `[lo, hi]`.
+    ZeroField {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Paginated range scan: skip `offset` rows then return up to `limit`.
+    ScanPage {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        offset: u32,
+        limit: u32,
+    },
 }
 
 /// A server response.
@@ -879,6 +1166,30 @@ impl Request {
             Request::Top { .. } => OpCode::Top,
             Request::Bottom { .. } => OpCode::Bottom,
             Request::PkExists { .. } => OpCode::PkExists,
+            Request::IncrementMulti { .. } => OpCode::IncrementMulti,
+            Request::CopyRow { .. } => OpCode::CopyRow,
+            Request::SwapField { .. } => OpCode::SwapField,
+            Request::Clamp { .. } => OpCode::Clamp,
+            Request::Average { .. } => OpCode::Average,
+            Request::DeleteIf { .. } => OpCode::DeleteIf,
+            Request::SetFieldIf { .. } => OpCode::SetFieldIf,
+            Request::RankOf { .. } => OpCode::RankOf,
+            Request::Percentile { .. } => OpCode::Percentile,
+            Request::SumFields { .. } => OpCode::SumFields,
+            Request::MaxField { .. } => OpCode::MaxField,
+            Request::FilterScan { .. } => OpCode::FilterScan,
+            Request::BatchIncrementField { .. } => OpCode::BatchIncrementField,
+            Request::CountDistinct { .. } => OpCode::CountDistinct,
+            Request::Median { .. } => OpCode::Median,
+            Request::BatchDeleteIf { .. } => OpCode::BatchDeleteIf,
+            Request::BatchPkExists { .. } => OpCode::BatchPkExists,
+            Request::FieldBetween { .. } => OpCode::FieldBetween,
+            Request::ScalarMin { .. } => OpCode::ScalarMin,
+            Request::ScalarMax { .. } => OpCode::ScalarMax,
+            Request::MultiGet { .. } => OpCode::MultiGet,
+            Request::IncrementOrInsert { .. } => OpCode::IncrementOrInsert,
+            Request::ZeroField { .. } => OpCode::ZeroField,
+            Request::ScanPage { .. } => OpCode::ScanPage,
         }
     }
 
@@ -1027,6 +1338,137 @@ impl Request {
                     w.u64(*pk);
                     w.u64s(values)?;
                 }
+            }
+            Request::IncrementMulti { pk, pairs } => {
+                w.u64(*pk);
+                let n = u32::try_from(pairs.len())
+                    .map_err(|_| NetError::Malformed("too many pairs in IncrementMulti"))?;
+                w.u32(n);
+                for (col, delta) in pairs {
+                    w.u32(*col).u64(*delta);
+                }
+            }
+            Request::CopyRow { src_pk, dst_pk } => {
+                w.u64(*src_pk).u64(*dst_pk);
+            }
+            Request::SwapField { pk1, pk2, col } => {
+                w.u64(*pk1).u64(*pk2).u32(*col);
+            }
+            Request::Clamp { pk, col, lo, hi } => {
+                w.u64(*pk).u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::Average { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::DeleteIf { pk, col, value } => {
+                w.u64(*pk).u32(*col).u64(*value);
+            }
+            Request::SetFieldIf {
+                pk,
+                col,
+                expected,
+                new_value,
+            } => {
+                w.u64(*pk).u32(*col).u64(*expected).u64(*new_value);
+            }
+            Request::RankOf { pk, col, lo, hi } => {
+                w.u64(*pk).u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::Percentile { col, lo, hi, pct } => {
+                w.u32(*col).u64(*lo).u64(*hi).u32(*pct);
+            }
+            Request::SumFields { pk, cols } | Request::MaxField { pk, cols } => {
+                w.u64(*pk);
+                let n =
+                    u32::try_from(cols.len()).map_err(|_| NetError::Malformed("too many cols"))?;
+                w.u32(n);
+                for col in cols {
+                    w.u32(*col);
+                }
+            }
+            Request::FilterScan {
+                scan_col,
+                lo,
+                hi,
+                filter_col,
+                filter_val,
+            } => {
+                w.u32(*scan_col)
+                    .u64(*lo)
+                    .u64(*hi)
+                    .u32(*filter_col)
+                    .u64(*filter_val);
+            }
+            Request::BatchIncrementField { col, delta, pks }
+            | Request::BatchDeleteIf {
+                col,
+                value: delta,
+                pks,
+            } => {
+                w.u32(*col).u64(*delta);
+                let n =
+                    u32::try_from(pks.len()).map_err(|_| NetError::Malformed("too many pks"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+            }
+            Request::CountDistinct { col, lo, hi }
+            | Request::Median { col, lo, hi }
+            | Request::ScalarMin { col, lo, hi }
+            | Request::ScalarMax { col, lo, hi }
+            | Request::ZeroField { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::BatchPkExists { pks } => {
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many pks in BatchPkExists"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+            }
+            Request::FieldBetween {
+                scan_col,
+                lo,
+                hi,
+                filter_col,
+                filter_lo,
+                filter_hi,
+            } => {
+                w.u32(*scan_col)
+                    .u64(*lo)
+                    .u64(*hi)
+                    .u32(*filter_col)
+                    .u64(*filter_lo)
+                    .u64(*filter_hi);
+            }
+            Request::MultiGet { pk, cols } => {
+                w.u64(*pk);
+                let n = u32::try_from(cols.len())
+                    .map_err(|_| NetError::Malformed("too many cols in MultiGet"))?;
+                w.u32(n);
+                for col in cols {
+                    w.u32(*col);
+                }
+            }
+            Request::IncrementOrInsert {
+                pk,
+                col,
+                delta,
+                values,
+            } => {
+                w.u64(*pk).u32(*col).u64(*delta);
+                w.u64s(values)?;
+            }
+            Request::ScanPage {
+                col,
+                lo,
+                hi,
+                offset,
+                limit,
+            } => {
+                w.u32(*col).u64(*lo).u64(*hi).u32(*offset).u32(*limit);
             }
         }
         Ok(w.0)
@@ -1247,6 +1689,196 @@ impl Request {
                 }
                 Request::MultiSet { pk, pairs }
             }
+            OpCode::IncrementMulti => {
+                let pk = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 12;
+                if n > max_possible {
+                    return Err(NetError::Malformed(
+                        "declared more pairs than payload holds",
+                    ));
+                }
+                let mut pairs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pairs.push((r.u32()?, r.u64()?));
+                }
+                Request::IncrementMulti { pk, pairs }
+            }
+            OpCode::CopyRow => Request::CopyRow {
+                src_pk: r.u64()?,
+                dst_pk: r.u64()?,
+            },
+            OpCode::SwapField => Request::SwapField {
+                pk1: r.u64()?,
+                pk2: r.u64()?,
+                col: r.u32()?,
+            },
+            OpCode::Clamp => Request::Clamp {
+                pk: r.u64()?,
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::Average => Request::Average {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::DeleteIf => Request::DeleteIf {
+                pk: r.u64()?,
+                col: r.u32()?,
+                value: r.u64()?,
+            },
+            OpCode::SetFieldIf => Request::SetFieldIf {
+                pk: r.u64()?,
+                col: r.u32()?,
+                expected: r.u64()?,
+                new_value: r.u64()?,
+            },
+            OpCode::RankOf => Request::RankOf {
+                pk: r.u64()?,
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::Percentile => Request::Percentile {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                pct: r.u32()?,
+            },
+            OpCode::SumFields => {
+                let pk = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 4;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more cols than payload holds"));
+                }
+                let mut cols = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cols.push(r.u32()?);
+                }
+                Request::SumFields { pk, cols }
+            }
+            OpCode::MaxField => {
+                let pk = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 4;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more cols than payload holds"));
+                }
+                let mut cols = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cols.push(r.u32()?);
+                }
+                Request::MaxField { pk, cols }
+            }
+            OpCode::FilterScan => Request::FilterScan {
+                scan_col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                filter_col: r.u32()?,
+                filter_val: r.u64()?,
+            },
+            OpCode::BatchIncrementField => {
+                let col = r.u32()?;
+                let delta = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more pks than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchIncrementField { col, delta, pks }
+            }
+            OpCode::CountDistinct => Request::CountDistinct {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::Median => Request::Median {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::BatchDeleteIf => {
+                let col = r.u32()?;
+                let value = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more pks than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchDeleteIf { col, value, pks }
+            }
+            OpCode::BatchPkExists => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more pks than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchPkExists { pks }
+            }
+            OpCode::FieldBetween => Request::FieldBetween {
+                scan_col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                filter_col: r.u32()?,
+                filter_lo: r.u64()?,
+                filter_hi: r.u64()?,
+            },
+            OpCode::ScalarMin => Request::ScalarMin {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::ScalarMax => Request::ScalarMax {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::MultiGet => {
+                let pk = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 4;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more cols than payload holds"));
+                }
+                let mut cols = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cols.push(r.u32()?);
+                }
+                Request::MultiGet { pk, cols }
+            }
+            OpCode::IncrementOrInsert => Request::IncrementOrInsert {
+                pk: r.u64()?,
+                col: r.u32()?,
+                delta: r.u64()?,
+                values: r.u64s()?,
+            },
+            OpCode::ZeroField => Request::ZeroField {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::ScanPage => Request::ScanPage {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                offset: r.u32()?,
+                limit: r.u32()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -2090,7 +2722,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=48 {
+                for op in 1u8..=72 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

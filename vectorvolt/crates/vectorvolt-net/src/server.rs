@@ -433,7 +433,21 @@ fn required_scope(req: &Request) -> Scope {
         | Request::Sum { .. }
         | Request::Top { .. }
         | Request::Bottom { .. }
-        | Request::PkExists { .. } => Scope::ReadOnly,
+        | Request::PkExists { .. }
+        | Request::Average { .. }
+        | Request::RankOf { .. }
+        | Request::Percentile { .. }
+        | Request::SumFields { .. }
+        | Request::MaxField { .. }
+        | Request::FilterScan { .. }
+        | Request::CountDistinct { .. }
+        | Request::Median { .. }
+        | Request::BatchPkExists { .. }
+        | Request::FieldBetween { .. }
+        | Request::ScalarMin { .. }
+        | Request::ScalarMax { .. }
+        | Request::MultiGet { .. }
+        | Request::ScanPage { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -453,7 +467,17 @@ fn required_scope(req: &Request) -> Scope {
         | Request::MultiSet { .. }
         | Request::DecrementClamp { .. }
         | Request::GetOrInsert { .. }
-        | Request::BatchSetField { .. } => Scope::ReadWrite,
+        | Request::BatchSetField { .. }
+        | Request::IncrementMulti { .. }
+        | Request::CopyRow { .. }
+        | Request::SwapField { .. }
+        | Request::Clamp { .. }
+        | Request::DeleteIf { .. }
+        | Request::SetFieldIf { .. }
+        | Request::BatchIncrementField { .. }
+        | Request::BatchDeleteIf { .. }
+        | Request::IncrementOrInsert { .. }
+        | Request::ZeroField { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -1156,6 +1180,506 @@ fn serve_request(
         Request::DescribeTable => Response::Schema {
             columns: engine.schema.clone(),
         },
+
+        Request::IncrementMulti { pk, pairs } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let mut values = row.values;
+                for (col, delta) in pairs {
+                    let idx = col as usize;
+                    if idx >= values.len() {
+                        return Response::Error {
+                            code: error_code::INVALID_ARGUMENT,
+                            message: format!("col {idx} out of range"),
+                        };
+                    }
+                    values[idx] = values[idx].saturating_add(delta);
+                }
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values.clone()) {
+                        Ok(_) => Response::Row { values },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::CopyRow { src_pk, dst_pk } => match engine.get(src_pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let mut values = row.values;
+                values[0] = dst_pk;
+                // upsert: delete dst if present, then insert
+                let _ = engine.delete(dst_pk);
+                match engine.insert(dst_pk, values) {
+                    Ok(_) => Response::Ok { affected: 1 },
+                    Err(e) => engine_error(e),
+                }
+            }
+        },
+
+        Request::SwapField { pk1, pk2, col } => {
+            let col_idx = col as usize;
+            let row1 = match engine.get(pk1) {
+                Err(e) => return engine_error(e),
+                Ok(None) => return Response::NotFound,
+                Ok(Some(r)) => r,
+            };
+            let row2 = match engine.get(pk2) {
+                Err(e) => return engine_error(e),
+                Ok(None) => return Response::NotFound,
+                Ok(Some(r)) => r,
+            };
+            if col_idx >= row1.values.len() || col_idx >= row2.values.len() {
+                return Response::Error {
+                    code: error_code::INVALID_ARGUMENT,
+                    message: format!("col {col_idx} out of range"),
+                };
+            }
+            let mut v1 = row1.values;
+            let mut v2 = row2.values;
+            std::mem::swap(&mut v1[col_idx], &mut v2[col_idx]);
+            if engine.delete(pk1).is_err() || engine.insert(pk1, v1).is_err() {
+                return Response::Error {
+                    code: error_code::ENGINE,
+                    message: "swap failed on pk1".into(),
+                };
+            }
+            if engine.delete(pk2).is_err() || engine.insert(pk2, v2).is_err() {
+                return Response::Error {
+                    code: error_code::ENGINE,
+                    message: "swap failed on pk2".into(),
+                };
+            }
+            Response::Ok { affected: 2 }
+        }
+
+        Request::Clamp { pk, col, lo, hi } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: format!("col {col_idx} out of range"),
+                    };
+                }
+                let mut values = row.values;
+                values[col_idx] = values[col_idx].clamp(lo, hi);
+                let new_val = values[col_idx];
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::Average { col, lo, hi } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            if rows.is_empty() {
+                return Response::NotFound;
+            }
+            let col_idx = col as usize;
+            let mut sum: u64 = 0;
+            let count = rows.len() as u64;
+            for row in &rows {
+                sum = sum.saturating_add(row.values[col_idx]);
+            }
+            Response::Row {
+                values: vec![sum, count],
+            }
+        }
+
+        Request::DeleteIf { pk, col, value } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: format!("col {col_idx} out of range"),
+                    };
+                }
+                if row.values[col_idx] != value {
+                    return Response::Ok { affected: 0 };
+                }
+                match engine.delete(pk) {
+                    Ok(_) => Response::Ok { affected: 1 },
+                    Err(e) => engine_error(e),
+                }
+            }
+        },
+
+        Request::SetFieldIf {
+            pk,
+            col,
+            expected,
+            new_value,
+        } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: format!("col {col_idx} out of range"),
+                    };
+                }
+                if row.values[col_idx] != expected {
+                    return Response::Ok { affected: 0 };
+                }
+                let mut values = row.values;
+                values[col_idx] = new_value;
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: 1 },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::RankOf { pk, col, lo, hi } => {
+            let col_idx = col as usize;
+            let target_row = match engine.get(pk) {
+                Err(e) => return engine_error(e),
+                Ok(None) => return Response::NotFound,
+                Ok(Some(r)) => r,
+            };
+            if col_idx >= target_row.values.len() {
+                return Response::Error {
+                    code: error_code::INVALID_ARGUMENT,
+                    message: format!("col {col_idx} out of range"),
+                };
+            }
+            let target_val = target_row.values[col_idx];
+            // Check pk is actually within the scan range
+            if target_val < lo || target_val > hi {
+                return Response::NotFound;
+            }
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let rank = rows
+                .iter()
+                .filter(|r| r.values[col_idx] < target_val)
+                .count() as u64;
+            Response::Ok { affected: rank }
+        }
+
+        Request::Percentile { col, lo, hi, pct } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            if rows.is_empty() {
+                return Response::NotFound;
+            }
+            if pct > 100 {
+                return Response::Error {
+                    code: error_code::INVALID_ARGUMENT,
+                    message: "pct must be 0–100".into(),
+                };
+            }
+            let mut vals: Vec<u64> = rows.iter().map(|r| r.values[col_idx]).collect();
+            vals.sort_unstable();
+            let idx = (pct as usize * (vals.len() - 1)) / 100;
+            Response::Ok {
+                affected: vals[idx],
+            }
+        }
+
+        Request::SumFields { pk, cols } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let mut sum: u64 = 0;
+                for col in cols {
+                    let idx = col as usize;
+                    if idx >= row.values.len() {
+                        return Response::Error {
+                            code: error_code::INVALID_ARGUMENT,
+                            message: format!("col {idx} out of range"),
+                        };
+                    }
+                    sum = sum.saturating_add(row.values[idx]);
+                }
+                Response::Ok { affected: sum }
+            }
+        },
+
+        Request::MaxField { pk, cols } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                if cols.is_empty() {
+                    return Response::Ok { affected: 0 };
+                }
+                let mut max_val: u64 = 0;
+                for col in cols {
+                    let idx = col as usize;
+                    if idx >= row.values.len() {
+                        return Response::Error {
+                            code: error_code::INVALID_ARGUMENT,
+                            message: format!("col {idx} out of range"),
+                        };
+                    }
+                    if row.values[idx] > max_val {
+                        max_val = row.values[idx];
+                    }
+                }
+                Response::Ok { affected: max_val }
+            }
+        },
+
+        Request::FilterScan {
+            scan_col,
+            lo,
+            hi,
+            filter_col,
+            filter_val,
+        } => {
+            let rows = match engine.scan(scan_col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let filter_idx = filter_col as usize;
+            let filtered: Vec<Vec<u64>> = rows
+                .into_iter()
+                .filter(|r| r.values.get(filter_idx).copied().unwrap_or(u64::MAX) == filter_val)
+                .map(|r| r.values)
+                .collect();
+            Response::Rows { rows: filtered }
+        }
+
+        Request::BatchIncrementField { col, delta, pks } => {
+            let col_idx = col as usize;
+            let mut count: u64 = 0;
+            for pk in pks {
+                match engine.get(pk) {
+                    Err(_) | Ok(None) => {}
+                    Ok(Some(row)) => {
+                        if col_idx < row.values.len() {
+                            let mut values = row.values;
+                            values[col_idx] = values[col_idx].saturating_add(delta);
+                            if engine.delete(pk).is_ok() && engine.insert(pk, values).is_ok() {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::CountDistinct { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut seen = std::collections::HashSet::new();
+            for row in &rows {
+                seen.insert(row.values[col_idx]);
+            }
+            Response::Ok {
+                affected: seen.len() as u64,
+            }
+        }
+
+        Request::Median { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            if rows.is_empty() {
+                return Response::NotFound;
+            }
+            let mut vals: Vec<u64> = rows.iter().map(|r| r.values[col_idx]).collect();
+            vals.sort_unstable();
+            let mid = vals.len() / 2;
+            Response::Ok {
+                affected: vals[mid],
+            }
+        }
+
+        Request::BatchDeleteIf { col, value, pks } => {
+            let col_idx = col as usize;
+            let mut count: u64 = 0;
+            for pk in pks {
+                match engine.get(pk) {
+                    Err(_) | Ok(None) => {}
+                    Ok(Some(row)) => {
+                        if row.values.get(col_idx).copied() == Some(value)
+                            && engine.delete(pk).is_ok()
+                        {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::BatchPkExists { pks } => {
+            let mut count: u64 = 0;
+            for pk in &pks {
+                if matches!(engine.get(*pk), Ok(Some(_))) {
+                    count += 1;
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::FieldBetween {
+            scan_col,
+            lo,
+            hi,
+            filter_col,
+            filter_lo,
+            filter_hi,
+        } => {
+            let filt_idx = filter_col as usize;
+            let rows = match engine.scan(scan_col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let out: Vec<Vec<u64>> = rows
+                .into_iter()
+                .filter(|r| {
+                    let fv = r.values.get(filt_idx).copied().unwrap_or(0);
+                    fv >= filter_lo && fv <= filter_hi
+                })
+                .map(|r| r.values)
+                .collect();
+            Response::Rows { rows: out }
+        }
+
+        Request::ScalarMin { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            match rows
+                .into_iter()
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .min()
+            {
+                Some(v) => Response::Ok { affected: v },
+                None => Response::NotFound,
+            }
+        }
+
+        Request::ScalarMax { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            match rows
+                .into_iter()
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .max()
+            {
+                Some(v) => Response::Ok { affected: v },
+                None => Response::NotFound,
+            }
+        }
+
+        Request::MultiGet { pk, cols } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let selected: Vec<u64> = cols
+                    .iter()
+                    .map(|&c| row.values.get(c as usize).copied().unwrap_or(0))
+                    .collect();
+                Response::Row { values: selected }
+            }
+        },
+
+        Request::IncrementOrInsert {
+            pk,
+            col,
+            delta,
+            values,
+        } => {
+            let col_idx = col as usize;
+            match engine.get(pk) {
+                Ok(Some(mut row)) => {
+                    let v = row.values.get(col_idx).copied().unwrap_or(0);
+                    let new_val = v.saturating_add(delta);
+                    row.values[col_idx] = new_val;
+                    match engine.insert(pk, row.values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    }
+                }
+                Ok(None) | Err(_) => match engine.insert(pk, values) {
+                    Ok(_) => Response::Ok { affected: 0 },
+                    Err(e) => engine_error(e),
+                },
+            }
+        }
+
+        Request::ZeroField { col, lo, hi } => {
+            let col_idx = col as usize;
+            let pks: Vec<u64> = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r.into_iter().map(|r| r.values[0]).collect(),
+                Err(e) => return engine_error(e),
+            };
+            let mut count: u64 = 0;
+            for pk in pks {
+                if let Ok(Some(mut row)) = engine.get(pk)
+                    && col_idx < row.values.len()
+                {
+                    row.values[col_idx] = 0;
+                    if engine.insert(pk, row.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::ScanPage {
+            col,
+            lo,
+            hi,
+            offset,
+            limit,
+        } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let out: Vec<Vec<u64>> = rows
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| (*i as u32) >= offset)
+                .take(limit as usize)
+                .map(|(_, r)| r.values)
+                .collect();
+            Response::Rows { rows: out }
+        }
 
         // Handled by auth gate or the catalog/txn blocks above.
         Request::Hello
