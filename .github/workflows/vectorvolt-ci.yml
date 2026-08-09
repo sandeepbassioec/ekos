@@ -94,6 +94,7 @@ jobs:
 
       - name: Benchmark the merge base
         run: |
+          git stash --include-untracked || true
           git checkout --detach ${{ github.event.pull_request.base.sha }}
           cargo bench --manifest-path vectorvolt/Cargo.toml -p vectorvolt-storage             --bench storage_bench -- --save-baseline base --warm-up-time 1             --measurement-time 3
 
