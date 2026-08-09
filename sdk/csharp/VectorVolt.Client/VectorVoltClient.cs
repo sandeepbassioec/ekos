@@ -54,10 +54,15 @@ public sealed class VectorVoltClient : IDisposable
         uint nonceLen = r.ReadU32();
         var nonce = r.ReadBytes((int)nonceLen);
 
-        var secretBytes = Encoding.UTF8.GetBytes(secret);
-        Span<byte> message = stackalloc byte[secretBytes.Length + (int)nonceLen];
-        secretBytes.CopyTo(message);
-        nonce.CopyTo(message.Slice(secretBytes.Length));
+        // The server stores the secret as raw bytes (from hex::decode of the --secret CLI arg).
+        // Decode hex here to match. If not hex, fall back to UTF-8 so plaintext secrets work too.
+        byte[] secretBytes;
+        try   { secretBytes = Convert.FromHexString(secret); }
+        catch { secretBytes = Encoding.UTF8.GetBytes(secret); }
+
+        var message = new byte[secretBytes.Length + (int)nonceLen];
+        secretBytes.CopyTo(message, 0);
+        nonce.CopyTo(message.AsSpan(secretBytes.Length));
 
         // Heap-allocate digest so it can safely be passed into PayloadWriter.WriteBytes
         byte[] digest = new byte[32];
@@ -989,23 +994,31 @@ public sealed class VectorVoltClient : IDisposable
     // Small helpers to cut repetition in the hot opcode paths
     private static PayloadWriter AllocU64PkValues(ulong pk, IReadOnlyList<ulong> values)
     {
-        var buf = new byte[8 + 4 + values.Count * 8];
+        // Wire protocol: pk | count | pk | val0 | val1 | ...
+        // pk is repeated as values[0] to match engine's schema (which includes pk column).
+        var buf = new byte[8 + 4 + (1 + values.Count) * 8];
         var w = new PayloadWriter(buf);
         w.WriteU64(pk);
-        WireProtocol.WriteU64s(ref w, values);
+        w.WriteU32((uint)(1 + values.Count));
+        w.WriteU64(pk);
+        foreach (var v in values) w.WriteU64(v);
         return w;
     }
 
     private static PayloadWriter BuildRowsPayload(IReadOnlyList<(ulong Pk, ulong[] Values)> rows)
     {
-        int size = 4 + rows.Sum(row => 8 + 4 + row.Values.Length * 8);
+        // Each row: pk | count | pk | val0 | val1 | ...
+        // pk repeated as values[0] to match engine schema (pk column included).
+        int size = 4 + rows.Sum(row => 8 + 4 + (1 + row.Values.Length) * 8);
         var payload = new byte[size];
         var w = new PayloadWriter(payload);
         w.WriteU32((uint)rows.Count);
         foreach (var (pk, values) in rows)
         {
             w.WriteU64(pk);
-            WireProtocol.WriteU64s(ref w, values);
+            w.WriteU32((uint)(1 + values.Length));
+            w.WriteU64(pk);
+            foreach (var v in values) w.WriteU64(v);
         }
         return w;
     }
