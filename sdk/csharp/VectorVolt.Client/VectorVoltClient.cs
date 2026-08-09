@@ -980,7 +980,10 @@ public sealed class VectorVoltClient : IDisposable
         uint count = r.ReadU32();
         var rows = new Row[count];
         for (int i = 0; i < (int)count; i++)
-            rows[i] = new Row { Values = WireProtocol.ReadU64s(ref r) };
+        {
+            var vals = WireProtocol.ReadU64s(ref r);
+            rows[i] = new Row { Pk = vals.Length > 0 ? vals[0] : 0UL, Values = vals };
+        }
         return rows;
     }
 
