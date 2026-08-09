@@ -979,6 +979,68 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    pub fn unique_count(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::UniqueCount { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn top_n(&mut self, col: u32, n: u32, lo: u64, hi: u64) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::TopN { col, n, lo, hi })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn bottom_n(&mut self, col: u32, n: u32, lo: u64, hi: u64) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::BottomN { col, n, lo, hi })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn move_field(&mut self, src_pk: u64, dst_pk: u64, col: u32) -> NetResult<Option<u64>> {
+        match self.call(&Request::MoveField {
+            src_pk,
+            dst_pk,
+            col,
+        })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn count_if(&mut self, col: u32, value: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::CountIf { col, value, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn set_if_greater(&mut self, col: u32, value: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::SetIfGreater { col, value, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn set_if_less(&mut self, col: u32, value: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::SetIfLess { col, value, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn abs_diff(&mut self, pk1: u64, pk2: u64, col: u32) -> NetResult<Option<u64>> {
+        match self.call(&Request::AbsDiff { pk1, pk2, col })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

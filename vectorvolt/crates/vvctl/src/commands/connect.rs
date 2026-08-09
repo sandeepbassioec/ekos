@@ -804,6 +804,80 @@ pub enum ConnectCommand {
         #[arg(long)]
         hi: u64,
     },
+    UniqueCount {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    TopN {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        n: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    BottomN {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        n: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    MoveField {
+        #[arg(long)]
+        src_pk: u64,
+        #[arg(long)]
+        dst_pk: u64,
+        #[arg(long)]
+        col: u32,
+    },
+    CountIf {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        value: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    SetIfGreater {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        value: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    SetIfLess {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        value: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    AbsDiff {
+        #[arg(long)]
+        pk1: u64,
+        #[arg(long)]
+        pk2: u64,
+        #[arg(long)]
+        col: u32,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1666,6 +1740,64 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             match client.delete_max(col, lo, hi).with_context(|| "delete-max")? {
                 None => println!("no rows in range"),
                 Some(pk) => println!("deleted pk={pk}"),
+            }
+        }
+
+        ConnectCommand::UniqueCount { col, lo, hi } => {
+            let count = client.unique_count(col, lo, hi).with_context(|| "unique-count")?;
+            println!("unique_count={count}");
+        }
+
+        ConnectCommand::TopN { col, n, lo, hi } => {
+            let rows = client.top_n(col, n, lo, hi).with_context(|| "top-n")?;
+            if rows.is_empty() {
+                println!("no rows");
+            } else {
+                for row in &rows {
+                    println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
+                }
+                println!("\n{} row(s)", rows.len());
+            }
+        }
+
+        ConnectCommand::BottomN { col, n, lo, hi } => {
+            let rows = client.bottom_n(col, n, lo, hi).with_context(|| "bottom-n")?;
+            if rows.is_empty() {
+                println!("no rows");
+            } else {
+                for row in &rows {
+                    println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
+                }
+                println!("\n{} row(s)", rows.len());
+            }
+        }
+
+        ConnectCommand::MoveField { src_pk, dst_pk, col } => {
+            match client.move_field(src_pk, dst_pk, col).with_context(|| "move-field")? {
+                None => println!("source or destination not found"),
+                Some(old_value) => println!("moved value={old_value} from pk={src_pk} to pk={dst_pk}"),
+            }
+        }
+
+        ConnectCommand::CountIf { col, value, lo, hi } => {
+            let count = client.count_if(col, value, lo, hi).with_context(|| "count-if")?;
+            println!("count={count}");
+        }
+
+        ConnectCommand::SetIfGreater { col, value, lo, hi } => {
+            let count = client.set_if_greater(col, value, lo, hi).with_context(|| "set-if-greater")?;
+            println!("updated={count}");
+        }
+
+        ConnectCommand::SetIfLess { col, value, lo, hi } => {
+            let count = client.set_if_less(col, value, lo, hi).with_context(|| "set-if-less")?;
+            println!("updated={count}");
+        }
+
+        ConnectCommand::AbsDiff { pk1, pk2, col } => {
+            match client.abs_diff(pk1, pk2, col).with_context(|| "abs-diff")? {
+                None => println!("one or both rows not found"),
+                Some(diff) => println!("diff={diff}"),
             }
         }
 
