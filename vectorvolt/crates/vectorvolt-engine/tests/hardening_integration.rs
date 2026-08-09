@@ -335,7 +335,10 @@ fn multi_generation_compaction_then_reopen() {
             e.flush().unwrap();
         }
         let r2 = e.compact().unwrap().expect("second compaction must run");
-        assert!(r2.rows_kept >= 10, "second compaction must keep the new rows");
+        assert!(
+            r2.rows_kept >= 10,
+            "second compaction must keep the new rows"
+        );
     }
 
     let e = TableEngine::open_with(schema, dir.path(), opts()).unwrap();
