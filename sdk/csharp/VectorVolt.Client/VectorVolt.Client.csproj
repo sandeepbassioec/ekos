@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Optimize>true</Optimize>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>1591;1574</NoWarn>
+
+    <!-- NuGet metadata -->
+    <PackageId>VectorVolt.Client</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>VectorVolt</Authors>
+    <Description>Official .NET client SDK for the VectorVolt ultra-low-latency data engine.</Description>
+    <PackageTags>vectorvolt;database;client;sdk;oltp;kernel-bypass</PackageTags>
+    <RepositoryUrl>https://github.com/sandeepbassioec/ekos</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- CRC32 for payload integrity checks — matches the Rust crc32fast crate. -->
+    <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- Expose internals to the test project. -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>VectorVolt.Client.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>
