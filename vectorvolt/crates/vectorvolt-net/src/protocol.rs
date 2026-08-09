@@ -182,6 +182,39 @@ pub enum OpCode {
     /// Rank = count of rows in the range whose column value is strictly less.
     /// Returns `Ok { affected: rank }` if `pk` is found in the range, `NotFound` otherwise.
     RankOf = 56,
+    /// Return the value at the Nth percentile of column `col` in `[lo, hi]`.
+    ///
+    /// `pct` is 0–100 inclusive. Returns `Ok { affected: value }` or `NotFound` if empty.
+    Percentile = 57,
+    /// Sum multiple column values of a single row.
+    ///
+    /// Returns `Ok { affected: sum }` (saturating) or `NotFound`.
+    SumFields = 58,
+    /// Return the maximum across multiple column values of a single row.
+    ///
+    /// Returns `Ok { affected: max }` or `NotFound`.
+    MaxField = 59,
+    /// Range scan with an additional equality filter on a second column.
+    ///
+    /// Scan `scan_col` in `[lo, hi]`; keep rows where `filter_col == filter_val`.
+    /// Returns `Rows { rows }`.
+    FilterScan = 60,
+    /// Increment the same column by `delta` across many rows in one round trip.
+    ///
+    /// Missing pks are silently skipped. Returns `Ok { affected: count }`.
+    BatchIncrementField = 61,
+    /// Count distinct values of column `col` in scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: count }`.
+    CountDistinct = 62,
+    /// Return the median value of column `col` in `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: value }` or `NotFound` if empty.
+    Median = 63,
+    /// Delete each pk in the list only if `values[col] == value`.
+    ///
+    /// Returns `Ok { affected: deleted_count }`.
+    BatchDeleteIf = 64,
     // Responses
     Pong = 129,
     Row = 130,
@@ -275,6 +308,14 @@ impl OpCode {
             54 => DeleteIf,
             55 => SetFieldIf,
             56 => RankOf,
+            57 => Percentile,
+            58 => SumFields,
+            59 => MaxField,
+            60 => FilterScan,
+            61 => BatchIncrementField,
+            62 => CountDistinct,
+            63 => Median,
+            64 => BatchDeleteIf,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -722,6 +763,55 @@ pub enum Request {
         lo: u64,
         hi: u64,
     },
+    /// Return the value at the Nth percentile of column `col` in `[lo, hi]`.
+    Percentile {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        pct: u32,
+    },
+    /// Sum listed columns of a single row.
+    SumFields {
+        pk: u64,
+        cols: Vec<u32>,
+    },
+    /// Return the maximum across listed columns of a single row.
+    MaxField {
+        pk: u64,
+        cols: Vec<u32>,
+    },
+    /// Range scan on `scan_col` in `[lo, hi]` filtered to rows where `filter_col == filter_val`.
+    FilterScan {
+        scan_col: u32,
+        lo: u64,
+        hi: u64,
+        filter_col: u32,
+        filter_val: u64,
+    },
+    /// Increment column `col` by `delta` across all listed pks (saturating).
+    BatchIncrementField {
+        col: u32,
+        delta: u64,
+        pks: Vec<u64>,
+    },
+    /// Count distinct values of column `col` in scan range `[lo, hi]`.
+    CountDistinct {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Median of column `col` in `[lo, hi]`.
+    Median {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Delete each pk only if `values[col] == value`.
+    BatchDeleteIf {
+        col: u32,
+        value: u64,
+        pks: Vec<u64>,
+    },
 }
 
 /// A server response.
@@ -993,6 +1083,14 @@ impl Request {
             Request::DeleteIf { .. } => OpCode::DeleteIf,
             Request::SetFieldIf { .. } => OpCode::SetFieldIf,
             Request::RankOf { .. } => OpCode::RankOf,
+            Request::Percentile { .. } => OpCode::Percentile,
+            Request::SumFields { .. } => OpCode::SumFields,
+            Request::MaxField { .. } => OpCode::MaxField,
+            Request::FilterScan { .. } => OpCode::FilterScan,
+            Request::BatchIncrementField { .. } => OpCode::BatchIncrementField,
+            Request::CountDistinct { .. } => OpCode::CountDistinct,
+            Request::Median { .. } => OpCode::Median,
+            Request::BatchDeleteIf { .. } => OpCode::BatchDeleteIf,
         }
     }
 
@@ -1176,6 +1274,48 @@ impl Request {
             }
             Request::RankOf { pk, col, lo, hi } => {
                 w.u64(*pk).u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::Percentile { col, lo, hi, pct } => {
+                w.u32(*col).u64(*lo).u64(*hi).u32(*pct);
+            }
+            Request::SumFields { pk, cols } | Request::MaxField { pk, cols } => {
+                w.u64(*pk);
+                let n =
+                    u32::try_from(cols.len()).map_err(|_| NetError::Malformed("too many cols"))?;
+                w.u32(n);
+                for col in cols {
+                    w.u32(*col);
+                }
+            }
+            Request::FilterScan {
+                scan_col,
+                lo,
+                hi,
+                filter_col,
+                filter_val,
+            } => {
+                w.u32(*scan_col)
+                    .u64(*lo)
+                    .u64(*hi)
+                    .u32(*filter_col)
+                    .u64(*filter_val);
+            }
+            Request::BatchIncrementField { col, delta, pks }
+            | Request::BatchDeleteIf {
+                col,
+                value: delta,
+                pks,
+            } => {
+                w.u32(*col).u64(*delta);
+                let n =
+                    u32::try_from(pks.len()).map_err(|_| NetError::Malformed("too many pks"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+            }
+            Request::CountDistinct { col, lo, hi } | Request::Median { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
             }
         }
         Ok(w.0)
@@ -1448,6 +1588,83 @@ impl Request {
                 lo: r.u64()?,
                 hi: r.u64()?,
             },
+            OpCode::Percentile => Request::Percentile {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                pct: r.u32()?,
+            },
+            OpCode::SumFields => {
+                let pk = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 4;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more cols than payload holds"));
+                }
+                let mut cols = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cols.push(r.u32()?);
+                }
+                Request::SumFields { pk, cols }
+            }
+            OpCode::MaxField => {
+                let pk = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 4;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more cols than payload holds"));
+                }
+                let mut cols = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cols.push(r.u32()?);
+                }
+                Request::MaxField { pk, cols }
+            }
+            OpCode::FilterScan => Request::FilterScan {
+                scan_col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                filter_col: r.u32()?,
+                filter_val: r.u64()?,
+            },
+            OpCode::BatchIncrementField => {
+                let col = r.u32()?;
+                let delta = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more pks than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchIncrementField { col, delta, pks }
+            }
+            OpCode::CountDistinct => Request::CountDistinct {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::Median => Request::Median {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::BatchDeleteIf => {
+                let col = r.u32()?;
+                let value = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more pks than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchDeleteIf { col, value, pks }
+            }
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -2291,7 +2508,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=56 {
+                for op in 1u8..=64 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

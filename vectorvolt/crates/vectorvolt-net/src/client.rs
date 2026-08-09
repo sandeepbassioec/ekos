@@ -728,6 +728,99 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Return the value at the Nth percentile (0–100) of column `col` in `[lo, hi]`.
+    ///
+    /// Returns `Some(value)` or `None` if the range is empty.
+    pub fn percentile(&mut self, col: u32, lo: u64, hi: u64, pct: u32) -> NetResult<Option<u64>> {
+        match self.call(&Request::Percentile { col, lo, hi, pct })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Sum listed columns of a single row.
+    ///
+    /// Returns `Some(sum)` or `None` if the pk is absent.
+    pub fn sum_fields(&mut self, pk: u64, cols: Vec<u32>) -> NetResult<Option<u64>> {
+        match self.call(&Request::SumFields { pk, cols })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Return the maximum across listed columns of a single row.
+    ///
+    /// Returns `Some(max)` or `None` if the pk is absent.
+    pub fn max_field(&mut self, pk: u64, cols: Vec<u32>) -> NetResult<Option<u64>> {
+        match self.call(&Request::MaxField { pk, cols })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Range scan on `scan_col` in `[lo, hi]`, keeping rows where `filter_col == filter_val`.
+    pub fn filter_scan(
+        &mut self,
+        scan_col: u32,
+        lo: u64,
+        hi: u64,
+        filter_col: u32,
+        filter_val: u64,
+    ) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::FilterScan {
+            scan_col,
+            lo,
+            hi,
+            filter_col,
+            filter_val,
+        })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Increment column `col` by `delta` across many pks (saturating, missing skipped).
+    ///
+    /// Returns the number of rows actually updated.
+    pub fn batch_increment_field(&mut self, col: u32, delta: u64, pks: Vec<u64>) -> NetResult<u64> {
+        match self.call(&Request::BatchIncrementField { col, delta, pks })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Count distinct values of column `col` in scan range `[lo, hi]`.
+    pub fn count_distinct(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::CountDistinct { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Median of column `col` in `[lo, hi]`.
+    ///
+    /// Returns `Some(value)` or `None` if the range is empty.
+    pub fn median(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::Median { col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Delete each pk only if `values[col] == value`.
+    ///
+    /// Returns the count of rows deleted.
+    pub fn batch_delete_if(&mut self, col: u32, value: u64, pks: Vec<u64>) -> NetResult<u64> {
+        match self.call(&Request::BatchDeleteIf { col, value, pks })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

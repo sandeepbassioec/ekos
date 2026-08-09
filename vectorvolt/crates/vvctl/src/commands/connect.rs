@@ -580,6 +580,93 @@ pub enum ConnectCommand {
         #[arg(long, default_value = "18446744073709551615")]
         hi: u64,
     },
+
+    /// Return the value at the Nth percentile (0-100) of col in [lo, hi].
+    Percentile {
+        #[arg(long, default_value = "0")]
+        col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+        /// Percentile 0–100.
+        #[arg(long, default_value = "50")]
+        pct: u32,
+    },
+
+    /// Sum multiple column values of a single row.
+    SumFields {
+        #[arg(long)]
+        pk: u64,
+        /// Column indices to sum.
+        #[arg(required = true)]
+        cols: Vec<u32>,
+    },
+
+    /// Return the maximum across multiple columns of a single row.
+    MaxField {
+        #[arg(long)]
+        pk: u64,
+        /// Column indices to compare.
+        #[arg(required = true)]
+        cols: Vec<u32>,
+    },
+
+    /// Range scan on scan-col [lo, hi] filtered to filter-col == filter-val.
+    FilterScan {
+        #[arg(long, default_value = "0")]
+        scan_col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+        #[arg(long)]
+        filter_col: u32,
+        #[arg(long)]
+        filter_val: u64,
+    },
+
+    /// Increment col by delta across many pks in one round trip.
+    BatchIncrementField {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        delta: u64,
+        /// Primary keys to update.
+        #[arg(required = true)]
+        pks: Vec<u64>,
+    },
+
+    /// Count distinct values of col in scan range [lo, hi].
+    CountDistinct {
+        #[arg(long, default_value = "0")]
+        col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
+    /// Return the median of col in [lo, hi].
+    Median {
+        #[arg(long, default_value = "0")]
+        col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
+    /// Delete each pk only if values[col] == value.
+    BatchDeleteIf {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        value: u64,
+        /// Primary keys to conditionally delete.
+        #[arg(required = true)]
+        pks: Vec<u64>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1202,6 +1289,88 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 None => println!("not found"),
                 Some(rank) => println!("{rank}"),
             }
+        }
+
+        ConnectCommand::Percentile { col, lo, hi, pct } => {
+            match client
+                .percentile(col, lo, hi, pct)
+                .with_context(|| format!("percentile col={col} [{lo},{hi}] pct={pct}"))?
+            {
+                None => println!("(empty)"),
+                Some(v) => println!("{v}"),
+            }
+        }
+
+        ConnectCommand::SumFields { pk, cols } => {
+            match client
+                .sum_fields(pk, cols)
+                .with_context(|| format!("sum-fields pk={pk}"))?
+            {
+                None => println!("not found"),
+                Some(v) => println!("{v}"),
+            }
+        }
+
+        ConnectCommand::MaxField { pk, cols } => {
+            match client
+                .max_field(pk, cols)
+                .with_context(|| format!("max-field pk={pk}"))?
+            {
+                None => println!("not found"),
+                Some(v) => println!("{v}"),
+            }
+        }
+
+        ConnectCommand::FilterScan {
+            scan_col,
+            lo,
+            hi,
+            filter_col,
+            filter_val,
+        } => {
+            let rows = client
+                .filter_scan(scan_col, lo, hi, filter_col, filter_val)
+                .with_context(|| {
+                    format!("filter-scan scan_col={scan_col} [{lo},{hi}] filter_col={filter_col} val={filter_val}")
+                })?;
+            if rows.is_empty() {
+                println!("(empty)");
+            } else {
+                for row in &rows {
+                    println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
+                }
+            }
+        }
+
+        ConnectCommand::BatchIncrementField { col, delta, pks } => {
+            let count = client
+                .batch_increment_field(col, delta, pks)
+                .with_context(|| format!("batch-increment-field col={col} delta={delta}"))?;
+            println!("{count} row(s) updated");
+        }
+
+        ConnectCommand::CountDistinct { col, lo, hi } => {
+            let count = client
+                .count_distinct(col, lo, hi)
+                .with_context(|| format!("count-distinct col={col} [{lo},{hi}]"))?;
+            println!("{count}");
+        }
+
+        ConnectCommand::Median { col, lo, hi } => {
+            match client
+                .median(col, lo, hi)
+                .with_context(|| format!("median col={col} [{lo},{hi}]"))?
+            {
+                None => println!("(empty)"),
+                Some(v) => println!("{v}"),
+            }
+        }
+
+        ConnectCommand::BatchDeleteIf { col, value, pks } => {
+            let count = client
+                .batch_delete_if(col, value, pks)
+                .with_context(|| format!("batch-delete-if col={col} value={value}"))?;
+            println!("{count} row(s) deleted");
         }
 
         ConnectCommand::GetMany { pks } => {

@@ -435,7 +435,13 @@ fn required_scope(req: &Request) -> Scope {
         | Request::Bottom { .. }
         | Request::PkExists { .. }
         | Request::Average { .. }
-        | Request::RankOf { .. } => Scope::ReadOnly,
+        | Request::RankOf { .. }
+        | Request::Percentile { .. }
+        | Request::SumFields { .. }
+        | Request::MaxField { .. }
+        | Request::FilterScan { .. }
+        | Request::CountDistinct { .. }
+        | Request::Median { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -461,7 +467,9 @@ fn required_scope(req: &Request) -> Scope {
         | Request::SwapField { .. }
         | Request::Clamp { .. }
         | Request::DeleteIf { .. }
-        | Request::SetFieldIf { .. } => Scope::ReadWrite,
+        | Request::SetFieldIf { .. }
+        | Request::BatchIncrementField { .. }
+        | Request::BatchDeleteIf { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -1363,6 +1371,162 @@ fn serve_request(
                 .filter(|r| r.values[col_idx] < target_val)
                 .count() as u64;
             Response::Ok { affected: rank }
+        }
+
+        Request::Percentile { col, lo, hi, pct } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            if rows.is_empty() {
+                return Response::NotFound;
+            }
+            if pct > 100 {
+                return Response::Error {
+                    code: error_code::INVALID_ARGUMENT,
+                    message: "pct must be 0–100".into(),
+                };
+            }
+            let mut vals: Vec<u64> = rows.iter().map(|r| r.values[col_idx]).collect();
+            vals.sort_unstable();
+            let idx = (pct as usize * (vals.len() - 1)) / 100;
+            Response::Ok {
+                affected: vals[idx],
+            }
+        }
+
+        Request::SumFields { pk, cols } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let mut sum: u64 = 0;
+                for col in cols {
+                    let idx = col as usize;
+                    if idx >= row.values.len() {
+                        return Response::Error {
+                            code: error_code::INVALID_ARGUMENT,
+                            message: format!("col {idx} out of range"),
+                        };
+                    }
+                    sum = sum.saturating_add(row.values[idx]);
+                }
+                Response::Ok { affected: sum }
+            }
+        },
+
+        Request::MaxField { pk, cols } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                if cols.is_empty() {
+                    return Response::Ok { affected: 0 };
+                }
+                let mut max_val: u64 = 0;
+                for col in cols {
+                    let idx = col as usize;
+                    if idx >= row.values.len() {
+                        return Response::Error {
+                            code: error_code::INVALID_ARGUMENT,
+                            message: format!("col {idx} out of range"),
+                        };
+                    }
+                    if row.values[idx] > max_val {
+                        max_val = row.values[idx];
+                    }
+                }
+                Response::Ok { affected: max_val }
+            }
+        },
+
+        Request::FilterScan {
+            scan_col,
+            lo,
+            hi,
+            filter_col,
+            filter_val,
+        } => {
+            let rows = match engine.scan(scan_col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let filter_idx = filter_col as usize;
+            let filtered: Vec<Vec<u64>> = rows
+                .into_iter()
+                .filter(|r| r.values.get(filter_idx).copied().unwrap_or(u64::MAX) == filter_val)
+                .map(|r| r.values)
+                .collect();
+            Response::Rows { rows: filtered }
+        }
+
+        Request::BatchIncrementField { col, delta, pks } => {
+            let col_idx = col as usize;
+            let mut count: u64 = 0;
+            for pk in pks {
+                match engine.get(pk) {
+                    Err(_) | Ok(None) => {}
+                    Ok(Some(row)) => {
+                        if col_idx < row.values.len() {
+                            let mut values = row.values;
+                            values[col_idx] = values[col_idx].saturating_add(delta);
+                            if engine.delete(pk).is_ok() && engine.insert(pk, values).is_ok() {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::CountDistinct { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut seen = std::collections::HashSet::new();
+            for row in &rows {
+                seen.insert(row.values[col_idx]);
+            }
+            Response::Ok {
+                affected: seen.len() as u64,
+            }
+        }
+
+        Request::Median { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            if rows.is_empty() {
+                return Response::NotFound;
+            }
+            let mut vals: Vec<u64> = rows.iter().map(|r| r.values[col_idx]).collect();
+            vals.sort_unstable();
+            let mid = vals.len() / 2;
+            Response::Ok {
+                affected: vals[mid],
+            }
+        }
+
+        Request::BatchDeleteIf { col, value, pks } => {
+            let col_idx = col as usize;
+            let mut count: u64 = 0;
+            for pk in pks {
+                match engine.get(pk) {
+                    Err(_) | Ok(None) => {}
+                    Ok(Some(row)) => {
+                        if row.values.get(col_idx).copied() == Some(value)
+                            && engine.delete(pk).is_ok()
+                        {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            Response::Ok { affected: count }
         }
 
         // Handled by auth gate or the catalog/txn blocks above.
