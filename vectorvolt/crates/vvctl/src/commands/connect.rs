@@ -878,6 +878,198 @@ pub enum ConnectCommand {
         #[arg(long)]
         col: u32,
     },
+    SwapFields {
+        #[arg(long)]
+        pk1: u64,
+        #[arg(long)]
+        pk2: u64,
+        #[arg(long)]
+        col: u32,
+    },
+    CopyRange {
+        #[arg(long)]
+        src_col: u32,
+        #[arg(long)]
+        dst_col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    PropagateMax {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    PropagateMin {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    ClampRange {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        min_val: u64,
+        #[arg(long)]
+        max_val: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    BatchConditionalSet {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        expected: u64,
+        #[arg(long)]
+        new_value: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    WindowRank {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    WindowPct {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    SumProduct {
+        #[arg(long)]
+        col_a: u32,
+        #[arg(long)]
+        col_b: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    NthValue {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        n: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    DenseRankWin {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    SetFieldMany {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        value: u64,
+        #[arg(long, num_args = 1..)]
+        pks: Vec<u64>,
+    },
+    MultiColumnSum {
+        #[arg(long, num_args = 1..)]
+        pks: Vec<u64>,
+        #[arg(long)]
+        col: u32,
+    },
+    FieldHistogram {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        bucket_size: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    ZScoreFilter {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    RunningSum {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    FloorDiv {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        divisor: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    MulField {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        factor: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    SetFieldAdd {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        addend: u64,
+    },
+    SetFieldMul {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        factor: u64,
+    },
+    SwapPkFields {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col_a: u32,
+        #[arg(long)]
+        col_b: u32,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1798,6 +1990,148 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             match client.abs_diff(pk1, pk2, col).with_context(|| "abs-diff")? {
                 None => println!("one or both rows not found"),
                 Some(diff) => println!("diff={diff}"),
+            }
+        }
+
+        ConnectCommand::SwapFields { pk1, pk2, col } => {
+            match client.swap_fields(pk1, pk2, col).with_context(|| "swap-fields")? {
+                None => println!("one or both rows not found"),
+                Some(_) => println!("swapped col={col} between pk={pk1} and pk={pk2}"),
+            }
+        }
+
+        ConnectCommand::CopyRange { src_col, dst_col, lo, hi } => {
+            let count = client.copy_range(src_col, dst_col, lo, hi).with_context(|| "copy-range")?;
+            println!("copied={count}");
+        }
+
+        ConnectCommand::PropagateMax { col, lo, hi } => {
+            let val = client.propagate_max(col, lo, hi).with_context(|| "propagate-max")?;
+            println!("propagated max={val}");
+        }
+
+        ConnectCommand::PropagateMin { col, lo, hi } => {
+            let val = client.propagate_min(col, lo, hi).with_context(|| "propagate-min")?;
+            println!("propagated min={val}");
+        }
+
+        ConnectCommand::ClampRange { col, min_val, max_val, lo, hi } => {
+            let count = client.clamp_range(col, min_val, max_val, lo, hi).with_context(|| "clamp-range")?;
+            println!("clamped={count}");
+        }
+
+        ConnectCommand::BatchConditionalSet { col, expected, new_value, lo, hi } => {
+            let count = client.batch_conditional_set(col, expected, new_value, lo, hi).with_context(|| "batch-conditional-set")?;
+            println!("updated={count}");
+        }
+
+        ConnectCommand::WindowRank { pk, col, lo, hi } => {
+            match client.window_rank(pk, col, lo, hi).with_context(|| "window-rank")? {
+                None => println!("row not found"),
+                Some(rank) => println!("rank={rank}"),
+            }
+        }
+
+        ConnectCommand::WindowPct { pk, col, lo, hi } => {
+            match client.window_pct(pk, col, lo, hi).with_context(|| "window-pct")? {
+                None => println!("row not found"),
+                Some(pct) => println!("percentile={pct}"),
+            }
+        }
+
+        ConnectCommand::SumProduct { col_a, col_b, lo, hi } => {
+            let sum = client.sum_product(col_a, col_b, lo, hi).with_context(|| "sum-product")?;
+            println!("sum_product={sum}");
+        }
+
+        ConnectCommand::NthValue { col, n, lo, hi } => {
+            match client.nth_value(col, n, lo, hi).with_context(|| "nth-value")? {
+                None => println!("no rows or n out of range"),
+                Some(v) => println!("value={v}"),
+            }
+        }
+
+        ConnectCommand::DenseRankWin { pk, col, lo, hi } => {
+            match client.dense_rank_win(pk, col, lo, hi).with_context(|| "dense-rank-win")? {
+                None => println!("row not found"),
+                Some(rank) => println!("dense_rank={rank}"),
+            }
+        }
+
+        ConnectCommand::SetFieldMany { col, value, pks } => {
+            let count = client.set_field_many(col, value, pks).with_context(|| "set-field-many")?;
+            println!("updated={count}");
+        }
+
+        ConnectCommand::MultiColumnSum { pks, col } => {
+            let sum = client.multi_column_sum(pks, col).with_context(|| "multi-column-sum")?;
+            println!("sum={sum}");
+        }
+
+        ConnectCommand::FieldHistogram { col, bucket_size, lo, hi } => {
+            let rows = client.field_histogram(col, bucket_size, lo, hi).with_context(|| "field-histogram")?;
+            if rows.is_empty() {
+                println!("no rows");
+            } else {
+                println!("bucket_start\tcount");
+                for row in &rows {
+                    println!("{}\t{}", row[0], row[1]);
+                }
+            }
+        }
+
+        ConnectCommand::ZScoreFilter { col, lo, hi } => {
+            let rows = client.zscore_filter(col, lo, hi).with_context(|| "zscore-filter")?;
+            if rows.is_empty() {
+                println!("no rows");
+            } else {
+                for row in &rows {
+                    println!("{}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"));
+                }
+                println!("\n{} row(s)", rows.len());
+            }
+        }
+
+        ConnectCommand::RunningSum { col, lo, hi } => {
+            let rows = client.running_sum(col, lo, hi).with_context(|| "running-sum")?;
+            if rows.is_empty() {
+                println!("no rows");
+            } else {
+                println!("pk\tvalue\trunning_sum");
+                for row in &rows {
+                    println!("{}\t{}\t{}", row[0], row[1], row[2]);
+                }
+            }
+        }
+
+        ConnectCommand::FloorDiv { col, divisor, lo, hi } => {
+            let count = client.floor_div(col, divisor, lo, hi).with_context(|| "floor-div")?;
+            println!("updated={count}");
+        }
+
+        ConnectCommand::MulField { col, factor, lo, hi } => {
+            let count = client.mul_field(col, factor, lo, hi).with_context(|| "mul-field")?;
+            println!("updated={count}");
+        }
+
+        ConnectCommand::SetFieldAdd { pk, col, addend } => {
+            match client.set_field_add(pk, col, addend).with_context(|| "set-field-add")? {
+                None => println!("row not found"),
+                Some(new_val) => println!("new_value={new_val}"),
+            }
+        }
+
+        ConnectCommand::SetFieldMul { pk, col, factor } => {
+            match client.set_field_mul(pk, col, factor).with_context(|| "set-field-mul")? {
+                None => println!("row not found"),
+                Some(new_val) => println!("new_value={new_val}"),
+            }
+        }
+
+        ConnectCommand::SwapPkFields { pk, col_a, col_b } => {
+            match client.swap_pk_fields(pk, col_a, col_b).with_context(|| "swap-pk-fields")? {
+                None => println!("row not found"),
+                Some(_) => println!("swapped col_a={col_a} and col_b={col_b} in pk={pk}"),
             }
         }
 

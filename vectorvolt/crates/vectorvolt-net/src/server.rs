@@ -456,7 +456,16 @@ fn required_scope(req: &Request) -> Scope {
         | Request::TopN { .. }
         | Request::BottomN { .. }
         | Request::CountIf { .. }
-        | Request::AbsDiff { .. } => Scope::ReadOnly,
+        | Request::AbsDiff { .. }
+        | Request::WindowRank { .. }
+        | Request::WindowPct { .. }
+        | Request::SumProduct { .. }
+        | Request::NthValue { .. }
+        | Request::DenseRankWin { .. }
+        | Request::MultiColumnSum { .. }
+        | Request::FieldHistogram { .. }
+        | Request::ZScoreFilter { .. }
+        | Request::RunningSum { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -493,7 +502,19 @@ fn required_scope(req: &Request) -> Scope {
         | Request::DeleteMax { .. }
         | Request::MoveField { .. }
         | Request::SetIfGreater { .. }
-        | Request::SetIfLess { .. } => Scope::ReadWrite,
+        | Request::SetIfLess { .. }
+        | Request::SwapFields { .. }
+        | Request::CopyRange { .. }
+        | Request::PropagateMax { .. }
+        | Request::PropagateMin { .. }
+        | Request::ClampRange { .. }
+        | Request::BatchConditionalSet { .. }
+        | Request::SetFieldMany { .. }
+        | Request::FloorDiv { .. }
+        | Request::MulField { .. }
+        | Request::SetFieldAdd { .. }
+        | Request::SetFieldMul { .. }
+        | Request::SwapPkFields { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -1998,6 +2019,533 @@ fn serve_request(
             let v2 = row2.values[col_idx];
             let diff = v1.abs_diff(v2);
             Response::Ok { affected: diff }
+        }
+
+        Request::SwapFields { pk1, pk2, col } => {
+            let col_idx = col as usize;
+            let mut row1 = match engine.get(pk1) {
+                Ok(Some(r)) => r,
+                Ok(None) => return Response::NotFound,
+                Err(e) => return engine_error(e),
+            };
+            let mut row2 = match engine.get(pk2) {
+                Ok(Some(r)) => r,
+                Ok(None) => return Response::NotFound,
+                Err(e) => return engine_error(e),
+            };
+            if col_idx >= row1.values.len() || col_idx >= row2.values.len() {
+                return Response::Error {
+                    code: error_code::SCHEMA,
+                    message: "column index out of range".into(),
+                };
+            }
+            std::mem::swap(&mut row1.values[col_idx], &mut row2.values[col_idx]);
+            if let Err(e) = engine.insert(pk1, row1.values) {
+                return engine_error(e);
+            }
+            if let Err(e) = engine.insert(pk2, row2.values) {
+                return engine_error(e);
+            }
+            Response::Ok { affected: 2 }
+        }
+
+        Request::CopyRange {
+            src_col,
+            dst_col,
+            lo,
+            hi,
+        } => {
+            let src_idx = src_col as usize;
+            let dst_idx = dst_col as usize;
+            let rows = match engine.scan(src_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut count = 0u64;
+            for row in rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && src_idx < live.values.len()
+                    && dst_idx < live.values.len()
+                {
+                    live.values[dst_idx] = live.values[src_idx];
+                    if engine.insert(pk, live.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::PropagateMax { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let live_rows: Vec<_> = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .collect();
+            if live_rows.is_empty() {
+                return Response::Ok { affected: 0 };
+            }
+            let max_val = live_rows
+                .iter()
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            for row in live_rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && col_idx < live.values.len()
+                {
+                    live.values[col_idx] = max_val;
+                    let _ = engine.insert(pk, live.values);
+                }
+            }
+            Response::Ok { affected: max_val }
+        }
+
+        Request::PropagateMin { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let live_rows: Vec<_> = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .collect();
+            if live_rows.is_empty() {
+                return Response::Ok { affected: 0 };
+            }
+            let min_val = live_rows
+                .iter()
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(u64::MAX))
+                .min()
+                .unwrap_or(0);
+            for row in live_rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && col_idx < live.values.len()
+                {
+                    live.values[col_idx] = min_val;
+                    let _ = engine.insert(pk, live.values);
+                }
+            }
+            Response::Ok { affected: min_val }
+        }
+
+        Request::ClampRange {
+            col,
+            min_val,
+            max_val,
+            lo,
+            hi,
+        } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut count = 0u64;
+            for row in rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && col_idx < live.values.len()
+                {
+                    let v = live.values[col_idx];
+                    let clamped = v.clamp(min_val, max_val);
+                    if clamped != v {
+                        live.values[col_idx] = clamped;
+                        if engine.insert(pk, live.values).is_ok() {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::BatchConditionalSet {
+            col,
+            expected,
+            new_value,
+            lo,
+            hi,
+        } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut count = 0u64;
+            for row in rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && col_idx < live.values.len()
+                    && live.values[col_idx] == expected
+                {
+                    live.values[col_idx] = new_value;
+                    if engine.insert(pk, live.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::WindowRank { pk, col, lo, hi } => {
+            let col_idx = col as usize;
+            let target = match engine.get(pk) {
+                Ok(Some(r)) => r,
+                Ok(None) => return Response::NotFound,
+                Err(e) => return engine_error(e),
+            };
+            let target_val = target.values.get(col_idx).copied().unwrap_or(0);
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let rank = rows
+                .into_iter()
+                .filter(|r| {
+                    matches!(engine.get(r.values[0]), Ok(Some(_)))
+                        && r.values.get(col_idx).copied().unwrap_or(0) < target_val
+                })
+                .count() as u64
+                + 1;
+            Response::Ok { affected: rank }
+        }
+
+        Request::WindowPct { pk, col, lo, hi } => {
+            let col_idx = col as usize;
+            let target = match engine.get(pk) {
+                Ok(Some(r)) => r,
+                Ok(None) => return Response::NotFound,
+                Err(e) => return engine_error(e),
+            };
+            let target_val = target.values.get(col_idx).copied().unwrap_or(0);
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let live: Vec<_> = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .collect();
+            let total = live.len() as u64;
+            if total == 0 {
+                return Response::Ok { affected: 0 };
+            }
+            let below = live
+                .iter()
+                .filter(|r| r.values.get(col_idx).copied().unwrap_or(0) < target_val)
+                .count() as u64;
+            let pct = (below * 100) / total;
+            Response::Ok { affected: pct }
+        }
+
+        Request::SumProduct {
+            col_a,
+            col_b,
+            lo,
+            hi,
+        } => {
+            let a_idx = col_a as usize;
+            let b_idx = col_b as usize;
+            let rows = match engine.scan(a_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let sum = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .map(|r| {
+                    let a = r.values.get(a_idx).copied().unwrap_or(0);
+                    let b = r.values.get(b_idx).copied().unwrap_or(0);
+                    a.saturating_mul(b)
+                })
+                .fold(0u64, u64::saturating_add);
+            Response::Ok { affected: sum }
+        }
+
+        Request::NthValue { col, n, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut vals: Vec<u64> = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .collect();
+            vals.sort_unstable();
+            match vals.get(n as usize) {
+                Some(&v) => Response::Ok { affected: v },
+                None => Response::NotFound,
+            }
+        }
+
+        Request::DenseRankWin { pk, col, lo, hi } => {
+            let col_idx = col as usize;
+            let target = match engine.get(pk) {
+                Ok(Some(r)) => r,
+                Ok(None) => return Response::NotFound,
+                Err(e) => return engine_error(e),
+            };
+            let target_val = target.values.get(col_idx).copied().unwrap_or(0);
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut distinct_below: std::collections::BTreeSet<u64> = rows
+                .into_iter()
+                .filter(|r| {
+                    matches!(engine.get(r.values[0]), Ok(Some(_)))
+                        && r.values.get(col_idx).copied().unwrap_or(0) < target_val
+                })
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .collect();
+            distinct_below.insert(target_val);
+            let rank = distinct_below.len() as u64;
+            Response::Ok { affected: rank }
+        }
+
+        Request::SetFieldMany { col, value, pks } => {
+            let col_idx = col as usize;
+            let mut count = 0u64;
+            for pk in pks {
+                if let Ok(Some(mut row)) = engine.get(pk)
+                    && col_idx < row.values.len()
+                {
+                    row.values[col_idx] = value;
+                    if engine.insert(pk, row.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::MultiColumnSum { pks, col } => {
+            let col_idx = col as usize;
+            let sum = pks
+                .iter()
+                .filter_map(|&pk| engine.get(pk).ok().flatten())
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .fold(0u64, u64::saturating_add);
+            Response::Ok { affected: sum }
+        }
+
+        Request::FieldHistogram {
+            col,
+            bucket_size,
+            lo,
+            hi,
+        } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let bucket_sz = if bucket_size == 0 { 1 } else { bucket_size };
+            let mut buckets: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            for row in rows {
+                if matches!(engine.get(row.values[0]), Ok(Some(_))) {
+                    let v = row.values.get(col_idx).copied().unwrap_or(0);
+                    let bucket_start = (v / bucket_sz) * bucket_sz;
+                    *buckets.entry(bucket_start).or_insert(0) += 1;
+                }
+            }
+            let out: Vec<Vec<u64>> = buckets.into_iter().map(|(k, v)| vec![k, v]).collect();
+            Response::Rows { rows: out }
+        }
+
+        Request::ZScoreFilter { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let live: Vec<_> = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .collect();
+            if live.is_empty() {
+                return Response::Rows { rows: vec![] };
+            }
+            let n = live.len() as f64;
+            let sum: f64 = live
+                .iter()
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0) as f64)
+                .sum();
+            let mean = sum / n;
+            let variance = live
+                .iter()
+                .map(|r| {
+                    let v = r.values.get(col_idx).copied().unwrap_or(0) as f64;
+                    (v - mean) * (v - mean)
+                })
+                .sum::<f64>()
+                / n;
+            let stddev = variance.sqrt();
+            let threshold = 2.0 * stddev;
+            let filtered: Vec<Vec<u64>> = live
+                .into_iter()
+                .filter(|r| {
+                    let v = r.values.get(col_idx).copied().unwrap_or(0) as f64;
+                    (v - mean).abs() <= threshold
+                })
+                .map(|r| r.values)
+                .collect();
+            Response::Rows { rows: filtered }
+        }
+
+        Request::RunningSum { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut running = 0u64;
+            let out: Vec<Vec<u64>> = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .map(|r| {
+                    let v = r.values.get(col_idx).copied().unwrap_or(0);
+                    running = running.saturating_add(v);
+                    vec![r.values[0], v, running]
+                })
+                .collect();
+            Response::Rows { rows: out }
+        }
+
+        Request::FloorDiv {
+            col,
+            divisor,
+            lo,
+            hi,
+        } => {
+            let col_idx = col as usize;
+            if divisor == 0 {
+                return Response::Error {
+                    code: error_code::MALFORMED,
+                    message: "divisor cannot be zero".into(),
+                };
+            }
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut count = 0u64;
+            for row in rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && col_idx < live.values.len()
+                {
+                    live.values[col_idx] /= divisor;
+                    if engine.insert(pk, live.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::MulField {
+            col,
+            factor,
+            lo,
+            hi,
+        } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut count = 0u64;
+            for row in rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && col_idx < live.values.len()
+                {
+                    live.values[col_idx] = live.values[col_idx].saturating_mul(factor);
+                    if engine.insert(pk, live.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::SetFieldAdd { pk, col, addend } => {
+            let col_idx = col as usize;
+            match engine.get(pk) {
+                Ok(Some(mut row)) => {
+                    if col_idx >= row.values.len() {
+                        return Response::Error {
+                            code: error_code::SCHEMA,
+                            message: "column index out of range".into(),
+                        };
+                    }
+                    row.values[col_idx] = row.values[col_idx].saturating_add(addend);
+                    let new_val = row.values[col_idx];
+                    match engine.insert(pk, row.values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    }
+                }
+                Ok(None) => Response::NotFound,
+                Err(e) => engine_error(e),
+            }
+        }
+
+        Request::SetFieldMul { pk, col, factor } => {
+            let col_idx = col as usize;
+            match engine.get(pk) {
+                Ok(Some(mut row)) => {
+                    if col_idx >= row.values.len() {
+                        return Response::Error {
+                            code: error_code::SCHEMA,
+                            message: "column index out of range".into(),
+                        };
+                    }
+                    row.values[col_idx] = row.values[col_idx].saturating_mul(factor);
+                    let new_val = row.values[col_idx];
+                    match engine.insert(pk, row.values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    }
+                }
+                Ok(None) => Response::NotFound,
+                Err(e) => engine_error(e),
+            }
+        }
+
+        Request::SwapPkFields { pk, col_a, col_b } => {
+            let a_idx = col_a as usize;
+            let b_idx = col_b as usize;
+            match engine.get(pk) {
+                Ok(Some(mut row)) => {
+                    if a_idx >= row.values.len() || b_idx >= row.values.len() {
+                        return Response::Error {
+                            code: error_code::SCHEMA,
+                            message: "column index out of range".into(),
+                        };
+                    }
+                    row.values.swap(a_idx, b_idx);
+                    match engine.insert(pk, row.values) {
+                        Ok(_) => Response::Ok { affected: 1 },
+                        Err(e) => engine_error(e),
+                    }
+                }
+                Ok(None) => Response::NotFound,
+                Err(e) => engine_error(e),
+            }
         }
 
         // Handled by auth gate or the catalog/txn blocks above.

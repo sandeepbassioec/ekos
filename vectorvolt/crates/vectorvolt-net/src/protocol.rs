@@ -263,6 +263,27 @@ pub enum OpCode {
     SetIfGreater = 86,
     SetIfLess = 87,
     AbsDiff = 88,
+    SwapFields = 89,
+    CopyRange = 90,
+    PropagateMax = 91,
+    PropagateMin = 92,
+    ClampRange = 93,
+    BatchConditionalSet = 94,
+    WindowRank = 95,
+    WindowPct = 96,
+    SumProduct = 97,
+    NthValue = 98,
+    DenseRankWin = 99,
+    SetFieldMany = 100,
+    MultiColumnSum = 101,
+    FieldHistogram = 102,
+    ZScoreFilter = 103,
+    RunningSum = 104,
+    FloorDiv = 105,
+    MulField = 106,
+    SetFieldAdd = 107,
+    SetFieldMul = 108,
+    SwapPkFields = 109,
     // Responses
     Pong = 129,
     Row = 130,
@@ -388,6 +409,27 @@ impl OpCode {
             86 => SetIfGreater,
             87 => SetIfLess,
             88 => AbsDiff,
+            89 => SwapFields,
+            90 => CopyRange,
+            91 => PropagateMax,
+            92 => PropagateMin,
+            93 => ClampRange,
+            94 => BatchConditionalSet,
+            95 => WindowRank,
+            96 => WindowPct,
+            97 => SumProduct,
+            98 => NthValue,
+            99 => DenseRankWin,
+            100 => SetFieldMany,
+            101 => MultiColumnSum,
+            102 => FieldHistogram,
+            103 => ZScoreFilter,
+            104 => RunningSum,
+            105 => FloorDiv,
+            106 => MulField,
+            107 => SetFieldAdd,
+            108 => SetFieldMul,
+            109 => SwapPkFields,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -1020,6 +1062,123 @@ pub enum Request {
         pk2: u64,
         col: u32,
     },
+    SwapFields {
+        pk1: u64,
+        pk2: u64,
+        col: u32,
+    },
+    CopyRange {
+        src_col: u32,
+        dst_col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    PropagateMax {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    PropagateMin {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    ClampRange {
+        col: u32,
+        min_val: u64,
+        max_val: u64,
+        lo: u64,
+        hi: u64,
+    },
+    BatchConditionalSet {
+        col: u32,
+        expected: u64,
+        new_value: u64,
+        lo: u64,
+        hi: u64,
+    },
+    WindowRank {
+        pk: u64,
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    WindowPct {
+        pk: u64,
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    SumProduct {
+        col_a: u32,
+        col_b: u32,
+        lo: u64,
+        hi: u64,
+    },
+    NthValue {
+        col: u32,
+        n: u32,
+        lo: u64,
+        hi: u64,
+    },
+    DenseRankWin {
+        pk: u64,
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    SetFieldMany {
+        col: u32,
+        value: u64,
+        pks: Vec<u64>,
+    },
+    MultiColumnSum {
+        pks: Vec<u64>,
+        col: u32,
+    },
+    FieldHistogram {
+        col: u32,
+        bucket_size: u64,
+        lo: u64,
+        hi: u64,
+    },
+    ZScoreFilter {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    RunningSum {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    FloorDiv {
+        col: u32,
+        divisor: u64,
+        lo: u64,
+        hi: u64,
+    },
+    MulField {
+        col: u32,
+        factor: u64,
+        lo: u64,
+        hi: u64,
+    },
+    SetFieldAdd {
+        pk: u64,
+        col: u32,
+        addend: u64,
+    },
+    SetFieldMul {
+        pk: u64,
+        col: u32,
+        factor: u64,
+    },
+    SwapPkFields {
+        pk: u64,
+        col_a: u32,
+        col_b: u32,
+    },
 }
 
 /// A server response.
@@ -1323,6 +1482,27 @@ impl Request {
             Request::SetIfGreater { .. } => OpCode::SetIfGreater,
             Request::SetIfLess { .. } => OpCode::SetIfLess,
             Request::AbsDiff { .. } => OpCode::AbsDiff,
+            Request::SwapFields { .. } => OpCode::SwapFields,
+            Request::CopyRange { .. } => OpCode::CopyRange,
+            Request::PropagateMax { .. } => OpCode::PropagateMax,
+            Request::PropagateMin { .. } => OpCode::PropagateMin,
+            Request::ClampRange { .. } => OpCode::ClampRange,
+            Request::BatchConditionalSet { .. } => OpCode::BatchConditionalSet,
+            Request::WindowRank { .. } => OpCode::WindowRank,
+            Request::WindowPct { .. } => OpCode::WindowPct,
+            Request::SumProduct { .. } => OpCode::SumProduct,
+            Request::NthValue { .. } => OpCode::NthValue,
+            Request::DenseRankWin { .. } => OpCode::DenseRankWin,
+            Request::SetFieldMany { .. } => OpCode::SetFieldMany,
+            Request::MultiColumnSum { .. } => OpCode::MultiColumnSum,
+            Request::FieldHistogram { .. } => OpCode::FieldHistogram,
+            Request::ZScoreFilter { .. } => OpCode::ZScoreFilter,
+            Request::RunningSum { .. } => OpCode::RunningSum,
+            Request::FloorDiv { .. } => OpCode::FloorDiv,
+            Request::MulField { .. } => OpCode::MulField,
+            Request::SetFieldAdd { .. } => OpCode::SetFieldAdd,
+            Request::SetFieldMul { .. } => OpCode::SetFieldMul,
+            Request::SwapPkFields { .. } => OpCode::SwapPkFields,
         }
     }
 
@@ -1640,6 +1820,108 @@ impl Request {
             }
             Request::AbsDiff { pk1, pk2, col } => {
                 w.u64(*pk1).u64(*pk2).u32(*col);
+            }
+            Request::SwapFields { pk1, pk2, col } => {
+                w.u64(*pk1).u64(*pk2).u32(*col);
+            }
+            Request::CopyRange {
+                src_col,
+                dst_col,
+                lo,
+                hi,
+            } => {
+                w.u32(*src_col).u32(*dst_col).u64(*lo).u64(*hi);
+            }
+            Request::PropagateMax { col, lo, hi }
+            | Request::PropagateMin { col, lo, hi }
+            | Request::ZScoreFilter { col, lo, hi }
+            | Request::RunningSum { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::ClampRange {
+                col,
+                min_val,
+                max_val,
+                lo,
+                hi,
+            } => {
+                w.u32(*col).u64(*min_val).u64(*max_val).u64(*lo).u64(*hi);
+            }
+            Request::BatchConditionalSet {
+                col,
+                expected,
+                new_value,
+                lo,
+                hi,
+            } => {
+                w.u32(*col).u64(*expected).u64(*new_value).u64(*lo).u64(*hi);
+            }
+            Request::WindowRank { pk, col, lo, hi }
+            | Request::WindowPct { pk, col, lo, hi }
+            | Request::DenseRankWin { pk, col, lo, hi } => {
+                w.u64(*pk).u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::SumProduct {
+                col_a,
+                col_b,
+                lo,
+                hi,
+            } => {
+                w.u32(*col_a).u32(*col_b).u64(*lo).u64(*hi);
+            }
+            Request::NthValue { col, n, lo, hi } => {
+                w.u32(*col).u32(*n).u64(*lo).u64(*hi);
+            }
+            Request::SetFieldMany { col, value, pks } => {
+                w.u32(*col).u64(*value);
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many pks in SetFieldMany"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+            }
+            Request::MultiColumnSum { pks, col } => {
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many pks in MultiColumnSum"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+                w.u32(*col);
+            }
+            Request::FieldHistogram {
+                col,
+                bucket_size,
+                lo,
+                hi,
+            } => {
+                w.u32(*col).u64(*bucket_size).u64(*lo).u64(*hi);
+            }
+            Request::FloorDiv {
+                col,
+                divisor,
+                lo,
+                hi,
+            } => {
+                w.u32(*col).u64(*divisor).u64(*lo).u64(*hi);
+            }
+            Request::MulField {
+                col,
+                factor,
+                lo,
+                hi,
+            } => {
+                w.u32(*col).u64(*factor).u64(*lo).u64(*hi);
+            }
+            Request::SetFieldAdd { pk, col, addend } => {
+                w.u64(*pk).u32(*col).u64(*addend);
+            }
+            Request::SetFieldMul { pk, col, factor } => {
+                w.u64(*pk).u32(*col).u64(*factor);
+            }
+            Request::SwapPkFields { pk, col_a, col_b } => {
+                w.u64(*pk).u32(*col_a).u32(*col_b);
             }
         }
         Ok(w.0)
@@ -2143,6 +2425,133 @@ impl Request {
                 pk1: r.u64()?,
                 pk2: r.u64()?,
                 col: r.u32()?,
+            },
+            OpCode::SwapFields => Request::SwapFields {
+                pk1: r.u64()?,
+                pk2: r.u64()?,
+                col: r.u32()?,
+            },
+            OpCode::CopyRange => Request::CopyRange {
+                src_col: r.u32()?,
+                dst_col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::PropagateMax => Request::PropagateMax {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::PropagateMin => Request::PropagateMin {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::ClampRange => Request::ClampRange {
+                col: r.u32()?,
+                min_val: r.u64()?,
+                max_val: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::BatchConditionalSet => Request::BatchConditionalSet {
+                col: r.u32()?,
+                expected: r.u64()?,
+                new_value: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::WindowRank => Request::WindowRank {
+                pk: r.u64()?,
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::WindowPct => Request::WindowPct {
+                pk: r.u64()?,
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::SumProduct => Request::SumProduct {
+                col_a: r.u32()?,
+                col_b: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::NthValue => Request::NthValue {
+                col: r.u32()?,
+                n: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::DenseRankWin => Request::DenseRankWin {
+                pk: r.u64()?,
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::SetFieldMany => {
+                let col = r.u32()?;
+                let value = r.u64()?;
+                let n = r.u32()? as usize;
+                let mut pks = Vec::with_capacity(n.min(65536));
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::SetFieldMany { col, value, pks }
+            }
+            OpCode::MultiColumnSum => {
+                let n = r.u32()? as usize;
+                let mut pks = Vec::with_capacity(n.min(65536));
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                let col = r.u32()?;
+                Request::MultiColumnSum { pks, col }
+            }
+            OpCode::FieldHistogram => Request::FieldHistogram {
+                col: r.u32()?,
+                bucket_size: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::ZScoreFilter => Request::ZScoreFilter {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::RunningSum => Request::RunningSum {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::FloorDiv => Request::FloorDiv {
+                col: r.u32()?,
+                divisor: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::MulField => Request::MulField {
+                col: r.u32()?,
+                factor: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::SetFieldAdd => Request::SetFieldAdd {
+                pk: r.u64()?,
+                col: r.u32()?,
+                addend: r.u64()?,
+            },
+            OpCode::SetFieldMul => Request::SetFieldMul {
+                pk: r.u64()?,
+                col: r.u32()?,
+                factor: r.u64()?,
+            },
+            OpCode::SwapPkFields => Request::SwapPkFields {
+                pk: r.u64()?,
+                col_a: r.u32()?,
+                col_b: r.u32()?,
             },
             other => return Err(NetError::NotARequest(other as u8)),
         };
@@ -2987,7 +3396,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=88 {
+                for op in 1u8..=109 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
