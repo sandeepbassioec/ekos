@@ -247,6 +247,14 @@ pub enum OpCode {
     ///
     /// Returns `Rows { rows }`.
     ScanPage = 72,
+    SumField = 73,
+    BatchGet = 74,
+    SetFieldRange = 75,
+    MaxRow = 76,
+    MinRow = 77,
+    IncrementRange = 78,
+    DeleteMin = 79,
+    DeleteMax = 80,
     // Responses
     Pong = 129,
     Row = 130,
@@ -356,6 +364,14 @@ impl OpCode {
             70 => IncrementOrInsert,
             71 => ZeroField,
             72 => ScanPage,
+            73 => SumField,
+            74 => BatchGet,
+            75 => SetFieldRange,
+            76 => MaxRow,
+            77 => MinRow,
+            78 => IncrementRange,
+            79 => DeleteMin,
+            80 => DeleteMax,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -903,6 +919,46 @@ pub enum Request {
         offset: u32,
         limit: u32,
     },
+    SumField {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    BatchGet {
+        pks: Vec<u64>,
+    },
+    SetFieldRange {
+        col: u32,
+        value: u64,
+        lo: u64,
+        hi: u64,
+    },
+    MaxRow {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    MinRow {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    IncrementRange {
+        col: u32,
+        delta: u64,
+        lo: u64,
+        hi: u64,
+    },
+    DeleteMin {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    DeleteMax {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
 }
 
 /// A server response.
@@ -1190,6 +1246,14 @@ impl Request {
             Request::IncrementOrInsert { .. } => OpCode::IncrementOrInsert,
             Request::ZeroField { .. } => OpCode::ZeroField,
             Request::ScanPage { .. } => OpCode::ScanPage,
+            Request::SumField { .. } => OpCode::SumField,
+            Request::BatchGet { .. } => OpCode::BatchGet,
+            Request::SetFieldRange { .. } => OpCode::SetFieldRange,
+            Request::MaxRow { .. } => OpCode::MaxRow,
+            Request::MinRow { .. } => OpCode::MinRow,
+            Request::IncrementRange { .. } => OpCode::IncrementRange,
+            Request::DeleteMin { .. } => OpCode::DeleteMin,
+            Request::DeleteMax { .. } => OpCode::DeleteMax,
         }
     }
 
@@ -1417,8 +1481,27 @@ impl Request {
             | Request::Median { col, lo, hi }
             | Request::ScalarMin { col, lo, hi }
             | Request::ScalarMax { col, lo, hi }
-            | Request::ZeroField { col, lo, hi } => {
+            | Request::ZeroField { col, lo, hi }
+            | Request::SumField { col, lo, hi }
+            | Request::MaxRow { col, lo, hi }
+            | Request::MinRow { col, lo, hi }
+            | Request::DeleteMin { col, lo, hi }
+            | Request::DeleteMax { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::BatchGet { pks } => {
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many pks in BatchGet"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+            }
+            Request::SetFieldRange { col, value, lo, hi } => {
+                w.u32(*col).u64(*value).u64(*lo).u64(*hi);
+            }
+            Request::IncrementRange { col, delta, lo, hi } => {
+                w.u32(*col).u64(*delta).u64(*lo).u64(*hi);
             }
             Request::BatchPkExists { pks } => {
                 let n = u32::try_from(pks.len())
@@ -1878,6 +1961,55 @@ impl Request {
                 hi: r.u64()?,
                 offset: r.u32()?,
                 limit: r.u32()?,
+            },
+            OpCode::SumField => Request::SumField {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::BatchGet => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more pks than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchGet { pks }
+            }
+            OpCode::SetFieldRange => Request::SetFieldRange {
+                col: r.u32()?,
+                value: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::MaxRow => Request::MaxRow {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::MinRow => Request::MinRow {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::IncrementRange => Request::IncrementRange {
+                col: r.u32()?,
+                delta: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::DeleteMin => Request::DeleteMin {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::DeleteMax => Request::DeleteMax {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
             },
             other => return Err(NetError::NotARequest(other as u8)),
         };
@@ -2722,7 +2854,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=72 {
+                for op in 1u8..=80 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

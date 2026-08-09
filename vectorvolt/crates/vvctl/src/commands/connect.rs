@@ -740,6 +740,70 @@ pub enum ConnectCommand {
         #[arg(long, default_value = "100")]
         limit: u32,
     },
+    SumField {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    BatchGet {
+        #[arg(required = true)]
+        pks: Vec<u64>,
+    },
+    SetFieldRange {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        value: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    MaxRow {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    MinRow {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    IncrementRange {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        delta: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    DeleteMin {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    DeleteMax {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1528,6 +1592,80 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                     println!("{}", line.join("\t"));
                 }
                 println!("\n{} row(s)", rows.len());
+            }
+        }
+
+        ConnectCommand::SumField { col, lo, hi } => {
+            let sum = client.sum_field(col, lo, hi).with_context(|| "sum-field")?;
+            println!("sum = {sum}");
+        }
+
+        ConnectCommand::BatchGet { pks } => {
+            let rows = client.batch_get(pks).with_context(|| "batch-get")?;
+            if rows.is_empty() {
+                println!("no rows found");
+            } else {
+                let col_count = rows[0].len();
+                let mut header = vec!["pk".to_string()];
+                header.extend((0..col_count).map(|i| format!("col[{i}]")));
+                println!("{}", header.join("\t"));
+                for row in &rows {
+                    let line: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                    println!("{}", line.join("\t"));
+                }
+                println!("\n{} row(s)", rows.len());
+            }
+        }
+
+        ConnectCommand::SetFieldRange { col, value, lo, hi } => {
+            let count = client
+                .set_field_range(col, value, lo, hi)
+                .with_context(|| format!("set-field-range col={col} value={value}"))?;
+            println!("{count} row(s) updated");
+        }
+
+        ConnectCommand::MaxRow { col, lo, hi } => {
+            match client.max_row(col, lo, hi).with_context(|| "max-row")? {
+                None => println!("no rows in range"),
+                Some(values) => {
+                    println!("pk={}", values[0]);
+                    for (i, v) in values.iter().enumerate() {
+                        println!("  col[{i}] = {v}");
+                    }
+                }
+            }
+        }
+
+        ConnectCommand::MinRow { col, lo, hi } => {
+            match client.min_row(col, lo, hi).with_context(|| "min-row")? {
+                None => println!("no rows in range"),
+                Some(values) => {
+                    println!("pk={}", values[0]);
+                    for (i, v) in values.iter().enumerate() {
+                        println!("  col[{i}] = {v}");
+                    }
+                }
+            }
+        }
+
+        ConnectCommand::IncrementRange { col, delta, lo, hi } => {
+            let count = client
+                .increment_range(col, delta, lo, hi)
+                .with_context(|| format!("increment-range col={col} delta={delta}"))?;
+            println!("{count} row(s) updated");
+        }
+
+        ConnectCommand::DeleteMin { col, lo, hi } => {
+            match client.delete_min(col, lo, hi).with_context(|| "delete-min")? {
+                None => println!("no rows in range"),
+                Some(pk) => println!("deleted pk={pk}"),
+            }
+        }
+
+        ConnectCommand::DeleteMax { col, lo, hi } => {
+            match client.delete_max(col, lo, hi).with_context(|| "delete-max")? {
+                None => println!("no rows in range"),
+                Some(pk) => println!("deleted pk={pk}"),
             }
         }
 

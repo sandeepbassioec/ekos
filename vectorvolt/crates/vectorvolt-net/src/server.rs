@@ -447,7 +447,11 @@ fn required_scope(req: &Request) -> Scope {
         | Request::ScalarMin { .. }
         | Request::ScalarMax { .. }
         | Request::MultiGet { .. }
-        | Request::ScanPage { .. } => Scope::ReadOnly,
+        | Request::ScanPage { .. }
+        | Request::SumField { .. }
+        | Request::BatchGet { .. }
+        | Request::MaxRow { .. }
+        | Request::MinRow { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -477,7 +481,11 @@ fn required_scope(req: &Request) -> Scope {
         | Request::BatchIncrementField { .. }
         | Request::BatchDeleteIf { .. }
         | Request::IncrementOrInsert { .. }
-        | Request::ZeroField { .. } => Scope::ReadWrite,
+        | Request::ZeroField { .. }
+        | Request::SetFieldRange { .. }
+        | Request::IncrementRange { .. }
+        | Request::DeleteMin { .. }
+        | Request::DeleteMax { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -1679,6 +1687,141 @@ fn serve_request(
                 .map(|(_, r)| r.values)
                 .collect();
             Response::Rows { rows: out }
+        }
+
+        Request::SumField { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let sum = rows
+                .into_iter()
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .fold(0u64, |acc, v| acc.saturating_add(v));
+            Response::Ok { affected: sum }
+        }
+
+        Request::BatchGet { pks } => {
+            let mut out = Vec::new();
+            for pk in pks {
+                if let Ok(Some(row)) = engine.get(pk) {
+                    out.push(row.values);
+                }
+            }
+            Response::Rows { rows: out }
+        }
+
+        Request::SetFieldRange { col, value, lo, hi } => {
+            let col_idx = col as usize;
+            let pks: Vec<u64> = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r.into_iter().map(|r| r.values[0]).collect(),
+                Err(e) => return engine_error(e),
+            };
+            let mut count: u64 = 0;
+            for pk in pks {
+                if let Ok(Some(mut row)) = engine.get(pk)
+                    && col_idx < row.values.len()
+                {
+                    row.values[col_idx] = value;
+                    if engine.insert(pk, row.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::MaxRow { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            match rows
+                .into_iter()
+                .max_by_key(|r| r.values.get(col_idx).copied().unwrap_or(0))
+            {
+                None => Response::NotFound,
+                Some(row) => Response::Row { values: row.values },
+            }
+        }
+
+        Request::MinRow { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            match rows
+                .into_iter()
+                .min_by_key(|r| r.values.get(col_idx).copied().unwrap_or(0))
+            {
+                None => Response::NotFound,
+                Some(row) => Response::Row { values: row.values },
+            }
+        }
+
+        Request::IncrementRange { col, delta, lo, hi } => {
+            let col_idx = col as usize;
+            let pks: Vec<u64> = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r.into_iter().map(|r| r.values[0]).collect(),
+                Err(e) => return engine_error(e),
+            };
+            let mut count: u64 = 0;
+            for pk in pks {
+                if let Ok(Some(mut row)) = engine.get(pk)
+                    && col_idx < row.values.len()
+                {
+                    row.values[col_idx] = row.values[col_idx].saturating_add(delta);
+                    if engine.insert(pk, row.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::DeleteMin { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            match rows
+                .into_iter()
+                .min_by_key(|r| r.values.get(col_idx).copied().unwrap_or(0))
+            {
+                None => Response::NotFound,
+                Some(row) => {
+                    let pk = row.values[0];
+                    match engine.delete(pk) {
+                        Ok(_) => Response::Ok { affected: pk },
+                        Err(e) => engine_error(e),
+                    }
+                }
+            }
+        }
+
+        Request::DeleteMax { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            match rows
+                .into_iter()
+                .max_by_key(|r| r.values.get(col_idx).copied().unwrap_or(0))
+            {
+                None => Response::NotFound,
+                Some(row) => {
+                    let pk = row.values[0];
+                    match engine.delete(pk) {
+                        Ok(_) => Response::Ok { affected: pk },
+                        Err(e) => engine_error(e),
+                    }
+                }
+            }
         }
 
         // Handled by auth gate or the catalog/txn blocks above.

@@ -919,6 +919,66 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    pub fn sum_field(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::SumField { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn batch_get(&mut self, pks: Vec<u64>) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::BatchGet { pks })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn set_field_range(&mut self, col: u32, value: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::SetFieldRange { col, value, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn max_row(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<Vec<u64>>> {
+        match self.call(&Request::MaxRow { col, lo, hi })? {
+            Response::Row { values } => Ok(Some(values)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn min_row(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<Vec<u64>>> {
+        match self.call(&Request::MinRow { col, lo, hi })? {
+            Response::Row { values } => Ok(Some(values)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn increment_range(&mut self, col: u32, delta: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::IncrementRange { col, delta, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn delete_min(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::DeleteMin { col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn delete_max(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::DeleteMax { col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.
