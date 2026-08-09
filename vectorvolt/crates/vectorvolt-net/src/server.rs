@@ -441,7 +441,13 @@ fn required_scope(req: &Request) -> Scope {
         | Request::MaxField { .. }
         | Request::FilterScan { .. }
         | Request::CountDistinct { .. }
-        | Request::Median { .. } => Scope::ReadOnly,
+        | Request::Median { .. }
+        | Request::BatchPkExists { .. }
+        | Request::FieldBetween { .. }
+        | Request::ScalarMin { .. }
+        | Request::ScalarMax { .. }
+        | Request::MultiGet { .. }
+        | Request::ScanPage { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -469,7 +475,9 @@ fn required_scope(req: &Request) -> Scope {
         | Request::DeleteIf { .. }
         | Request::SetFieldIf { .. }
         | Request::BatchIncrementField { .. }
-        | Request::BatchDeleteIf { .. } => Scope::ReadWrite,
+        | Request::BatchDeleteIf { .. }
+        | Request::IncrementOrInsert { .. }
+        | Request::ZeroField { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -1527,6 +1535,150 @@ fn serve_request(
                 }
             }
             Response::Ok { affected: count }
+        }
+
+        Request::BatchPkExists { pks } => {
+            let mut count: u64 = 0;
+            for pk in &pks {
+                if matches!(engine.get(*pk), Ok(Some(_))) {
+                    count += 1;
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::FieldBetween {
+            scan_col,
+            lo,
+            hi,
+            filter_col,
+            filter_lo,
+            filter_hi,
+        } => {
+            let filt_idx = filter_col as usize;
+            let rows = match engine.scan(scan_col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let out: Vec<Vec<u64>> = rows
+                .into_iter()
+                .filter(|r| {
+                    let fv = r.values.get(filt_idx).copied().unwrap_or(0);
+                    fv >= filter_lo && fv <= filter_hi
+                })
+                .map(|r| r.values)
+                .collect();
+            Response::Rows { rows: out }
+        }
+
+        Request::ScalarMin { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            match rows
+                .into_iter()
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .min()
+            {
+                Some(v) => Response::Ok { affected: v },
+                None => Response::NotFound,
+            }
+        }
+
+        Request::ScalarMax { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            match rows
+                .into_iter()
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .max()
+            {
+                Some(v) => Response::Ok { affected: v },
+                None => Response::NotFound,
+            }
+        }
+
+        Request::MultiGet { pk, cols } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let selected: Vec<u64> = cols
+                    .iter()
+                    .map(|&c| row.values.get(c as usize).copied().unwrap_or(0))
+                    .collect();
+                Response::Row { values: selected }
+            }
+        },
+
+        Request::IncrementOrInsert {
+            pk,
+            col,
+            delta,
+            values,
+        } => {
+            let col_idx = col as usize;
+            match engine.get(pk) {
+                Ok(Some(mut row)) => {
+                    let v = row.values.get(col_idx).copied().unwrap_or(0);
+                    let new_val = v.saturating_add(delta);
+                    row.values[col_idx] = new_val;
+                    match engine.insert(pk, row.values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    }
+                }
+                Ok(None) | Err(_) => match engine.insert(pk, values) {
+                    Ok(_) => Response::Ok { affected: 0 },
+                    Err(e) => engine_error(e),
+                },
+            }
+        }
+
+        Request::ZeroField { col, lo, hi } => {
+            let col_idx = col as usize;
+            let pks: Vec<u64> = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r.into_iter().map(|r| r.values[0]).collect(),
+                Err(e) => return engine_error(e),
+            };
+            let mut count: u64 = 0;
+            for pk in pks {
+                if let Ok(Some(mut row)) = engine.get(pk)
+                    && col_idx < row.values.len()
+                {
+                    row.values[col_idx] = 0;
+                    if engine.insert(pk, row.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::ScanPage {
+            col,
+            lo,
+            hi,
+            offset,
+            limit,
+        } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let out: Vec<Vec<u64>> = rows
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| (*i as u32) >= offset)
+                .take(limit as usize)
+                .map(|(_, r)| r.values)
+                .collect();
+            Response::Rows { rows: out }
         }
 
         // Handled by auth gate or the catalog/txn blocks above.

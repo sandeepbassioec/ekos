@@ -215,6 +215,38 @@ pub enum OpCode {
     ///
     /// Returns `Ok { affected: deleted_count }`.
     BatchDeleteIf = 64,
+    /// Check multiple primary keys for existence in one round trip.
+    ///
+    /// Returns `Ok { affected: count }` where `count` is the number of pks that exist.
+    BatchPkExists = 65,
+    /// Range scan on `scan_col` in `[lo, hi]` keeping rows where `filter_col` in `[filter_lo, filter_hi]`.
+    ///
+    /// Returns `Rows { rows }`.
+    FieldBetween = 66,
+    /// Minimum value of column `col` over scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: min }` or `NotFound` if empty.
+    ScalarMin = 67,
+    /// Maximum value of column `col` over scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: max }` or `NotFound` if empty.
+    ScalarMax = 68,
+    /// Return only the listed columns of a single row.
+    ///
+    /// Returns `Row { values }` with one entry per requested col, or `NotFound`.
+    MultiGet = 69,
+    /// Add `delta` to column `col` if `pk` exists; otherwise insert `values` (with `values[col]` as initial).
+    ///
+    /// Returns `Ok { affected: new_value }`.
+    IncrementOrInsert = 70,
+    /// Set column `col` to 0 for every row in scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: count }`.
+    ZeroField = 71,
+    /// Paginated range scan: skip `offset` rows then return up to `limit`.
+    ///
+    /// Returns `Rows { rows }`.
+    ScanPage = 72,
     // Responses
     Pong = 129,
     Row = 130,
@@ -316,6 +348,14 @@ impl OpCode {
             62 => CountDistinct,
             63 => Median,
             64 => BatchDeleteIf,
+            65 => BatchPkExists,
+            66 => FieldBetween,
+            67 => ScalarMin,
+            68 => ScalarMax,
+            69 => MultiGet,
+            70 => IncrementOrInsert,
+            71 => ZeroField,
+            72 => ScanPage,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -812,6 +852,57 @@ pub enum Request {
         value: u64,
         pks: Vec<u64>,
     },
+    /// Check multiple primary keys for existence; returns the count that exist.
+    BatchPkExists {
+        pks: Vec<u64>,
+    },
+    /// Range scan on `scan_col` in `[lo, hi]`, keeping rows where `filter_col` in `[filter_lo, filter_hi]`.
+    FieldBetween {
+        scan_col: u32,
+        lo: u64,
+        hi: u64,
+        filter_col: u32,
+        filter_lo: u64,
+        filter_hi: u64,
+    },
+    /// Minimum value of column `col` over scan range `[lo, hi]`.
+    ScalarMin {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Maximum value of column `col` over scan range `[lo, hi]`.
+    ScalarMax {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Return only listed columns of a single row.
+    MultiGet {
+        pk: u64,
+        cols: Vec<u32>,
+    },
+    /// Increment `col` by `delta` if `pk` exists; otherwise insert `values`.
+    IncrementOrInsert {
+        pk: u64,
+        col: u32,
+        delta: u64,
+        values: Vec<u64>,
+    },
+    /// Set column `col` to 0 for all rows in scan range `[lo, hi]`.
+    ZeroField {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Paginated range scan: skip `offset` rows then return up to `limit`.
+    ScanPage {
+        col: u32,
+        lo: u64,
+        hi: u64,
+        offset: u32,
+        limit: u32,
+    },
 }
 
 /// A server response.
@@ -1091,6 +1182,14 @@ impl Request {
             Request::CountDistinct { .. } => OpCode::CountDistinct,
             Request::Median { .. } => OpCode::Median,
             Request::BatchDeleteIf { .. } => OpCode::BatchDeleteIf,
+            Request::BatchPkExists { .. } => OpCode::BatchPkExists,
+            Request::FieldBetween { .. } => OpCode::FieldBetween,
+            Request::ScalarMin { .. } => OpCode::ScalarMin,
+            Request::ScalarMax { .. } => OpCode::ScalarMax,
+            Request::MultiGet { .. } => OpCode::MultiGet,
+            Request::IncrementOrInsert { .. } => OpCode::IncrementOrInsert,
+            Request::ZeroField { .. } => OpCode::ZeroField,
+            Request::ScanPage { .. } => OpCode::ScanPage,
         }
     }
 
@@ -1314,8 +1413,62 @@ impl Request {
                     w.u64(*pk);
                 }
             }
-            Request::CountDistinct { col, lo, hi } | Request::Median { col, lo, hi } => {
+            Request::CountDistinct { col, lo, hi }
+            | Request::Median { col, lo, hi }
+            | Request::ScalarMin { col, lo, hi }
+            | Request::ScalarMax { col, lo, hi }
+            | Request::ZeroField { col, lo, hi } => {
                 w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::BatchPkExists { pks } => {
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many pks in BatchPkExists"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+            }
+            Request::FieldBetween {
+                scan_col,
+                lo,
+                hi,
+                filter_col,
+                filter_lo,
+                filter_hi,
+            } => {
+                w.u32(*scan_col)
+                    .u64(*lo)
+                    .u64(*hi)
+                    .u32(*filter_col)
+                    .u64(*filter_lo)
+                    .u64(*filter_hi);
+            }
+            Request::MultiGet { pk, cols } => {
+                w.u64(*pk);
+                let n = u32::try_from(cols.len())
+                    .map_err(|_| NetError::Malformed("too many cols in MultiGet"))?;
+                w.u32(n);
+                for col in cols {
+                    w.u32(*col);
+                }
+            }
+            Request::IncrementOrInsert {
+                pk,
+                col,
+                delta,
+                values,
+            } => {
+                w.u64(*pk).u32(*col).u64(*delta);
+                w.u64s(values)?;
+            }
+            Request::ScanPage {
+                col,
+                lo,
+                hi,
+                offset,
+                limit,
+            } => {
+                w.u32(*col).u64(*lo).u64(*hi).u32(*offset).u32(*limit);
             }
         }
         Ok(w.0)
@@ -1665,6 +1818,67 @@ impl Request {
                 }
                 Request::BatchDeleteIf { col, value, pks }
             }
+            OpCode::BatchPkExists => {
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 8;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more pks than payload holds"));
+                }
+                let mut pks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchPkExists { pks }
+            }
+            OpCode::FieldBetween => Request::FieldBetween {
+                scan_col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                filter_col: r.u32()?,
+                filter_lo: r.u64()?,
+                filter_hi: r.u64()?,
+            },
+            OpCode::ScalarMin => Request::ScalarMin {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::ScalarMax => Request::ScalarMax {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::MultiGet => {
+                let pk = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 4;
+                if n > max_possible {
+                    return Err(NetError::Malformed("declared more cols than payload holds"));
+                }
+                let mut cols = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cols.push(r.u32()?);
+                }
+                Request::MultiGet { pk, cols }
+            }
+            OpCode::IncrementOrInsert => Request::IncrementOrInsert {
+                pk: r.u64()?,
+                col: r.u32()?,
+                delta: r.u64()?,
+                values: r.u64s()?,
+            },
+            OpCode::ZeroField => Request::ZeroField {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::ScanPage => Request::ScanPage {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                offset: r.u32()?,
+                limit: r.u32()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -2508,7 +2722,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=64 {
+                for op in 1u8..=72 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

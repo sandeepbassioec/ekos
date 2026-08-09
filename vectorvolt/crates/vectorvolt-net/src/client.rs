@@ -821,6 +821,104 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    pub fn batch_pk_exists(&mut self, pks: Vec<u64>) -> NetResult<u64> {
+        match self.call(&Request::BatchPkExists { pks })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn field_between(
+        &mut self,
+        scan_col: u32,
+        lo: u64,
+        hi: u64,
+        filter_col: u32,
+        filter_lo: u64,
+        filter_hi: u64,
+    ) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::FieldBetween {
+            scan_col,
+            lo,
+            hi,
+            filter_col,
+            filter_lo,
+            filter_hi,
+        })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn scalar_min(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::ScalarMin { col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn scalar_max(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::ScalarMax { col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn multi_get(&mut self, pk: u64, cols: Vec<u32>) -> NetResult<Option<Vec<u64>>> {
+        match self.call(&Request::MultiGet { pk, cols })? {
+            Response::Row { values } => Ok(Some(values)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn increment_or_insert(
+        &mut self,
+        pk: u64,
+        col: u32,
+        delta: u64,
+        values: Vec<u64>,
+    ) -> NetResult<u64> {
+        match self.call(&Request::IncrementOrInsert {
+            pk,
+            col,
+            delta,
+            values,
+        })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn zero_field(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::ZeroField { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn scan_page(
+        &mut self,
+        col: u32,
+        lo: u64,
+        hi: u64,
+        offset: u32,
+        limit: u32,
+    ) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::ScanPage {
+            col,
+            lo,
+            hi,
+            offset,
+            limit,
+        })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

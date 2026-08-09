@@ -667,6 +667,79 @@ pub enum ConnectCommand {
         #[arg(required = true)]
         pks: Vec<u64>,
     },
+    BatchPkExists {
+        /// Primary keys to probe.
+        #[arg(required = true)]
+        pks: Vec<u64>,
+    },
+    FieldBetween {
+        #[arg(long)]
+        scan_col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+        #[arg(long)]
+        filter_col: u32,
+        #[arg(long)]
+        filter_lo: u64,
+        #[arg(long)]
+        filter_hi: u64,
+    },
+    ScalarMin {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    ScalarMax {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    MultiGet {
+        #[arg(long)]
+        pk: u64,
+        /// Column indices to retrieve.
+        #[arg(required = true)]
+        cols: Vec<u32>,
+    },
+    IncrementOrInsert {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        delta: u64,
+        /// Full row values used when inserting.
+        #[arg(required = true)]
+        values: Vec<u64>,
+    },
+    ZeroField {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    ScanPage {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+        #[arg(long, default_value = "0")]
+        offset: u32,
+        #[arg(long, default_value = "100")]
+        limit: u32,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1371,6 +1444,91 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .batch_delete_if(col, value, pks)
                 .with_context(|| format!("batch-delete-if col={col} value={value}"))?;
             println!("{count} row(s) deleted");
+        }
+
+        ConnectCommand::BatchPkExists { pks } => {
+            let count = client
+                .batch_pk_exists(pks)
+                .with_context(|| "batch-pk-exists")?;
+            println!("{count} pk(s) found");
+        }
+
+        ConnectCommand::FieldBetween { scan_col, lo, hi, filter_col, filter_lo, filter_hi } => {
+            let rows = client
+                .field_between(scan_col, lo, hi, filter_col, filter_lo, filter_hi)
+                .with_context(|| "field-between")?;
+            if rows.is_empty() {
+                println!("no rows found");
+            } else {
+                let col_count = rows[0].len();
+                let mut header = vec!["pk".to_string()];
+                header.extend((0..col_count).map(|i| format!("col[{i}]")));
+                println!("{}", header.join("\t"));
+                for row in &rows {
+                    let line: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                    println!("{}", line.join("\t"));
+                }
+                println!("\n{} row(s)", rows.len());
+            }
+        }
+
+        ConnectCommand::ScalarMin { col, lo, hi } => {
+            match client.scalar_min(col, lo, hi).with_context(|| "scalar-min")? {
+                None => println!("no rows in range"),
+                Some(v) => println!("min = {v}"),
+            }
+        }
+
+        ConnectCommand::ScalarMax { col, lo, hi } => {
+            match client.scalar_max(col, lo, hi).with_context(|| "scalar-max")? {
+                None => println!("no rows in range"),
+                Some(v) => println!("max = {v}"),
+            }
+        }
+
+        ConnectCommand::MultiGet { pk, cols } => {
+            match client.multi_get(pk, cols).with_context(|| format!("multi-get pk={pk}"))? {
+                None => println!("not found: pk={pk}"),
+                Some(values) => {
+                    println!("pk={pk}");
+                    for (i, v) in values.iter().enumerate() {
+                        println!("  col[{i}] = {v}");
+                    }
+                }
+            }
+        }
+
+        ConnectCommand::IncrementOrInsert { pk, col, delta, values } => {
+            let new_val = client
+                .increment_or_insert(pk, col, delta, values)
+                .with_context(|| format!("increment-or-insert pk={pk} col={col} delta={delta}"))?;
+            println!("new_value = {new_val}");
+        }
+
+        ConnectCommand::ZeroField { col, lo, hi } => {
+            let count = client
+                .zero_field(col, lo, hi)
+                .with_context(|| format!("zero-field col={col}"))?;
+            println!("{count} row(s) updated");
+        }
+
+        ConnectCommand::ScanPage { col, lo, hi, offset, limit } => {
+            let rows = client
+                .scan_page(col, lo, hi, offset, limit)
+                .with_context(|| format!("scan-page col={col} offset={offset} limit={limit}"))?;
+            if rows.is_empty() {
+                println!("no rows");
+            } else {
+                let col_count = rows[0].len();
+                let mut header = vec!["pk".to_string()];
+                header.extend((0..col_count).map(|i| format!("col[{i}]")));
+                println!("{}", header.join("\t"));
+                for row in &rows {
+                    let line: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                    println!("{}", line.join("\t"));
+                }
+                println!("\n{} row(s)", rows.len());
+            }
         }
 
         ConnectCommand::GetMany { pks } => {
