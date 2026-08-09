@@ -2495,7 +2495,7 @@ impl Request {
                 let col = r.u32()?;
                 let value = r.u64()?;
                 let n = r.u32()? as usize;
-                let mut pks = Vec::with_capacity(n);
+                let mut pks = Vec::with_capacity(n.min(65536));
                 for _ in 0..n {
                     pks.push(r.u64()?);
                 }
@@ -2503,7 +2503,7 @@ impl Request {
             }
             OpCode::MultiColumnSum => {
                 let n = r.u32()? as usize;
-                let mut pks = Vec::with_capacity(n);
+                let mut pks = Vec::with_capacity(n.min(65536));
                 for _ in 0..n {
                     pks.push(r.u64()?);
                 }
