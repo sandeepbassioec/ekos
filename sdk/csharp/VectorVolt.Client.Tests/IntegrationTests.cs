@@ -1,3 +1,4 @@
+using System.Linq;
 using VectorVolt.Client;
 using Xunit;
 
@@ -500,6 +501,140 @@ public class TransactionTests : IDisposable
         _client.Insert(2UL, [99UL]);
         _client.RollbackTxn(txId);
         Assert.Null(_client.Get(2UL));
+    }
+
+    public void Dispose() { _client.Dispose(); _server.Dispose(); }
+}
+
+// ── SecondaryLookup ───────────────────────────────────────────────────────────
+
+public class SecondaryLookupTests : IDisposable
+{
+    private readonly ServerHarness _server;
+    private readonly VectorVoltClient _client;
+
+    public SecondaryLookupTests()
+    {
+        _server = ServerHarness.Start(["pk", "age", "score"]);
+        _client = _server.OpenClient();
+    }
+
+    [Fact]
+    public void SecondaryLookup_returns_all_rows_matching_value()
+    {
+        _client.Insert(1UL, [30UL, 100UL]);
+        _client.Insert(2UL, [40UL, 200UL]);
+        _client.Insert(3UL, [30UL, 300UL]);
+
+        var rows = _client.SecondaryLookup(1, 30UL);
+        var pks = rows.Select(r => r.Pk).OrderBy(p => p).ToArray();
+        Assert.Equal([1UL, 3UL], pks);
+    }
+
+    [Fact]
+    public void SecondaryLookup_returns_empty_when_no_match()
+    {
+        _client.Insert(1UL, [30UL, 100UL]);
+
+        var rows = _client.SecondaryLookup(1, 999UL);
+        Assert.Empty(rows);
+    }
+
+    [Fact]
+    public void SecondaryLookup_returns_full_row_values()
+    {
+        _client.Insert(5UL, [77UL, 555UL]);
+
+        var rows = _client.SecondaryLookup(1, 77UL);
+        Assert.Single(rows);
+        Assert.Equal(5UL, rows[0].Pk);
+    }
+
+    [Fact]
+    public void SecondaryLookup_col2_finds_by_second_data_column()
+    {
+        _client.Insert(10UL, [1UL, 42UL]);
+        _client.Insert(11UL, [2UL, 42UL]);
+        _client.Insert(12UL, [3UL, 99UL]);
+
+        var rows = _client.SecondaryLookup(2, 42UL);
+        var pks = rows.Select(r => r.Pk).OrderBy(p => p).ToArray();
+        Assert.Equal([10UL, 11UL], pks);
+    }
+
+    [Fact]
+    public void SecondaryLookup_after_delete_excludes_deleted_row()
+    {
+        _client.Insert(20UL, [50UL, 0UL]);
+        _client.Insert(21UL, [50UL, 0UL]);
+        _client.Delete(20UL);
+
+        var rows = _client.SecondaryLookup(1, 50UL);
+        var pks = rows.Select(r => r.Pk).ToArray();
+        Assert.DoesNotContain(20UL, pks);
+        Assert.Contains(21UL, pks);
+    }
+
+    [Fact]
+    public void SecondaryLookup_on_empty_table_returns_empty()
+    {
+        var rows = _client.SecondaryLookup(1, 0UL);
+        Assert.Empty(rows);
+    }
+
+    public void Dispose() { _client.Dispose(); _server.Dispose(); }
+}
+
+// ── FkExists ──────────────────────────────────────────────────────────────────
+
+public class FkExistsTests : IDisposable
+{
+    private readonly ServerHarness _server;
+    private readonly VectorVoltClient _client;
+
+    public FkExistsTests()
+    {
+        _server = ServerHarness.Start(["pk", "val"]);
+        _client = _server.OpenClient();
+    }
+
+    [Fact]
+    public void FkExists_true_for_inserted_pk()
+    {
+        _client.Insert(42UL, [1UL]);
+        Assert.True(_client.FkExists(42UL));
+    }
+
+    [Fact]
+    public void FkExists_false_for_never_inserted_pk()
+    {
+        _client.Insert(1UL, [1UL]);
+        Assert.False(_client.FkExists(9999UL));
+    }
+
+    [Fact]
+    public void FkExists_on_empty_table_returns_false()
+    {
+        Assert.False(_client.FkExists(1UL));
+    }
+
+    [Fact]
+    public void FkExists_true_after_delete()
+    {
+        // CuckooFilter is not purged on delete — false-positive behaviour is documented.
+        _client.Insert(7UL, [1UL]);
+        _client.Delete(7UL);
+        Assert.True(_client.FkExists(7UL));
+    }
+
+    [Fact]
+    public void FkExists_no_false_negatives_for_batch()
+    {
+        for (ulong pk = 1; pk <= 50; pk++)
+            _client.Insert(pk, [pk]);
+
+        for (ulong pk = 1; pk <= 50; pk++)
+            Assert.True(_client.FkExists(pk));
     }
 
     public void Dispose() { _client.Dispose(); _server.Dispose(); }
