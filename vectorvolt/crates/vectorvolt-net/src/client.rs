@@ -1259,6 +1259,104 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    pub fn count_range(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::CountRange { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn sum_range(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::SumRange { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn min_range(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::MinRange { col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn max_range(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::MaxRange { col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn avg_range(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::AvgRange { col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn increment_field(&mut self, pk: u64, col: u32) -> NetResult<Option<u64>> {
+        match self.call(&Request::IncrementField { pk, col })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn decrement_field(&mut self, pk: u64, col: u32) -> NetResult<Option<u64>> {
+        match self.call(&Request::DecrementField { pk, col })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn set_min(&mut self, pk: u64, col: u32, value: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::SetMin { pk, col, value })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn set_max(&mut self, pk: u64, col: u32, value: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::SetMax { pk, col, value })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn xor_field(&mut self, col: u32, mask: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::XorField { col, mask, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn and_field(&mut self, col: u32, mask: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::AndField { col, mask, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn or_field(&mut self, col: u32, mask: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::OrField { col, mask, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn batch_get_field(&mut self, col: u32, pks: Vec<u64>) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::BatchGetField { col, pks })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

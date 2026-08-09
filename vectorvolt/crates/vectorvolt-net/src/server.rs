@@ -465,7 +465,13 @@ fn required_scope(req: &Request) -> Scope {
         | Request::MultiColumnSum { .. }
         | Request::FieldHistogram { .. }
         | Request::ZScoreFilter { .. }
-        | Request::RunningSum { .. } => Scope::ReadOnly,
+        | Request::RunningSum { .. }
+        | Request::CountRange { .. }
+        | Request::SumRange { .. }
+        | Request::MinRange { .. }
+        | Request::MaxRange { .. }
+        | Request::AvgRange { .. }
+        | Request::BatchGetField { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -514,7 +520,14 @@ fn required_scope(req: &Request) -> Scope {
         | Request::MulField { .. }
         | Request::SetFieldAdd { .. }
         | Request::SetFieldMul { .. }
-        | Request::SwapPkFields { .. } => Scope::ReadWrite,
+        | Request::SwapPkFields { .. }
+        | Request::IncrementField { .. }
+        | Request::DecrementField { .. }
+        | Request::SetMin { .. }
+        | Request::SetMax { .. }
+        | Request::XorField { .. }
+        | Request::AndField { .. }
+        | Request::OrField { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -2546,6 +2559,242 @@ fn serve_request(
                 Ok(None) => Response::NotFound,
                 Err(e) => engine_error(e),
             }
+        }
+
+        Request::CountRange { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let count = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .count() as u64;
+            Response::Ok { affected: count }
+        }
+
+        Request::SumRange { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let sum = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .map(|r| r.values.get(col_idx).copied().unwrap_or(0))
+                .fold(0u64, |a, v| a.saturating_add(v));
+            Response::Ok { affected: sum }
+        }
+
+        Request::MinRange { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let min_val = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .filter_map(|r| r.values.get(col_idx).copied())
+                .min();
+            match min_val {
+                Some(v) => Response::Ok { affected: v },
+                None => Response::NotFound,
+            }
+        }
+
+        Request::MaxRange { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let max_val = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .filter_map(|r| r.values.get(col_idx).copied())
+                .max();
+            match max_val {
+                Some(v) => Response::Ok { affected: v },
+                None => Response::NotFound,
+            }
+        }
+
+        Request::AvgRange { col, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let vals: Vec<u64> = rows
+                .into_iter()
+                .filter(|r| matches!(engine.get(r.values[0]), Ok(Some(_))))
+                .filter_map(|r| r.values.get(col_idx).copied())
+                .collect();
+            if vals.is_empty() {
+                return Response::NotFound;
+            }
+            let sum: u64 = vals.iter().copied().fold(0u64, |a, v| a.saturating_add(v));
+            Response::Ok {
+                affected: sum / vals.len() as u64,
+            }
+        }
+
+        Request::IncrementField { pk, col } => {
+            let col_idx = col as usize;
+            match engine.get(pk) {
+                Ok(Some(mut row)) if col_idx < row.values.len() => {
+                    row.values[col_idx] = row.values[col_idx].saturating_add(1);
+                    let new_val = row.values[col_idx];
+                    match engine.insert(pk, row.values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    }
+                }
+                Ok(Some(_)) => Response::Error {
+                    code: error_code::SCHEMA,
+                    message: "column index out of range".into(),
+                },
+                Ok(None) => Response::NotFound,
+                Err(e) => engine_error(e),
+            }
+        }
+
+        Request::DecrementField { pk, col } => {
+            let col_idx = col as usize;
+            match engine.get(pk) {
+                Ok(Some(mut row)) if col_idx < row.values.len() => {
+                    row.values[col_idx] = row.values[col_idx].saturating_sub(1);
+                    let new_val = row.values[col_idx];
+                    match engine.insert(pk, row.values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    }
+                }
+                Ok(Some(_)) => Response::Error {
+                    code: error_code::SCHEMA,
+                    message: "column index out of range".into(),
+                },
+                Ok(None) => Response::NotFound,
+                Err(e) => engine_error(e),
+            }
+        }
+
+        Request::SetMin { pk, col, value } => {
+            let col_idx = col as usize;
+            match engine.get(pk) {
+                Ok(Some(mut row)) if col_idx < row.values.len() => {
+                    row.values[col_idx] = row.values[col_idx].min(value);
+                    let new_val = row.values[col_idx];
+                    match engine.insert(pk, row.values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    }
+                }
+                Ok(Some(_)) => Response::Error {
+                    code: error_code::SCHEMA,
+                    message: "column index out of range".into(),
+                },
+                Ok(None) => Response::NotFound,
+                Err(e) => engine_error(e),
+            }
+        }
+
+        Request::SetMax { pk, col, value } => {
+            let col_idx = col as usize;
+            match engine.get(pk) {
+                Ok(Some(mut row)) if col_idx < row.values.len() => {
+                    row.values[col_idx] = row.values[col_idx].max(value);
+                    let new_val = row.values[col_idx];
+                    match engine.insert(pk, row.values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    }
+                }
+                Ok(Some(_)) => Response::Error {
+                    code: error_code::SCHEMA,
+                    message: "column index out of range".into(),
+                },
+                Ok(None) => Response::NotFound,
+                Err(e) => engine_error(e),
+            }
+        }
+
+        Request::XorField { col, mask, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut count = 0u64;
+            for row in rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && col_idx < live.values.len()
+                {
+                    live.values[col_idx] ^= mask;
+                    if engine.insert(pk, live.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::AndField { col, mask, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut count = 0u64;
+            for row in rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && col_idx < live.values.len()
+                {
+                    live.values[col_idx] &= mask;
+                    if engine.insert(pk, live.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::OrField { col, mask, lo, hi } => {
+            let col_idx = col as usize;
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let mut count = 0u64;
+            for row in rows {
+                let pk = row.values[0];
+                if let Ok(Some(mut live)) = engine.get(pk)
+                    && col_idx < live.values.len()
+                {
+                    live.values[col_idx] |= mask;
+                    if engine.insert(pk, live.values).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Response::Ok { affected: count }
+        }
+
+        Request::BatchGetField { col, pks } => {
+            let col_idx = col as usize;
+            let mut rows: Vec<Vec<u64>> = Vec::new();
+            for pk in pks {
+                if let Ok(Some(row)) = engine.get(pk) {
+                    let val = row.values.get(col_idx).copied().unwrap_or(0);
+                    rows.push(vec![pk, val]);
+                }
+            }
+            Response::Rows { rows }
         }
 
         // Handled by auth gate or the catalog/txn blocks above.

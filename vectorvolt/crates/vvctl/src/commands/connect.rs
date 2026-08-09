@@ -1070,6 +1070,110 @@ pub enum ConnectCommand {
         #[arg(long)]
         col_b: u32,
     },
+    CountRange {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    SumRange {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    MinRange {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    MaxRange {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    AvgRange {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    IncrementField {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+    },
+    DecrementField {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+    },
+    SetMin {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        value: u64,
+    },
+    SetMax {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        value: u64,
+    },
+    XorField {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        mask: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    AndField {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        mask: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    OrField {
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        mask: u64,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+    BatchGetField {
+        #[arg(long)]
+        col: u32,
+        #[arg(long, num_args = 1..)]
+        pks: Vec<u64>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -2132,6 +2236,94 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             match client.swap_pk_fields(pk, col_a, col_b).with_context(|| "swap-pk-fields")? {
                 None => println!("row not found"),
                 Some(_) => println!("swapped col_a={col_a} and col_b={col_b} in pk={pk}"),
+            }
+        }
+
+        ConnectCommand::CountRange { col, lo, hi } => {
+            let count = client.count_range(col, lo, hi).with_context(|| "count-range")?;
+            println!("count={count}");
+        }
+
+        ConnectCommand::SumRange { col, lo, hi } => {
+            let sum = client.sum_range(col, lo, hi).with_context(|| "sum-range")?;
+            println!("sum={sum}");
+        }
+
+        ConnectCommand::MinRange { col, lo, hi } => {
+            match client.min_range(col, lo, hi).with_context(|| "min-range")? {
+                None => println!("no rows in range"),
+                Some(v) => println!("min={v}"),
+            }
+        }
+
+        ConnectCommand::MaxRange { col, lo, hi } => {
+            match client.max_range(col, lo, hi).with_context(|| "max-range")? {
+                None => println!("no rows in range"),
+                Some(v) => println!("max={v}"),
+            }
+        }
+
+        ConnectCommand::AvgRange { col, lo, hi } => {
+            match client.avg_range(col, lo, hi).with_context(|| "avg-range")? {
+                None => println!("no rows in range"),
+                Some(v) => println!("avg={v}"),
+            }
+        }
+
+        ConnectCommand::IncrementField { pk, col } => {
+            match client.increment_field(pk, col).with_context(|| "increment-field")? {
+                None => println!("row not found"),
+                Some(v) => println!("new_value={v}"),
+            }
+        }
+
+        ConnectCommand::DecrementField { pk, col } => {
+            match client.decrement_field(pk, col).with_context(|| "decrement-field")? {
+                None => println!("row not found"),
+                Some(v) => println!("new_value={v}"),
+            }
+        }
+
+        ConnectCommand::SetMin { pk, col, value } => {
+            match client.set_min(pk, col, value).with_context(|| "set-min")? {
+                None => println!("row not found"),
+                Some(v) => println!("new_value={v}"),
+            }
+        }
+
+        ConnectCommand::SetMax { pk, col, value } => {
+            match client.set_max(pk, col, value).with_context(|| "set-max")? {
+                None => println!("row not found"),
+                Some(v) => println!("new_value={v}"),
+            }
+        }
+
+        ConnectCommand::XorField { col, mask, lo, hi } => {
+            let affected = client.xor_field(col, mask, lo, hi).with_context(|| "xor-field")?;
+            println!("affected={affected}");
+        }
+
+        ConnectCommand::AndField { col, mask, lo, hi } => {
+            let affected = client.and_field(col, mask, lo, hi).with_context(|| "and-field")?;
+            println!("affected={affected}");
+        }
+
+        ConnectCommand::OrField { col, mask, lo, hi } => {
+            let affected = client.or_field(col, mask, lo, hi).with_context(|| "or-field")?;
+            println!("affected={affected}");
+        }
+
+        ConnectCommand::BatchGetField { col, pks } => {
+            let rows = client
+                .batch_get_field(col, pks)
+                .with_context(|| "batch-get-field")?;
+            if rows.is_empty() {
+                println!("no rows found");
+            } else {
+                println!("pk\tvalue");
+                for r in rows {
+                    println!("{}\t{}", r[0], r[1]);
+                }
             }
         }
 

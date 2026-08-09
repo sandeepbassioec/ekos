@@ -284,6 +284,19 @@ pub enum OpCode {
     SetFieldAdd = 107,
     SetFieldMul = 108,
     SwapPkFields = 109,
+    CountRange = 110,
+    SumRange = 111,
+    MinRange = 112,
+    MaxRange = 113,
+    AvgRange = 114,
+    IncrementField = 115,
+    DecrementField = 116,
+    SetMin = 117,
+    SetMax = 118,
+    XorField = 119,
+    AndField = 120,
+    OrField = 121,
+    BatchGetField = 122,
     // Responses
     Pong = 129,
     Row = 130,
@@ -430,6 +443,19 @@ impl OpCode {
             107 => SetFieldAdd,
             108 => SetFieldMul,
             109 => SwapPkFields,
+            110 => CountRange,
+            111 => SumRange,
+            112 => MinRange,
+            113 => MaxRange,
+            114 => AvgRange,
+            115 => IncrementField,
+            116 => DecrementField,
+            117 => SetMin,
+            118 => SetMax,
+            119 => XorField,
+            120 => AndField,
+            121 => OrField,
+            122 => BatchGetField,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -1179,6 +1205,71 @@ pub enum Request {
         col_a: u32,
         col_b: u32,
     },
+    CountRange {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    SumRange {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    MinRange {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    MaxRange {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    AvgRange {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    IncrementField {
+        pk: u64,
+        col: u32,
+    },
+    DecrementField {
+        pk: u64,
+        col: u32,
+    },
+    SetMin {
+        pk: u64,
+        col: u32,
+        value: u64,
+    },
+    SetMax {
+        pk: u64,
+        col: u32,
+        value: u64,
+    },
+    XorField {
+        col: u32,
+        mask: u64,
+        lo: u64,
+        hi: u64,
+    },
+    AndField {
+        col: u32,
+        mask: u64,
+        lo: u64,
+        hi: u64,
+    },
+    OrField {
+        col: u32,
+        mask: u64,
+        lo: u64,
+        hi: u64,
+    },
+    BatchGetField {
+        col: u32,
+        pks: Vec<u64>,
+    },
 }
 
 /// A server response.
@@ -1503,6 +1594,19 @@ impl Request {
             Request::SetFieldAdd { .. } => OpCode::SetFieldAdd,
             Request::SetFieldMul { .. } => OpCode::SetFieldMul,
             Request::SwapPkFields { .. } => OpCode::SwapPkFields,
+            Request::CountRange { .. } => OpCode::CountRange,
+            Request::SumRange { .. } => OpCode::SumRange,
+            Request::MinRange { .. } => OpCode::MinRange,
+            Request::MaxRange { .. } => OpCode::MaxRange,
+            Request::AvgRange { .. } => OpCode::AvgRange,
+            Request::IncrementField { .. } => OpCode::IncrementField,
+            Request::DecrementField { .. } => OpCode::DecrementField,
+            Request::SetMin { .. } => OpCode::SetMin,
+            Request::SetMax { .. } => OpCode::SetMax,
+            Request::XorField { .. } => OpCode::XorField,
+            Request::AndField { .. } => OpCode::AndField,
+            Request::OrField { .. } => OpCode::OrField,
+            Request::BatchGetField { .. } => OpCode::BatchGetField,
         }
     }
 
@@ -1922,6 +2026,33 @@ impl Request {
             }
             Request::SwapPkFields { pk, col_a, col_b } => {
                 w.u64(*pk).u32(*col_a).u32(*col_b);
+            }
+            Request::CountRange { col, lo, hi }
+            | Request::SumRange { col, lo, hi }
+            | Request::MinRange { col, lo, hi }
+            | Request::MaxRange { col, lo, hi }
+            | Request::AvgRange { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::IncrementField { pk, col } | Request::DecrementField { pk, col } => {
+                w.u64(*pk).u32(*col);
+            }
+            Request::SetMin { pk, col, value } | Request::SetMax { pk, col, value } => {
+                w.u64(*pk).u32(*col).u64(*value);
+            }
+            Request::XorField { col, mask, lo, hi }
+            | Request::AndField { col, mask, lo, hi }
+            | Request::OrField { col, mask, lo, hi } => {
+                w.u32(*col).u64(*mask).u64(*lo).u64(*hi);
+            }
+            Request::BatchGetField { col, pks } => {
+                w.u32(*col);
+                let n = u32::try_from(pks.len())
+                    .map_err(|_| NetError::Malformed("too many pks in BatchGetField"))?;
+                w.u32(n);
+                for pk in pks {
+                    w.u64(*pk);
+                }
             }
         }
         Ok(w.0)
@@ -2553,6 +2684,76 @@ impl Request {
                 col_a: r.u32()?,
                 col_b: r.u32()?,
             },
+            OpCode::CountRange => Request::CountRange {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::SumRange => Request::SumRange {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::MinRange => Request::MinRange {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::MaxRange => Request::MaxRange {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::AvgRange => Request::AvgRange {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::IncrementField => Request::IncrementField {
+                pk: r.u64()?,
+                col: r.u32()?,
+            },
+            OpCode::DecrementField => Request::DecrementField {
+                pk: r.u64()?,
+                col: r.u32()?,
+            },
+            OpCode::SetMin => Request::SetMin {
+                pk: r.u64()?,
+                col: r.u32()?,
+                value: r.u64()?,
+            },
+            OpCode::SetMax => Request::SetMax {
+                pk: r.u64()?,
+                col: r.u32()?,
+                value: r.u64()?,
+            },
+            OpCode::XorField => Request::XorField {
+                col: r.u32()?,
+                mask: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::AndField => Request::AndField {
+                col: r.u32()?,
+                mask: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::OrField => Request::OrField {
+                col: r.u32()?,
+                mask: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::BatchGetField => {
+                let col = r.u32()?;
+                let n = r.u32()? as usize;
+                let mut pks = Vec::with_capacity(n.min(65536));
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Request::BatchGetField { col, pks }
+            }
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -3396,7 +3597,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=109 {
+                for op in 1u8..=122 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }
