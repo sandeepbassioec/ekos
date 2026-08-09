@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use store::OutputFormat;
-use vvctl::commands::{bench, connect, hal, serve, store, table, wal};
+use vvctl::commands::{bench, connect, hal, keygen, serve, store, table, wal};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOMEPAGE: &str = "https://workerruntime.com";
@@ -54,6 +54,9 @@ enum Commands {
     /// WAL inspection and verification commands.
     #[command(subcommand)]
     Wal(wal::WalCommand),
+
+    /// Generate a cryptographically random 32-byte hex secret (for use with --secret).
+    Keygen(keygen::KeygenArgs),
 
     /// Print version and build info.
     Version,
@@ -166,6 +169,8 @@ fn main() -> Result<()> {
             StoreCommand::Stats { dir } => store::cmd_stats(dir, fmt)?,
             StoreCommand::Compact { dir } => store::cmd_compact(dir, fmt)?,
         },
+
+        Commands::Keygen(args) => keygen::run(args)?,
 
         Commands::Version => print_version(),
     }

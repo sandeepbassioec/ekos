@@ -36,3 +36,4 @@ serde_json     = { workspace = true }
 chrono         = { workspace = true }
 ctrlc = "3.5.2"
 hex = "0.4.3"
+getrandom = { workspace = true }

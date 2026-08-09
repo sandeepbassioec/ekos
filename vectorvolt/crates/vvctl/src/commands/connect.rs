@@ -1180,7 +1180,23 @@ pub enum ConnectCommand {
 
 pub fn run(args: ConnectArgs) -> Result<()> {
     let timeout = Duration::from_millis(args.timeout_ms);
-    let mut client = open_client(&args, timeout)?;
+    let mut client = open_client(&args, timeout).map_err(|e| {
+        // Give the operator a direct hint when the server requires auth but no
+        // secret was provided. The raw error message says "authenticate with
+        // Hello then Auth" which is correct but low-level for a CLI user.
+        let msg = e.to_string();
+        if (msg.contains("authenticate") || msg.contains("unauthenticated"))
+            && args.secret.is_none()
+        {
+            anyhow::anyhow!(
+                "{e}\n\nHint: this server requires authentication.\n\
+                 Pass --secret <hex> with the shared secret, or generate one with:\n\
+                 \n    vvctl keygen\n"
+            )
+        } else {
+            anyhow::anyhow!("{e}")
+        }
+    })?;
 
     match args.command {
         ConnectCommand::Ping => {

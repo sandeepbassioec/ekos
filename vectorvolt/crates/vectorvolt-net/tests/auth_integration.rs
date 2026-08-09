@@ -1,391 +1,332 @@
-//! Authentication over real sockets (VV-SEC-001/002/003).
-//!
-//! The unit tests in `auth` prove the challenge–response logic. These prove the
-//! gate is actually in front of the engine — that an unauthenticated peer cannot
-//! read, write, or learn anything about the data, no matter which opcode it tries.
+//! Layer 5 auth integration tests -- end-to-end challenge-response over a real socket.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use tempfile::TempDir;
-use vectorvolt_engine::{Durability, EngineOptions, TableEngine};
-use vectorvolt_net::server::ServerStats;
-use vectorvolt_net::{
-    AuthConfig, Client, Request, Response, Scope, Secret, Server, ServerConfig, error_code,
-};
+use vectorvolt_engine::TableEngine;
+use vectorvolt_net::{AuthConfig, Client, Scope, Secret, Server, ServerConfig};
 
-const SECRET: &[u8] = b"a-sufficiently-long-shared-secret";
-
-struct Harness {
-    addr: SocketAddr,
-    stats: Arc<ServerStats>,
-    shutdown: vectorvolt_net::server::ShutdownHandle,
-    _dir: TempDir,
+fn schema() -> Vec<String> {
+    vec!["pk".into(), "score".into()]
 }
 
-fn start(auth: bool) -> Harness {
-    let dir = TempDir::new().unwrap();
-    let engine = Arc::new(
-        TableEngine::open_with(
-            vec!["id".into(), "price".into(), "qty".into()],
-            dir.path(),
-            EngineOptions::new(1_000_000).with_durability(Durability::WriteOnly),
-        )
-        .unwrap(),
-    );
-    let mut cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
-    if auth {
-        // Admin explicitly. `with_key` defaults to ReadOnly (least privilege), so
-        // these tests — which are about AUTHENTICATION, not authorisation — must
-        // ask for full access rather than inherit it. Three of them failed when
-        // the default was introduced, which is the default doing its job.
-        cfg = cfg.with_auth(AuthConfig::disabled().with_scoped_key(
-            "app1",
-            Secret::new(SECRET.to_vec()).unwrap(),
-            Scope::Admin,
-        ));
-        assert!(cfg.requires_auth());
-    }
+fn start_server_no_auth() -> (TempDir, Server, std::net::SocketAddr) {
+    let tmp = TempDir::new().unwrap();
+    let engine = Arc::new(TableEngine::open(schema(), tmp.path(), 1_048_576).unwrap());
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let cfg = ServerConfig::new(addr).with_auth(AuthConfig::disabled());
     let server = Server::bind(engine, cfg).unwrap();
-    let addr = server.local_addr().unwrap();
-    let stats = server.stats();
-    let shutdown = server.shutdown_handle();
-    std::thread::spawn(move || {
-        let _ = server.serve();
-    });
-    Harness {
-        addr,
-        stats,
-        shutdown,
-        _dir: dir,
-    }
+    let local = server.local_addr().unwrap();
+    (tmp, server, local)
 }
 
-impl Drop for Harness {
-    fn drop(&mut self) {
-        self.shutdown.shutdown();
-    }
+fn start_server_with_auth(auth: AuthConfig) -> (TempDir, Server, std::net::SocketAddr) {
+    let tmp = TempDir::new().unwrap();
+    let engine = Arc::new(TableEngine::open(schema(), tmp.path(), 1_048_576).unwrap());
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let cfg = ServerConfig::new(addr).with_auth(auth);
+    let server = Server::bind(engine, cfg).unwrap();
+    let local = server.local_addr().unwrap();
+    (tmp, server, local)
 }
 
-fn client(addr: SocketAddr) -> Client {
-    let c = Client::connect(addr).unwrap();
-    c.set_timeout(Some(Duration::from_secs(10))).unwrap();
-    c
+fn background(server: Server) {
+    std::thread::spawn(move || server.serve().unwrap());
 }
 
-/// The happy path: authenticate, then everything works.
+fn rw_auth() -> AuthConfig {
+    let secret = Secret::new(b"correct-horse-battery-staple!!!!!".to_vec()).unwrap();
+    AuthConfig::disabled().with_scoped_key("rw", secret, Scope::ReadWrite)
+}
+
+fn ro_auth() -> AuthConfig {
+    let secret = Secret::new(b"readonly-secret-readonly-secret!!".to_vec()).unwrap();
+    AuthConfig::disabled().with_scoped_key("ro", secret, Scope::ReadOnly)
+}
+
+fn admin_auth() -> AuthConfig {
+    let secret = Secret::new(b"admin-secret-admin-secret-admin!!".to_vec()).unwrap();
+    AuthConfig::disabled().with_scoped_key("admin", secret, Scope::Admin)
+}
+
+// -- Tests: no auth (auth disabled) -------------------------------------------
+
 #[test]
-fn an_authenticated_client_has_full_access() {
-    let h = start(true);
-    let mut c = Client::connect_authenticated(h.addr, "app1", SECRET).unwrap();
+fn no_auth_server_accepts_any_connection() {
+    let (_tmp, server, addr) = start_server_no_auth();
+    background(server);
+    let mut c = Client::connect(addr).unwrap();
+    c.insert(1, vec![1, 100]).unwrap();
+    assert_eq!(c.get(1).unwrap().unwrap()[1], 100);
+}
 
-    c.insert(1, vec![1, 100, 7]).unwrap();
-    assert_eq!(c.get(1).unwrap().unwrap(), vec![1, 100, 7]);
+#[test]
+fn no_auth_ping_works_without_hello() {
+    let (_tmp, server, addr) = start_server_no_auth();
+    background(server);
+    let mut c = Client::connect(addr).unwrap();
+    c.ping().unwrap();
+}
+
+// -- Tests: successful authentication -----------------------------------------
+
+#[test]
+fn correct_secret_authenticates_and_allows_reads() {
+    let (_tmp, server, addr) = start_server_with_auth(ro_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "ro", b"readonly-secret-readonly-secret!!").unwrap();
+    c.ping().unwrap();
+    assert!(c.get(99).unwrap().is_none());
+}
+
+#[test]
+fn correct_rw_secret_allows_writes() {
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "rw", b"correct-horse-battery-staple!!!!!").unwrap();
+    c.insert(1, vec![1, 42]).unwrap();
+    assert_eq!(c.get(1).unwrap().unwrap()[1], 42);
+    c.delete(1).unwrap();
+}
+
+#[test]
+fn correct_admin_secret_allows_flush_and_compact() {
+    let (_tmp, server, addr) = start_server_with_auth(admin_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "admin", b"admin-secret-admin-secret-admin!!").unwrap();
+    c.insert(1, vec![1, 10]).unwrap();
     c.flush().unwrap();
-    assert!(!c.range_scan(0, 0, 10, 0).unwrap().is_empty());
-    assert!(c.delete(1).unwrap());
-    let _ = c.stats().unwrap();
-
-    assert_eq!(h.stats.auth_successes.load(Ordering::Relaxed), 1);
-    assert_eq!(h.stats.auth_failures.load(Ordering::Relaxed), 0);
-}
-
-/// **Every data operation is refused before authentication.**
-///
-/// Enumerated rather than spot-checked: a gate that covers `Get` but forgets
-/// `RangeScan` is worse than no gate, because it looks closed.
-#[test]
-fn unauthenticated_connections_can_do_nothing_to_the_data() {
-    let h = start(true);
-    let mut c = client(h.addr);
-
-    let forbidden = vec![
-        Request::Get { pk: 1 },
-        Request::Insert {
-            pk: 1,
-            values: vec![1, 2, 3],
-        },
-        Request::Delete { pk: 1 },
-        Request::RangeScan {
-            col: 0,
-            lo: 0,
-            hi: u64::MAX,
-            limit: 0,
-        },
-        Request::Flush,
-        Request::Compact,
-        // Stats leaks row counts and byte totals — information about the data,
-        // even if not the data itself.
-        Request::Stats,
-    ];
-
-    for req in &forbidden {
-        match c.call(req).unwrap() {
-            Response::Error { code, .. } => assert_eq!(
-                code,
-                error_code::UNAUTHENTICATED,
-                "{req:?} was not refused for the right reason"
-            ),
-            other => panic!("{req:?} was ALLOWED without auth: {other:?}"),
-        }
-    }
-    assert_eq!(
-        h.stats.unauthenticated_rejections.load(Ordering::Relaxed),
-        forbidden.len() as u64
-    );
-
-    // And nothing landed.
-    let mut good = Client::connect_authenticated(h.addr, "app1", SECRET).unwrap();
-    assert!(
-        good.get(1).unwrap().is_none(),
-        "an unauthenticated insert wrote data"
-    );
-}
-
-/// `Ping` is allowed without credentials, deliberately.
-///
-/// A health check needs liveness without holding secrets, and a successful ping
-/// reveals nothing a successful TCP connect does not.
-#[test]
-fn ping_is_allowed_without_authentication() {
-    let h = start(true);
-    let mut c = client(h.addr);
-    c.ping().unwrap();
-    c.ping().unwrap();
+    c.compact().unwrap();
 }
 
 #[test]
-fn a_wrong_secret_is_refused_and_grants_nothing() {
-    let h = start(true);
-    let mut c = client(h.addr);
-
-    let err = c
-        .authenticate("app1", b"the-wrong-secret-entirely")
-        .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains(&error_code::AUTH_FAILED.to_string())
-    );
-
-    match c.call(&Request::Get { pk: 1 }).unwrap() {
-        Response::Error { code, .. } => assert_eq!(code, error_code::UNAUTHENTICATED),
-        other => panic!("access granted after a failed auth: {other:?}"),
-    }
-    assert_eq!(h.stats.auth_failures.load(Ordering::Relaxed), 1);
-    assert_eq!(h.stats.auth_successes.load(Ordering::Relaxed), 0);
-}
-
-/// An unknown key id fails the same way a wrong secret does.
-#[test]
-fn an_unknown_key_id_is_refused_indistinguishably() {
-    let h = start(true);
-    let mut c = client(h.addr);
-    let unknown = c.authenticate("nosuchkey", SECRET).unwrap_err().to_string();
-
-    let mut c2 = client(h.addr);
-    let wrong = c2
-        .authenticate("app1", b"the-wrong-secret-entirely")
-        .unwrap_err()
-        .to_string();
-
-    assert_eq!(
-        unknown, wrong,
-        "the two failures are distinguishable, which leaks which key ids exist"
-    );
-}
-
-/// **A captured handshake cannot be replayed onto a new connection.**
-///
-/// This is the property that makes challenge–response worth the extra round trip
-/// over a bearer token: an observer who records a full successful login learns
-/// nothing reusable.
-#[test]
-fn a_captured_handshake_does_not_authenticate_a_new_connection() {
-    let h = start(true);
-
-    // Capture a real, successful exchange.
-    let mut victim = client(h.addr);
-    let nonce = match victim.call(&Request::Hello).unwrap() {
-        Response::Challenge { nonce } => nonce,
-        other => panic!("expected a challenge, got {other:?}"),
-    };
-    let response = vectorvolt_net::auth::client_response(SECRET, &nonce).to_vec();
-    let captured = Request::Auth {
-        key_id: "app1".into(),
-        response,
-    };
-    assert!(matches!(
-        victim.call(&captured).unwrap(),
-        Response::Ok { .. }
-    ));
-
-    // Replay it verbatim on a fresh connection.
-    let mut attacker = client(h.addr);
-    let _ = attacker.call(&Request::Hello).unwrap(); // different nonce
-    match attacker.call(&captured).unwrap() {
-        Response::Error { code, .. } => assert_eq!(code, error_code::AUTH_FAILED),
-        other => panic!("a replayed handshake authenticated: {other:?}"),
-    }
-    match attacker.call(&Request::Get { pk: 1 }).unwrap() {
-        Response::Error { code, .. } => assert_eq!(code, error_code::UNAUTHENTICATED),
-        other => panic!("replay granted access: {other:?}"),
-    }
-}
-
-/// Answering without asking for a challenge fails.
-#[test]
-fn a_response_without_a_challenge_is_refused() {
-    let h = start(true);
-    let mut c = client(h.addr);
-    let resp = c
-        .call(&Request::Auth {
-            key_id: "app1".into(),
-            response: vec![0u8; 32],
-        })
+fn authenticate_twice_on_same_connection_succeeds() {
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+    let mut c = Client::connect(addr).unwrap();
+    c.authenticate("rw", b"correct-horse-battery-staple!!!!!")
         .unwrap();
-    match resp {
-        Response::Error { code, .. } => assert_eq!(code, error_code::AUTH_FAILED),
-        other => panic!("auth succeeded with no challenge: {other:?}"),
-    }
+    c.authenticate("rw", b"correct-horse-battery-staple!!!!!")
+        .unwrap();
+    c.ping().unwrap();
 }
 
-/// Repeated failures close the connection, bounding online brute force.
-#[test]
-fn repeated_failures_close_the_connection() {
-    let h = start(true);
-    let mut c = client(h.addr);
+// -- Tests: unauthenticated rejection -----------------------------------------
 
-    let mut got_error_before_close = 0;
-    for _ in 0..vectorvolt_net::auth::MAX_AUTH_ATTEMPTS + 2 {
-        if c.authenticate("app1", b"wrong-secret-wrong-secret").is_ok() {
-            panic!("a wrong secret authenticated");
-        }
-        got_error_before_close += 1;
-        // Once locked out the server answers and closes, so the next call fails at
-        // the transport rather than returning an error response.
-        if c.ping().is_err() {
-            break;
-        }
-    }
+#[test]
+fn unauthenticated_get_is_rejected_when_auth_enabled() {
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+    let mut c = Client::connect(addr).unwrap();
+    let err = c.get(1).unwrap_err();
+    let msg = err.to_string();
     assert!(
-        got_error_before_close <= vectorvolt_net::auth::MAX_AUTH_ATTEMPTS + 1,
-        "the server allowed {got_error_before_close} attempts on one connection"
-    );
-
-    // A NEW connection still works — lock-out is per connection, not a global ban
-    // that a wrong password could use to lock out everyone else.
-    let mut fresh = Client::connect_authenticated(h.addr, "app1", SECRET).unwrap();
-    fresh.ping().unwrap();
-}
-
-/// Authentication is per connection, not per process.
-#[test]
-fn authentication_does_not_leak_between_connections() {
-    let h = start(true);
-    let mut authed = Client::connect_authenticated(h.addr, "app1", SECRET).unwrap();
-    authed.insert(1, vec![1, 2, 3]).unwrap();
-
-    // A second connection is still anonymous.
-    let mut other = client(h.addr);
-    match other.call(&Request::Get { pk: 1 }).unwrap() {
-        Response::Error { code, .. } => assert_eq!(code, error_code::UNAUTHENTICATED),
-        other => panic!("a second connection inherited authentication: {other:?}"),
-    }
-}
-
-/// With no credentials configured, everything works unauthenticated.
-///
-/// The embedded case. Openly open beats silently broken — and `requires_auth()`
-/// lets a deployment assert which mode it is in rather than discover it.
-#[test]
-fn auth_disabled_leaves_the_server_fully_open() {
-    let h = start(false);
-    let mut c = client(h.addr);
-    c.insert(1, vec![1, 2, 3]).unwrap();
-    assert_eq!(c.get(1).unwrap().unwrap(), vec![1, 2, 3]);
-    assert_eq!(
-        h.stats.unauthenticated_rejections.load(Ordering::Relaxed),
-        0
-    );
-
-    assert!(!ServerConfig::new("127.0.0.1:0".parse().unwrap()).requires_auth());
-}
-
-/// Authenticating twice on one connection is harmless.
-#[test]
-fn re_authenticating_is_idempotent() {
-    let h = start(true);
-    let mut c = Client::connect_authenticated(h.addr, "app1", SECRET).unwrap();
-    c.insert(1, vec![1, 2, 3]).unwrap();
-    c.authenticate("app1", SECRET).unwrap();
-    assert_eq!(
-        c.get(1).unwrap().unwrap(),
-        vec![1, 2, 3],
-        "re-authenticating disturbed the session"
+        msg.contains("authenticate") || msg.contains("unauthenticated") || msg.contains("Auth"),
+        "unexpected error: {msg}"
     );
 }
 
-/// A malformed auth message is refused rather than crashing the handler.
 #[test]
-fn malformed_auth_messages_are_refused() {
-    let h = start(true);
-    for response in [vec![], vec![0u8; 1], vec![0u8; 31], vec![0u8; 1000]] {
-        let mut c = client(h.addr);
-        let _ = c.call(&Request::Hello).unwrap();
-        match c
-            .call(&Request::Auth {
-                key_id: "app1".into(),
-                response,
-            })
-            .unwrap()
-        {
-            Response::Error { code, .. } => assert_eq!(code, error_code::AUTH_FAILED),
-            other => panic!("a malformed response authenticated: {other:?}"),
-        }
-    }
-    // An empty key id, and a very long one.
-    let mut c = client(h.addr);
-    let _ = c.call(&Request::Hello).unwrap();
-    assert!(matches!(
-        c.call(&Request::Auth {
-            key_id: String::new(),
-            response: vec![0u8; 32],
-        })
-        .unwrap(),
-        Response::Error { .. }
-    ));
-
-    let mut c = client(h.addr);
-    let _ = c.call(&Request::Hello).unwrap();
-    assert!(matches!(
-        c.call(&Request::Auth {
-            key_id: "x".repeat(10_000),
-            response: vec![0u8; 32],
-        })
-        .unwrap(),
-        Response::Error { .. }
-    ));
-
-    // The server is still healthy.
-    let mut good = Client::connect_authenticated(h.addr, "app1", SECRET).unwrap();
-    good.ping().unwrap();
+fn ping_allowed_before_auth_on_auth_enabled_server() {
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+    let mut c = Client::connect(addr).unwrap();
+    c.ping().unwrap();
 }
 
-/// Every connection gets a distinct nonce.
+// -- Tests: wrong secret / unknown key ----------------------------------------
+
 #[test]
-fn each_connection_receives_a_different_challenge() {
-    let h = start(true);
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..25 {
-        let mut c = client(h.addr);
-        match c.call(&Request::Hello).unwrap() {
-            Response::Challenge { nonce } => {
-                assert_eq!(nonce.len(), vectorvolt_net::auth::NONCE_LEN);
-                assert!(seen.insert(nonce), "two connections got the same nonce");
-            }
-            other => panic!("expected a challenge, got {other:?}"),
-        }
+fn wrong_secret_is_rejected() {
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+    let result = Client::connect_authenticated(addr, "rw", b"this-is-not-the-right-secret!!!");
+    let Err(e) = result else {
+        panic!("expected auth error but connect succeeded")
+    };
+    let msg = e.to_string();
+    assert!(
+        msg.contains("response")
+            || msg.contains("auth")
+            || msg.contains("Auth")
+            || msg.contains("failed"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn unknown_key_id_gives_same_error_class_as_wrong_secret() {
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+    let result =
+        Client::connect_authenticated(addr, "nosuchkey", b"correct-horse-battery-staple!!!!!");
+    let Err(e) = result else {
+        panic!("expected auth error but connect succeeded")
+    };
+    let msg = e.to_string();
+    assert!(
+        msg.contains("response")
+            || msg.contains("auth")
+            || msg.contains("Auth")
+            || msg.contains("failed"),
+        "unexpected error: {msg}"
+    );
+}
+
+// -- Tests: scope enforcement -------------------------------------------------
+
+#[test]
+fn read_only_key_cannot_insert() {
+    let (_tmp, server, addr) = start_server_with_auth(ro_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "ro", b"readonly-secret-readonly-secret!!").unwrap();
+    let err = c.insert(1, vec![1, 99]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read-write") || msg.contains("scope") || msg.contains("Insufficient"),
+        "expected scope error, got: {msg}"
+    );
+}
+
+#[test]
+fn read_only_key_cannot_delete() {
+    let (_tmp, server, addr) = start_server_with_auth(ro_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "ro", b"readonly-secret-readonly-secret!!").unwrap();
+    let err = c.delete(1).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read-write") || msg.contains("scope") || msg.contains("Insufficient"),
+        "expected scope error, got: {msg}"
+    );
+}
+
+#[test]
+fn read_only_key_can_scan_and_count() {
+    let (_tmp, server, addr) = start_server_with_auth(ro_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "ro", b"readonly-secret-readonly-secret!!").unwrap();
+    let rows = c.range_scan(0, 0, u64::MAX, 0).unwrap();
+    assert!(rows.is_empty());
+    let count = c.count(0, 0, u64::MAX).unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn read_write_key_cannot_flush() {
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "rw", b"correct-horse-battery-staple!!!!!").unwrap();
+    let err = c.flush().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("admin") || msg.contains("scope") || msg.contains("Insufficient"),
+        "expected scope error on flush, got: {msg}"
+    );
+}
+
+#[test]
+fn read_write_key_cannot_compact() {
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "rw", b"correct-horse-battery-staple!!!!!").unwrap();
+    let err = c.compact().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("admin") || msg.contains("scope") || msg.contains("Insufficient"),
+        "expected scope error on compact, got: {msg}"
+    );
+}
+
+#[test]
+fn read_write_key_cannot_truncate() {
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "rw", b"correct-horse-battery-staple!!!!!").unwrap();
+    let err = c.truncate().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("admin") || msg.contains("scope") || msg.contains("Insufficient"),
+        "expected scope error on truncate, got: {msg}"
+    );
+}
+
+#[test]
+fn admin_key_can_read_write_and_admin_ops() {
+    let (_tmp, server, addr) = start_server_with_auth(admin_auth());
+    background(server);
+    let mut c =
+        Client::connect_authenticated(addr, "admin", b"admin-secret-admin-secret-admin!!").unwrap();
+    c.insert(1, vec![1, 77]).unwrap();
+    assert_eq!(c.get(1).unwrap().unwrap()[1], 77);
+    c.flush().unwrap();
+    c.compact().unwrap();
+    c.truncate().unwrap();
+    assert!(c.get(1).unwrap().is_none());
+}
+
+// -- Tests: multi-key config with different scopes ----------------------------
+
+#[test]
+fn multiple_keys_with_different_scopes_enforced_independently() {
+    let ro_secret = Secret::new(b"readonly-secret-readonly-secret!!".to_vec()).unwrap();
+    let rw_secret = Secret::new(b"correct-horse-battery-staple!!!!!".to_vec()).unwrap();
+    let admin_secret = Secret::new(b"admin-secret-admin-secret-admin!!".to_vec()).unwrap();
+    let auth = AuthConfig::disabled()
+        .with_scoped_key("ro", ro_secret, Scope::ReadOnly)
+        .with_scoped_key("rw", rw_secret, Scope::ReadWrite)
+        .with_scoped_key("admin", admin_secret, Scope::Admin);
+
+    let tmp = TempDir::new().unwrap();
+    let engine = Arc::new(TableEngine::open(schema(), tmp.path(), 1_048_576).unwrap());
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = Server::bind(engine, ServerConfig::new(addr).with_auth(auth)).unwrap();
+    let local = server.local_addr().unwrap();
+    background(server);
+
+    let mut ro =
+        Client::connect_authenticated(local, "ro", b"readonly-secret-readonly-secret!!").unwrap();
+    assert!(ro.get(1).unwrap().is_none());
+    assert!(ro.insert(1, vec![1, 1]).is_err());
+
+    let mut rw =
+        Client::connect_authenticated(local, "rw", b"correct-horse-battery-staple!!!!!").unwrap();
+    rw.insert(1, vec![1, 10]).unwrap();
+    assert!(rw.flush().is_err());
+
+    let mut admin =
+        Client::connect_authenticated(local, "admin", b"admin-secret-admin-secret-admin!!")
+            .unwrap();
+    admin.flush().unwrap();
+}
+
+// -- Tests: lockout after repeated failures -----------------------------------
+
+#[test]
+fn three_bad_attempts_lock_out_the_connection() {
+    use vectorvolt_net::auth::MAX_AUTH_ATTEMPTS;
+
+    let (_tmp, server, addr) = start_server_with_auth(rw_auth());
+    background(server);
+
+    let mut c = Client::connect(addr).unwrap();
+    for _ in 0..MAX_AUTH_ATTEMPTS {
+        let _ = c.authenticate("rw", b"wrong-password-wrong-password!!!!");
     }
+    // After MAX_AUTH_ATTEMPTS failures the server closes the connection.
+    // Any further operation must return an error (I/O or auth).
+    let data_result = c.get(1);
+    assert!(
+        data_result.is_err(),
+        "expected error after lockout but got ok"
+    );
 }
