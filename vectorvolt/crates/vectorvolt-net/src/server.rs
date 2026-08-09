@@ -1784,44 +1784,38 @@ fn serve_request(
 
         Request::DeleteMin { col, lo, hi } => {
             let col_idx = col as usize;
-            let rows = match engine.scan(col_idx, lo, hi) {
+            let mut rows = match engine.scan(col_idx, lo, hi) {
                 Ok(r) => r,
                 Err(e) => return engine_error(e),
             };
-            match rows
-                .into_iter()
-                .min_by_key(|r| r.values.get(col_idx).copied().unwrap_or(0))
-            {
-                None => Response::NotFound,
-                Some(row) => {
-                    let pk = row.values[0];
-                    match engine.delete(pk) {
-                        Ok(_) => Response::Ok { affected: pk },
-                        Err(e) => engine_error(e),
-                    }
+            rows.sort_by_key(|r| r.values.get(col_idx).copied().unwrap_or(0));
+            let mut result = Response::NotFound;
+            for row in rows {
+                let pk = row.values[0];
+                if matches!(engine.get(pk), Ok(Some(_))) && engine.delete(pk).is_ok() {
+                    result = Response::Ok { affected: pk };
+                    break;
                 }
             }
+            result
         }
 
         Request::DeleteMax { col, lo, hi } => {
             let col_idx = col as usize;
-            let rows = match engine.scan(col_idx, lo, hi) {
+            let mut rows = match engine.scan(col_idx, lo, hi) {
                 Ok(r) => r,
                 Err(e) => return engine_error(e),
             };
-            match rows
-                .into_iter()
-                .max_by_key(|r| r.values.get(col_idx).copied().unwrap_or(0))
-            {
-                None => Response::NotFound,
-                Some(row) => {
-                    let pk = row.values[0];
-                    match engine.delete(pk) {
-                        Ok(_) => Response::Ok { affected: pk },
-                        Err(e) => engine_error(e),
-                    }
+            rows.sort_by_key(|r| std::cmp::Reverse(r.values.get(col_idx).copied().unwrap_or(0)));
+            let mut result = Response::NotFound;
+            for row in rows {
+                let pk = row.values[0];
+                if matches!(engine.get(pk), Ok(Some(_))) && engine.delete(pk).is_ok() {
+                    result = Response::Ok { affected: pk };
+                    break;
                 }
             }
+            result
         }
 
         // Handled by auth gate or the catalog/txn blocks above.
