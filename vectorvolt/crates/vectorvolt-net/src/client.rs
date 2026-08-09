@@ -1041,6 +1041,224 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    pub fn swap_fields(&mut self, pk1: u64, pk2: u64, col: u32) -> NetResult<Option<u64>> {
+        match self.call(&Request::SwapFields { pk1, pk2, col })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn copy_range(&mut self, src_col: u32, dst_col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::CopyRange {
+            src_col,
+            dst_col,
+            lo,
+            hi,
+        })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn propagate_max(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::PropagateMax { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn propagate_min(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::PropagateMin { col, lo, hi })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn clamp_range(
+        &mut self,
+        col: u32,
+        min_val: u64,
+        max_val: u64,
+        lo: u64,
+        hi: u64,
+    ) -> NetResult<u64> {
+        match self.call(&Request::ClampRange {
+            col,
+            min_val,
+            max_val,
+            lo,
+            hi,
+        })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn batch_conditional_set(
+        &mut self,
+        col: u32,
+        expected: u64,
+        new_value: u64,
+        lo: u64,
+        hi: u64,
+    ) -> NetResult<u64> {
+        match self.call(&Request::BatchConditionalSet {
+            col,
+            expected,
+            new_value,
+            lo,
+            hi,
+        })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn window_rank(&mut self, pk: u64, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::WindowRank { pk, col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn window_pct(&mut self, pk: u64, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::WindowPct { pk, col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn sum_product(&mut self, col_a: u32, col_b: u32, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::SumProduct {
+            col_a,
+            col_b,
+            lo,
+            hi,
+        })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn nth_value(&mut self, col: u32, n: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::NthValue { col, n, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn dense_rank_win(
+        &mut self,
+        pk: u64,
+        col: u32,
+        lo: u64,
+        hi: u64,
+    ) -> NetResult<Option<u64>> {
+        match self.call(&Request::DenseRankWin { pk, col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn set_field_many(&mut self, col: u32, value: u64, pks: Vec<u64>) -> NetResult<u64> {
+        match self.call(&Request::SetFieldMany { col, value, pks })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn multi_column_sum(&mut self, pks: Vec<u64>, col: u32) -> NetResult<u64> {
+        match self.call(&Request::MultiColumnSum { pks, col })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn field_histogram(
+        &mut self,
+        col: u32,
+        bucket_size: u64,
+        lo: u64,
+        hi: u64,
+    ) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::FieldHistogram {
+            col,
+            bucket_size,
+            lo,
+            hi,
+        })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn zscore_filter(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::ZScoreFilter { col, lo, hi })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn running_sum(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Vec<Vec<u64>>> {
+        match self.call(&Request::RunningSum { col, lo, hi })? {
+            Response::Rows { rows } => Ok(rows),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn floor_div(&mut self, col: u32, divisor: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::FloorDiv {
+            col,
+            divisor,
+            lo,
+            hi,
+        })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn mul_field(&mut self, col: u32, factor: u64, lo: u64, hi: u64) -> NetResult<u64> {
+        match self.call(&Request::MulField {
+            col,
+            factor,
+            lo,
+            hi,
+        })? {
+            Response::Ok { affected } => Ok(affected),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn set_field_add(&mut self, pk: u64, col: u32, addend: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::SetFieldAdd { pk, col, addend })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn set_field_mul(&mut self, pk: u64, col: u32, factor: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::SetFieldMul { pk, col, factor })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub fn swap_pk_fields(&mut self, pk: u64, col_a: u32, col_b: u32) -> NetResult<Option<u64>> {
+        match self.call(&Request::SwapPkFields { pk, col_a, col_b })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.
