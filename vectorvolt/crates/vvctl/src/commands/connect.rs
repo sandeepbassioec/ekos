@@ -494,6 +494,92 @@ pub enum ConnectCommand {
         #[arg(required = true)]
         pairs: Vec<String>,
     },
+
+    /// Atomically increment multiple columns of a row.
+    ///
+    /// Pairs are `col:delta` arguments, e.g. `1:5 2:10`.
+    IncrementMulti {
+        /// Primary key of the row to update.
+        #[arg(long)]
+        pk: u64,
+        /// Column-delta pairs in `col:delta` format.
+        #[arg(required = true)]
+        pairs: Vec<String>,
+    },
+
+    /// Copy the row at src-pk to dst-pk (upsert semantics).
+    CopyRow {
+        #[arg(long)]
+        src_pk: u64,
+        #[arg(long)]
+        dst_pk: u64,
+    },
+
+    /// Swap column col value between pk1 and pk2.
+    SwapField {
+        #[arg(long)]
+        pk1: u64,
+        #[arg(long)]
+        pk2: u64,
+        #[arg(long)]
+        col: u32,
+    },
+
+    /// Clamp column col of row pk into [lo, hi].
+    Clamp {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        lo: u64,
+        #[arg(long)]
+        hi: u64,
+    },
+
+    /// Return sum and count of column col over scan range [lo, hi].
+    Average {
+        #[arg(long, default_value = "0")]
+        col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
+
+    /// Delete row at pk only if values[col] == value.
+    DeleteIf {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        value: u64,
+    },
+
+    /// Set values[col] to new-value only if it currently equals expected.
+    SetFieldIf {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long)]
+        col: u32,
+        #[arg(long)]
+        expected: u64,
+        #[arg(long)]
+        new_value: u64,
+    },
+
+    /// Return the 0-based rank of pk's col value within scan range [lo, hi].
+    RankOf {
+        #[arg(long)]
+        pk: u64,
+        #[arg(long, default_value = "0")]
+        col: u32,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1011,6 +1097,110 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 println!("updated");
             } else {
                 println!("not found");
+            }
+        }
+
+        ConnectCommand::IncrementMulti { pk, pairs } => {
+            let mut parsed = Vec::with_capacity(pairs.len());
+            for s in &pairs {
+                let (col_str, delta_str) = s
+                    .split_once(':')
+                    .with_context(|| format!("pair '{s}' must be col:delta"))?;
+                let col: u32 = col_str
+                    .parse()
+                    .with_context(|| format!("invalid column '{col_str}'"))?;
+                let delta: u64 = delta_str
+                    .parse()
+                    .with_context(|| format!("invalid delta '{delta_str}'"))?;
+                parsed.push((col, delta));
+            }
+            match client
+                .increment_multi(pk, parsed)
+                .with_context(|| format!("increment-multi pk={pk}"))?
+            {
+                None => println!("not found"),
+                Some(values) => {
+                    println!("{}", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\t"))
+                }
+            }
+        }
+
+        ConnectCommand::CopyRow { src_pk, dst_pk } => {
+            let ok = client
+                .copy_row(src_pk, dst_pk)
+                .with_context(|| format!("copy-row {src_pk} -> {dst_pk}"))?;
+            if ok {
+                println!("copied");
+            } else {
+                println!("not found: {src_pk}");
+            }
+        }
+
+        ConnectCommand::SwapField { pk1, pk2, col } => {
+            let ok = client
+                .swap_field(pk1, pk2, col)
+                .with_context(|| format!("swap-field pk1={pk1} pk2={pk2} col={col}"))?;
+            if ok {
+                println!("swapped");
+            } else {
+                println!("not found");
+            }
+        }
+
+        ConnectCommand::Clamp { pk, col, lo, hi } => {
+            match client
+                .clamp(pk, col, lo, hi)
+                .with_context(|| format!("clamp pk={pk} col={col} [{lo},{hi}]"))?
+            {
+                None => println!("not found"),
+                Some(v) => println!("{v}"),
+            }
+        }
+
+        ConnectCommand::Average { col, lo, hi } => {
+            match client
+                .average(col, lo, hi)
+                .with_context(|| format!("average col={col} [{lo},{hi}]"))?
+            {
+                None => println!("(empty)"),
+                Some((sum, count)) => println!("sum={sum} count={count}"),
+            }
+        }
+
+        ConnectCommand::DeleteIf { pk, col, value } => {
+            match client
+                .delete_if(pk, col, value)
+                .with_context(|| format!("delete-if pk={pk} col={col} value={value}"))?
+            {
+                None => println!("not found"),
+                Some(true) => println!("deleted"),
+                Some(false) => println!("mismatch: not deleted"),
+            }
+        }
+
+        ConnectCommand::SetFieldIf {
+            pk,
+            col,
+            expected,
+            new_value,
+        } => {
+            match client
+                .set_field_if(pk, col, expected, new_value)
+                .with_context(|| format!("set-field-if pk={pk} col={col}"))?
+            {
+                None => println!("not found"),
+                Some(true) => println!("updated"),
+                Some(false) => println!("mismatch: not updated"),
+            }
+        }
+
+        ConnectCommand::RankOf { pk, col, lo, hi } => {
+            match client
+                .rank_of(pk, col, lo, hi)
+                .with_context(|| format!("rank-of pk={pk} col={col} [{lo},{hi}]"))?
+            {
+                None => println!("not found"),
+                Some(rank) => println!("{rank}"),
             }
         }
 

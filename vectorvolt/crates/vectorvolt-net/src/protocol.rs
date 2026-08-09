@@ -149,6 +149,39 @@ pub enum OpCode {
     Bottom = 47,
     /// Exact primary-key existence check (not probabilistic).
     PkExists = 48,
+    /// Atomically increment multiple `(col, delta)` pairs on one row (saturating at u64::MAX).
+    ///
+    /// Returns `Row { new_values }` with the full updated row, or `NotFound`.
+    IncrementMulti = 49,
+    /// Copy the row at `src_pk` to `dst_pk` (insert-or-replace).
+    ///
+    /// Returns `Ok { affected: 1 }` if `src_pk` exists, `NotFound` otherwise.
+    CopyRow = 50,
+    /// Swap the value of column `col` between `pk1` and `pk2`.
+    ///
+    /// Returns `Ok { affected: 2 }` if both pks exist, `NotFound` otherwise.
+    SwapField = 51,
+    /// Clamp column `col` of row `pk` into `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: new_value }` if found, `NotFound` if absent.
+    Clamp = 52,
+    /// Return `[sum, count]` for column `col` over the scan range `[lo, hi]`.
+    ///
+    /// Returns `Row { values: [sum, count] }`, or `NotFound` if no rows match.
+    Average = 53,
+    /// Delete the row at `pk` only when `values[col] == value`.
+    ///
+    /// Returns `Ok { affected: 1 }` if deleted, `Ok { affected: 0 }` on mismatch, `NotFound` if absent.
+    DeleteIf = 54,
+    /// Set `values[col]` to `new_value` only if it currently equals `expected`.
+    ///
+    /// Returns `Ok { affected: 1 }` on update, `Ok { affected: 0 }` on mismatch, `NotFound` if absent.
+    SetFieldIf = 55,
+    /// Return the 0-based rank of `pk`'s column `col` value within `[lo, hi]`.
+    ///
+    /// Rank = count of rows in the range whose column value is strictly less.
+    /// Returns `Ok { affected: rank }` if `pk` is found in the range, `NotFound` otherwise.
+    RankOf = 56,
     // Responses
     Pong = 129,
     Row = 130,
@@ -234,6 +267,14 @@ impl OpCode {
             46 => Top,
             47 => Bottom,
             48 => PkExists,
+            49 => IncrementMulti,
+            50 => CopyRow,
+            51 => SwapField,
+            52 => Clamp,
+            53 => Average,
+            54 => DeleteIf,
+            55 => SetFieldIf,
+            56 => RankOf,
             129 => Pong,
             130 => Row,
             131 => NotFound,
@@ -616,6 +657,71 @@ pub enum Request {
     PkExists {
         pk: u64,
     },
+    /// Atomically increment multiple `(col, delta)` pairs on one row.
+    ///
+    /// Returns `Row { new_values }` or `NotFound`.
+    IncrementMulti {
+        pk: u64,
+        pairs: Vec<(u32, u64)>,
+    },
+    /// Copy the row at `src_pk` to `dst_pk` (upsert semantics).
+    ///
+    /// Returns `Ok { affected: 1 }` or `NotFound`.
+    CopyRow {
+        src_pk: u64,
+        dst_pk: u64,
+    },
+    /// Swap column `col` value between `pk1` and `pk2`.
+    ///
+    /// Returns `Ok { affected: 2 }` or `NotFound` if either pk is absent.
+    SwapField {
+        pk1: u64,
+        pk2: u64,
+        col: u32,
+    },
+    /// Clamp column `col` of row `pk` into `[lo, hi]`.
+    ///
+    /// Returns `Ok { affected: new_value }` or `NotFound`.
+    Clamp {
+        pk: u64,
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Return sum and count of column `col` over scan range `[lo, hi]`.
+    ///
+    /// Returns `Row { values: [sum, count] }` or `NotFound` if no rows match.
+    Average {
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
+    /// Delete the row at `pk` only if `values[col] == value`.
+    ///
+    /// Returns `Ok { 1 }` if deleted, `Ok { 0 }` on mismatch, `NotFound` if absent.
+    DeleteIf {
+        pk: u64,
+        col: u32,
+        value: u64,
+    },
+    /// Set `values[col]` to `new_value` only if it currently equals `expected`.
+    ///
+    /// Returns `Ok { 1 }` on update, `Ok { 0 }` on mismatch, `NotFound` if absent.
+    SetFieldIf {
+        pk: u64,
+        col: u32,
+        expected: u64,
+        new_value: u64,
+    },
+    /// 0-based rank of `pk`'s `col` value among rows in scan range `[lo, hi]`.
+    ///
+    /// Returns `Ok { rank }` if `pk` is present in the range, `NotFound` otherwise.
+    RankOf {
+        pk: u64,
+        col: u32,
+        lo: u64,
+        hi: u64,
+    },
 }
 
 /// A server response.
@@ -879,6 +985,14 @@ impl Request {
             Request::Top { .. } => OpCode::Top,
             Request::Bottom { .. } => OpCode::Bottom,
             Request::PkExists { .. } => OpCode::PkExists,
+            Request::IncrementMulti { .. } => OpCode::IncrementMulti,
+            Request::CopyRow { .. } => OpCode::CopyRow,
+            Request::SwapField { .. } => OpCode::SwapField,
+            Request::Clamp { .. } => OpCode::Clamp,
+            Request::Average { .. } => OpCode::Average,
+            Request::DeleteIf { .. } => OpCode::DeleteIf,
+            Request::SetFieldIf { .. } => OpCode::SetFieldIf,
+            Request::RankOf { .. } => OpCode::RankOf,
         }
     }
 
@@ -1027,6 +1141,41 @@ impl Request {
                     w.u64(*pk);
                     w.u64s(values)?;
                 }
+            }
+            Request::IncrementMulti { pk, pairs } => {
+                w.u64(*pk);
+                let n = u32::try_from(pairs.len())
+                    .map_err(|_| NetError::Malformed("too many pairs in IncrementMulti"))?;
+                w.u32(n);
+                for (col, delta) in pairs {
+                    w.u32(*col).u64(*delta);
+                }
+            }
+            Request::CopyRow { src_pk, dst_pk } => {
+                w.u64(*src_pk).u64(*dst_pk);
+            }
+            Request::SwapField { pk1, pk2, col } => {
+                w.u64(*pk1).u64(*pk2).u32(*col);
+            }
+            Request::Clamp { pk, col, lo, hi } => {
+                w.u64(*pk).u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::Average { col, lo, hi } => {
+                w.u32(*col).u64(*lo).u64(*hi);
+            }
+            Request::DeleteIf { pk, col, value } => {
+                w.u64(*pk).u32(*col).u64(*value);
+            }
+            Request::SetFieldIf {
+                pk,
+                col,
+                expected,
+                new_value,
+            } => {
+                w.u64(*pk).u32(*col).u64(*expected).u64(*new_value);
+            }
+            Request::RankOf { pk, col, lo, hi } => {
+                w.u64(*pk).u32(*col).u64(*lo).u64(*hi);
             }
         }
         Ok(w.0)
@@ -1247,6 +1396,58 @@ impl Request {
                 }
                 Request::MultiSet { pk, pairs }
             }
+            OpCode::IncrementMulti => {
+                let pk = r.u64()?;
+                let n = r.u32()? as usize;
+                let max_possible = (r.b.len() - r.at) / 12;
+                if n > max_possible {
+                    return Err(NetError::Malformed(
+                        "declared more pairs than payload holds",
+                    ));
+                }
+                let mut pairs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    pairs.push((r.u32()?, r.u64()?));
+                }
+                Request::IncrementMulti { pk, pairs }
+            }
+            OpCode::CopyRow => Request::CopyRow {
+                src_pk: r.u64()?,
+                dst_pk: r.u64()?,
+            },
+            OpCode::SwapField => Request::SwapField {
+                pk1: r.u64()?,
+                pk2: r.u64()?,
+                col: r.u32()?,
+            },
+            OpCode::Clamp => Request::Clamp {
+                pk: r.u64()?,
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::Average => Request::Average {
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
+            OpCode::DeleteIf => Request::DeleteIf {
+                pk: r.u64()?,
+                col: r.u32()?,
+                value: r.u64()?,
+            },
+            OpCode::SetFieldIf => Request::SetFieldIf {
+                pk: r.u64()?,
+                col: r.u32()?,
+                expected: r.u64()?,
+                new_value: r.u64()?,
+            },
+            OpCode::RankOf => Request::RankOf {
+                pk: r.u64()?,
+                col: r.u32()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+            },
             other => return Err(NetError::NotARequest(other as u8)),
         };
         r.finish()?;
@@ -2090,7 +2291,7 @@ mod tests {
             for _ in 0..200 {
                 let buf: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
                 let _ = Header::decode(&buf);
-                for op in 1u8..=48 {
+                for op in 1u8..=56 {
                     if let Ok(o) = OpCode::from_u8(op) {
                         let _ = Request::decode(o, &buf);
                     }

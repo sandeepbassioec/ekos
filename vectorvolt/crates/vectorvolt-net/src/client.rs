@@ -625,6 +625,109 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// Atomically increment multiple `(col, delta)` pairs on one row.
+    ///
+    /// Returns `Some(new_values)` or `None` if the pk is absent.
+    pub fn increment_multi(
+        &mut self,
+        pk: u64,
+        pairs: Vec<(u32, u64)>,
+    ) -> NetResult<Option<Vec<u64>>> {
+        match self.call(&Request::IncrementMulti { pk, pairs })? {
+            Response::Row { values } => Ok(Some(values)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Copy the row at `src_pk` to `dst_pk`.
+    ///
+    /// Returns `true` if the source existed, `false` if not found.
+    pub fn copy_row(&mut self, src_pk: u64, dst_pk: u64) -> NetResult<bool> {
+        match self.call(&Request::CopyRow { src_pk, dst_pk })? {
+            Response::Ok { .. } => Ok(true),
+            Response::NotFound => Ok(false),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Swap column `col` value between `pk1` and `pk2`.
+    ///
+    /// Returns `true` if both existed, `false` if either was absent.
+    pub fn swap_field(&mut self, pk1: u64, pk2: u64, col: u32) -> NetResult<bool> {
+        match self.call(&Request::SwapField { pk1, pk2, col })? {
+            Response::Ok { .. } => Ok(true),
+            Response::NotFound => Ok(false),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Clamp column `col` of row `pk` into `[lo, hi]`.
+    ///
+    /// Returns `Some(new_value)` or `None` if absent.
+    pub fn clamp(&mut self, pk: u64, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::Clamp { pk, col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Return `(sum, count)` for column `col` over scan range `[lo, hi]`.
+    ///
+    /// Returns `None` if no rows match.
+    pub fn average(&mut self, col: u32, lo: u64, hi: u64) -> NetResult<Option<(u64, u64)>> {
+        match self.call(&Request::Average { col, lo, hi })? {
+            Response::Row { values } => Ok(Some((values[0], values[1]))),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Delete the row at `pk` only if `values[col] == value`.
+    ///
+    /// Returns `true` if deleted, `false` on mismatch, `None` if absent.
+    pub fn delete_if(&mut self, pk: u64, col: u32, value: u64) -> NetResult<Option<bool>> {
+        match self.call(&Request::DeleteIf { pk, col, value })? {
+            Response::Ok { affected } => Ok(Some(affected == 1)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Set `values[col]` to `new_value` only if it currently equals `expected`.
+    ///
+    /// Returns `true` if updated, `false` on mismatch, `None` if absent.
+    pub fn set_field_if(
+        &mut self,
+        pk: u64,
+        col: u32,
+        expected: u64,
+        new_value: u64,
+    ) -> NetResult<Option<bool>> {
+        match self.call(&Request::SetFieldIf {
+            pk,
+            col,
+            expected,
+            new_value,
+        })? {
+            Response::Ok { affected } => Ok(Some(affected == 1)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// 0-based rank of `pk`'s `col` value among rows in scan range `[lo, hi]`.
+    ///
+    /// Returns `Some(rank)` if `pk` is in the range, `None` otherwise.
+    pub fn rank_of(&mut self, pk: u64, col: u32, lo: u64, hi: u64) -> NetResult<Option<u64>> {
+        match self.call(&Request::RankOf { pk, col, lo, hi })? {
+            Response::Ok { affected } => Ok(Some(affected)),
+            Response::NotFound => Ok(None),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Turn an unexpected response into an error.

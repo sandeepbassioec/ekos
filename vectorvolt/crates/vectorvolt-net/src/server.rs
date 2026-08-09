@@ -433,7 +433,9 @@ fn required_scope(req: &Request) -> Scope {
         | Request::Sum { .. }
         | Request::Top { .. }
         | Request::Bottom { .. }
-        | Request::PkExists { .. } => Scope::ReadOnly,
+        | Request::PkExists { .. }
+        | Request::Average { .. }
+        | Request::RankOf { .. } => Scope::ReadOnly,
         Request::Insert { .. }
         | Request::Delete { .. }
         | Request::BatchInsert { .. }
@@ -453,7 +455,13 @@ fn required_scope(req: &Request) -> Scope {
         | Request::MultiSet { .. }
         | Request::DecrementClamp { .. }
         | Request::GetOrInsert { .. }
-        | Request::BatchSetField { .. } => Scope::ReadWrite,
+        | Request::BatchSetField { .. }
+        | Request::IncrementMulti { .. }
+        | Request::CopyRow { .. }
+        | Request::SwapField { .. }
+        | Request::Clamp { .. }
+        | Request::DeleteIf { .. }
+        | Request::SetFieldIf { .. } => Scope::ReadWrite,
         Request::Flush
         | Request::Compact
         | Request::UseTable { .. }
@@ -1156,6 +1164,206 @@ fn serve_request(
         Request::DescribeTable => Response::Schema {
             columns: engine.schema.clone(),
         },
+
+        Request::IncrementMulti { pk, pairs } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let mut values = row.values;
+                for (col, delta) in pairs {
+                    let idx = col as usize;
+                    if idx >= values.len() {
+                        return Response::Error {
+                            code: error_code::INVALID_ARGUMENT,
+                            message: format!("col {idx} out of range"),
+                        };
+                    }
+                    values[idx] = values[idx].saturating_add(delta);
+                }
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values.clone()) {
+                        Ok(_) => Response::Row { values },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::CopyRow { src_pk, dst_pk } => match engine.get(src_pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let mut values = row.values;
+                values[0] = dst_pk;
+                // upsert: delete dst if present, then insert
+                let _ = engine.delete(dst_pk);
+                match engine.insert(dst_pk, values) {
+                    Ok(_) => Response::Ok { affected: 1 },
+                    Err(e) => engine_error(e),
+                }
+            }
+        },
+
+        Request::SwapField { pk1, pk2, col } => {
+            let col_idx = col as usize;
+            let row1 = match engine.get(pk1) {
+                Err(e) => return engine_error(e),
+                Ok(None) => return Response::NotFound,
+                Ok(Some(r)) => r,
+            };
+            let row2 = match engine.get(pk2) {
+                Err(e) => return engine_error(e),
+                Ok(None) => return Response::NotFound,
+                Ok(Some(r)) => r,
+            };
+            if col_idx >= row1.values.len() || col_idx >= row2.values.len() {
+                return Response::Error {
+                    code: error_code::INVALID_ARGUMENT,
+                    message: format!("col {col_idx} out of range"),
+                };
+            }
+            let mut v1 = row1.values;
+            let mut v2 = row2.values;
+            std::mem::swap(&mut v1[col_idx], &mut v2[col_idx]);
+            if engine.delete(pk1).is_err() || engine.insert(pk1, v1).is_err() {
+                return Response::Error {
+                    code: error_code::ENGINE,
+                    message: "swap failed on pk1".into(),
+                };
+            }
+            if engine.delete(pk2).is_err() || engine.insert(pk2, v2).is_err() {
+                return Response::Error {
+                    code: error_code::ENGINE,
+                    message: "swap failed on pk2".into(),
+                };
+            }
+            Response::Ok { affected: 2 }
+        }
+
+        Request::Clamp { pk, col, lo, hi } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: format!("col {col_idx} out of range"),
+                    };
+                }
+                let mut values = row.values;
+                values[col_idx] = values[col_idx].clamp(lo, hi);
+                let new_val = values[col_idx];
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: new_val },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::Average { col, lo, hi } => {
+            let rows = match engine.scan(col as usize, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            if rows.is_empty() {
+                return Response::NotFound;
+            }
+            let col_idx = col as usize;
+            let mut sum: u64 = 0;
+            let count = rows.len() as u64;
+            for row in &rows {
+                sum = sum.saturating_add(row.values[col_idx]);
+            }
+            Response::Row {
+                values: vec![sum, count],
+            }
+        }
+
+        Request::DeleteIf { pk, col, value } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: format!("col {col_idx} out of range"),
+                    };
+                }
+                if row.values[col_idx] != value {
+                    return Response::Ok { affected: 0 };
+                }
+                match engine.delete(pk) {
+                    Ok(_) => Response::Ok { affected: 1 },
+                    Err(e) => engine_error(e),
+                }
+            }
+        },
+
+        Request::SetFieldIf {
+            pk,
+            col,
+            expected,
+            new_value,
+        } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::NotFound,
+            Ok(Some(row)) => {
+                let col_idx = col as usize;
+                if col_idx >= row.values.len() {
+                    return Response::Error {
+                        code: error_code::INVALID_ARGUMENT,
+                        message: format!("col {col_idx} out of range"),
+                    };
+                }
+                if row.values[col_idx] != expected {
+                    return Response::Ok { affected: 0 };
+                }
+                let mut values = row.values;
+                values[col_idx] = new_value;
+                match engine.delete(pk) {
+                    Err(e) => engine_error(e),
+                    Ok(_) => match engine.insert(pk, values) {
+                        Ok(_) => Response::Ok { affected: 1 },
+                        Err(e) => engine_error(e),
+                    },
+                }
+            }
+        },
+
+        Request::RankOf { pk, col, lo, hi } => {
+            let col_idx = col as usize;
+            let target_row = match engine.get(pk) {
+                Err(e) => return engine_error(e),
+                Ok(None) => return Response::NotFound,
+                Ok(Some(r)) => r,
+            };
+            if col_idx >= target_row.values.len() {
+                return Response::Error {
+                    code: error_code::INVALID_ARGUMENT,
+                    message: format!("col {col_idx} out of range"),
+                };
+            }
+            let target_val = target_row.values[col_idx];
+            // Check pk is actually within the scan range
+            if target_val < lo || target_val > hi {
+                return Response::NotFound;
+            }
+            let rows = match engine.scan(col_idx, lo, hi) {
+                Ok(r) => r,
+                Err(e) => return engine_error(e),
+            };
+            let rank = rows
+                .iter()
+                .filter(|r| r.values[col_idx] < target_val)
+                .count() as u64;
+            Response::Ok { affected: rank }
+        }
 
         // Handled by auth gate or the catalog/txn blocks above.
         Request::Hello
