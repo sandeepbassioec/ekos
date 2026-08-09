@@ -72,10 +72,10 @@ fn count_distinct_range_filter() {
     let (_tmp, server, addr) = start_server();
     background(server);
     let mut c = Client::connect(addr).unwrap();
-    c.insert(1, vec![1, 5]).unwrap();   // tag=5, outside [10,50]
-    c.insert(2, vec![2, 10]).unwrap();  // inside
-    c.insert(3, vec![3, 10]).unwrap();  // duplicate 10 inside
-    c.insert(4, vec![4, 50]).unwrap();  // inside
+    c.insert(1, vec![1, 5]).unwrap(); // tag=5, outside [10,50]
+    c.insert(2, vec![2, 10]).unwrap(); // inside
+    c.insert(3, vec![3, 10]).unwrap(); // duplicate 10 inside
+    c.insert(4, vec![4, 50]).unwrap(); // inside
     // range [10, 50] → tags 10, 10, 50 → 2 distinct
     assert_eq!(c.count_distinct(1, 10, 50).unwrap(), 2);
 }

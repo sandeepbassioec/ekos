@@ -65,7 +65,7 @@ fn filter_scan_range_restricts_results() {
     let (_tmp, server, addr) = start_server();
     background(server);
     let mut c = Client::connect(addr).unwrap();
-    c.insert(1, vec![1, 1, 5]).unwrap();  // score=5 outside [10,100]
+    c.insert(1, vec![1, 1, 5]).unwrap(); // score=5 outside [10,100]
     c.insert(2, vec![2, 1, 50]).unwrap(); // score=50 inside
     let rows = c.filter_scan(2, 10, 100, 1, 1).unwrap();
     assert_eq!(rows.len(), 1);

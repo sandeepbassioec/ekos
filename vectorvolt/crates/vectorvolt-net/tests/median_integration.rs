@@ -69,7 +69,7 @@ fn median_range_filter() {
     let (_tmp, server, addr) = start_server();
     background(server);
     let mut c = Client::connect(addr).unwrap();
-    c.insert(1, vec![1, 5]).unwrap();   // outside [10,100]
+    c.insert(1, vec![1, 5]).unwrap(); // outside [10,100]
     c.insert(2, vec![2, 30]).unwrap();
     c.insert(3, vec![3, 50]).unwrap();
     c.insert(4, vec![4, 70]).unwrap();
