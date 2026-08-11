@@ -41,6 +41,30 @@ internal sealed class ServerHarness : IDisposable
         string[] columns, string keyId, string secret, int timeoutMs = 5_000)
         => StartCore(columns, keyId, secret, timeoutMs);
 
+    /// <summary>Start a multi-table server (--multi flag). No initial schema needed.</summary>
+    public static ServerHarness StartMultiTable(int timeoutMs = 5_000)
+    {
+        int port   = GetFreePort();
+        string dir = Path.Combine(Path.GetTempPath(), $"vv_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName               = VvctlPath(),
+            Arguments              = $"serve {dir} --addr 127.0.0.1:{port} --multi",
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            UseShellExecute        = false,
+            CreateNoWindow         = true,
+        };
+
+        var proc = Process.Start(psi)
+            ?? throw new InvalidOperationException($"Failed to start vvctl: {psi.FileName}");
+
+        WaitForPort(port, timeoutMs, proc);
+        return new ServerHarness(proc, dir, port, "", "");
+    }
+
     private static ServerHarness StartCore(
         string[] columns, string? keyId, string? secret, int timeoutMs)
     {
