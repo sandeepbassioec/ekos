@@ -6,6 +6,7 @@ members = [
     "crates/vectorvolt-index",
     "crates/vectorvolt-storage",
     "crates/vectorvolt-query",
+    "crates/vectorvolt-replication",
     "crates/vectorvolt-txn",
     "crates/vectorvolt-engine",
     "crates/vectorvolt-net",
@@ -70,7 +71,8 @@ vectorvolt-hal     = { path = "crates/vectorvolt-hal" }
 vectorvolt-wal     = { path = "crates/vectorvolt-wal" }
 vectorvolt-index   = { path = "crates/vectorvolt-index" }
 vectorvolt-storage = { path = "crates/vectorvolt-storage" }
-vectorvolt-query   = { path = "crates/vectorvolt-query" }
+vectorvolt-query       = { path = "crates/vectorvolt-query" }
+vectorvolt-replication = { path = "crates/vectorvolt-replication" }
 vectorvolt-txn     = { path = "crates/vectorvolt-txn" }
 vectorvolt-engine  = { path = "crates/vectorvolt-engine" }
 vectorvolt-net     = { path = "crates/vectorvolt-net" }
