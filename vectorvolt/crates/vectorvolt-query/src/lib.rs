@@ -1,21 +1,28 @@
-//! `vectorvolt-query` — Phase 2 query execution for VectorVolt.
+//! `vectorvolt-query` — text-based query DSL for VectorVolt.
 //!
-//! Sits on top of `vectorvolt-index` (CuckooMap, SecondaryIndex, ZoneMap,
-//! CuckooFilter) and `vectorvolt-storage` (PartitionReader) to provide:
+//! ## Syntax
 //!
-//! | Operation | Index used | Latency target |
-//! |---|---|---|
-//! | `pk_lookup` | CuckooMap → PartitionReader | ~120 ns + column read |
-//! | `range_scan` | ZoneMap prune + PartitionReader | ~10 ns per pruned partition |
-//! | `secondary_scan` | SecondaryIndex → CuckooMap → PartitionReader | ~500 ns setup |
-//! | `fk_exists` | CuckooFilter | ~150 ns |
+//! | Statement | Example |
+//! |-----------|---------|
+//! | `GET <pk>` | `GET 42` |
+//! | `INSERT <pk> <v1> [v2 ...]` | `INSERT 1 1 25 99` |
+//! | `DELETE <pk>` | `DELETE 7` |
+//! | `SCAN col=<n> lo=<lo> hi=<hi>` | `SCAN col=1 lo=20 hi=30` |
+//! | `SECONDARY col=<n> val=<v>` | `SECONDARY col=1 val=55` |
+//! | `BEGIN` | starts a transaction, returns `TxnId` |
+//! | `COMMIT <txn_id>` | `COMMIT 0` |
+//! | `ROLLBACK <txn_id>` | `ROLLBACK 0` |
+//! | `GET TXN <txn_id> <pk>` | `GET TXN 0 42` |
+//! | `INSERT TXN <txn_id> <pk> <v1> ...` | `INSERT TXN 0 1 1 25` |
+//! | `DELETE TXN <txn_id> <pk>` | `DELETE TXN 0 7` |
+//! | `DESCRIBE` | returns schema column names |
+//! | `STATS` | returns engine statistics |
 
-pub mod catalog;
-pub mod engine;
-pub mod error;
-pub mod row;
+mod error;
+mod executor;
+mod lexer;
+mod parser;
 
-pub use catalog::TableCatalog;
-pub use engine::QueryEngine;
 pub use error::{QueryError, QueryResult};
-pub use row::QueryRow;
+pub use executor::{execute, run, QueryResponse};
+pub use parser::{parse, Query};
