@@ -2012,8 +2012,18 @@ version = "0.1.0"
 dependencies = [
  "tempfile",
  "thiserror",
- "vectorvolt-index",
- "vectorvolt-storage",
+ "vectorvolt-engine",
+]
+
+[[package]]
+name = "vectorvolt-replication"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "parking_lot",
+ "tempfile",
+ "thiserror",
+ "vectorvolt-engine",
 ]
 
 [[package]]
