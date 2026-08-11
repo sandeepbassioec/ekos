@@ -4,16 +4,15 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use vectorvolt_engine::TableRegistry;
 
+use crate::server::AppState;
 use crate::types::{
     CreateTableBody, ErrorResp, InsertBody, OkResp, RowResp, RowsResp, ScanQuery, SchemaResp,
     SecondaryQuery, TablesResp,
 };
 
-pub type Reg = Arc<TableRegistry>;
-
-fn engine_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
+fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
+    st.metrics.record_err();
     let msg = e.to_string();
     let status = if msg.contains("NotFound") || msg.contains("not found") {
         StatusCode::NOT_FOUND
@@ -28,19 +27,25 @@ fn engine_err(e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
 // ── row insert ────────────────────────────────────────────────────────────────
 
 pub async fn insert_row(
-    State(reg): State<Reg>,
+    State(st): State<Arc<AppState>>,
     Path((table, pk)): Path<(String, u64)>,
     Json(body): Json<InsertBody>,
 ) -> impl IntoResponse {
-    match reg.get(&table) {
-        Err(e) => engine_err(e).into_response(),
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
         Ok(eng) => match eng.insert(pk, body.values.clone()) {
-            Ok(_) => Json(RowResp {
-                pk,
-                values: body.values,
-            })
-            .into_response(),
-            Err(e) => engine_err(e).into_response(),
+            Ok(_) => {
+                st.metrics
+                    .rows_inserted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.metrics.record_ok();
+                Json(RowResp {
+                    pk,
+                    values: body.values,
+                })
+                .into_response()
+            }
+            Err(e) => engine_err(&st, e).into_response(),
         },
     }
 }
@@ -48,25 +53,34 @@ pub async fn insert_row(
 // ── row get ───────────────────────────────────────────────────────────────────
 
 pub async fn get_row(
-    State(reg): State<Reg>,
+    State(st): State<Arc<AppState>>,
     Path((table, pk)): Path<(String, u64)>,
 ) -> impl IntoResponse {
-    match reg.get(&table) {
-        Err(e) => engine_err(e).into_response(),
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
         Ok(eng) => match eng.get(pk) {
-            Err(e) => engine_err(e).into_response(),
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResp {
-                    error: format!("pk={pk} not found"),
-                }),
-            )
-                .into_response(),
-            Ok(Some(row)) => Json(RowResp {
-                pk: row.pk,
-                values: row.values,
-            })
-            .into_response(),
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(None) => {
+                st.metrics.record_err();
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResp {
+                        error: format!("pk={pk} not found"),
+                    }),
+                )
+                    .into_response()
+            }
+            Ok(Some(row)) => {
+                st.metrics
+                    .rows_fetched
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.metrics.record_ok();
+                Json(RowResp {
+                    pk: row.pk,
+                    values: row.values,
+                })
+                .into_response()
+            }
         },
     }
 }
@@ -74,14 +88,20 @@ pub async fn get_row(
 // ── row delete ────────────────────────────────────────────────────────────────
 
 pub async fn delete_row(
-    State(reg): State<Reg>,
+    State(st): State<Arc<AppState>>,
     Path((table, pk)): Path<(String, u64)>,
 ) -> impl IntoResponse {
-    match reg.get(&table) {
-        Err(e) => engine_err(e).into_response(),
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
         Ok(eng) => match eng.delete(pk) {
-            Ok(_) => Json(OkResp { ok: true }).into_response(),
-            Err(e) => engine_err(e).into_response(),
+            Ok(_) => {
+                st.metrics
+                    .rows_deleted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.metrics.record_ok();
+                Json(OkResp { ok: true }).into_response()
+            }
+            Err(e) => engine_err(&st, e).into_response(),
         },
     }
 }
@@ -89,15 +109,23 @@ pub async fn delete_row(
 // ── scan ──────────────────────────────────────────────────────────────────────
 
 pub async fn scan_rows(
-    State(reg): State<Reg>,
+    State(st): State<Arc<AppState>>,
     Path(table): Path<String>,
     Query(q): Query<ScanQuery>,
 ) -> impl IntoResponse {
-    match reg.get(&table) {
-        Err(e) => engine_err(e).into_response(),
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
         Ok(eng) => match eng.scan(q.col as usize, q.lo, q.hi) {
-            Err(e) => engine_err(e).into_response(),
+            Err(e) => engine_err(&st, e).into_response(),
             Ok(rows) => {
+                let count = rows.len() as u64;
+                st.metrics
+                    .rows_fetched
+                    .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                st.metrics
+                    .scans_executed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.metrics.record_ok();
                 let resp = RowsResp {
                     rows: rows
                         .into_iter()
@@ -116,15 +144,23 @@ pub async fn scan_rows(
 // ── secondary lookup ──────────────────────────────────────────────────────────
 
 pub async fn secondary_lookup(
-    State(reg): State<Reg>,
+    State(st): State<Arc<AppState>>,
     Path(table): Path<String>,
     Query(q): Query<SecondaryQuery>,
 ) -> impl IntoResponse {
-    match reg.get(&table) {
-        Err(e) => engine_err(e).into_response(),
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
         Ok(eng) => match eng.secondary_scan(q.col, q.val) {
-            Err(e) => engine_err(e).into_response(),
+            Err(e) => engine_err(&st, e).into_response(),
             Ok(rows) => {
+                let count = rows.len() as u64;
+                st.metrics
+                    .rows_fetched
+                    .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                st.metrics
+                    .secondary_lookups
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.metrics.record_ok();
                 let resp = RowsResp {
                     rows: rows
                         .into_iter()
@@ -142,45 +178,58 @@ pub async fn secondary_lookup(
 
 // ── list tables ───────────────────────────────────────────────────────────────
 
-pub async fn list_tables(State(reg): State<Reg>) -> impl IntoResponse {
+pub async fn list_tables(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    st.metrics.record_ok();
     Json(TablesResp {
-        tables: reg.list_tables(),
+        tables: st.registry.list_tables(),
     })
 }
 
 // ── describe table ────────────────────────────────────────────────────────────
 
 pub async fn describe_table(
-    State(reg): State<Reg>,
+    State(st): State<Arc<AppState>>,
     Path(table): Path<String>,
 ) -> impl IntoResponse {
-    match reg.get(&table) {
-        Err(e) => engine_err(e).into_response(),
-        Ok(eng) => Json(SchemaResp {
-            columns: eng.schema.clone(),
-        })
-        .into_response(),
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => {
+            st.metrics.record_ok();
+            Json(SchemaResp {
+                columns: eng.schema.clone(),
+            })
+            .into_response()
+        }
     }
 }
 
 // ── create table ──────────────────────────────────────────────────────────────
 
 pub async fn create_table(
-    State(reg): State<Reg>,
+    State(st): State<Arc<AppState>>,
     Path(table): Path<String>,
     Json(body): Json<CreateTableBody>,
 ) -> impl IntoResponse {
-    match reg.create_table(&table, body.columns) {
-        Ok(_) => (StatusCode::CREATED, Json(OkResp { ok: true })).into_response(),
-        Err(e) => engine_err(e).into_response(),
+    match st.registry.create_table(&table, body.columns) {
+        Ok(_) => {
+            st.metrics.record_ok();
+            (StatusCode::CREATED, Json(OkResp { ok: true })).into_response()
+        }
+        Err(e) => engine_err(&st, e).into_response(),
     }
 }
 
 // ── drop table ────────────────────────────────────────────────────────────────
 
-pub async fn drop_table(State(reg): State<Reg>, Path(table): Path<String>) -> impl IntoResponse {
-    match reg.drop_table(&table) {
-        Ok(_) => Json(OkResp { ok: true }).into_response(),
-        Err(e) => engine_err(e).into_response(),
+pub async fn drop_table(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+) -> impl IntoResponse {
+    match st.registry.drop_table(&table) {
+        Ok(_) => {
+            st.metrics.record_ok();
+            Json(OkResp { ok: true }).into_response()
+        }
+        Err(e) => engine_err(&st, e).into_response(),
     }
 }
