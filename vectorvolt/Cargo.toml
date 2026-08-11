@@ -9,6 +9,7 @@ members = [
     "crates/vectorvolt-txn",
     "crates/vectorvolt-engine",
     "crates/vectorvolt-net",
+    "crates/vectorvolt-http",
     "crates/vvctl",
 ]
 resolver = "2"
@@ -25,6 +26,9 @@ description = "VectorVolt — ultra-low-latency kernel-bypass data engine"
 [workspace.dependencies]
 # async
 tokio          = { version = "1.45", features = ["full"] }
+axum           = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
+tower          = { version = "0.5", default-features = false }
+reqwest        = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # error handling
 anyhow         = "1.0"
 thiserror      = "2.0"
@@ -70,6 +74,7 @@ vectorvolt-query   = { path = "crates/vectorvolt-query" }
 vectorvolt-txn     = { path = "crates/vectorvolt-txn" }
 vectorvolt-engine  = { path = "crates/vectorvolt-engine" }
 vectorvolt-net     = { path = "crates/vectorvolt-net" }
+vectorvolt-http    = { path = "crates/vectorvolt-http" }
 # testing
 tempfile       = "3.14"
 
