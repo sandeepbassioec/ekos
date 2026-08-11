@@ -23,6 +23,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use vectorvolt_engine::{EngineOptions, TableEngine, TableRegistry};
+use vectorvolt_http::{HttpServer, HttpServerConfig};
 use vectorvolt_net::tls::ServerTlsConfig;
 use vectorvolt_net::{AuthConfig, Scope, Secret, Server, ServerConfig};
 
@@ -73,6 +74,13 @@ pub struct ServeArgs {
     /// When this flag is set, `--columns` is ignored.
     #[arg(long)]
     pub multi: bool,
+
+    /// Also start an HTTP/REST gateway on this address (e.g. `127.0.0.1:7879`).
+    ///
+    /// The gateway exposes a JSON API that mirrors the wire-protocol opcodes,
+    /// making VectorVolt accessible from any HTTP client. Disabled if omitted.
+    #[arg(long)]
+    pub http_addr: Option<SocketAddr>,
 }
 
 /// Everything needed to run the server, extracted so tests can bind without blocking.
@@ -244,6 +252,44 @@ pub fn run(args: ServeArgs) -> Result<()> {
     );
     eprintln!("  max conns : {}", args.max_connections);
     eprintln!("  flush thr : {} rows", FLUSH_THRESHOLD);
+
+    // ── HTTP gateway (optional) ───────────────────────────────────────────────
+    if let Some(http_addr) = args.http_addr {
+        // Build a TableRegistry view for the HTTP layer.
+        // In multi-table mode reuse the existing registry; in single-table mode
+        // wrap the one engine as "default" so HTTP can address it.
+        let http_reg: std::sync::Arc<vectorvolt_engine::TableRegistry> =
+            if let Some(ref reg) = registry {
+                std::sync::Arc::clone(reg)
+            } else if let Some(ref eng) = engine {
+                std::sync::Arc::new(vectorvolt_engine::TableRegistry::new_with_default(
+                    std::sync::Arc::clone(eng),
+                ))
+            } else {
+                unreachable!("either registry or engine must be present")
+            };
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(async move {
+                let cfg = HttpServerConfig::new(http_addr);
+                match HttpServer::bind(http_reg, cfg).await {
+                    Ok(srv) => {
+                        eprintln!(
+                            "  http      : http://{}",
+                            srv.local_addr().unwrap_or(http_addr)
+                        );
+                        if let Err(e) = srv.serve().await {
+                            eprintln!("HTTP gateway error: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("HTTP gateway bind failed: {e}"),
+                }
+            });
+        });
+    } else {
+        eprintln!("  http      : disabled (use --http-addr to enable)");
+    }
+
     eprintln!();
     eprintln!("Ready. Press Ctrl-C to stop.");
 
