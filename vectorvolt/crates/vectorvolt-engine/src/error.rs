@@ -33,6 +33,9 @@ pub enum EngineError {
 
     #[error("no table selected — send UseTable first")]
     NoTableSelected,
+
+    #[error("transaction {0} not found (already committed, rolled back, or never started)")]
+    TxnNotFound(u64),
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;

@@ -26,7 +26,8 @@ pub use vectorvolt_txn::{FlushResult, WalTip};
 use vectorvolt_txn::{Mutation, TxnManager};
 use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
 
-use crate::{CompactResult, EngineError, EngineResult, EngineRow, EngineStats};
+use crate::mvcc::MvccStore;
+use crate::{CompactResult, EngineError, EngineResult, EngineRow, EngineStats, TxnId};
 
 /// Per-table engine: owns the write path (TxnManager) and read path (PartitionReader map).
 pub struct TableEngine {
@@ -41,6 +42,8 @@ pub struct TableEngine {
     write_options: WriteOptions,
     /// What manifest recovery found at open. See [`TableEngine::manifest_recovery`].
     manifest_recovery: ManifestRecovery,
+    /// MVCC transaction store — open transactions live here until commit/rollback.
+    mvcc: std::sync::Arc<MvccStore>,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -339,6 +342,7 @@ impl TableEngine {
             compaction_strategy: options.compaction_strategy,
             write_options: options.write_options,
             manifest_recovery,
+            mvcc: MvccStore::new(),
         })
     }
 
@@ -841,5 +845,66 @@ impl TableEngine {
             parts.entry(key).or_insert(reader);
         }
         Ok(())
+    }
+
+    // ── MVCC transaction API ──────────────────────────────────────────────────
+
+    /// Begin a new multi-statement transaction.  Returns a [`TxnId`] that must
+    /// be passed to every subsequent `*_txn` call.
+    pub fn begin(&self) -> TxnId {
+        self.mvcc.begin()
+    }
+
+    /// Stage an insert inside `txn_id`.  The row is not visible to other
+    /// readers until `commit_txn` succeeds.
+    pub fn insert_txn(&self, txn_id: TxnId, pk: u64, values: Vec<u64>) -> EngineResult<()> {
+        self.mvcc.write_insert(txn_id, pk, values)
+    }
+
+    /// Stage a delete inside `txn_id`.
+    pub fn delete_txn(&self, txn_id: TxnId, pk: u64) -> EngineResult<()> {
+        self.mvcc.write_delete(txn_id, pk)
+    }
+
+    /// Read `pk` through the transaction's write buffer, then fall through to
+    /// the committed engine state.
+    ///
+    /// - A pending `insert_txn` for this pk returns `Ok(Some(row))`.
+    /// - A pending `delete_txn` for this pk returns `Ok(None)`.
+    /// - A pk not touched by this transaction returns the committed engine value.
+    pub fn get_txn(&self, txn_id: TxnId, pk: u64) -> EngineResult<Option<EngineRow>> {
+        match self.mvcc.read_intent(txn_id, pk)? {
+            Some(Some(values)) => Ok(Some(EngineRow { pk, values })),
+            Some(None) => Ok(None), // pending delete
+            None => self.get(pk),   // not in this txn — read committed state
+        }
+    }
+
+    /// Atomically apply all mutations in `txn_id` to the engine, then remove
+    /// the transaction from the store.
+    ///
+    /// Mutations are applied in undefined pk order.  If the engine returns an
+    /// error mid-commit the partial mutations already applied are not rolled
+    /// back — callers that need atomicity at the storage layer should wrap the
+    /// engine in an outer WAL, or accept that a crash mid-commit may leave the
+    /// engine in a partially-updated state.
+    pub fn commit_txn(&self, txn_id: TxnId) -> EngineResult<()> {
+        let mutations = self.mvcc.drain_commit(txn_id)?;
+        for (pk, intent) in mutations {
+            match intent {
+                Some(values) => {
+                    self.insert(pk, values)?;
+                }
+                None => {
+                    self.delete(pk)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Discard all pending mutations for `txn_id` without applying them.
+    pub fn rollback_txn(&self, txn_id: TxnId) -> EngineResult<()> {
+        self.mvcc.rollback(txn_id)
     }
 }
