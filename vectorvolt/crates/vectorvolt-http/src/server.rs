@@ -7,6 +7,14 @@ use tokio::net::TcpListener;
 use vectorvolt_engine::TableRegistry;
 
 use crate::handlers;
+use crate::metrics::Metrics;
+use crate::obs;
+
+/// Shared state injected into every axum handler.
+pub struct AppState {
+    pub registry: Arc<TableRegistry>,
+    pub metrics: Arc<Metrics>,
+}
 
 /// Configuration for the HTTP gateway.
 pub struct HttpServerConfig {
@@ -31,7 +39,8 @@ impl HttpServer {
         registry: Arc<TableRegistry>,
         config: HttpServerConfig,
     ) -> std::io::Result<Self> {
-        let app = build_router(registry);
+        let metrics = Metrics::new();
+        let app = build_router(registry, metrics);
         let listener = TcpListener::bind(config.addr).await?;
         Ok(Self { listener, app })
     }
@@ -47,8 +56,12 @@ impl HttpServer {
     }
 }
 
-fn build_router(registry: Arc<TableRegistry>) -> Router {
+fn build_router(registry: Arc<TableRegistry>, metrics: Arc<Metrics>) -> Router {
+    let state = Arc::new(AppState { registry, metrics });
     Router::new()
+        // Observability
+        .route("/health", get(obs::health))
+        .route("/metrics", get(obs::prometheus_metrics))
         // Table management
         .route("/tables", get(handlers::list_tables))
         .route("/tables/{table}", post(handlers::create_table))
@@ -61,5 +74,5 @@ fn build_router(registry: Arc<TableRegistry>) -> Router {
         // Queries
         .route("/tables/{table}/scan", get(handlers::scan_rows))
         .route("/tables/{table}/secondary", get(handlers::secondary_lookup))
-        .with_state(registry)
+        .with_state(state)
 }

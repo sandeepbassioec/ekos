@@ -4,6 +4,8 @@
 //!
 //! | Method | Path | Operation |
 //! |--------|------|-----------|
+//! | GET    | `/health` | JSON health check |
+//! | GET    | `/metrics` | Prometheus text metrics |
 //! | POST   | `/tables/{table}/rows/{pk}` | Insert row |
 //! | GET    | `/tables/{table}/rows/{pk}` | Get row by pk |
 //! | DELETE | `/tables/{table}/rows/{pk}` | Delete row |
@@ -15,7 +17,10 @@
 //! | DELETE | `/tables/{table}` | Drop table |
 
 pub mod handlers;
+pub mod metrics;
+pub mod obs;
 pub mod server;
 pub mod types;
 
-pub use server::{HttpServer, HttpServerConfig};
+pub use metrics::Metrics;
+pub use server::{AppState, HttpServer, HttpServerConfig};

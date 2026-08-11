@@ -353,3 +353,167 @@ async fn two_tables_are_isolated() {
     assert_eq!(a["values"][1], 10);
     assert_eq!(b["values"][1], 20);
 }
+
+// ── observability: health ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn health_returns_ok_status() {
+    let h = Harness::start_multi().await;
+    let resp: Value = h
+        .client
+        .get(h.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["status"], "ok");
+    assert!(resp["version"].is_string(), "version must be present");
+}
+
+#[tokio::test]
+async fn health_table_count_reflects_creates() {
+    let h = Harness::start_multi().await;
+    let before: Value = h
+        .client
+        .get(h.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let t0 = before["tables"].as_u64().unwrap();
+
+    h.client
+        .post(h.url("/tables/obs_t"))
+        .json(&json!({ "columns": ["pk","v"] }))
+        .send()
+        .await
+        .unwrap();
+
+    let after: Value = h
+        .client
+        .get(h.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["tables"].as_u64().unwrap(), t0 + 1);
+}
+
+#[tokio::test]
+async fn health_request_counters_increment() {
+    let h = Harness::start_with_table("cnt", &["pk", "v"]).await;
+
+    // insert → ok
+    h.client
+        .post(h.url("/tables/cnt/rows/1"))
+        .json(&json!({ "values": [1u64, 99u64] }))
+        .send()
+        .await
+        .unwrap();
+    // get missing → err
+    h.client
+        .get(h.url("/tables/cnt/rows/9999"))
+        .send()
+        .await
+        .unwrap();
+
+    let health: Value = h
+        .client
+        .get(h.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(health["requests_total"].as_u64().unwrap() >= 2);
+    assert!(health["requests_ok"].as_u64().unwrap() >= 1);
+    assert!(health["requests_err"].as_u64().unwrap() >= 1);
+}
+
+// ── observability: Prometheus metrics ────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_endpoint_returns_prometheus_text() {
+    let h = Harness::start_multi().await;
+    let resp = h.client.get(h.url("/metrics")).send().await.unwrap();
+    assert!(resp.status().is_success());
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ct.contains("text/plain"),
+        "metrics must be text/plain, got {ct}"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("vectorvolt_http_requests_total"),
+        "missing counter"
+    );
+    assert!(body.contains("# TYPE"), "missing TYPE comments");
+}
+
+#[tokio::test]
+async fn metrics_track_inserts() {
+    let h = Harness::start_with_table("m", &["pk", "age"]).await;
+    for pk in 1u64..=3 {
+        h.client
+            .post(h.url(&format!("/tables/m/rows/{pk}")))
+            .json(&json!({ "values": [pk, 10u64] }))
+            .send()
+            .await
+            .unwrap();
+    }
+    let body = h
+        .client
+        .get(h.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let inserted: u64 = body
+        .lines()
+        .find(|l| l.starts_with("vectorvolt_rows_inserted_total "))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        inserted >= 3,
+        "expected >= 3 inserts tracked, got {inserted}"
+    );
+}
+
+#[tokio::test]
+async fn metrics_include_per_table_stats() {
+    let h = Harness::start_with_table("pt", &["pk", "v"]).await;
+    h.client
+        .post(h.url("/tables/pt/rows/7"))
+        .json(&json!({ "values": [7u64, 42u64] }))
+        .send()
+        .await
+        .unwrap();
+    let body = h
+        .client
+        .get(h.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("vectorvolt_table_rows_buffered{table=\"pt\"}"),
+        "per-table buffered gauge missing"
+    );
+}
