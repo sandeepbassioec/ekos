@@ -268,24 +268,28 @@ pub fn run(args: ServeArgs) -> Result<()> {
             } else {
                 unreachable!("either registry or engine must be present")
             };
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(async move {
-                let cfg = HttpServerConfig::new(http_addr);
-                match HttpServer::bind(http_reg, cfg).await {
-                    Ok(srv) => {
-                        eprintln!(
-                            "  http      : http://{}",
-                            srv.local_addr().unwrap_or(http_addr)
-                        );
-                        if let Err(e) = srv.serve().await {
-                            eprintln!("HTTP gateway error: {e}");
+        std::thread::Builder::new()
+            .name("http-gateway".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                rt.block_on(async move {
+                    let cfg = HttpServerConfig::new(http_addr);
+                    match HttpServer::bind(http_reg, cfg).await {
+                        Ok(srv) => {
+                            eprintln!(
+                                "  http      : http://{}",
+                                srv.local_addr().unwrap_or(http_addr)
+                            );
+                            if let Err(e) = srv.serve().await {
+                                eprintln!("HTTP gateway error: {e}");
+                            }
                         }
+                        Err(e) => eprintln!("HTTP gateway bind failed: {e}"),
                     }
-                    Err(e) => eprintln!("HTTP gateway bind failed: {e}"),
-                }
-            });
-        });
+                });
+            })
+            .expect("spawn http-gateway thread");
     } else {
         eprintln!("  http      : disabled (use --http-addr to enable)");
     }
