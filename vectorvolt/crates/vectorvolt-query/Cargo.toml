@@ -1,16 +1,11 @@
 [package]
-name        = "vectorvolt-query"
-description = "VectorVolt Phase 2 query execution — PK lookup, range scan, secondary index, FK validation"
-version.workspace   = true
-authors.workspace   = true
-edition.workspace   = true
-license.workspace   = true
-repository.workspace = true
+name = "vectorvolt-query"
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-vectorvolt-index   = { workspace = true }
-vectorvolt-storage = { workspace = true }
-thiserror          = { workspace = true }
+vectorvolt-engine = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

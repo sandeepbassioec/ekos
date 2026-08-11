@@ -1,297 +1,196 @@
-//! Integration tests for `vectorvolt-query`.
-//!
-//! Each test builds a full TableCatalog with real PartitionReaders (written to
-//! temp files) and exercises the QueryEngine end-to-end.
+/// Layer 19 — query DSL integration tests.
+///
+/// Each test parses a query string and executes it against a live TableEngine
+/// to verify that the full lexer → parser → executor pipeline works end-to-end.
+use tempfile::TempDir;
+use vectorvolt_engine::{Durability, EngineOptions, TableEngine};
+use vectorvolt_query::{run, QueryResponse};
 
-use std::collections::HashMap;
-use std::io::Write;
-
-use tempfile::NamedTempFile;
-use vectorvolt_index::{CuckooFilter, CuckooMap, RowDescriptor, SecondaryIndex, ZoneMap};
-use vectorvolt_query::{QueryEngine, TableCatalog};
-use vectorvolt_storage::{ColumnValues, MicroPartition, PartitionReader, write_partition};
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-struct TempPartition {
-    _file: NamedTempFile,
-    reader: PartitionReader,
+fn open() -> (TableEngine, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let eng = TableEngine::open_with(
+        vec!["pk".into(), "age".into(), "score".into()],
+        dir.path(),
+        EngineOptions::new(1_048_576).with_durability(Durability::WriteOnly),
+    )
+    .unwrap();
+    (eng, dir)
 }
 
-fn make_partition(file_id: u16, partition_id: u16, pks: &[u64], values: &[u64]) -> TempPartition {
-    let mut p = MicroPartition::new(file_id, partition_id);
-    p.push_column("pk", ColumnValues::Raw(pks.to_vec()))
-        .unwrap();
-    p.push_column("val", ColumnValues::auto_encode(values.to_vec()))
-        .unwrap();
+// ── insert + get ──────────────────────────────────────────────────────────────
 
-    let mut buf: Vec<u8> = Vec::new();
-    write_partition(&mut buf, &p).unwrap();
-
-    let mut tmp = NamedTempFile::new().unwrap();
-    tmp.write_all(&buf).unwrap();
-    tmp.flush().unwrap();
-
-    let reader = PartitionReader::open(tmp.path()).unwrap();
-    TempPartition { _file: tmp, reader }
-}
-
-// ── tests ─────────────────────────────────────────────────────────────────────
-
-/// PK point lookup returns the correct row.
 #[test]
-fn pk_lookup_finds_correct_row() {
-    let tp = make_partition(0, 0, &[100u64, 200, 300], &[10u64, 20, 30]);
-
-    let mut pk_index = CuckooMap::with_capacity(8);
-    pk_index.insert(100, RowDescriptor::new(0, 0, 0)).unwrap();
-    pk_index.insert(200, RowDescriptor::new(0, 0, 1)).unwrap();
-    pk_index.insert(300, RowDescriptor::new(0, 0, 2)).unwrap();
-
-    let mut partitions = HashMap::new();
-    partitions.insert((0u16, 0u16), tp.reader);
-
-    let catalog = TableCatalog::new(
-        pk_index,
-        SecondaryIndex::new(),
-        ZoneMap::new(),
-        CuckooFilter::with_capacity(8),
-        partitions,
-    );
-    let engine = QueryEngine::new(catalog);
-
-    let row = engine.pk_lookup(200).unwrap().expect("pk=200 must exist");
-    assert_eq!(row.pk, 200);
-    assert_eq!(row.values[0], 200); // col 0 = pk
-    assert_eq!(row.values[1], 20); // col 1 = val
-}
-
-/// PK lookup for a missing key returns None.
-#[test]
-fn pk_lookup_missing_key_returns_none() {
-    let tp = make_partition(0, 0, &[1u64], &[99u64]);
-
-    let mut pk_index = CuckooMap::with_capacity(8);
-    pk_index.insert(1, RowDescriptor::new(0, 0, 0)).unwrap();
-
-    let mut partitions = HashMap::new();
-    partitions.insert((0u16, 0u16), tp.reader);
-
-    let catalog = TableCatalog::new(
-        pk_index,
-        SecondaryIndex::new(),
-        ZoneMap::new(),
-        CuckooFilter::with_capacity(8),
-        partitions,
-    );
-    let engine = QueryEngine::new(catalog);
-
-    assert!(engine.pk_lookup(42).unwrap().is_none());
-}
-
-/// Range scan across two partitions with ZoneMap pruning.
-#[test]
-fn range_scan_multi_partition_with_zone_pruning() {
-    // Partition 0: pks=[1,2,3], val=[10,20,30] → zone [10,30]
-    // Partition 1: pks=[4,5,6], val=[40,50,60] → zone [40,60]
-    // Query: val BETWEEN 10 AND 30 → only partition 0 should be scanned
-    let tp0 = make_partition(0, 0, &[1u64, 2, 3], &[10u64, 20, 30]);
-    let tp1 = make_partition(0, 1, &[4u64, 5, 6], &[40u64, 50, 60]);
-
-    let mut pk_index = CuckooMap::with_capacity(16);
-    pk_index.insert(1, RowDescriptor::new(0, 0, 0)).unwrap();
-    pk_index.insert(2, RowDescriptor::new(0, 0, 1)).unwrap();
-    pk_index.insert(3, RowDescriptor::new(0, 0, 2)).unwrap();
-    pk_index.insert(4, RowDescriptor::new(0, 1, 0)).unwrap();
-    pk_index.insert(5, RowDescriptor::new(0, 1, 1)).unwrap();
-    pk_index.insert(6, RowDescriptor::new(0, 1, 2)).unwrap();
-
-    let mut partitions = HashMap::new();
-    partitions.insert((0u16, 0u16), tp0.reader);
-    partitions.insert((0u16, 1u16), tp1.reader);
-
-    let catalog = TableCatalog::new(
-        pk_index,
-        SecondaryIndex::new(),
-        ZoneMap::new(),
-        CuckooFilter::with_capacity(16),
-        partitions,
-    );
-    let engine = QueryEngine::new(catalog);
-
-    let mut rows = engine.range_scan(1, 10, 30).unwrap();
-    rows.sort_by_key(|r| r.values[1]);
-
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0].values[1], 10);
-    assert_eq!(rows[1].values[1], 20);
-    assert_eq!(rows[2].values[1], 30);
-
-    // No rows from partition 1 (vals 40-60 outside [10,30])
-    for r in &rows {
-        assert!(r.values[1] <= 30);
+fn insert_and_get_row() {
+    let (eng, _dir) = open();
+    run(&eng, "INSERT 1 1 25 99").unwrap();
+    let resp = run(&eng, "GET 1").unwrap();
+    match resp {
+        QueryResponse::Row(row) => {
+            assert_eq!(row.pk, 1);
+            assert_eq!(row.values[1], 25);
+            assert_eq!(row.values[2], 99);
+        }
+        other => panic!("expected Row, got {other:?}"),
     }
 }
 
-/// Range scan returns empty slice when no values fall in range.
 #[test]
-fn range_scan_no_match_returns_empty() {
-    let tp = make_partition(0, 0, &[1u64, 2], &[5u64, 10]);
-
-    let mut pk_index = CuckooMap::with_capacity(8);
-    pk_index.insert(1, RowDescriptor::new(0, 0, 0)).unwrap();
-    pk_index.insert(2, RowDescriptor::new(0, 0, 1)).unwrap();
-
-    let mut partitions = HashMap::new();
-    partitions.insert((0u16, 0u16), tp.reader);
-
-    let catalog = TableCatalog::new(
-        pk_index,
-        SecondaryIndex::new(),
-        ZoneMap::new(),
-        CuckooFilter::with_capacity(8),
-        partitions,
-    );
-    let engine = QueryEngine::new(catalog);
-
-    let rows = engine.range_scan(1, 100, 200).unwrap();
-    assert!(rows.is_empty());
+fn get_missing_row_returns_not_found() {
+    let (eng, _dir) = open();
+    let resp = run(&eng, "GET 9999").unwrap();
+    assert!(matches!(resp, QueryResponse::NotFound));
 }
 
-/// Secondary index scan resolves PKs to full rows.
+// ── delete ────────────────────────────────────────────────────────────────────
+
 #[test]
-fn secondary_scan_resolves_rows() {
-    let pks = [1u64, 2, 3];
-    let vals = [42u64, 99, 42]; // val=42 for pk=1 and pk=3
-
-    let tp = make_partition(0, 0, &pks, &vals);
-
-    let mut pk_index = CuckooMap::with_capacity(8);
-    for (offset, &pk) in pks.iter().enumerate() {
-        pk_index
-            .insert(pk, RowDescriptor::new(0, 0, offset as u32))
-            .unwrap();
-    }
-
-    // secondary_index: hash(42) → [1, 3], hash(99) → [2]
-    let mut secondary_index = SecondaryIndex::new();
-    secondary_index.insert(42u32, 1u32); // pk=1 has val=42
-    secondary_index.insert(42u32, 3u32); // pk=3 has val=42
-    secondary_index.insert(99u32, 2u32); // pk=2 has val=99
-
-    let mut partitions = HashMap::new();
-    partitions.insert((0u16, 0u16), tp.reader);
-
-    let catalog = TableCatalog::new(
-        pk_index,
-        secondary_index,
-        ZoneMap::new(),
-        CuckooFilter::with_capacity(8),
-        partitions,
-    );
-    let engine = QueryEngine::new(catalog);
-
-    let mut rows = engine.secondary_scan(42u32).unwrap();
-    rows.sort_by_key(|r| r.pk);
-
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].pk, 1);
-    assert_eq!(rows[0].values[1], 42);
-    assert_eq!(rows[1].pk, 3);
-    assert_eq!(rows[1].values[1], 42);
+fn delete_row_then_get_not_found() {
+    let (eng, _dir) = open();
+    run(&eng, "INSERT 5 5 0 0").unwrap();
+    run(&eng, "DELETE 5").unwrap();
+    let resp = run(&eng, "GET 5").unwrap();
+    assert!(matches!(resp, QueryResponse::NotFound));
 }
 
-/// FK existence check: inserted keys are found; non-inserted keys are not.
+// ── scan ──────────────────────────────────────────────────────────────────────
+
 #[test]
-fn fk_exists_inserted_keys() {
-    let tp = make_partition(0, 0, &[10u64], &[1u64]);
-
-    let mut pk_index = CuckooMap::with_capacity(8);
-    pk_index.insert(10, RowDescriptor::new(0, 0, 0)).unwrap();
-
-    let mut fk_filter = CuckooFilter::with_capacity(32);
-    for k in [10u64, 20, 30, 40, 50] {
-        fk_filter.insert(k).unwrap();
+fn scan_returns_range() {
+    let (eng, _dir) = open();
+    for pk in 1u64..=5 {
+        run(&eng, &format!("INSERT {pk} {pk} {} 0", pk * 10)).unwrap();
     }
-
-    let mut partitions = HashMap::new();
-    partitions.insert((0u16, 0u16), tp.reader);
-
-    let catalog = TableCatalog::new(
-        pk_index,
-        SecondaryIndex::new(),
-        ZoneMap::new(),
-        fk_filter,
-        partitions,
-    );
-    let engine = QueryEngine::new(catalog);
-
-    assert!(engine.fk_exists(10));
-    assert!(engine.fk_exists(20));
-    assert!(engine.fk_exists(50));
-    // 9999 was never inserted — very unlikely to be a false positive at this size
-    assert!(!engine.fk_exists(9999));
+    let resp = run(&eng, "SCAN col=1 lo=20 hi=30").unwrap();
+    match resp {
+        QueryResponse::Rows(rows) => {
+            let mut pks: Vec<u64> = rows.iter().map(|r| r.pk).collect();
+            pks.sort();
+            assert_eq!(pks, vec![2, 3]);
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
 }
 
-/// Full workflow: build catalog, run all 4 query types against one table.
+// ── secondary ────────────────────────────────────────────────────────────────
+
 #[test]
-fn full_query_workflow() {
-    // 6 rows across 2 partitions
-    let tp0 = make_partition(1, 0, &[1u64, 2, 3], &[10u64, 20, 30]);
-    let tp1 = make_partition(1, 1, &[4u64, 5, 6], &[40u64, 20, 60]);
-
-    let mut pk_index = CuckooMap::with_capacity(16);
-    pk_index.insert(1, RowDescriptor::new(1, 0, 0)).unwrap();
-    pk_index.insert(2, RowDescriptor::new(1, 0, 1)).unwrap();
-    pk_index.insert(3, RowDescriptor::new(1, 0, 2)).unwrap();
-    pk_index.insert(4, RowDescriptor::new(1, 1, 0)).unwrap();
-    pk_index.insert(5, RowDescriptor::new(1, 1, 1)).unwrap();
-    pk_index.insert(6, RowDescriptor::new(1, 1, 2)).unwrap();
-
-    // Secondary: val=20 appears at pk=2 and pk=5
-    let mut secondary_index = SecondaryIndex::new();
-    secondary_index.insert(20u32, 2u32);
-    secondary_index.insert(20u32, 5u32);
-
-    // FK filter covers all PKs
-    let mut fk_filter = CuckooFilter::with_capacity(16);
-    for pk in 1u64..=6 {
-        fk_filter.insert(pk).unwrap();
+fn secondary_lookup_returns_matching_rows() {
+    let (eng, _dir) = open();
+    for pk in 1u64..=3 {
+        run(&eng, &format!("INSERT {pk} {pk} 55 0")).unwrap();
     }
+    run(&eng, "INSERT 4 4 99 0").unwrap();
+    let resp = run(&eng, "SECONDARY col=1 val=55").unwrap();
+    match resp {
+        QueryResponse::Rows(rows) => {
+            let mut pks: Vec<u64> = rows.iter().map(|r| r.pk).collect();
+            pks.sort();
+            assert_eq!(pks, vec![1, 2, 3]);
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
 
-    let mut partitions = HashMap::new();
-    partitions.insert((1u16, 0u16), tp0.reader);
-    partitions.insert((1u16, 1u16), tp1.reader);
+// ── describe + stats ──────────────────────────────────────────────────────────
 
-    let catalog = TableCatalog::new(
-        pk_index,
-        secondary_index,
-        ZoneMap::new(),
-        fk_filter,
-        partitions,
-    );
-    let engine = QueryEngine::new(catalog);
+#[test]
+fn describe_returns_schema() {
+    let (eng, _dir) = open();
+    let resp = run(&eng, "DESCRIBE").unwrap();
+    match resp {
+        QueryResponse::Schema(cols) => {
+            assert_eq!(cols, vec!["pk", "age", "score"]);
+        }
+        other => panic!("expected Schema, got {other:?}"),
+    }
+}
 
-    // 1. PK lookup
-    assert_eq!(engine.pk_lookup(4).unwrap().unwrap().values[1], 40);
-    assert!(engine.pk_lookup(99).unwrap().is_none());
+#[test]
+fn stats_returns_engine_stats() {
+    let (eng, _dir) = open();
+    run(&eng, "INSERT 1 1 0 0").unwrap();
+    let resp = run(&eng, "STATS").unwrap();
+    match resp {
+        QueryResponse::Stats(s) => {
+            assert!(s.rows_buffered >= 1, "at least 1 row in buffer");
+        }
+        other => panic!("expected Stats, got {other:?}"),
+    }
+}
 
-    // 2. Range scan: val BETWEEN 20 AND 40
-    let mut range = engine.range_scan(1, 20, 40).unwrap();
-    range.sort_by_key(|r| r.pk);
-    let range_pks: Vec<u64> = range.iter().map(|r| r.pk).collect();
-    assert!(range_pks.contains(&2)); // val=20
-    assert!(range_pks.contains(&4)); // val=40
-    assert!(range_pks.contains(&5)); // val=20
+// ── transactions ──────────────────────────────────────────────────────────────
 
-    // 3. Secondary scan
-    let mut sec = engine.secondary_scan(20u32).unwrap();
-    sec.sort_by_key(|r| r.pk);
-    assert_eq!(sec.len(), 2);
-    assert_eq!(sec[0].pk, 2);
-    assert_eq!(sec[1].pk, 5);
+#[test]
+fn begin_returns_txn_id() {
+    let (eng, _dir) = open();
+    let resp = run(&eng, "BEGIN").unwrap();
+    assert!(matches!(resp, QueryResponse::TxnStarted(_)));
+}
 
-    // 4. FK exists
-    assert!(engine.fk_exists(3));
-    assert!(!engine.fk_exists(777));
+#[test]
+fn txn_insert_commit_visible() {
+    let (eng, _dir) = open();
+    let txn_id = match run(&eng, "BEGIN").unwrap() {
+        QueryResponse::TxnStarted(id) => id,
+        other => panic!("expected TxnStarted, got {other:?}"),
+    };
+    run(&eng, &format!("INSERT TXN {txn_id} 10 10 50 1")).unwrap();
+    // not yet visible
+    assert!(matches!(
+        run(&eng, "GET 10").unwrap(),
+        QueryResponse::NotFound
+    ));
+    // commit
+    run(&eng, &format!("COMMIT {txn_id}")).unwrap();
+    // now visible
+    match run(&eng, "GET 10").unwrap() {
+        QueryResponse::Row(row) => assert_eq!(row.values[1], 50),
+        other => panic!("expected Row after commit, got {other:?}"),
+    }
+}
+
+#[test]
+fn txn_rollback_discards_insert() {
+    let (eng, _dir) = open();
+    let txn_id = match run(&eng, "BEGIN").unwrap() {
+        QueryResponse::TxnStarted(id) => id,
+        other => panic!("{other:?}"),
+    };
+    run(&eng, &format!("INSERT TXN {txn_id} 20 20 0 0")).unwrap();
+    run(&eng, &format!("ROLLBACK {txn_id}")).unwrap();
+    assert!(matches!(
+        run(&eng, "GET 20").unwrap(),
+        QueryResponse::NotFound
+    ));
+}
+
+#[test]
+fn get_txn_sees_pending_insert() {
+    let (eng, _dir) = open();
+    let txn_id = match run(&eng, "BEGIN").unwrap() {
+        QueryResponse::TxnStarted(id) => id,
+        other => panic!("{other:?}"),
+    };
+    run(&eng, &format!("INSERT TXN {txn_id} 7 7 77 0")).unwrap();
+    match run(&eng, &format!("GET TXN {txn_id} 7")).unwrap() {
+        QueryResponse::Row(row) => assert_eq!(row.values[1], 77),
+        other => panic!("expected Row, got {other:?}"),
+    }
+    run(&eng, &format!("ROLLBACK {txn_id}")).unwrap();
+}
+
+// ── parser error handling ─────────────────────────────────────────────────────
+
+#[test]
+fn parse_error_on_unknown_keyword() {
+    let (eng, _dir) = open();
+    let err = run(&eng, "FOOBAR 1").unwrap_err();
+    assert!(matches!(err, vectorvolt_query::QueryError::Syntax(_)));
+}
+
+#[test]
+fn parse_error_on_missing_pk() {
+    let (eng, _dir) = open();
+    let err = run(&eng, "GET").unwrap_err();
+    assert!(matches!(err, vectorvolt_query::QueryError::UnexpectedEof));
 }
