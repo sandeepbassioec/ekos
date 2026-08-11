@@ -639,3 +639,99 @@ public class FkExistsTests : IDisposable
 
     public void Dispose() { _client.Dispose(); _server.Dispose(); }
 }
+
+// ── Control plane — multi-table mode ─────────────────────────────────────────
+
+public class ControlPlaneTests : IDisposable
+{
+    private readonly ServerHarness _server;
+    private readonly VectorVoltClient _client;
+
+    public ControlPlaneTests()
+    {
+        _server = ServerHarness.StartMultiTable();
+        _client = _server.OpenClient();
+    }
+
+    [Fact]
+    public void CreateTable_then_ListTables_contains_new_table()
+    {
+        _client.CreateTable("orders", ["pk", "amount", "ts"]);
+        var tables = _client.ListTables();
+        Assert.Contains("orders", tables);
+    }
+
+    [Fact]
+    public void TableExists_false_before_create_true_after()
+    {
+        Assert.False(_client.TableExists("products"));
+        _client.CreateTable("products", ["pk", "price"]);
+        Assert.True(_client.TableExists("products"));
+    }
+
+    [Fact]
+    public void DropTable_removes_table_from_list()
+    {
+        _client.CreateTable("tmp", ["pk", "val"]);
+        Assert.True(_client.TableExists("tmp"));
+        _client.DropTable("tmp");
+        Assert.False(_client.TableExists("tmp"));
+    }
+
+    [Fact]
+    public void UseTable_switches_active_table_for_crud()
+    {
+        _client.CreateTable("alpha", ["pk", "x"]);
+        _client.CreateTable("beta",  ["pk", "y"]);
+
+        _client.UseTable("alpha");
+        _client.Insert(1UL, [10UL]);
+
+        _client.UseTable("beta");
+        _client.Insert(1UL, [99UL]);
+
+        // Read back from each table independently.
+        _client.UseTable("alpha");
+        var rowA = _client.Get(1UL);
+        Assert.NotNull(rowA);
+        Assert.Equal(10UL, rowA[1]);
+
+        _client.UseTable("beta");
+        var rowB = _client.Get(1UL);
+        Assert.NotNull(rowB);
+        Assert.Equal(99UL, rowB[1]);
+    }
+
+    [Fact]
+    public void DescribeTable_returns_schema_columns()
+    {
+        _client.CreateTable("items", ["pk", "name_hash", "qty"]);
+        _client.UseTable("items");
+        var schema = _client.DescribeTable();
+        Assert.Equal(3, schema.Length);
+        Assert.Equal("pk",        schema[0]);
+        Assert.Equal("name_hash", schema[1]);
+        Assert.Equal("qty",       schema[2]);
+    }
+
+    [Fact]
+    public void ListTables_empty_on_fresh_server()
+    {
+        var tables = _client.ListTables();
+        Assert.Empty(tables);
+    }
+
+    [Fact]
+    public void CreateTable_duplicate_is_idempotent_or_errors_gracefully()
+    {
+        _client.CreateTable("dup", ["pk", "v"]);
+        // Second create should either succeed silently or throw a server exception —
+        // either is acceptable; what is NOT acceptable is a crash or connection drop.
+        try { _client.CreateTable("dup", ["pk", "v"]); }
+        catch (VectorVoltServerException) { /* expected */ }
+        // Connection still usable.
+        Assert.True(_client.TableExists("dup"));
+    }
+
+    public void Dispose() { _client.Dispose(); _server.Dispose(); }
+}
