@@ -26,6 +26,7 @@
 mod compact;
 mod engine;
 mod error;
+mod mvcc;
 mod registry;
 mod row;
 mod stats;
@@ -34,6 +35,7 @@ pub use compact::CompactResult;
 pub use engine::TableEngine;
 pub use engine::{Durability, EngineOptions, FlushResult, WalTip};
 pub use error::{EngineError, EngineResult};
+pub use mvcc::TxnId;
 pub use registry::{SCHEMA_FILE, TableRegistry};
 pub use row::EngineRow;
 pub use stats::EngineStats;
