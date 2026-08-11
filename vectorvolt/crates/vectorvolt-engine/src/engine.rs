@@ -31,9 +31,9 @@ use crate::{CompactResult, EngineError, EngineResult, EngineRow, EngineStats, Tx
 
 /// Per-table engine: owns the write path (TxnManager) and read path (PartitionReader map).
 pub struct TableEngine {
-    txn: TxnManager,
+    pub(crate) txn: TxnManager,
     /// Flushed partition files keyed by (file_id, partition_id).
-    partitions: RwLock<HashMap<(u16, u16), PartitionReader>>,
+    pub(crate) partitions: RwLock<HashMap<(u16, u16), PartitionReader>>,
     partition_dir: PathBuf,
     pub schema: Vec<String>,
     /// How `compact` chooses what to merge.
@@ -773,7 +773,7 @@ impl TableEngine {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Flush write buffer and register the new partition.
-    fn do_flush(&self) -> EngineResult<()> {
+    pub(crate) fn do_flush(&self) -> EngineResult<()> {
         if self.txn.flush()?.is_some() {
             self.sync_partitions()?;
         }

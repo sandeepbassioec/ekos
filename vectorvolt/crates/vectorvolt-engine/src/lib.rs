@@ -23,6 +23,7 @@
 //! assert_eq!(row.values[1], 25);
 //! ```
 
+mod aggregate;
 mod compact;
 mod engine;
 mod error;
