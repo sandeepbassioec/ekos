@@ -33,7 +33,7 @@ use crate::{EngineError, EngineResult};
 impl TableEngine {
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    fn check_col(&self, col_idx: usize) -> EngineResult<()> {
+    pub(crate) fn check_col(&self, col_idx: usize) -> EngineResult<()> {
         let col_count = self.schema.len();
         if col_idx >= col_count {
             return Err(EngineError::ColOutOfRange { col_idx, col_count });
@@ -42,7 +42,7 @@ impl TableEngine {
     }
 
     /// Flush the write buffer if any buffered rows exist.
-    fn flush_if_needed(&self) -> EngineResult<()> {
+    pub(crate) fn flush_if_needed(&self) -> EngineResult<()> {
         if self.txn.row_count_buffered() > 0 {
             self.do_flush()?;
         }

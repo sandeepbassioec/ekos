@@ -32,6 +32,7 @@ mod error;
 mod mvcc;
 mod registry;
 mod row;
+mod sort;
 mod stats;
 
 pub use aggregate::HistogramBucket;
