@@ -1,15 +1,18 @@
-//! On-demand secondary indexes.
+//! Secondary indexes — on-demand build, auto-maintained on writes.
 //!
 //! A secondary index maps a non-PK column value to the set of PKs that hold
 //! that value, enabling O(log n) exact and range lookups without a full scan.
 //!
 //! ## Lifecycle
 //!
-//! Indexes are **built on demand** and **not auto-maintained** on writes.
-//! After inserting or deleting rows, rebuild the index with
-//! [`TableEngine::build_secondary_index`] to keep it consistent.
-//! Stale indexes return stale results — no silent corruption occurs because
-//! index results are PK lists that callers then resolve through `get`.
+//! An index is built explicitly with [`TableEngine::build_secondary_index`],
+//! which performs a full partition scan.  Once built, every subsequent
+//! `insert` and `delete` on the engine automatically updates all live indexes
+//! so they stay consistent with the table.  Dropping an index stops
+//! maintenance for that column; rebuilding it restores consistency from the
+//! full partition snapshot.
+//!
+//! If no index is built, `insert` and `delete` pay no extra cost.
 //!
 //! ## API
 //!
@@ -18,6 +21,7 @@
 //! | `build_secondary_index(col)` | Scan all partitions and build the index for `col`. |
 //! | `secondary_lookup(col, value)` | PKs where `col == value`. |
 //! | `secondary_range_lookup(col, lo, hi)` | PKs where `col` is in `[lo, hi]`. |
+//! | `secondary_get(col, value)` | Full rows where `col == value`. |
 //! | `drop_secondary_index(col)` | Remove the index for `col` from memory. |
 //! | `has_secondary_index(col)` | Whether an index currently exists for `col`. |
 //! | `secondary_index_entry_count(col)` | Number of distinct values in the index. |
@@ -141,5 +145,54 @@ impl TableEngine {
             .get(&col_idx)
             .map(|idx| idx.len())
             .unwrap_or(0)
+    }
+
+    // ── Write-path maintenance ────────────────────────────────────────────────
+
+    /// Update all live secondary indexes after a successful `insert`.
+    ///
+    /// `old_row` is `None` for a pure insert, or `Some` when replacing an
+    /// existing row (upsert path).  `new_values` is the full column slice that
+    /// was just written.
+    ///
+    /// Fast path: returns immediately when no indexes are live.
+    pub(crate) fn secondary_maintain_insert(
+        &self,
+        pk: u64,
+        old_row: Option<&EngineRow>,
+        new_values: &[u64],
+    ) {
+        let mut indexes = self.secondary_indexes.write();
+        if indexes.is_empty() {
+            return;
+        }
+        for (col_idx, btree) in indexes.iter_mut() {
+            // Remove pk from the old bucket when replacing an existing row.
+            if let Some(old) = old_row {
+                let old_val = old.values[*col_idx];
+                if let Some(set) = btree.get_mut(&old_val) {
+                    set.remove(&pk);
+                }
+            }
+            // Insert pk into the new bucket.
+            let new_val = new_values[*col_idx];
+            btree.entry(new_val).or_default().insert(pk);
+        }
+    }
+
+    /// Update all live secondary indexes after a successful `delete`.
+    ///
+    /// Fast path: a no-op when no indexes are live.
+    pub(crate) fn secondary_maintain_delete(&self, pk: u64, old_row: &EngineRow) {
+        let mut indexes = self.secondary_indexes.write();
+        if indexes.is_empty() {
+            return;
+        }
+        for (col_idx, btree) in indexes.iter_mut() {
+            let old_val = old_row.values[*col_idx];
+            if let Some(set) = btree.get_mut(&old_val) {
+                set.remove(&pk);
+            }
+        }
     }
 }
