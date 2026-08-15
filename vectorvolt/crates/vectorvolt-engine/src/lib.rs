@@ -32,6 +32,7 @@ mod registry;
 mod row;
 mod stats;
 
+pub use aggregate::HistogramBucket;
 pub use compact::CompactResult;
 pub use engine::TableEngine;
 pub use engine::{Durability, EngineOptions, FlushResult, WalTip};
