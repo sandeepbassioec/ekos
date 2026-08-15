@@ -28,6 +28,7 @@ mod compact;
 mod engine;
 mod error;
 mod mvcc;
+mod project;
 mod registry;
 mod row;
 mod stats;
