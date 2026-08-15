@@ -9,4 +9,6 @@ pub struct EngineStats {
     pub partition_count: usize,
     /// Column names in schema order.
     pub schema: Vec<String>,
+    /// Auto-compact threshold if configured, otherwise `None`.
+    pub auto_compact_threshold: Option<usize>,
 }

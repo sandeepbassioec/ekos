@@ -51,6 +51,9 @@ pub struct TableEngine {
     /// sequence for the whole conditional write, preventing two concurrent CAS
     /// callers from interleaving their individual steps.
     pub(crate) cas_lock: parking_lot::Mutex<()>,
+    /// Auto-compact trigger: compact after any flush that produces ≥ N partitions.
+    /// `None` means manual compaction only.
+    auto_compact_threshold: Option<usize>,
     /// Per-row TTL deadlines: pk → expire_at (opaque u64 timestamp, caller's epoch).
     /// Rows absent from this map never expire.
     pub(crate) ttl_index: RwLock<std::collections::BTreeMap<u64, u64>>,
@@ -128,6 +131,10 @@ pub struct EngineOptions {
     /// enable LZ4, since a compacted partition is colder than a fresh one, but it
     /// costs O(1) point reads so it is off by default.
     pub write_options: WriteOptions,
+    /// When `Some(n)`, automatically call `compact()` after every flush that
+    /// brings the partition count to `n` or more.  `None` (default) disables
+    /// the auto-trigger; callers must invoke `compact()` explicitly.
+    pub auto_compact_threshold: Option<usize>,
 }
 
 impl Default for EngineOptions {
@@ -143,6 +150,7 @@ impl EngineOptions {
             durability: Durability::Fsync,
             compaction_strategy: CompactionStrategy::default(),
             write_options: WriteOptions::default(),
+            auto_compact_threshold: None,
         }
     }
 
@@ -162,6 +170,46 @@ impl EngineOptions {
     /// O(column) rather than O(1) — see `vectorvolt_storage::COMPRESSION_LZ4`.
     pub fn with_compressed_compaction(mut self) -> Self {
         self.write_options = WriteOptions::new().with_lz4();
+        self
+    }
+
+    /// Automatically compact after any flush that brings the partition count to
+    /// `threshold` or more.
+    ///
+    /// A threshold of `2` compacts every time a second partition is created.
+    /// Choose a larger value (e.g. `8`) to amortise the compaction cost over
+    /// several flushes while still bounding read amplification.
+    ///
+    /// Also sets `l0_trigger: 1` on a Leveled strategy (or `min_run: 1` on
+    /// SizeTiered) so the compaction planner always produces a job when the
+    /// threshold fires — without this adjustment the default `l0_trigger: 4`
+    /// would cause the compaction call to be a no-op for small tables.
+    pub fn with_auto_compact(mut self, threshold: usize) -> Self {
+        self.auto_compact_threshold = Some(threshold.max(1));
+        self.compaction_strategy = match self.compaction_strategy {
+            CompactionStrategy::Leveled {
+                level_multiplier,
+                l1_bytes,
+                garbage_threshold,
+                ..
+            } => CompactionStrategy::Leveled {
+                l0_trigger: 1,
+                level_multiplier,
+                l1_bytes,
+                garbage_threshold,
+            },
+            CompactionStrategy::SizeTiered {
+                max_run,
+                size_ratio,
+                garbage_threshold,
+                ..
+            } => CompactionStrategy::SizeTiered {
+                min_run: 1,
+                max_run,
+                size_ratio,
+                garbage_threshold,
+            },
+        };
         self
     }
 }
@@ -363,6 +411,7 @@ impl TableEngine {
             manifest_recovery,
             mvcc: MvccStore::new(),
             cas_lock: parking_lot::Mutex::new(()),
+            auto_compact_threshold: options.auto_compact_threshold,
             ttl_index: RwLock::new(std::collections::BTreeMap::new()),
             secondary_indexes: RwLock::new(std::collections::HashMap::new()),
         })
@@ -391,6 +440,7 @@ impl TableEngine {
         let tip = self.txn.insert(pk, values)?;
         if self.txn.total_rows_flushed() > flushed_before {
             self.sync_partitions()?;
+            self.maybe_compact()?;
         }
 
         if let Some((old_row, new_vals)) = index_work {
@@ -424,6 +474,7 @@ impl TableEngine {
         let result = self.txn.flush()?;
         if result.is_some() {
             self.sync_partitions()?;
+            self.maybe_compact()?;
         }
         Ok(result)
     }
@@ -852,6 +903,7 @@ impl TableEngine {
             rows_flushed: self.txn.total_rows_flushed(),
             partition_count: self.partitions.read().len(),
             schema: self.schema.clone(),
+            auto_compact_threshold: self.auto_compact_threshold,
         }
     }
 
@@ -861,6 +913,26 @@ impl TableEngine {
     pub(crate) fn do_flush(&self) -> EngineResult<()> {
         if self.txn.flush()?.is_some() {
             self.sync_partitions()?;
+            self.maybe_compact()?;
+        }
+        Ok(())
+    }
+
+    /// Compact if the partition count has reached the auto-compact threshold.
+    ///
+    /// Called after every `sync_partitions`.  A no-op when
+    /// `auto_compact_threshold` is `None` or the count is below the threshold.
+    ///
+    /// No recursion: `compact()` calls `do_flush()`, which only enters
+    /// `sync_partitions` + `maybe_compact` when `txn.flush()` flushes rows
+    /// (returns `Some`).  Because `compact()` begins with `do_flush()` and
+    /// succeeds only when the write buffer is empty, its internal `do_flush`
+    /// call returns `None` and the chain stops there.
+    fn maybe_compact(&self) -> EngineResult<()> {
+        if let Some(threshold) = self.auto_compact_threshold
+            && self.partitions.read().len() >= threshold
+        {
+            self.compact()?;
         }
         Ok(())
     }
