@@ -53,3 +53,35 @@ pub struct ErrorResp {
 pub struct OkResp {
     pub ok: bool,
 }
+
+// ── query endpoint ────────────────────────────────────────────────────────────
+
+/// JSON envelope returned by `POST /tables/{table}/query`.
+///
+/// Every variant carries a `type` discriminant so callers can pattern-match
+/// without inspecting field presence.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum QueryResp {
+    Row {
+        pk: u64,
+        values: Vec<u64>,
+    },
+    Rows {
+        rows: Vec<RowResp>,
+    },
+    TxnStarted {
+        txn_id: u64,
+    },
+    Schema {
+        columns: Vec<String>,
+    },
+    Stats {
+        rows_buffered: usize,
+        rows_flushed: u64,
+        partition_count: usize,
+        schema: Vec<String>,
+    },
+    Ok,
+    NotFound,
+}
