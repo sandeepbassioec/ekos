@@ -27,6 +27,7 @@ mod aggregate;
 mod batch;
 mod compact;
 mod cond;
+mod distinct;
 mod engine;
 mod error;
 mod field_update;
