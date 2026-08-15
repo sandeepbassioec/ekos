@@ -58,60 +58,18 @@ impl TableEngine {
             }
         }
 
-        if self.txn.row_count_buffered() > 0 {
-            self.do_flush()?;
-        }
-
-        // Determine which columns to actually decode.
-        // col 0 is always needed for the PK; add it if missing from projection.
-        let mut decode_set: Vec<usize> = vec![0];
-        for &c in projection {
-            if !decode_set.contains(&c) {
-                decode_set.push(c);
-            }
-        }
-        if !decode_set.contains(&filter_col) {
-            decode_set.push(filter_col);
-        }
-
-        let mut results = Vec::new();
-        let parts = self.partitions.read();
-
-        for reader in parts.values() {
-            // Zone prune on the filter column.
-            if let Ok((min, max)) = reader.zone_min_max(filter_col)
-                && (min > hi || max < lo)
-            {
-                continue;
-            }
-
-            let offsets = reader.filter_offsets(filter_col, lo, hi)?;
-            if offsets.is_empty() {
-                continue;
-            }
-
-            // Decode only the columns we need.
-            let mut bufs: std::collections::HashMap<usize, Vec<u64>> =
-                std::collections::HashMap::new();
-            let mut tmp = Vec::new();
-            for &c in &decode_set {
-                reader.decode_column_into(c, &mut tmp)?;
-                bufs.insert(c, std::mem::take(&mut tmp));
-            }
-
-            let pk_buf = bufs.get(&0).map(Vec::as_slice).unwrap_or(&[]);
-
-            for &o in &offsets {
-                let o = o as usize;
-                let pk = pk_buf.get(o).copied().unwrap_or(u64::MAX);
-                let values: Vec<u64> = projection
-                    .iter()
-                    .map(|&c| bufs.get(&c).and_then(|b| b.get(o)).copied().unwrap_or(0))
-                    .collect();
-                results.push(EngineRow { pk, values });
-            }
-        }
-
+        // Use scan_deduped for authoritative, pk-deduplicated rows, then
+        // project.  This is slightly less efficient than the old partition-
+        // level selective decode, but is correct in the presence of stale
+        // partition copies from un-compacted updates.
+        let full_rows = self.scan_deduped(filter_col, lo, hi)?;
+        let results = full_rows
+            .into_iter()
+            .map(|row| {
+                let values: Vec<u64> = projection.iter().map(|&c| row.values[c]).collect();
+                EngineRow { pk: row.pk, values }
+            })
+            .collect();
         Ok(results)
     }
 }

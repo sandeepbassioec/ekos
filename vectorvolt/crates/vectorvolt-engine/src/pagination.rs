@@ -31,8 +31,6 @@
 //! | Exact `limit` rows remain | Returns them, `next_cursor = None` |
 //! | More than `limit` rows remain | Returns first `limit`, `next_cursor = Some(last_pk)` |
 
-use std::collections::HashMap;
-
 use crate::engine::TableEngine;
 use crate::{EngineResult, EngineRow};
 
@@ -68,19 +66,9 @@ impl TableEngine {
             });
         }
 
-        // Collect all matching rows, then dedup by pk (keeping the row whose
-        // values come last — i.e. the most-recently written partition, which
-        // appears last in the partition map's iteration order after sync).
-        let raw = self.scan(filter_col, lo, hi)?;
-
-        // Dedup: later entries overwrite earlier ones for the same pk.
-        let mut by_pk: HashMap<u64, EngineRow> = HashMap::with_capacity(raw.len());
-        for row in raw {
-            by_pk.insert(row.pk, row);
-        }
-
-        // Sort surviving rows by pk ascending, then apply cursor.
-        let mut rows: Vec<EngineRow> = by_pk.into_values().collect();
+        // scan_deduped gives one authoritative row per PK (re-verified via
+        // get()), so no further dedup is needed here.
+        let mut rows = self.scan_deduped(filter_col, lo, hi)?;
         rows.sort_unstable_by_key(|r| r.pk);
         let start = rows.partition_point(|r| r.pk <= after_pk);
         let rows = &rows[start..];

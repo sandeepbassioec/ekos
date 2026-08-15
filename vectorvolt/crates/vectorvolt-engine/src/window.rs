@@ -45,7 +45,7 @@ impl TableEngine {
     ) -> EngineResult<Vec<WindowRow>> {
         self.check_col(filter_col)?;
         self.check_col(agg_col)?;
-        let mut rows = self.scan(filter_col, lo, hi)?;
+        let mut rows = self.scan_deduped(filter_col, lo, hi)?;
         rows.sort_unstable_by_key(|r| r.pk);
         let mut cumsum: u64 = 0;
         Ok(rows
@@ -70,7 +70,7 @@ impl TableEngine {
         hi: u64,
     ) -> EngineResult<Vec<WindowRow>> {
         self.check_col(filter_col)?;
-        let mut rows = self.scan(filter_col, lo, hi)?;
+        let mut rows = self.scan_deduped(filter_col, lo, hi)?;
         rows.sort_unstable_by_key(|r| r.pk);
         Ok(rows
             .into_iter()
@@ -98,7 +98,7 @@ impl TableEngine {
     ) -> EngineResult<Vec<WindowRow>> {
         self.check_col(filter_col)?;
         self.check_col(sort_col)?;
-        let mut rows = self.scan(filter_col, lo, hi)?;
+        let mut rows = self.scan_deduped(filter_col, lo, hi)?;
         sort_rows(&mut rows, sort_col, ascending);
         Ok(assign_rank(&rows, sort_col, false))
     }
@@ -118,7 +118,7 @@ impl TableEngine {
     ) -> EngineResult<Vec<WindowRow>> {
         self.check_col(filter_col)?;
         self.check_col(sort_col)?;
-        let mut rows = self.scan(filter_col, lo, hi)?;
+        let mut rows = self.scan_deduped(filter_col, lo, hi)?;
         sort_rows(&mut rows, sort_col, ascending);
         Ok(assign_rank(&rows, sort_col, true))
     }

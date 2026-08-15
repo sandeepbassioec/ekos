@@ -57,7 +57,7 @@ impl TableEngine {
     /// Rows inserted without a TTL are always included.  Order matches `scan`.
     pub fn scan_with_ttl(&self, now: u64) -> EngineResult<Vec<EngineRow>> {
         // Use col 0 (pk) with [0, u64::MAX] to match all rows.
-        let all = self.scan(0, 0, u64::MAX)?;
+        let all = self.scan_deduped(0, 0, u64::MAX)?;
         let ttl = self.ttl_index.read();
         Ok(all
             .into_iter()

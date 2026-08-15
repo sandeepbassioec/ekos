@@ -17,6 +17,8 @@
 //! For small `L` relative to `M` the sort dominates; a future layer could
 //! replace it with a tournament heap for O(M log L) without changing the API.
 
+use std::collections::HashSet;
+
 use crate::engine::TableEngine;
 use crate::{EngineResult, EngineRow};
 
@@ -108,6 +110,15 @@ impl TableEngine {
 
         if candidates.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Dedup by pk: the same PK can appear from multiple partition files
+        // when a row was updated but not yet compacted.  Keep only the first
+        // occurrence; the sort_val may be stale but the row is materialised
+        // via get() below so the caller always receives current data.
+        {
+            let mut seen: HashSet<u64> = HashSet::with_capacity(candidates.len());
+            candidates.retain(|(_, pk)| seen.insert(*pk));
         }
 
         // Sort all candidates, then take limit.

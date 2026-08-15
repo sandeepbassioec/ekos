@@ -16,6 +16,8 @@
 //! Decoding work scales with matching rows at each stage, not total rows — a
 //! selective first predicate makes later checks nearly free.
 
+use std::collections::HashSet;
+
 use crate::engine::TableEngine;
 use crate::{EngineResult, EngineRow};
 
@@ -98,6 +100,22 @@ impl TableEngine {
             }
         }
 
-        Ok(results)
+        // Dedup by pk via get(): the same PK can appear in multiple partition
+        // files.  For each unique PK, get() provides the authoritative current
+        // row; we then re-verify all predicates on the current values so rows
+        // updated out of the predicate range are correctly excluded.
+        let mut seen: HashSet<u64> = HashSet::with_capacity(results.len());
+        let mut verified: Vec<EngineRow> = Vec::with_capacity(results.len());
+        for row in results {
+            if seen.insert(row.pk)
+                && let Some(current) = self.get(row.pk)?
+                && predicates
+                    .iter()
+                    .all(|&(col, lo, hi)| current.values[col] >= lo && current.values[col] <= hi)
+            {
+                verified.push(current);
+            }
+        }
+        Ok(verified)
     }
 }
