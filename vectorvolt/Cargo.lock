@@ -1978,6 +1978,7 @@ dependencies = [
  "tokio",
  "tower",
  "vectorvolt-engine",
+ "vectorvolt-query",
 ]
 
 [[package]]
