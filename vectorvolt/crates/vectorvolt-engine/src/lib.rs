@@ -41,6 +41,7 @@ mod secondary_index;
 mod sort;
 mod stats;
 mod ttl;
+mod update_where;
 mod window;
 
 pub use aggregate::HistogramBucket;
