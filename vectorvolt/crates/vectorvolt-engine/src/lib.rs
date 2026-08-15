@@ -33,6 +33,7 @@ mod mvcc;
 mod project;
 mod registry;
 mod row;
+mod sort;
 mod stats;
 
 pub use aggregate::HistogramBucket;
