@@ -517,3 +517,171 @@ async fn metrics_include_per_table_stats() {
         "per-table buffered gauge missing"
     );
 }
+
+// ── Layer 22: text query DSL over HTTP ────────────────────────────────────────
+
+/// Helper: POST a text query to `/tables/{table}/query` and return the JSON.
+async fn query(h: &Harness, table: &str, q: &str) -> Value {
+    h.client
+        .post(h.url(&format!("/tables/{table}/query")))
+        .body(q.to_string())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn query_insert_and_get() {
+    let h = Harness::start_with_table("qt", &["pk", "age", "score"]).await;
+    let ins = query(&h, "qt", "INSERT 10 10 25 99").await;
+    assert_eq!(ins["type"], "ok");
+
+    let got = query(&h, "qt", "GET 10").await;
+    assert_eq!(got["type"], "row");
+    assert_eq!(got["pk"], 10);
+    assert_eq!(got["values"][1], 25);
+}
+
+#[tokio::test]
+async fn query_get_not_found() {
+    let h = Harness::start_with_table("qt2", &["pk", "age"]).await;
+    let resp = query(&h, "qt2", "GET 999").await;
+    assert_eq!(resp["type"], "not_found");
+}
+
+#[tokio::test]
+async fn query_delete_row() {
+    let h = Harness::start_with_table("qt3", &["pk", "val"]).await;
+    query(&h, "qt3", "INSERT 1 1 100").await;
+    let del = query(&h, "qt3", "DELETE 1").await;
+    assert_eq!(del["type"], "ok");
+    let got = query(&h, "qt3", "GET 1").await;
+    assert_eq!(got["type"], "not_found");
+}
+
+#[tokio::test]
+async fn query_scan_returns_rows() {
+    let h = Harness::start_with_table("qt4", &["pk", "age"]).await;
+    query(&h, "qt4", "INSERT 1 1 10").await;
+    query(&h, "qt4", "INSERT 2 2 20").await;
+    query(&h, "qt4", "INSERT 3 3 30").await;
+    let resp = query(&h, "qt4", "SCAN col=1 lo=10 hi=20").await;
+    assert_eq!(resp["type"], "rows");
+    assert_eq!(resp["rows"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn query_describe_returns_schema() {
+    let h = Harness::start_with_table("qt5", &["pk", "name", "qty"]).await;
+    let resp = query(&h, "qt5", "DESCRIBE").await;
+    assert_eq!(resp["type"], "schema");
+    assert_eq!(resp["columns"], json!(["pk", "name", "qty"]));
+}
+
+#[tokio::test]
+async fn query_stats_returns_numeric_fields() {
+    let h = Harness::start_with_table("qt6", &["pk", "v"]).await;
+    query(&h, "qt6", "INSERT 1 1 42").await;
+    let resp = query(&h, "qt6", "STATS").await;
+    assert_eq!(resp["type"], "stats");
+    assert!(resp["rows_buffered"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn query_txn_begin_commit() {
+    let h = Harness::start_with_table("qt7", &["pk", "val"]).await;
+    let begun = query(&h, "qt7", "BEGIN").await;
+    assert_eq!(begun["type"], "txn_started");
+    let txn_id = begun["txn_id"].as_u64().unwrap();
+
+    let ins = query(&h, "qt7", &format!("INSERT TXN {txn_id} 5 5 777")).await;
+    assert_eq!(ins["type"], "ok");
+
+    // Not visible outside txn yet
+    let before = query(&h, "qt7", "GET 5").await;
+    assert_eq!(before["type"], "not_found");
+
+    let commit = query(&h, "qt7", &format!("COMMIT {txn_id}")).await;
+    assert_eq!(commit["type"], "ok");
+
+    let after = query(&h, "qt7", "GET 5").await;
+    assert_eq!(after["type"], "row");
+    assert_eq!(after["values"][1], 777);
+}
+
+#[tokio::test]
+async fn query_txn_rollback_discards_writes() {
+    let h = Harness::start_with_table("qt8", &["pk", "val"]).await;
+    let begun = query(&h, "qt8", "BEGIN").await;
+    let txn_id = begun["txn_id"].as_u64().unwrap();
+
+    query(&h, "qt8", &format!("INSERT TXN {txn_id} 9 9 55")).await;
+    let rb = query(&h, "qt8", &format!("ROLLBACK {txn_id}")).await;
+    assert_eq!(rb["type"], "ok");
+
+    let got = query(&h, "qt8", "GET 9").await;
+    assert_eq!(got["type"], "not_found");
+}
+
+#[tokio::test]
+async fn query_unknown_table_returns_error() {
+    let h = Harness::start_multi().await;
+    let resp = h
+        .client
+        .post(h.url("/tables/no_such_table/query"))
+        .body("GET 1")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "expected 4xx for unknown table"
+    );
+}
+
+#[tokio::test]
+async fn query_syntax_error_returns_error() {
+    let h = Harness::start_with_table("qt9", &["pk", "v"]).await;
+    let resp = h
+        .client
+        .post(h.url("/tables/qt9/query"))
+        .body("NOT A VALID QUERY @@@@")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_server_error() || resp.status().is_client_error());
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn query_ok_increments_metrics_counter() {
+    let h = Harness::start_with_table("qt10", &["pk", "v"]).await;
+    let before: Value = h
+        .client
+        .get(h.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let before_ok = before["requests_ok"].as_u64().unwrap();
+
+    query(&h, "qt10", "INSERT 1 1 10").await;
+    query(&h, "qt10", "GET 1").await;
+
+    let after: Value = h
+        .client
+        .get(h.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(after["requests_ok"].as_u64().unwrap() > before_ok);
+}

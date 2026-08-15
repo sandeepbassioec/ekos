@@ -7,8 +7,8 @@ use axum::response::IntoResponse;
 
 use crate::server::AppState;
 use crate::types::{
-    CreateTableBody, ErrorResp, InsertBody, OkResp, RowResp, RowsResp, ScanQuery, SchemaResp,
-    SecondaryQuery, TablesResp,
+    CreateTableBody, ErrorResp, InsertBody, OkResp, QueryResp, RowResp, RowsResp, ScanQuery,
+    SchemaResp, SecondaryQuery, TablesResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -231,5 +231,62 @@ pub async fn drop_table(
             Json(OkResp { ok: true }).into_response()
         }
         Err(e) => engine_err(&st, e).into_response(),
+    }
+}
+
+// ── text query ────────────────────────────────────────────────────────────────
+
+/// `POST /tables/{table}/query` — execute a text query via the VectorVolt DSL.
+///
+/// Request body: `text/plain` query string (e.g. `"GET pk=42"`, `"BEGIN"`,
+/// `"SCAN col=1 lo=0 hi=100"`).
+///
+/// Response: JSON tagged-union keyed on `"type"`:
+/// `"row"`, `"rows"`, `"txn_started"`, `"schema"`, `"stats"`, `"ok"`, `"not_found"`.
+pub async fn query_handler(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    body: String,
+) -> impl IntoResponse {
+    let eng = match st.registry.get(&table) {
+        Err(e) => return engine_err(&st, e).into_response(),
+        Ok(eng) => eng,
+    };
+
+    match vectorvolt_query::run(&eng, &body) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(resp) => {
+            st.metrics.record_ok();
+            let json = match resp {
+                vectorvolt_query::QueryResponse::Row(row) => Json(QueryResp::Row {
+                    pk: row.pk,
+                    values: row.values,
+                }),
+                vectorvolt_query::QueryResponse::Rows(rows) => Json(QueryResp::Rows {
+                    rows: rows
+                        .into_iter()
+                        .map(|r| RowResp {
+                            pk: r.pk,
+                            values: r.values,
+                        })
+                        .collect(),
+                }),
+                vectorvolt_query::QueryResponse::TxnStarted(id) => {
+                    Json(QueryResp::TxnStarted { txn_id: id })
+                }
+                vectorvolt_query::QueryResponse::Schema(cols) => {
+                    Json(QueryResp::Schema { columns: cols })
+                }
+                vectorvolt_query::QueryResponse::Stats(s) => Json(QueryResp::Stats {
+                    rows_buffered: s.rows_buffered,
+                    rows_flushed: s.rows_flushed,
+                    partition_count: s.partition_count,
+                    schema: s.schema,
+                }),
+                vectorvolt_query::QueryResponse::Ok => Json(QueryResp::Ok),
+                vectorvolt_query::QueryResponse::NotFound => Json(QueryResp::NotFound),
+            };
+            json.into_response()
+        }
     }
 }

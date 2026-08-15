@@ -74,5 +74,7 @@ fn build_router(registry: Arc<TableRegistry>, metrics: Arc<Metrics>) -> Router {
         // Queries
         .route("/tables/{table}/scan", get(handlers::scan_rows))
         .route("/tables/{table}/secondary", get(handlers::secondary_lookup))
+        // Text query DSL
+        .route("/tables/{table}/query", post(handlers::query_handler))
         .with_state(state)
 }
