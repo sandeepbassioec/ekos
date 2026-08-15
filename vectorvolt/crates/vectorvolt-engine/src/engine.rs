@@ -54,8 +54,9 @@ pub struct TableEngine {
     /// Per-row TTL deadlines: pk → expire_at (opaque u64 timestamp, caller's epoch).
     /// Rows absent from this map never expire.
     pub(crate) ttl_index: RwLock<std::collections::BTreeMap<u64, u64>>,
-    /// On-demand secondary indexes: col_idx → (col_value → set of PKs).
-    /// Built explicitly via `build_secondary_index`; not auto-maintained on writes.
+    /// Secondary indexes: col_idx → (col_value → set of PKs).
+    /// Built explicitly via `build_secondary_index`; auto-maintained by every
+    /// subsequent `insert` and `delete` so long as the index is live.
     pub(crate) secondary_indexes: RwLock<
         std::collections::HashMap<
             usize,
@@ -373,18 +374,46 @@ impl TableEngine {
     ///
     /// If the write buffer hits its threshold an auto-flush is triggered and
     /// the new partition is immediately registered for reads.
+    ///
+    /// All live secondary indexes are updated atomically after the write
+    /// succeeds, at no extra cost when no indexes are built.
     pub fn insert(&self, pk: u64, values: Vec<u64>) -> EngineResult<WalTip> {
+        // Snapshot the old row and clone the new values for index maintenance.
+        // Only pays the cost when at least one secondary index is live.
+        let index_work = if !self.secondary_indexes.read().is_empty() {
+            let old_row = self.get(pk)?;
+            Some((old_row, values.clone()))
+        } else {
+            None
+        };
+
         let flushed_before = self.txn.total_rows_flushed();
         let tip = self.txn.insert(pk, values)?;
         if self.txn.total_rows_flushed() > flushed_before {
             self.sync_partitions()?;
         }
+
+        if let Some((old_row, new_vals)) = index_work {
+            self.secondary_maintain_insert(pk, old_row.as_ref(), &new_vals);
+        }
+
         Ok(tip)
     }
 
     /// Remove a row. Returns `Err(TxnError::PkNotFound)` for unknown PKs.
+    ///
+    /// All live secondary indexes are updated after the delete succeeds.
     pub fn delete(&self, pk: u64) -> EngineResult<WalTip> {
-        Ok(self.txn.delete(pk)?)
+        let old_row = if !self.secondary_indexes.read().is_empty() {
+            self.get(pk)?
+        } else {
+            None
+        };
+        let tip = self.txn.delete(pk)?;
+        if let Some(row) = old_row {
+            self.secondary_maintain_delete(pk, &row);
+        }
+        Ok(tip)
     }
 
     /// Flush the write buffer to a new `.vvsst` partition file.
