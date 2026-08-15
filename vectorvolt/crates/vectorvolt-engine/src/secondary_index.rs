@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine::TableEngine;
+use crate::index_catalog;
 use crate::{EngineResult, EngineRow};
 
 impl TableEngine {
@@ -46,21 +47,15 @@ impl TableEngine {
 
         let mut index: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
 
-        {
-            let mut col_buf: Vec<u64> = Vec::new();
-            let mut pk_buf: Vec<u64> = Vec::new();
-            let parts = self.partitions.read();
-            for reader in parts.values() {
-                reader.decode_column_into(col_idx, &mut col_buf)?;
-                reader.decode_column_into(0, &mut pk_buf)?;
-                let len = col_buf.len().min(pk_buf.len());
-                for i in 0..len {
-                    index.entry(col_buf[i]).or_default().insert(pk_buf[i]);
-                }
-            }
+        // scan_deduped goes through get() so only live (non-deleted) rows are
+        // included — raw partition reads include physically-present tombstoned
+        // rows that have been removed from the pk_index.
+        for row in self.scan_deduped(col_idx, 0, u64::MAX)? {
+            index.entry(row.values[col_idx]).or_default().insert(row.pk);
         }
 
         self.secondary_indexes.write().insert(col_idx, index);
+        self.save_index_catalog();
         Ok(())
     }
 
@@ -124,11 +119,24 @@ impl TableEngine {
         Ok(rows)
     }
 
-    /// Remove the secondary index for `col_idx` from memory.
+    /// Remove the secondary index for `col_idx` from memory and from the
+    /// on-disk catalog so it is not rebuilt on the next restart.
     ///
     /// A no-op when no index exists for that column.
     pub fn drop_secondary_index(&self, col_idx: usize) {
         self.secondary_indexes.write().remove(&col_idx);
+        self.save_index_catalog();
+    }
+
+    /// Write the current set of live index column ids to the catalog file.
+    ///
+    /// Best-effort: a write failure (e.g. read-only test filesystem) is
+    /// silently ignored.  The worst outcome is that the index is not rebuilt
+    /// on the next restart — the same state as before Layer 41 existed.
+    pub(crate) fn save_index_catalog(&self) {
+        let mut cols: Vec<usize> = self.secondary_indexes.read().keys().copied().collect();
+        cols.sort_unstable();
+        let _ = index_catalog::save(&self.catalog_path, &cols);
     }
 
     /// Whether a secondary index currently exists for `col_idx`.

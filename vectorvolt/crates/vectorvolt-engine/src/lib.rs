@@ -32,6 +32,7 @@ mod engine;
 mod error;
 mod field_update;
 mod groupby;
+mod index_catalog;
 mod mvcc;
 mod pagination;
 mod project;
