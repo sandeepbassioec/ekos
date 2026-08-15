@@ -36,6 +36,7 @@ mod registry;
 mod row;
 mod sort;
 mod stats;
+mod ttl;
 
 pub use aggregate::HistogramBucket;
 pub use compact::CompactResult;
