@@ -24,6 +24,7 @@
 //! ```
 
 mod aggregate;
+mod batch;
 mod compact;
 mod cond;
 mod engine;
