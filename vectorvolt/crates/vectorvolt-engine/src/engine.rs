@@ -51,6 +51,9 @@ pub struct TableEngine {
     /// sequence for the whole conditional write, preventing two concurrent CAS
     /// callers from interleaving their individual steps.
     pub(crate) cas_lock: parking_lot::Mutex<()>,
+    /// Per-row TTL deadlines: pk → expire_at (opaque u64 timestamp, caller's epoch).
+    /// Rows absent from this map never expire.
+    pub(crate) ttl_index: RwLock<std::collections::BTreeMap<u64, u64>>,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -351,6 +354,7 @@ impl TableEngine {
             manifest_recovery,
             mvcc: MvccStore::new(),
             cas_lock: parking_lot::Mutex::new(()),
+            ttl_index: RwLock::new(std::collections::BTreeMap::new()),
         })
     }
 
