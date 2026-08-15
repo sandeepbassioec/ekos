@@ -29,6 +29,7 @@ mod compact;
 mod cond;
 mod engine;
 mod error;
+mod groupby;
 mod mvcc;
 mod project;
 mod registry;
