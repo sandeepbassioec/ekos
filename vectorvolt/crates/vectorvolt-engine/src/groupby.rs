@@ -5,20 +5,16 @@
 //! Results are returned as a `Vec<(group_value, aggregate)>` sorted
 //! ascending by `group_value` for deterministic output.
 //!
-//! ## Architecture
+//! ## Dedup correctness
 //!
-//! Like the scalar aggregates in `aggregate.rs`, these functions:
-//!
-//! 1. **Zone-prune** — skip partitions where `filter_col` has no overlap with
-//!    `[lo, hi]`.
-//! 2. **Two-column decode** — decode only `filter_col` (to re-check the
-//!    predicate) + `group_col` (for grouping) + `agg_col` (for the aggregate).
-//!    No full-row materialisation.
-//! 3. **BTreeMap accumulation** — keyed on `group_col` value, updated in-place.
+//! All four methods route through `scan_deduped` so each logical row
+//! contributes exactly once, even when a row has been updated since the last
+//! compaction and its physical bytes appear in more than one partition file.
+
+use std::collections::BTreeMap;
 
 use crate::EngineResult;
 use crate::engine::TableEngine;
-use std::collections::BTreeMap;
 
 impl TableEngine {
     // ── internal helper ───────────────────────────────────────────────────────
@@ -40,7 +36,6 @@ impl TableEngine {
     /// Count rows per `group_col` value where `filter_col` is in `[lo, hi]`.
     ///
     /// Returns `Vec<(group_value, count)>` sorted ascending by `group_value`.
-    /// `agg_col` is ignored (pass any valid column index).
     pub fn group_by_count(
         &self,
         filter_col: usize,
@@ -53,34 +48,9 @@ impl TableEngine {
         if lo > hi {
             return Ok(Vec::new());
         }
-        self.flush_if_needed()?;
-
         let mut acc: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut filter_buf: Vec<u64> = Vec::new();
-        let mut group_buf: Vec<u64> = Vec::new();
-
-        let parts = self.partitions.read();
-        for reader in parts.values() {
-            if let Ok((min, max)) = reader.zone_min_max(filter_col)
-                && (min > hi || max < lo)
-            {
-                continue;
-            }
-            let offsets = reader.filter_offsets(filter_col, lo, hi)?;
-            if offsets.is_empty() {
-                continue;
-            }
-            reader.decode_column_into(filter_col, &mut filter_buf)?;
-            reader.decode_column_into(group_col, &mut group_buf)?;
-            for &o in &offsets {
-                let idx = o as usize;
-                let fv = *filter_buf.get(idx).unwrap_or(&0);
-                if fv < lo || fv > hi {
-                    continue;
-                }
-                let gv = *group_buf.get(idx).unwrap_or(&0);
-                *acc.entry(gv).or_insert(0) += 1;
-            }
+        for row in self.scan_deduped(filter_col, lo, hi)? {
+            *acc.entry(row.values[group_col]).or_insert(0) += 1;
         }
         Ok(acc.into_iter().collect())
     }
@@ -101,37 +71,10 @@ impl TableEngine {
         if lo > hi {
             return Ok(Vec::new());
         }
-        self.flush_if_needed()?;
-
         let mut acc: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut filter_buf: Vec<u64> = Vec::new();
-        let mut group_buf: Vec<u64> = Vec::new();
-        let mut agg_buf: Vec<u64> = Vec::new();
-
-        let parts = self.partitions.read();
-        for reader in parts.values() {
-            if let Ok((min, max)) = reader.zone_min_max(filter_col)
-                && (min > hi || max < lo)
-            {
-                continue;
-            }
-            let offsets = reader.filter_offsets(filter_col, lo, hi)?;
-            if offsets.is_empty() {
-                continue;
-            }
-            reader.decode_column_into(filter_col, &mut filter_buf)?;
-            reader.decode_column_into(group_col, &mut group_buf)?;
-            reader.decode_column_into(agg_col, &mut agg_buf)?;
-            for &o in &offsets {
-                let idx = o as usize;
-                let fv = *filter_buf.get(idx).unwrap_or(&0);
-                if fv < lo || fv > hi {
-                    continue;
-                }
-                let gv = *group_buf.get(idx).unwrap_or(&0);
-                let av = *agg_buf.get(idx).unwrap_or(&0);
-                *acc.entry(gv).or_insert(0) = acc.get(&gv).unwrap_or(&0).wrapping_add(av);
-            }
+        for row in self.scan_deduped(filter_col, lo, hi)? {
+            let e = acc.entry(row.values[group_col]).or_insert(0);
+            *e = e.wrapping_add(row.values[agg_col]);
         }
         Ok(acc.into_iter().collect())
     }
@@ -152,39 +95,12 @@ impl TableEngine {
         if lo > hi {
             return Ok(Vec::new());
         }
-        self.flush_if_needed()?;
-
         let mut acc: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut filter_buf: Vec<u64> = Vec::new();
-        let mut group_buf: Vec<u64> = Vec::new();
-        let mut agg_buf: Vec<u64> = Vec::new();
-
-        let parts = self.partitions.read();
-        for reader in parts.values() {
-            if let Ok((min, max)) = reader.zone_min_max(filter_col)
-                && (min > hi || max < lo)
-            {
-                continue;
-            }
-            let offsets = reader.filter_offsets(filter_col, lo, hi)?;
-            if offsets.is_empty() {
-                continue;
-            }
-            reader.decode_column_into(filter_col, &mut filter_buf)?;
-            reader.decode_column_into(group_col, &mut group_buf)?;
-            reader.decode_column_into(agg_col, &mut agg_buf)?;
-            for &o in &offsets {
-                let idx = o as usize;
-                let fv = *filter_buf.get(idx).unwrap_or(&0);
-                if fv < lo || fv > hi {
-                    continue;
-                }
-                let gv = *group_buf.get(idx).unwrap_or(&0);
-                let av = *agg_buf.get(idx).unwrap_or(&0);
-                acc.entry(gv)
-                    .and_modify(|cur| *cur = (*cur).min(av))
-                    .or_insert(av);
-            }
+        for row in self.scan_deduped(filter_col, lo, hi)? {
+            let av = row.values[agg_col];
+            acc.entry(row.values[group_col])
+                .and_modify(|cur| *cur = (*cur).min(av))
+                .or_insert(av);
         }
         Ok(acc.into_iter().collect())
     }
@@ -205,39 +121,12 @@ impl TableEngine {
         if lo > hi {
             return Ok(Vec::new());
         }
-        self.flush_if_needed()?;
-
         let mut acc: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut filter_buf: Vec<u64> = Vec::new();
-        let mut group_buf: Vec<u64> = Vec::new();
-        let mut agg_buf: Vec<u64> = Vec::new();
-
-        let parts = self.partitions.read();
-        for reader in parts.values() {
-            if let Ok((min, max)) = reader.zone_min_max(filter_col)
-                && (min > hi || max < lo)
-            {
-                continue;
-            }
-            let offsets = reader.filter_offsets(filter_col, lo, hi)?;
-            if offsets.is_empty() {
-                continue;
-            }
-            reader.decode_column_into(filter_col, &mut filter_buf)?;
-            reader.decode_column_into(group_col, &mut group_buf)?;
-            reader.decode_column_into(agg_col, &mut agg_buf)?;
-            for &o in &offsets {
-                let idx = o as usize;
-                let fv = *filter_buf.get(idx).unwrap_or(&0);
-                if fv < lo || fv > hi {
-                    continue;
-                }
-                let gv = *group_buf.get(idx).unwrap_or(&0);
-                let av = *agg_buf.get(idx).unwrap_or(&0);
-                acc.entry(gv)
-                    .and_modify(|cur| *cur = (*cur).max(av))
-                    .or_insert(av);
-            }
+        for row in self.scan_deduped(filter_col, lo, hi)? {
+            let av = row.values[agg_col];
+            acc.entry(row.values[group_col])
+                .and_modify(|cur| *cur = (*cur).max(av))
+                .or_insert(av);
         }
         Ok(acc.into_iter().collect())
     }

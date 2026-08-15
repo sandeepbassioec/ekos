@@ -53,24 +53,11 @@ impl TableEngine {
 
     /// Count rows where `col_idx` is in `[lo, hi]`.
     ///
-    /// Uses zone pruning to skip partitions entirely and decodes only the
-    /// target column — **no full-row materialisation**.
+    /// Uses `scan_deduped` so each logical row is counted exactly once even
+    /// when stale partition copies exist from un-compacted updates.
     pub fn count_range(&self, col_idx: usize, lo: u64, hi: u64) -> EngineResult<u64> {
         self.check_col(col_idx)?;
-        self.flush_if_needed()?;
-
-        let mut count = 0u64;
-        let parts = self.partitions.read();
-        for reader in parts.values() {
-            if let Ok((min, max)) = reader.zone_min_max(col_idx)
-                && (min > hi || max < lo)
-            {
-                continue; // zone prune
-            }
-            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
-            count += offsets.len() as u64;
-        }
-        Ok(count)
+        Ok(self.scan_deduped(col_idx, lo, hi)?.len() as u64)
     }
 
     /// Sum values in `col_idx` for rows where `col_idx` is in `[lo, hi]`.
@@ -78,27 +65,10 @@ impl TableEngine {
     /// Returns `0` for an empty result set.  Wraps on `u64` overflow.
     pub fn sum_range(&self, col_idx: usize, lo: u64, hi: u64) -> EngineResult<u64> {
         self.check_col(col_idx)?;
-        self.flush_if_needed()?;
-
-        let mut total = 0u64;
-        let mut col_buf = Vec::new();
-        let parts = self.partitions.read();
-        for reader in parts.values() {
-            if let Ok((min, max)) = reader.zone_min_max(col_idx)
-                && (min > hi || max < lo)
-            {
-                continue;
-            }
-            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
-            if offsets.is_empty() {
-                continue;
-            }
-            reader.decode_column_into(col_idx, &mut col_buf)?;
-            for &o in &offsets {
-                total = total.wrapping_add(*col_buf.get(o as usize).unwrap_or(&0));
-            }
-        }
-        Ok(total)
+        Ok(self
+            .scan_deduped(col_idx, lo, hi)?
+            .iter()
+            .fold(0u64, |acc, r| acc.wrapping_add(r.values[col_idx])))
     }
 
     /// Minimum value in `col_idx` for rows where `col_idx` is in `[lo, hi]`.
@@ -106,31 +76,11 @@ impl TableEngine {
     /// Returns `None` if no rows match.
     pub fn min_range(&self, col_idx: usize, lo: u64, hi: u64) -> EngineResult<Option<u64>> {
         self.check_col(col_idx)?;
-        self.flush_if_needed()?;
-
-        let mut result: Option<u64> = None;
-        let mut col_buf = Vec::new();
-        let parts = self.partitions.read();
-        for reader in parts.values() {
-            if let Ok((min, max)) = reader.zone_min_max(col_idx)
-                && (min > hi || max < lo)
-            {
-                continue;
-            }
-            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
-            if offsets.is_empty() {
-                continue;
-            }
-            reader.decode_column_into(col_idx, &mut col_buf)?;
-            for &o in &offsets {
-                let v = *col_buf.get(o as usize).unwrap_or(&u64::MAX);
-                result = Some(match result {
-                    None => v,
-                    Some(cur) => cur.min(v),
-                });
-            }
-        }
-        Ok(result)
+        Ok(self
+            .scan_deduped(col_idx, lo, hi)?
+            .iter()
+            .map(|r| r.values[col_idx])
+            .reduce(u64::min))
     }
 
     /// Maximum value in `col_idx` for rows where `col_idx` is in `[lo, hi]`.
@@ -138,31 +88,11 @@ impl TableEngine {
     /// Returns `None` if no rows match.
     pub fn max_range(&self, col_idx: usize, lo: u64, hi: u64) -> EngineResult<Option<u64>> {
         self.check_col(col_idx)?;
-        self.flush_if_needed()?;
-
-        let mut result: Option<u64> = None;
-        let mut col_buf = Vec::new();
-        let parts = self.partitions.read();
-        for reader in parts.values() {
-            if let Ok((min, max)) = reader.zone_min_max(col_idx)
-                && (min > hi || max < lo)
-            {
-                continue;
-            }
-            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
-            if offsets.is_empty() {
-                continue;
-            }
-            reader.decode_column_into(col_idx, &mut col_buf)?;
-            for &o in &offsets {
-                let v = *col_buf.get(o as usize).unwrap_or(&0);
-                result = Some(match result {
-                    None => v,
-                    Some(cur) => cur.max(v),
-                });
-            }
-        }
-        Ok(result)
+        Ok(self
+            .scan_deduped(col_idx, lo, hi)?
+            .iter()
+            .map(|r| r.values[col_idx])
+            .reduce(u64::max))
     }
 
     /// Average of `col_idx` for rows where `col_idx` is in `[lo, hi]`.
@@ -170,33 +100,14 @@ impl TableEngine {
     /// Returns `None` if no rows match.
     pub fn avg_range(&self, col_idx: usize, lo: u64, hi: u64) -> EngineResult<Option<f64>> {
         self.check_col(col_idx)?;
-        self.flush_if_needed()?;
-
-        let mut total = 0u64;
-        let mut count = 0u64;
-        let mut col_buf = Vec::new();
-        let parts = self.partitions.read();
-        for reader in parts.values() {
-            if let Ok((min, max)) = reader.zone_min_max(col_idx)
-                && (min > hi || max < lo)
-            {
-                continue;
-            }
-            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
-            if offsets.is_empty() {
-                continue;
-            }
-            reader.decode_column_into(col_idx, &mut col_buf)?;
-            for &o in &offsets {
-                total = total.wrapping_add(*col_buf.get(o as usize).unwrap_or(&0));
-                count += 1;
-            }
+        let rows = self.scan_deduped(col_idx, lo, hi)?;
+        if rows.is_empty() {
+            return Ok(None);
         }
-        if count == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(total as f64 / count as f64))
-        }
+        let total: u64 = rows
+            .iter()
+            .fold(0u64, |acc, r| acc.wrapping_add(r.values[col_idx]));
+        Ok(Some(total as f64 / rows.len() as f64))
     }
 
     // ── analytical aggregates ─────────────────────────────────────────────────

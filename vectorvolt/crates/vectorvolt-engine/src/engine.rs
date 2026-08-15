@@ -13,7 +13,7 @@
 //! registers them.  `get()` and `scan()` flush any pending rows before reading so
 //! callers always see a consistent view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use parking_lot::RwLock;
@@ -588,6 +588,41 @@ impl TableEngine {
         }
 
         Ok(results)
+    }
+
+    /// Like `scan()` but with authoritative PK deduplication.
+    ///
+    /// `scan()` can return the same PK from multiple partition files when a row
+    /// has been updated but not yet compacted — the stale physical bytes remain
+    /// in the old partition.  This method collects candidate PKs via `scan()`
+    /// (keeping zone-pruning efficiency), then uses `get(pk)` as the sole
+    /// source of truth for each unique PK.  The filter `[lo, hi]` is
+    /// re-verified against the authoritative row so rows updated out of range
+    /// are correctly excluded.
+    ///
+    /// All read-path methods that return rows or aggregate over rows should use
+    /// this instead of `scan()`.  The exception is write-path helpers that only
+    /// need PKs and handle their own dedup (e.g. `matching_pks` in
+    /// `update_where`).
+    pub(crate) fn scan_deduped(
+        &self,
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+    ) -> EngineResult<Vec<EngineRow>> {
+        let raw = self.scan(filter_col, lo, hi)?;
+        let mut seen: HashSet<u64> = HashSet::with_capacity(raw.len());
+        let mut result: Vec<EngineRow> = Vec::with_capacity(raw.len());
+        for row in raw {
+            if seen.insert(row.pk)
+                && let Some(current) = self.get(row.pk)?
+                && current.values[filter_col] >= lo
+                && current.values[filter_col] <= hi
+            {
+                result.push(current);
+            }
+        }
+        Ok(result)
     }
 
     // ── Compaction ────────────────────────────────────────────────────────────
