@@ -35,6 +35,7 @@ mod project;
 mod range_delete;
 mod registry;
 mod row;
+mod secondary_index;
 mod sort;
 mod stats;
 mod ttl;
