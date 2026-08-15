@@ -44,6 +44,13 @@ pub struct TableEngine {
     manifest_recovery: ManifestRecovery,
     /// MVCC transaction store — open transactions live here until commit/rollback.
     mvcc: std::sync::Arc<MvccStore>,
+    /// Serialises conditional write operations (CAS, insert-if-absent, upsert).
+    ///
+    /// `txn.insert` acquires `pk_index.write()` internally so we cannot hold
+    /// the index lock externally.  This mutex serialises the read-check-write
+    /// sequence for the whole conditional write, preventing two concurrent CAS
+    /// callers from interleaving their individual steps.
+    pub(crate) cas_lock: parking_lot::Mutex<()>,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -343,6 +350,7 @@ impl TableEngine {
             write_options: options.write_options,
             manifest_recovery,
             mvcc: MvccStore::new(),
+            cas_lock: parking_lot::Mutex::new(()),
         })
     }
 

@@ -25,6 +25,7 @@
 
 mod aggregate;
 mod compact;
+mod cond;
 mod engine;
 mod error;
 mod mvcc;
@@ -34,6 +35,7 @@ mod stats;
 
 pub use aggregate::HistogramBucket;
 pub use compact::CompactResult;
+pub use cond::UpsertResult;
 pub use engine::TableEngine;
 pub use engine::{Durability, EngineOptions, FlushResult, WalTip};
 pub use error::{EngineError, EngineResult};
