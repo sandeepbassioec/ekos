@@ -31,6 +31,7 @@ mod engine;
 mod error;
 mod groupby;
 mod mvcc;
+mod range_delete;
 mod registry;
 mod row;
 mod sort;
