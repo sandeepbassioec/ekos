@@ -41,6 +41,7 @@ mod secondary_index;
 mod sort;
 mod stats;
 mod ttl;
+mod window;
 
 pub use aggregate::HistogramBucket;
 pub use compact::CompactResult;
@@ -52,3 +53,4 @@ pub use mvcc::TxnId;
 pub use registry::{SCHEMA_FILE, TableRegistry};
 pub use row::EngineRow;
 pub use stats::EngineStats;
+pub use window::WindowRow;
