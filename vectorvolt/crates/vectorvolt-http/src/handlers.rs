@@ -7,9 +7,10 @@ use axum::response::IntoResponse;
 
 use crate::server::AppState;
 use crate::types::{
-    AggResp, CountResp, CreateTableBody, ErrorResp, InsertBody, OkResp, PageResp, QueryResp,
-    RangeQuery, RowResp, RowsResp, ScanPageQuery, ScanQuery, ScanSortedQuery, SchemaResp,
-    SecondaryQuery, TablesResp, UpdateFieldBody,
+    AggResp, BucketResp, CountResp, CreateTableBody, ErrorResp, HistogramQuery, HistogramResp,
+    InsertBody, OkResp, PageResp, PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp,
+    RowsResp, ScanPageQuery, ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp,
+    UpdateFieldBody,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -301,6 +302,19 @@ pub async fn query_handler(
                         .collect(),
                     next_cursor: page.next_cursor,
                 }),
+                vectorvolt_query::QueryResponse::Histogram(bkts) => Json(QueryResp::Histogram {
+                    buckets: bkts
+                        .into_iter()
+                        .map(|b| BucketResp {
+                            lo: b.lo,
+                            hi: b.hi,
+                            count: b.count,
+                        })
+                        .collect(),
+                }),
+                vectorvolt_query::QueryResponse::Percentile(v) => {
+                    Json(QueryResp::Percentile { value: v })
+                }
             };
             json.into_response()
         }
@@ -512,6 +526,54 @@ pub async fn delete_range(
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 st.metrics.record_ok();
                 Json(CountResp { count: n as u64 }).into_response()
+            }
+        },
+    }
+}
+
+// ── Layer 50: histogram + percentile endpoints ────────────────────────────────
+
+/// `GET /tables/{table}/histogram?col=&lo=&hi=&buckets=`
+pub async fn histogram(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<HistogramQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.histogram_range(q.col, q.lo, q.hi, q.buckets) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(bkts) => {
+                st.metrics.record_ok();
+                Json(HistogramResp {
+                    buckets: bkts
+                        .into_iter()
+                        .map(|b| BucketResp {
+                            lo: b.lo,
+                            hi: b.hi,
+                            count: b.count,
+                        })
+                        .collect(),
+                })
+                .into_response()
+            }
+        },
+    }
+}
+
+/// `GET /tables/{table}/percentile?col=&lo=&hi=&p=` (`p` is 0–100)
+pub async fn percentile(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<PercentileQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.percentile_range(q.col, q.lo, q.hi, q.p as f64) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(v) => {
+                st.metrics.record_ok();
+                Json(PercentileResp { value: v }).into_response()
             }
         },
     }
