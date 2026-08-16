@@ -149,6 +149,11 @@ fn build_router(
         // Layer 50: histogram + percentile
         .route("/tables/{table}/histogram", get(handlers::histogram))
         .route("/tables/{table}/percentile", get(handlers::percentile))
+        // Layer 51: group-by aggregates
+        .route("/tables/{table}/group/count", get(handlers::group_count))
+        .route("/tables/{table}/group/sum", get(handlers::group_sum))
+        .route("/tables/{table}/group/min", get(handlers::group_min))
+        .route("/tables/{table}/group/max", get(handlers::group_max))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

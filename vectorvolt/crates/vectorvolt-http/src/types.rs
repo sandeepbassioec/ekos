@@ -194,4 +194,38 @@ pub enum QueryResp {
     Percentile {
         value: Option<u64>,
     },
+    /// GROUP COUNT/SUM/MIN/MAX result.
+    Group {
+        entries: Vec<GroupEntryResp>,
+    },
+}
+
+// ── Layer 51 query params + response types ────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct GroupByQuery {
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub group_col: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GroupByAggQuery {
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub group_col: usize,
+    pub agg_col: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GroupEntryResp {
+    pub group_val: u64,
+    pub agg_val: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GroupResp {
+    pub entries: Vec<GroupEntryResp>,
 }

@@ -110,6 +110,42 @@ pub enum Query {
         hi: u64,
         p: u64,
     },
+
+    // ── Layer 51: group-by aggregates ─────────────────────────────────────────
+    /// `GROUP COUNT filter_col=<n> lo=<lo> hi=<hi> group_col=<g>`
+    GroupCount {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        group_col: usize,
+    },
+
+    /// `GROUP SUM filter_col=<n> lo=<lo> hi=<hi> group_col=<g> agg_col=<a>`
+    GroupSum {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        group_col: usize,
+        agg_col: usize,
+    },
+
+    /// `GROUP MIN filter_col=<n> lo=<lo> hi=<hi> group_col=<g> agg_col=<a>`
+    GroupMin {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        group_col: usize,
+        agg_col: usize,
+    },
+
+    /// `GROUP MAX filter_col=<n> lo=<lo> hi=<hi> group_col=<g> agg_col=<a>`
+    GroupMax {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        group_col: usize,
+        agg_col: usize,
+    },
 }
 
 /// Parse a query string into a [`Query`].
@@ -338,6 +374,70 @@ impl Parser {
                 Ok(Query::Percentile { col, lo, hi, p })
             }
 
+            // ── Layer 51: group-by aggregates ─────────────────────────────────
+            Keyword::Group => {
+                let agg_kw = match self.next() {
+                    Some(Token::Keyword(k)) => k,
+                    Some(t) => {
+                        return Err(QueryError::Syntax(format!(
+                            "expected COUNT/SUM/MIN/MAX after GROUP, got {t:?}"
+                        )))
+                    }
+                    None => return Err(QueryError::UnexpectedEof),
+                };
+                let (filter_col, lo, hi) = self.parse_filter_col_lo_hi()?;
+                self.expect_keyword(Keyword::GroupCol)?;
+                self.expect_eq()?;
+                let group_col = self.expect_int()? as usize;
+                match agg_kw {
+                    Keyword::Count => Ok(Query::GroupCount {
+                        filter_col,
+                        lo,
+                        hi,
+                        group_col,
+                    }),
+                    Keyword::Sum => {
+                        self.expect_keyword(Keyword::AggCol)?;
+                        self.expect_eq()?;
+                        let agg_col = self.expect_int()? as usize;
+                        Ok(Query::GroupSum {
+                            filter_col,
+                            lo,
+                            hi,
+                            group_col,
+                            agg_col,
+                        })
+                    }
+                    Keyword::Min => {
+                        self.expect_keyword(Keyword::AggCol)?;
+                        self.expect_eq()?;
+                        let agg_col = self.expect_int()? as usize;
+                        Ok(Query::GroupMin {
+                            filter_col,
+                            lo,
+                            hi,
+                            group_col,
+                            agg_col,
+                        })
+                    }
+                    Keyword::Max => {
+                        self.expect_keyword(Keyword::AggCol)?;
+                        self.expect_eq()?;
+                        let agg_col = self.expect_int()? as usize;
+                        Ok(Query::GroupMax {
+                            filter_col,
+                            lo,
+                            hi,
+                            group_col,
+                            agg_col,
+                        })
+                    }
+                    other => Err(QueryError::Syntax(format!(
+                        "expected COUNT/SUM/MIN/MAX after GROUP, got {other:?}"
+                    ))),
+                }
+            }
+
             other => Err(QueryError::Syntax(format!(
                 "{other:?} is not a statement keyword"
             ))),
@@ -347,6 +447,20 @@ impl Parser {
     /// Parse `col=<n> lo=<lo> hi=<hi>` — shared by COUNT/SUM/MIN/MAX/AVG/SCAN.
     fn parse_col_lo_hi(&mut self) -> QueryResult<(usize, u64, u64)> {
         self.expect_keyword(Keyword::Col)?;
+        self.expect_eq()?;
+        let col = self.expect_int()? as usize;
+        self.expect_keyword(Keyword::Lo)?;
+        self.expect_eq()?;
+        let lo = self.expect_int()?;
+        self.expect_keyword(Keyword::Hi)?;
+        self.expect_eq()?;
+        let hi = self.expect_int()?;
+        Ok((col, lo, hi))
+    }
+
+    /// Parse `filter_col=<n> lo=<lo> hi=<hi>` — used by GROUP-BY aggregates.
+    fn parse_filter_col_lo_hi(&mut self) -> QueryResult<(usize, u64, u64)> {
+        self.expect_keyword(Keyword::FilterCol)?;
         self.expect_eq()?;
         let col = self.expect_int()? as usize;
         self.expect_keyword(Keyword::Lo)?;

@@ -7,10 +7,10 @@ use axum::response::IntoResponse;
 
 use crate::server::AppState;
 use crate::types::{
-    AggResp, BucketResp, CountResp, CreateTableBody, ErrorResp, HistogramQuery, HistogramResp,
-    InsertBody, OkResp, PageResp, PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp,
-    RowsResp, ScanPageQuery, ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp,
-    UpdateFieldBody,
+    AggResp, BucketResp, CountResp, CreateTableBody, ErrorResp, GroupByAggQuery, GroupByQuery,
+    GroupEntryResp, GroupResp, HistogramQuery, HistogramResp, InsertBody, OkResp, PageResp,
+    PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp, RowsResp, ScanPageQuery,
+    ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp, UpdateFieldBody,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -315,6 +315,15 @@ pub async fn query_handler(
                 vectorvolt_query::QueryResponse::Percentile(v) => {
                     Json(QueryResp::Percentile { value: v })
                 }
+                vectorvolt_query::QueryResponse::GroupResult(pairs) => Json(QueryResp::Group {
+                    entries: pairs
+                        .into_iter()
+                        .map(|(g, a)| GroupEntryResp {
+                            group_val: g,
+                            agg_val: a,
+                        })
+                        .collect(),
+                }),
             };
             json.into_response()
         }
@@ -574,6 +583,92 @@ pub async fn percentile(
             Ok(v) => {
                 st.metrics.record_ok();
                 Json(PercentileResp { value: v }).into_response()
+            }
+        },
+    }
+}
+
+// ── Layer 51: group-by aggregate endpoints ────────────────────────────────────
+
+fn to_group_resp(pairs: Vec<(u64, u64)>) -> GroupResp {
+    GroupResp {
+        entries: pairs
+            .into_iter()
+            .map(|(g, a)| GroupEntryResp {
+                group_val: g,
+                agg_val: a,
+            })
+            .collect(),
+    }
+}
+
+/// `GET /tables/{table}/group/count?filter_col=&lo=&hi=&group_col=`
+pub async fn group_count(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<GroupByQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.group_by_count(q.filter_col, q.lo, q.hi, q.group_col) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(pairs) => {
+                st.metrics.record_ok();
+                Json(to_group_resp(pairs)).into_response()
+            }
+        },
+    }
+}
+
+/// `GET /tables/{table}/group/sum?filter_col=&lo=&hi=&group_col=&agg_col=`
+pub async fn group_sum(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<GroupByAggQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.group_by_sum(q.filter_col, q.lo, q.hi, q.group_col, q.agg_col) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(pairs) => {
+                st.metrics.record_ok();
+                Json(to_group_resp(pairs)).into_response()
+            }
+        },
+    }
+}
+
+/// `GET /tables/{table}/group/min?filter_col=&lo=&hi=&group_col=&agg_col=`
+pub async fn group_min(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<GroupByAggQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.group_by_min(q.filter_col, q.lo, q.hi, q.group_col, q.agg_col) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(pairs) => {
+                st.metrics.record_ok();
+                Json(to_group_resp(pairs)).into_response()
+            }
+        },
+    }
+}
+
+/// `GET /tables/{table}/group/max?filter_col=&lo=&hi=&group_col=&agg_col=`
+pub async fn group_max(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<GroupByAggQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.group_by_max(q.filter_col, q.lo, q.hi, q.group_col, q.agg_col) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(pairs) => {
+                st.metrics.record_ok();
+                Json(to_group_resp(pairs)).into_response()
             }
         },
     }
