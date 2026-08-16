@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod connect;
 pub mod hal;
+pub mod http;
 pub mod keygen;
 pub mod serve;
 pub mod store;
