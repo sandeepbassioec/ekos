@@ -46,6 +46,11 @@ pub enum Keyword {
     Percentile,
     Buckets,
     P,
+    // Layer 51 additions
+    Group,
+    FilterCol,
+    GroupCol,
+    AggCol,
 }
 
 impl Keyword {
@@ -85,6 +90,10 @@ impl Keyword {
             "PERCENTILE" => Some(Self::Percentile),
             "BUCKETS" => Some(Self::Buckets),
             "P" => Some(Self::P),
+            "GROUP" => Some(Self::Group),
+            "FILTER_COL" => Some(Self::FilterCol),
+            "GROUP_COL" => Some(Self::GroupCol),
+            "AGG_COL" => Some(Self::AggCol),
             _ => None,
         }
     }

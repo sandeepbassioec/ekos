@@ -44,6 +44,10 @@ pub enum QueryResponse {
 
     /// Percentile value from PERCENTILE (None when no rows matched).
     Percentile(Option<u64>),
+
+    // ── Layer 51 ──────────────────────────────────────────────────────────────
+    /// Group-by result: Vec of (group_val, agg_val) pairs.
+    GroupResult(Vec<(u64, u64)>),
 }
 
 /// Execute `query` against `engine`.
@@ -194,6 +198,50 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         Query::Percentile { col, lo, hi, p } => {
             let v = engine.percentile_range(col, lo, hi, p as f64)?;
             Ok(QueryResponse::Percentile(v))
+        }
+
+        // ── Layer 51: group-by aggregates ─────────────────────────────────────
+        Query::GroupCount {
+            filter_col,
+            lo,
+            hi,
+            group_col,
+        } => {
+            let pairs = engine.group_by_count(filter_col, lo, hi, group_col)?;
+            Ok(QueryResponse::GroupResult(pairs))
+        }
+
+        Query::GroupSum {
+            filter_col,
+            lo,
+            hi,
+            group_col,
+            agg_col,
+        } => {
+            let pairs = engine.group_by_sum(filter_col, lo, hi, group_col, agg_col)?;
+            Ok(QueryResponse::GroupResult(pairs))
+        }
+
+        Query::GroupMin {
+            filter_col,
+            lo,
+            hi,
+            group_col,
+            agg_col,
+        } => {
+            let pairs = engine.group_by_min(filter_col, lo, hi, group_col, agg_col)?;
+            Ok(QueryResponse::GroupResult(pairs))
+        }
+
+        Query::GroupMax {
+            filter_col,
+            lo,
+            hi,
+            group_col,
+            agg_col,
+        } => {
+            let pairs = engine.group_by_max(filter_col, lo, hi, group_col, agg_col)?;
+            Ok(QueryResponse::GroupResult(pairs))
         }
     }
 }
