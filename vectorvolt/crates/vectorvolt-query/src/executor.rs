@@ -65,6 +65,13 @@ pub enum QueryResponse {
     // ── Layer 54 ──────────────────────────────────────────────────────────────
     /// Number of rows updated by UPDATE WHERE / INCREMENT WHERE / DECREMENT WHERE.
     UpdatedCount(usize),
+
+    // ── Layer 55 ──────────────────────────────────────────────────────────────
+    /// Results of a BATCH GET — one entry per requested pk (None = not found).
+    BatchRows(Vec<Option<EngineRow>>),
+
+    /// Number of rows deleted by BATCH DELETE.
+    BatchDeleted(usize),
 }
 
 /// Execute `query` against `engine`.
@@ -342,6 +349,17 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         } => {
             let n = engine.decrement_field_where(&[(filter_col, lo, hi)], target_col, delta)?;
             Ok(QueryResponse::UpdatedCount(n))
+        }
+
+        // ── Layer 55: batch operations ─────────────────────────────────────────
+        Query::BatchGet { pks } => {
+            let results = engine.batch_get(&pks)?;
+            Ok(QueryResponse::BatchRows(results))
+        }
+
+        Query::BatchDelete { pks } => {
+            let n = engine.batch_delete(&pks)?;
+            Ok(QueryResponse::BatchDeleted(n))
         }
     }
 }

@@ -7,12 +7,13 @@ use axum::response::IntoResponse;
 
 use crate::server::AppState;
 use crate::types::{
-    AggResp, BucketResp, CountResp, CreateTableBody, DistinctResp, ErrorResp, GroupByAggQuery,
-    GroupByQuery, GroupEntryResp, GroupResp, HistogramQuery, HistogramResp, IncrDecrWhereQuery,
-    InsertBody, OkResp, PageResp, PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp,
-    RowsResp, ScanPageQuery, ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp,
-    UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
-    WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
+    AggResp, BatchDeleteResp, BatchGetResp, BatchPksBody, BucketResp, CountResp, CreateTableBody,
+    DistinctResp, ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp, GroupResp,
+    HistogramQuery, HistogramResp, IncrDecrWhereQuery, InsertBody, OkResp, PageResp,
+    PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp, RowsResp, ScanPageQuery,
+    ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp, UpdateFieldBody,
+    UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp, WindowAggQuery,
+    WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -348,6 +349,20 @@ pub async fn query_handler(
                 }
                 vectorvolt_query::QueryResponse::UpdatedCount(n) => {
                     Json(QueryResp::Updated { updated: n })
+                }
+                vectorvolt_query::QueryResponse::BatchRows(results) => Json(QueryResp::BatchRows {
+                    rows: results
+                        .into_iter()
+                        .map(|opt| {
+                            opt.map(|r| RowResp {
+                                pk: r.pk,
+                                values: r.values,
+                            })
+                        })
+                        .collect(),
+                }),
+                vectorvolt_query::QueryResponse::BatchDeleted(n) => {
+                    Json(QueryResp::BatchDeleted { deleted: n })
                 }
             };
             json.into_response()
@@ -884,5 +899,52 @@ pub async fn decrement_field_where(
                 }
             }
         }
+    }
+}
+
+// ── Layer 55: batch operations ────────────────────────────────────────────────
+
+pub async fn batch_get(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Json(body): Json<BatchPksBody>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.batch_get(&body.pks) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(results) => {
+                st.metrics.record_ok();
+                Json(BatchGetResp {
+                    rows: results
+                        .into_iter()
+                        .map(|opt| {
+                            opt.map(|r| RowResp {
+                                pk: r.pk,
+                                values: r.values,
+                            })
+                        })
+                        .collect(),
+                })
+                .into_response()
+            }
+        },
+    }
+}
+
+pub async fn batch_delete(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Json(body): Json<BatchPksBody>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.batch_delete(&body.pks) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(n) => {
+                st.metrics.record_ok();
+                Json(BatchDeleteResp { deleted: n }).into_response()
+            }
+        },
     }
 }

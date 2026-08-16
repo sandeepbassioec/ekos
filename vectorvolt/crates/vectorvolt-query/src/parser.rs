@@ -211,6 +211,13 @@ pub enum Query {
         target_col: usize,
         delta: u64,
     },
+
+    // ── Layer 55: batch operations ────────────────────────────────────────────
+    /// `BATCH GET pk1 pk2 ...`
+    BatchGet { pks: Vec<u64> },
+
+    /// `BATCH DELETE pk1 pk2 ...`
+    BatchDelete { pks: Vec<u64> },
 }
 
 /// Parse a query string into a [`Query`].
@@ -632,6 +639,32 @@ impl Parser {
                     target_col,
                     delta,
                 })
+            }
+
+            // ── Layer 55: batch operations ──────────────────────────────────
+            Keyword::Batch => {
+                let op_kw = match self.next() {
+                    Some(Token::Keyword(k)) => k,
+                    Some(t) => {
+                        return Err(QueryError::Syntax(format!(
+                            "expected GET or DELETE after BATCH, got {t:?}"
+                        )))
+                    }
+                    None => return Err(QueryError::UnexpectedEof),
+                };
+                let mut pks = Vec::new();
+                while matches!(self.peek(), Some(Token::Int(_))) {
+                    if let Some(Token::Int(n)) = self.next() {
+                        pks.push(n);
+                    }
+                }
+                match op_kw {
+                    Keyword::Get => Ok(Query::BatchGet { pks }),
+                    Keyword::Delete => Ok(Query::BatchDelete { pks }),
+                    other => Err(QueryError::Syntax(format!(
+                        "expected GET or DELETE after BATCH, got {other:?}"
+                    ))),
+                }
             }
 
             other => Err(QueryError::Syntax(format!(

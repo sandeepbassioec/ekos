@@ -214,6 +214,14 @@ pub enum QueryResp {
     Updated {
         updated: usize,
     },
+    /// BATCH GET result: rows (null entries for not-found pks).
+    BatchRows {
+        rows: Vec<Option<RowResp>>,
+    },
+    /// BATCH DELETE result.
+    BatchDeleted {
+        deleted: usize,
+    },
 }
 
 // ── Layer 53 response types ───────────────────────────────────────────────────
@@ -257,6 +265,23 @@ pub struct IncrDecrWhereQuery {
 #[derive(Debug, Serialize)]
 pub struct UpdatedResp {
     pub updated: usize,
+}
+
+// ── Layer 55 request + response types ────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct BatchPksBody {
+    pub pks: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchGetResp {
+    pub rows: Vec<Option<RowResp>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchDeleteResp {
+    pub deleted: usize,
 }
 
 // ── Layer 51 query params + response types ────────────────────────────────────

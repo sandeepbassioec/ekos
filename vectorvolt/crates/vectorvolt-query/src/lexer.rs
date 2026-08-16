@@ -67,6 +67,8 @@ pub enum Keyword {
     Decrement,
     Delta,
     TargetCol,
+    // Layer 55 additions
+    Batch,
 }
 
 impl Keyword {
@@ -123,6 +125,7 @@ impl Keyword {
             "DECREMENT" => Some(Self::Decrement),
             "DELTA" => Some(Self::Delta),
             "TARGET_COL" => Some(Self::TargetCol),
+            "BATCH" => Some(Self::Batch),
             _ => None,
         }
     }
