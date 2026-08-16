@@ -39,6 +39,7 @@ fn start_plain(dir: &TempDir) -> (SocketAddr, impl FnOnce()) {
         key: None,
         multi: false,
         http_addr: None,
+        http_token: None,
     };
 
     let bound = bind(&args).expect("bind");
@@ -69,6 +70,7 @@ fn start_authed(dir: &TempDir, secret_hex: &str) -> (SocketAddr, impl FnOnce()) 
         key: None,
         multi: false,
         http_addr: None,
+        http_token: None,
     };
 
     let bound = bind(&args).expect("bind");
@@ -126,6 +128,7 @@ fn bind_creates_schema_file_for_new_table() {
         key: None,
         multi: false,
         http_addr: None,
+        http_token: None,
     };
     let bound = bind(&args).unwrap();
     bound.server.shutdown_handle().shutdown();
@@ -151,6 +154,7 @@ fn bind_reads_existing_schema_from_disk() {
         key: None,
         multi: false,
         http_addr: None,
+        http_token: None,
     };
     let bound = bind(&args).unwrap();
     bound.server.shutdown_handle().shutdown();
@@ -173,6 +177,7 @@ fn bind_fails_when_no_table_and_no_columns() {
         key: None,
         multi: false,
         http_addr: None,
+        http_token: None,
     };
     assert!(bind(&args).is_err());
 }
@@ -194,6 +199,7 @@ fn bind_fails_with_cert_but_no_key() {
         key: None,
         multi: false,
         http_addr: None,
+        http_token: None,
     };
     assert!(bind(&args).is_err());
 }
@@ -698,3 +704,4 @@ fn client_fk_exists_true_after_insert() {
     assert!(found, "pk=55 must be found");
     assert!(!not_found, "pk=9999 must not be found");
 }
+
