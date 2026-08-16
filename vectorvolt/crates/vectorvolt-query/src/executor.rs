@@ -54,6 +54,13 @@ pub enum QueryResponse {
     // ── Layer 52 ──────────────────────────────────────────────────────────────
     /// Window function result: Vec of (pk, window_val) rows.
     WindowRows(Vec<WindowRow>),
+
+    // ── Layer 53 ──────────────────────────────────────────────────────────────
+    /// Sorted unique values from DISTINCT.
+    DistinctValues(Vec<u64>),
+
+    /// (value, count) pairs from VALUE_COUNTS.
+    ValueCounts(Vec<(u64, u64)>),
 }
 
 /// Execute `query` against `engine`.
@@ -286,6 +293,17 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         } => {
             let rows = engine.dense_rank_by(filter_col, lo, hi, sort_col, asc)?;
             Ok(QueryResponse::WindowRows(rows))
+        }
+
+        // ── Layer 53: distinct + value counts ─────────────────────────────────
+        Query::Distinct { col, lo, hi } => {
+            let vals = engine.distinct_values(col, lo, hi)?;
+            Ok(QueryResponse::DistinctValues(vals))
+        }
+
+        Query::ValueCounts { col, lo, hi } => {
+            let pairs = engine.value_counts(col, lo, hi)?;
+            Ok(QueryResponse::ValueCounts(pairs))
         }
     }
 }

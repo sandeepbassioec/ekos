@@ -176,6 +176,13 @@ pub enum Query {
         sort_col: usize,
         asc: bool,
     },
+
+    // ── Layer 53: distinct + value counts ─────────────────────────────────────
+    /// `DISTINCT col=<n> lo=<lo> hi=<hi>`
+    Distinct { col: usize, lo: u64, hi: u64 },
+
+    /// `VALUE_COUNTS col=<n> lo=<lo> hi=<hi>`
+    ValueCounts { col: usize, lo: u64, hi: u64 },
 }
 
 /// Parse a query string into a [`Query`].
@@ -531,6 +538,17 @@ impl Parser {
                         "expected RUNNING_SUM/RUNNING_COUNT/RANK/DENSE_RANK after WINDOW, got {other:?}"
                     ))),
                 }
+            }
+
+            // ── Layer 53: distinct + value counts ──────────────────────────
+            Keyword::Distinct => {
+                let (col, lo, hi) = self.parse_col_lo_hi()?;
+                Ok(Query::Distinct { col, lo, hi })
+            }
+
+            Keyword::ValueCounts => {
+                let (col, lo, hi) = self.parse_col_lo_hi()?;
+                Ok(Query::ValueCounts { col, lo, hi })
             }
 
             other => Err(QueryError::Syntax(format!(
