@@ -74,6 +74,19 @@ pub enum Keyword {
     // Layer 57 additions
     Project,
     Cols,
+    // Layer 58 additions
+    IfAbsent,
+    Cas,
+    Expected,
+    New,
+    // Layer 59 additions
+    Row,
+    // Layer 60 additions
+    Ttl,
+    Expire,
+    Purge,
+    Expired,
+    Now,
 }
 
 impl Keyword {
@@ -134,6 +147,16 @@ impl Keyword {
             "AND" => Some(Self::And),
             "PROJECT" => Some(Self::Project),
             "COLS" => Some(Self::Cols),
+            "IF_ABSENT" => Some(Self::IfAbsent),
+            "CAS" => Some(Self::Cas),
+            "EXPECTED" => Some(Self::Expected),
+            "NEW" => Some(Self::New),
+            "ROW" => Some(Self::Row),
+            "TTL" => Some(Self::Ttl),
+            "EXPIRE" => Some(Self::Expire),
+            "PURGE" => Some(Self::Purge),
+            "EXPIRED" => Some(Self::Expired),
+            "NOW" => Some(Self::Now),
             _ => None,
         }
     }

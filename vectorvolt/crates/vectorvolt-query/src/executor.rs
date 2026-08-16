@@ -80,6 +80,27 @@ pub enum QueryResponse {
     // ── Layer 57 ──────────────────────────────────────────────────────────────
     /// Projected rows from SCAN PROJECT (values contain only the requested cols).
     ProjectedRows(Vec<EngineRow>),
+
+    // ── Layer 58 ──────────────────────────────────────────────────────────────
+    /// Result of INSERT IF_ABSENT: true = row was inserted, false = already existed.
+    ConditionalInserted(bool),
+
+    /// Result of CAS: true = swap applied, false = expected values did not match.
+    Swapped(bool),
+
+    // ── Layer 59 ──────────────────────────────────────────────────────────────
+    /// Number of rows inserted by BATCH INSERT.
+    BatchInserted(usize),
+
+    // ── Layer 60 ──────────────────────────────────────────────────────────────
+    /// Result of GET TTL (None = row absent or expired).
+    TtlRow(Option<EngineRow>),
+
+    /// Rows from SCAN TTL (excludes expired rows).
+    TtlRows(Vec<EngineRow>),
+
+    /// Number of rows purged by PURGE EXPIRED.
+    Purged(usize),
 }
 
 /// Execute `query` against `engine`.
@@ -385,6 +406,52 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         } => {
             let rows = engine.scan_project(filter_col, lo, hi, &projection)?;
             Ok(QueryResponse::ProjectedRows(rows))
+        }
+
+        // ── Layer 58: conditional writes ────────────────────────────────────────
+        Query::InsertIfAbsent { pk, values } => {
+            let inserted = engine.insert_if_absent(pk, values)?;
+            Ok(QueryResponse::ConditionalInserted(inserted))
+        }
+
+        Query::CompareAndSwap {
+            pk,
+            expected,
+            new_values,
+        } => {
+            let swapped = engine.compare_and_swap(pk, &expected, new_values)?;
+            Ok(QueryResponse::Swapped(swapped))
+        }
+
+        // ── Layer 59: batch insert ───────────────────────────────────────────────
+        Query::BatchInsert { rows } => {
+            let n = engine.batch_insert(rows)?;
+            Ok(QueryResponse::BatchInserted(n))
+        }
+
+        // ── Layer 60: TTL operations ─────────────────────────────────────────────
+        Query::InsertWithTtl {
+            pk,
+            values,
+            expire_at,
+        } => {
+            engine.insert_with_ttl(pk, values, expire_at)?;
+            Ok(QueryResponse::Ok)
+        }
+
+        Query::GetWithTtl { pk, now } => {
+            let row = engine.get_with_ttl(pk, now)?;
+            Ok(QueryResponse::TtlRow(row))
+        }
+
+        Query::ScanWithTtl { now } => {
+            let rows = engine.scan_with_ttl(now)?;
+            Ok(QueryResponse::TtlRows(rows))
+        }
+
+        Query::PurgeExpired { now } => {
+            let n = engine.purge_expired(now)?;
+            Ok(QueryResponse::Purged(n))
         }
     }
 }

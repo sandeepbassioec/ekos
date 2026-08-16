@@ -230,6 +230,31 @@ pub enum QueryResp {
     ProjectedRows {
         rows: Vec<RowResp>,
     },
+    /// INSERT IF_ABSENT result.
+    ConditionalInserted {
+        inserted: bool,
+    },
+    /// CAS result.
+    Swapped {
+        swapped: bool,
+    },
+    /// BATCH INSERT result.
+    BatchInserted {
+        inserted: usize,
+    },
+    /// GET TTL result (row present and not expired).
+    TtlRow {
+        pk: u64,
+        values: Vec<u64>,
+    },
+    /// SCAN TTL result.
+    TtlRows {
+        rows: Vec<RowResp>,
+    },
+    /// PURGE EXPIRED result.
+    Purged {
+        purged: usize,
+    },
 }
 
 // ── Layer 53 response types ───────────────────────────────────────────────────
@@ -348,6 +373,60 @@ impl ScanWhereQuery {
         }
         v
     }
+}
+
+// ── Layer 58 request + response types ────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CasBody {
+    pub expected: Vec<u64>,
+    pub new_values: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConditionalInsertResp {
+    pub inserted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CasResp {
+    pub swapped: bool,
+}
+
+// ── Layer 59 request + response types ────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct BatchInsertRowBody {
+    pub pk: u64,
+    pub values: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchInsertBody {
+    pub rows: Vec<BatchInsertRowBody>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchInsertResp {
+    pub inserted: usize,
+}
+
+// ── Layer 60 request + response types ────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct InsertTtlBody {
+    pub values: Vec<u64>,
+    pub expire_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TtlNowQuery {
+    pub now: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurgedResp {
+    pub purged: usize,
 }
 
 // ── Layer 51 query params + response types ────────────────────────────────────
