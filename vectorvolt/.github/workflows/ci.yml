@@ -11,8 +11,9 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Fast gate: fmt + clippy on Linux only. Runs in ~1 min; blocks the matrix
-  # early so a trivial formatting miss doesn't burn 3 OS runners.
+  # ── Fast gate ──────────────────────────────────────────────────────────────
+  # fmt + clippy on Linux only. Runs in ~1 min; blocks the matrix early so a
+  # trivial formatting miss doesn't burn 3 OS runners.
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -24,9 +25,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format check
         run: cargo fmt --all --check
+        working-directory: vectorvolt
+      # --all-targets covers lib, bins, tests, benches, and examples.
+      # --all-features ensures feature-gated code is also linted.
       - name: Clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: vectorvolt
 
+  # ── Rust tests (Linux + Windows) ──────────────────────────────────────────
   test:
     name: Test (${{ matrix.os }})
     needs: lint
@@ -41,14 +47,49 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: cargo test --workspace --all-features
+        working-directory: vectorvolt
       - name: Doc tests
         run: cargo test --workspace --doc
+        working-directory: vectorvolt
 
-  bench-smoke:
-    name: Benchmark smoke test
+  # ── Bench compile (no-run) ────────────────────────────────────────────────
+  # Verifies that all Criterion bench harnesses compile in release mode.
+  # Does NOT actually run the benchmarks (too slow for CI).
+  bench-compile:
+    name: Bench compile
     needs: lint
     runs-on: ubuntu-latest
-    # Only run the release build on pushes to main/develop, not on every PR.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile benchmarks
+        run: cargo bench --no-run --workspace
+        working-directory: vectorvolt
+
+  # ── Rustdoc ───────────────────────────────────────────────────────────────
+  # Ensures all public items are documented and doc-examples compile.
+  docs:
+    name: Docs
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs
+        run: cargo doc --no-deps --workspace
+        working-directory: vectorvolt
+        env:
+          RUSTDOCFLAGS: "-D rustdoc::broken-intra-doc-links"
+
+  # ── Release build smoke ───────────────────────────────────────────────────
+  # Full --release build on pushes only (not every PR) to catch link errors
+  # and LTO issues that only surface in release mode.
+  release-smoke:
+    name: Release build smoke
+    needs: lint
+    runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
@@ -56,3 +97,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --release --workspace
+        working-directory: vectorvolt

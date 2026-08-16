@@ -13,9 +13,35 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ── Lint + bench compile before touching anything ─────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+        working-directory: vectorvolt
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: vectorvolt
+      - name: Bench compile
+        run: cargo bench --no-run --workspace
+        working-directory: vectorvolt
+      - name: Docs
+        run: cargo doc --no-deps --workspace
+        working-directory: vectorvolt
+        env:
+          RUSTDOCFLAGS: "-D rustdoc::broken-intra-doc-links"
+
   # ── Run tests on all platforms before releasing ────────────────────────────
   test:
     name: Test (${{ matrix.os }})
+    needs: lint
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
@@ -27,6 +53,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --workspace --all-features
+        working-directory: vectorvolt
 
   # ── Build release binaries ────────────────────────────────────────────────
   build:
@@ -82,10 +109,12 @@ jobs:
       - name: Build (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cross build --release --target ${{ matrix.target }} -p vvctl
+        working-directory: vectorvolt
 
       - name: Build (cargo)
         if: matrix.target != 'aarch64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }} -p vvctl
+        working-directory: vectorvolt
 
       # ── Package ────────────────────────────────────────────────────────────
       - name: Package (tar.gz)
@@ -94,7 +123,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME}
           TARGET=${{ matrix.target }}
-          BINARY=target/${TARGET}/release/vvctl
+          BINARY=vectorvolt/target/${TARGET}/release/vvctl
           ARCHIVE=vvctl-${VERSION}-${TARGET}.tar.gz
           tar -czf "${ARCHIVE}" -C "$(dirname $BINARY)" "$(basename $BINARY)"
           sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
@@ -106,7 +135,7 @@ jobs:
         run: |
           $VERSION = $env:GITHUB_REF_NAME
           $TARGET  = "${{ matrix.target }}"
-          $BINARY  = "target\$TARGET\release\vvctl.exe"
+          $BINARY  = "vectorvolt\target\$TARGET\release\vvctl.exe"
           $ARCHIVE = "vvctl-$VERSION-$TARGET.zip"
           Compress-Archive -Path $BINARY -DestinationPath $ARCHIVE
           $hash = (Get-FileHash $ARCHIVE -Algorithm SHA256).Hash.ToLower()
@@ -143,8 +172,8 @@ jobs:
           tar -xzf dist/vvctl-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz -C ${PKG}/usr/bin/
 
           # Patch version in control file
-          sed "s/Version: .*/Version: ${VERSION}/" packaging/debian/control > ${PKG}/DEBIAN/control
-          cp packaging/debian/changelog ${PKG}/DEBIAN/changelog
+          sed "s/Version: .*/Version: ${VERSION}/" vectorvolt/packaging/debian/control > ${PKG}/DEBIAN/control
+          cp vectorvolt/packaging/debian/changelog ${PKG}/DEBIAN/changelog
 
           dpkg-deb --build ${PKG}
           mv ${PKG}.deb vectorvolt_${VERSION}_amd64.deb
@@ -176,7 +205,7 @@ jobs:
           mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
           cp dist/vvctl-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz \
              rpmbuild/SOURCES/
-          sed "s/Version:.*/Version:    ${VERSION}/" packaging/rpm/vectorvolt.spec \
+          sed "s/Version:.*/Version:    ${VERSION}/" vectorvolt/packaging/rpm/vectorvolt.spec \
             > rpmbuild/SPECS/vectorvolt.spec
           rpmbuild --define "_topdir $(pwd)/rpmbuild" -bb rpmbuild/SPECS/vectorvolt.spec
           find rpmbuild/RPMS -name "*.rpm" -exec mv {} . \;

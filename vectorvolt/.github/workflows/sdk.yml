@@ -1,0 +1,114 @@
+name: SDK Tests
+
+# Run on every PR and push to main/develop that touches the SDKs or the engine.
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "vectorvolt/**"
+      - "sdk/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "vectorvolt/**"
+      - "sdk/**"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Build vvctl release binary (shared by both SDK jobs) ──────────────────
+  build-vvctl:
+    name: Build vvctl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vectorvolt
+      - name: Build vvctl (release)
+        run: cargo build --release -p vvctl
+        working-directory: vectorvolt
+      - name: Upload vvctl binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vvctl-linux-x86_64
+          path: vectorvolt/target/release/vvctl
+          retention-days: 1
+
+  # ── Python SDK tests ───────────────────────────────────────────────────────
+  python-sdk:
+    name: Python SDK
+    needs: build-vvctl
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download vvctl
+        uses: actions/download-artifact@v4
+        with:
+          name: vvctl-linux-x86_64
+          path: vectorvolt/target/release/
+
+      - name: Make vvctl executable
+        run: chmod +x vectorvolt/target/release/vvctl
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install SDK (editable)
+        run: pip install -e sdk/python
+
+      - name: Install pytest
+        run: pip install pytest
+
+      # Run existing tests (Layer 15) and new expansion tests (Layer 45).
+      - name: Run Python SDK tests
+        run: pytest sdk/python/tests/ -v --tb=short
+        timeout-minutes: 5
+
+  # ── C# SDK tests ──────────────────────────────────────────────────────────
+  csharp-sdk:
+    name: C# SDK (.NET ${{ matrix.dotnet }})
+    needs: build-vvctl
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dotnet: ["8.0"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download vvctl
+        uses: actions/download-artifact@v4
+        with:
+          name: vvctl-linux-x86_64
+          path: vectorvolt/target/release/
+
+      - name: Make vvctl executable
+        run: chmod +x vectorvolt/target/release/vvctl
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ matrix.dotnet }}
+
+      - name: Restore NuGet packages
+        run: dotnet restore sdk/csharp/VectorVolt.Client.sln
+
+      - name: Build SDK
+        run: dotnet build sdk/csharp/VectorVolt.Client.sln --no-restore -c Release
+
+      # Run all xUnit tests. The ServerHarness finds vvctl via the relative path
+      # vectorvolt/target/release/vvctl[.exe] from the solution root.
+      - name: Run C# SDK tests
+        run: >
+          dotnet test sdk/csharp/VectorVolt.Client.Tests/
+          --no-build -c Release
+          --logger "console;verbosity=normal"
+          --blame-hang-timeout 60s
+        timeout-minutes: 10
