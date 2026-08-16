@@ -495,3 +495,17 @@ pub struct WindowRowResp {
 pub struct WindowResp {
     pub rows: Vec<WindowRowResp>,
 }
+
+// ── Layer 65 query params ─────────────────────────────────────────────────────
+
+/// Optional column-range filter for `GET /tables/{t}/subscribe`.
+///
+/// When all three fields are present, only events whose `values[col]` falls in
+/// `[lo, hi]` are forwarded.  Delete events (no values) are suppressed when a
+/// filter is active.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct SubscribeQuery {
+    pub col: Option<usize>,
+    pub lo: Option<u64>,
+    pub hi: Option<u64>,
+}

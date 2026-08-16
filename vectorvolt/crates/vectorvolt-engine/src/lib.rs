@@ -25,6 +25,7 @@
 
 mod aggregate;
 mod batch;
+pub mod cdc;
 mod compact;
 mod cond;
 mod distinct;
@@ -48,6 +49,7 @@ mod update_where;
 mod window;
 
 pub use aggregate::HistogramBucket;
+pub use cdc::{ChangeEvent, ChangeKind};
 pub use compact::CompactResult;
 pub use cond::UpsertResult;
 pub use engine::TableEngine;

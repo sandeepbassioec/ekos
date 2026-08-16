@@ -4,6 +4,9 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::server::AppState;
 use crate::types::{
@@ -13,9 +16,9 @@ use crate::types::{
     HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody, OkResp, PageResp,
     PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RowResp, RowsResp,
     ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery,
-    SchemaResp, SecondaryQuery, TablesResp, TtlNowQuery, UpdateFieldBody, UpdateWhereQuery,
-    UpdatedResp, ValueCountEntry, ValueCountsResp, WindowAggQuery, WindowCountQuery,
-    WindowRankQuery, WindowResp, WindowRowResp,
+    SchemaResp, SecondaryQuery, SubscribeQuery, TablesResp, TtlNowQuery, UpdateFieldBody,
+    UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp, WindowAggQuery,
+    WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -1200,5 +1203,45 @@ pub async fn scan_where(
                 .into_response()
             }
         },
+    }
+}
+
+// ── Layer 65: CDC / SSE subscribe ────────────────────────────────────────────
+
+/// `GET /tables/{table}/subscribe[?col=&lo=&hi=]`
+///
+/// Opens a Server-Sent Events stream.  Each event is a JSON-serialised
+/// [`ChangeEvent`].  The optional `col`/`lo`/`hi` query parameters filter
+/// events: only events whose `values[col]` falls in `[lo, hi]` are forwarded.
+/// Delete events (no values) are suppressed when a filter is active.
+pub async fn subscribe_handler(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(query): Query<SubscribeQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => {
+            let rx = eng.subscribe_changes();
+            let stream = BroadcastStream::new(rx).filter_map(move |result| {
+                let ev = match result {
+                    Ok(e) => e,
+                    Err(_) => return None, // lagged receiver — skip and continue
+                };
+                if let (Some(col), Some(lo), Some(hi)) = (query.col, query.lo, query.hi) {
+                    match &ev.values {
+                        Some(vals) if col < vals.len() && vals[col] >= lo && vals[col] <= hi => {}
+                        _ => return None,
+                    }
+                }
+                let json = serde_json::to_string(&ev).ok()?;
+                Some(Ok::<Event, std::convert::Infallible>(
+                    Event::default().data(json),
+                ))
+            });
+            Sse::new(stream)
+                .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(30)))
+                .into_response()
+        }
     }
 }
