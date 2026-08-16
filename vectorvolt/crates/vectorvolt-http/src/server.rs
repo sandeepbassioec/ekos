@@ -191,6 +191,34 @@ fn build_router(
         .route("/tables/{table}/scan_where", get(handlers::scan_where))
         // Layer 57: column projection scan
         .route("/tables/{table}/scan/project", get(handlers::scan_project))
+        // Layer 58: conditional writes
+        .route(
+            "/tables/{table}/rows/{pk}/if_absent",
+            post(handlers::insert_if_absent),
+        )
+        .route(
+            "/tables/{table}/rows/{pk}/cas",
+            post(handlers::compare_and_swap),
+        )
+        // Layer 59: batch insert
+        .route("/tables/{table}/batch/insert", post(handlers::batch_insert))
+        // Layer 60: TTL operations
+        .route(
+            "/tables/{table}/rows/{pk}/ttl",
+            post(handlers::insert_with_ttl),
+        )
+        .route(
+            "/tables/{table}/get_with_ttl/{pk}",
+            get(handlers::get_with_ttl),
+        )
+        .route(
+            "/tables/{table}/scan_with_ttl",
+            get(handlers::scan_with_ttl),
+        )
+        .route(
+            "/tables/{table}/purge_expired",
+            post(handlers::purge_expired),
+        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

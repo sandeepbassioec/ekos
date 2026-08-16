@@ -7,13 +7,15 @@ use axum::response::IntoResponse;
 
 use crate::server::AppState;
 use crate::types::{
-    AggResp, BatchDeleteResp, BatchGetResp, BatchPksBody, BucketResp, CountResp, CreateTableBody,
-    DistinctResp, ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp, GroupResp,
-    HistogramQuery, HistogramResp, IncrDecrWhereQuery, InsertBody, OkResp, PageResp,
-    PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp, RowsResp, ScanPageQuery,
-    ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery, SchemaResp,
-    SecondaryQuery, TablesResp, UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry,
-    ValueCountsResp, WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
+    AggResp, BatchDeleteResp, BatchGetResp, BatchInsertBody, BatchInsertResp, BatchPksBody,
+    BucketResp, CasBody, CasResp, ConditionalInsertResp, CountResp, CreateTableBody, DistinctResp,
+    ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp, GroupResp, HistogramQuery,
+    HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody, OkResp, PageResp,
+    PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RowResp, RowsResp,
+    ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery,
+    SchemaResp, SecondaryQuery, TablesResp, TtlNowQuery, UpdateFieldBody, UpdateWhereQuery,
+    UpdatedResp, ValueCountEntry, ValueCountsResp, WindowAggQuery, WindowCountQuery,
+    WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -386,6 +388,30 @@ pub async fn query_handler(
                             .collect(),
                     })
                 }
+                vectorvolt_query::QueryResponse::ConditionalInserted(b) => {
+                    Json(QueryResp::ConditionalInserted { inserted: b })
+                }
+                vectorvolt_query::QueryResponse::Swapped(b) => {
+                    Json(QueryResp::Swapped { swapped: b })
+                }
+                vectorvolt_query::QueryResponse::BatchInserted(n) => {
+                    Json(QueryResp::BatchInserted { inserted: n })
+                }
+                vectorvolt_query::QueryResponse::TtlRow(Some(row)) => Json(QueryResp::TtlRow {
+                    pk: row.pk,
+                    values: row.values,
+                }),
+                vectorvolt_query::QueryResponse::TtlRow(None) => Json(QueryResp::NotFound),
+                vectorvolt_query::QueryResponse::TtlRows(rows) => Json(QueryResp::TtlRows {
+                    rows: rows
+                        .into_iter()
+                        .map(|r| RowResp {
+                            pk: r.pk,
+                            values: r.values,
+                        })
+                        .collect(),
+                }),
+                vectorvolt_query::QueryResponse::Purged(n) => Json(QueryResp::Purged { purged: n }),
             };
             json.into_response()
         }
@@ -995,6 +1021,154 @@ pub async fn batch_delete(
             Ok(n) => {
                 st.metrics.record_ok();
                 Json(BatchDeleteResp { deleted: n }).into_response()
+            }
+        },
+    }
+}
+
+// ── Layer 58: conditional writes ─────────────────────────────────────────────
+
+pub async fn insert_if_absent(
+    State(st): State<Arc<AppState>>,
+    Path((table, pk)): Path<(String, u64)>,
+    Json(body): Json<InsertBody>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.insert_if_absent(pk, body.values) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(inserted) => {
+                st.metrics.record_ok();
+                Json(ConditionalInsertResp { inserted }).into_response()
+            }
+        },
+    }
+}
+
+pub async fn compare_and_swap(
+    State(st): State<Arc<AppState>>,
+    Path((table, pk)): Path<(String, u64)>,
+    Json(body): Json<CasBody>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.compare_and_swap(pk, &body.expected, body.new_values) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(swapped) => {
+                st.metrics.record_ok();
+                Json(CasResp { swapped }).into_response()
+            }
+        },
+    }
+}
+
+// ── Layer 59: batch insert ────────────────────────────────────────────────────
+
+pub async fn batch_insert(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Json(body): Json<BatchInsertBody>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => {
+            let rows = body.rows.into_iter().map(|r| (r.pk, r.values));
+            match eng.batch_insert(rows) {
+                Err(e) => engine_err(&st, e).into_response(),
+                Ok(n) => {
+                    st.metrics.record_ok();
+                    Json(BatchInsertResp { inserted: n }).into_response()
+                }
+            }
+        }
+    }
+}
+
+// ── Layer 60: TTL operations ──────────────────────────────────────────────────
+
+pub async fn insert_with_ttl(
+    State(st): State<Arc<AppState>>,
+    Path((table, pk)): Path<(String, u64)>,
+    Json(body): Json<InsertTtlBody>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.insert_with_ttl(pk, body.values, body.expire_at) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(()) => {
+                st.metrics.record_ok();
+                Json(OkResp { ok: true }).into_response()
+            }
+        },
+    }
+}
+
+pub async fn get_with_ttl(
+    State(st): State<Arc<AppState>>,
+    Path((table, pk)): Path<(String, u64)>,
+    Query(q): Query<TtlNowQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.get_with_ttl(pk, q.now) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(Some(row)) => {
+                st.metrics.record_ok();
+                Json(RowResp {
+                    pk: row.pk,
+                    values: row.values,
+                })
+                .into_response()
+            }
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResp {
+                    error: "not found or expired".into(),
+                }),
+            )
+                .into_response(),
+        },
+    }
+}
+
+pub async fn scan_with_ttl(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<TtlNowQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.scan_with_ttl(q.now) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(rows) => {
+                st.metrics.record_ok();
+                Json(RowsResp {
+                    rows: rows
+                        .into_iter()
+                        .map(|r| RowResp {
+                            pk: r.pk,
+                            values: r.values,
+                        })
+                        .collect(),
+                })
+                .into_response()
+            }
+        },
+    }
+}
+
+pub async fn purge_expired(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<TtlNowQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.purge_expired(q.now) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(n) => {
+                st.metrics.record_ok();
+                Json(PurgedResp { purged: n }).into_response()
             }
         },
     }

@@ -231,6 +231,38 @@ pub enum Query {
         hi: u64,
         projection: Vec<usize>,
     },
+
+    // ── Layer 58: conditional writes ─────────────────────────────────────────
+    /// `INSERT IF_ABSENT <pk> <v1> [v2 ...]`
+    InsertIfAbsent { pk: u64, values: Vec<u64> },
+
+    /// `CAS <pk> EXPECTED <v1> [v2 ...] NEW <v1> [v2 ...]`
+    CompareAndSwap {
+        pk: u64,
+        expected: Vec<u64>,
+        new_values: Vec<u64>,
+    },
+
+    // ── Layer 59: batch insert ────────────────────────────────────────────────
+    /// `BATCH INSERT ROW <pk> <v1> [v2 ...] [ROW <pk> <v1> [v2 ...] ...]`
+    BatchInsert { rows: Vec<(u64, Vec<u64>)> },
+
+    // ── Layer 60: TTL operations ──────────────────────────────────────────────
+    /// `INSERT TTL <pk> <v1> [v2 ...] EXPIRE <n>`
+    InsertWithTtl {
+        pk: u64,
+        values: Vec<u64>,
+        expire_at: u64,
+    },
+
+    /// `GET TTL <pk> NOW <n>`
+    GetWithTtl { pk: u64, now: u64 },
+
+    /// `SCAN TTL NOW <n>`
+    ScanWithTtl { now: u64 },
+
+    /// `PURGE EXPIRED NOW <n>`
+    PurgeExpired { now: u64 },
 }
 
 /// Parse a query string into a [`Query`].
@@ -297,6 +329,12 @@ impl Parser {
                     let txn_id = self.expect_int()?;
                     let pk = self.expect_int()?;
                     Ok(Query::GetTxn { txn_id, pk })
+                } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Ttl))) {
+                    self.next(); // consume TTL
+                    let pk = self.expect_int()?;
+                    self.expect_keyword(Keyword::Now)?;
+                    let now = self.expect_int()?;
+                    Ok(Query::GetWithTtl { pk, now })
                 } else {
                     let pk = self.expect_int()?;
                     Ok(Query::Get { pk })
@@ -310,6 +348,22 @@ impl Parser {
                     let pk = self.expect_int()?;
                     let values = self.collect_ints();
                     Ok(Query::InsertTxn { txn_id, pk, values })
+                } else if matches!(self.peek(), Some(Token::Keyword(Keyword::IfAbsent))) {
+                    self.next(); // consume IF_ABSENT
+                    let pk = self.expect_int()?;
+                    let values = self.collect_ints();
+                    Ok(Query::InsertIfAbsent { pk, values })
+                } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Ttl))) {
+                    self.next(); // consume TTL
+                    let pk = self.expect_int()?;
+                    let values = self.collect_ints();
+                    self.expect_keyword(Keyword::Expire)?;
+                    let expire_at = self.expect_int()?;
+                    Ok(Query::InsertWithTtl {
+                        pk,
+                        values,
+                        expire_at,
+                    })
                 } else {
                     let pk = self.expect_int()?;
                     let values = self.collect_ints();
@@ -377,6 +431,11 @@ impl Parser {
                         hi,
                         projection,
                     })
+                } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Ttl))) {
+                    self.next(); // consume TTL
+                    self.expect_keyword(Keyword::Now)?;
+                    let now = self.expect_int()?;
+                    Ok(Query::ScanWithTtl { now })
                 } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
                     self.next(); // consume WHERE
                                  // parse 1..N  col=<n> lo=<lo> hi=<hi>  triplets separated by optional AND
@@ -705,24 +764,59 @@ impl Parser {
                     Some(Token::Keyword(k)) => k,
                     Some(t) => {
                         return Err(QueryError::Syntax(format!(
-                            "expected GET or DELETE after BATCH, got {t:?}"
+                            "expected GET/DELETE/INSERT after BATCH, got {t:?}"
                         )))
                     }
                     None => return Err(QueryError::UnexpectedEof),
                 };
-                let mut pks = Vec::new();
-                while matches!(self.peek(), Some(Token::Int(_))) {
-                    if let Some(Token::Int(n)) = self.next() {
-                        pks.push(n);
-                    }
-                }
                 match op_kw {
-                    Keyword::Get => Ok(Query::BatchGet { pks }),
-                    Keyword::Delete => Ok(Query::BatchDelete { pks }),
+                    Keyword::Get => {
+                        let pks = self.collect_ints();
+                        Ok(Query::BatchGet { pks })
+                    }
+                    Keyword::Delete => {
+                        let pks = self.collect_ints();
+                        Ok(Query::BatchDelete { pks })
+                    }
+                    Keyword::Insert => {
+                        let mut rows: Vec<(u64, Vec<u64>)> = Vec::new();
+                        loop {
+                            self.expect_keyword(Keyword::Row)?;
+                            let pk = self.expect_int()?;
+                            let values = self.collect_ints();
+                            rows.push((pk, values));
+                            if !matches!(self.peek(), Some(Token::Keyword(Keyword::Row))) {
+                                break;
+                            }
+                        }
+                        Ok(Query::BatchInsert { rows })
+                    }
                     other => Err(QueryError::Syntax(format!(
-                        "expected GET or DELETE after BATCH, got {other:?}"
+                        "expected GET/DELETE/INSERT after BATCH, got {other:?}"
                     ))),
                 }
+            }
+
+            // ── Layer 58: CAS ───────────────────────────────────────────────
+            Keyword::Cas => {
+                let pk = self.expect_int()?;
+                self.expect_keyword(Keyword::Expected)?;
+                let expected = self.collect_ints();
+                self.expect_keyword(Keyword::New)?;
+                let new_values = self.collect_ints();
+                Ok(Query::CompareAndSwap {
+                    pk,
+                    expected,
+                    new_values,
+                })
+            }
+
+            // ── Layer 60: PURGE ─────────────────────────────────────────────
+            Keyword::Purge => {
+                self.expect_keyword(Keyword::Expired)?;
+                self.expect_keyword(Keyword::Now)?;
+                let now = self.expect_int()?;
+                Ok(Query::PurgeExpired { now })
             }
 
             other => Err(QueryError::Syntax(format!(
