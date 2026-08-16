@@ -171,6 +171,19 @@ fn build_router(
         // Layer 53: distinct + value_counts
         .route("/tables/{table}/distinct", get(handlers::distinct))
         .route("/tables/{table}/value_counts", get(handlers::value_counts))
+        // Layer 54: bulk predicate field updates
+        .route(
+            "/tables/{table}/update_where",
+            get(handlers::update_field_where),
+        )
+        .route(
+            "/tables/{table}/increment_where",
+            get(handlers::increment_field_where),
+        )
+        .route(
+            "/tables/{table}/decrement_where",
+            get(handlers::decrement_field_where),
+        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

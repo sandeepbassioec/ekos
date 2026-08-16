@@ -183,6 +183,34 @@ pub enum Query {
 
     /// `VALUE_COUNTS col=<n> lo=<lo> hi=<hi>`
     ValueCounts { col: usize, lo: u64, hi: u64 },
+
+    // ── Layer 54: bulk predicate field updates ────────────────────────────────
+    /// `UPDATE WHERE filter_col=<n> lo=<lo> hi=<hi> target_col=<c> val=<v>`
+    UpdateWhere {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        target_col: usize,
+        val: u64,
+    },
+
+    /// `INCREMENT WHERE filter_col=<n> lo=<lo> hi=<hi> target_col=<c> delta=<d>`
+    IncrementWhere {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        target_col: usize,
+        delta: u64,
+    },
+
+    /// `DECREMENT WHERE filter_col=<n> lo=<lo> hi=<hi> target_col=<c> delta=<d>`
+    DecrementWhere {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        target_col: usize,
+        delta: u64,
+    },
 }
 
 /// Parse a query string into a [`Query`].
@@ -363,15 +391,33 @@ impl Parser {
             }
 
             Keyword::Update => {
-                self.expect_keyword(Keyword::Field)?;
-                let pk = self.expect_int()?;
-                self.expect_keyword(Keyword::Col)?;
-                self.expect_eq()?;
-                let col = self.expect_int()? as usize;
-                self.expect_keyword(Keyword::Val)?;
-                self.expect_eq()?;
-                let val = self.expect_int()?;
-                Ok(Query::UpdateField { pk, col, val })
+                if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
+                    self.next(); // consume WHERE
+                    let (filter_col, lo, hi) = self.parse_filter_col_lo_hi()?;
+                    self.expect_keyword(Keyword::TargetCol)?;
+                    self.expect_eq()?;
+                    let target_col = self.expect_int()? as usize;
+                    self.expect_keyword(Keyword::Val)?;
+                    self.expect_eq()?;
+                    let val = self.expect_int()?;
+                    Ok(Query::UpdateWhere {
+                        filter_col,
+                        lo,
+                        hi,
+                        target_col,
+                        val,
+                    })
+                } else {
+                    self.expect_keyword(Keyword::Field)?;
+                    let pk = self.expect_int()?;
+                    self.expect_keyword(Keyword::Col)?;
+                    self.expect_eq()?;
+                    let col = self.expect_int()? as usize;
+                    self.expect_keyword(Keyword::Val)?;
+                    self.expect_eq()?;
+                    let val = self.expect_int()?;
+                    Ok(Query::UpdateField { pk, col, val })
+                }
             }
 
             Keyword::Delete => {
@@ -549,6 +595,43 @@ impl Parser {
             Keyword::ValueCounts => {
                 let (col, lo, hi) = self.parse_col_lo_hi()?;
                 Ok(Query::ValueCounts { col, lo, hi })
+            }
+
+            // ── Layer 54: bulk predicate field updates ──────────────────────
+            Keyword::Increment => {
+                self.expect_keyword(Keyword::Where)?;
+                let (filter_col, lo, hi) = self.parse_filter_col_lo_hi()?;
+                self.expect_keyword(Keyword::TargetCol)?;
+                self.expect_eq()?;
+                let target_col = self.expect_int()? as usize;
+                self.expect_keyword(Keyword::Delta)?;
+                self.expect_eq()?;
+                let delta = self.expect_int()?;
+                Ok(Query::IncrementWhere {
+                    filter_col,
+                    lo,
+                    hi,
+                    target_col,
+                    delta,
+                })
+            }
+
+            Keyword::Decrement => {
+                self.expect_keyword(Keyword::Where)?;
+                let (filter_col, lo, hi) = self.parse_filter_col_lo_hi()?;
+                self.expect_keyword(Keyword::TargetCol)?;
+                self.expect_eq()?;
+                let target_col = self.expect_int()? as usize;
+                self.expect_keyword(Keyword::Delta)?;
+                self.expect_eq()?;
+                let delta = self.expect_int()?;
+                Ok(Query::DecrementWhere {
+                    filter_col,
+                    lo,
+                    hi,
+                    target_col,
+                    delta,
+                })
             }
 
             other => Err(QueryError::Syntax(format!(

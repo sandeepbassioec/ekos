@@ -61,6 +61,12 @@ pub enum Keyword {
     // Layer 53 additions
     Distinct,
     ValueCounts,
+    // Layer 54 additions
+    Where,
+    Increment,
+    Decrement,
+    Delta,
+    TargetCol,
 }
 
 impl Keyword {
@@ -112,6 +118,11 @@ impl Keyword {
             "SORT_COL" => Some(Self::SortCol),
             "DISTINCT" => Some(Self::Distinct),
             "VALUE_COUNTS" => Some(Self::ValueCounts),
+            "WHERE" => Some(Self::Where),
+            "INCREMENT" => Some(Self::Increment),
+            "DECREMENT" => Some(Self::Decrement),
+            "DELTA" => Some(Self::Delta),
+            "TARGET_COL" => Some(Self::TargetCol),
             _ => None,
         }
     }

@@ -8,11 +8,11 @@ use axum::response::IntoResponse;
 use crate::server::AppState;
 use crate::types::{
     AggResp, BucketResp, CountResp, CreateTableBody, DistinctResp, ErrorResp, GroupByAggQuery,
-    GroupByQuery, GroupEntryResp, GroupResp, HistogramQuery, HistogramResp, InsertBody, OkResp,
-    PageResp, PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp, RowsResp,
-    ScanPageQuery, ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp,
-    UpdateFieldBody, ValueCountEntry, ValueCountsResp, WindowAggQuery, WindowCountQuery,
-    WindowRankQuery, WindowResp, WindowRowResp,
+    GroupByQuery, GroupEntryResp, GroupResp, HistogramQuery, HistogramResp, IncrDecrWhereQuery,
+    InsertBody, OkResp, PageResp, PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp,
+    RowsResp, ScanPageQuery, ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp,
+    UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
+    WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -345,6 +345,9 @@ pub async fn query_handler(
                             .map(|(v, c)| ValueCountEntry { value: v, count: c })
                             .collect(),
                     })
+                }
+                vectorvolt_query::QueryResponse::UpdatedCount(n) => {
+                    Json(QueryResp::Updated { updated: n })
                 }
             };
             json.into_response()
@@ -823,5 +826,63 @@ pub async fn value_counts(
                 .into_response()
             }
         },
+    }
+}
+
+// ── Layer 54: bulk predicate field updates ────────────────────────────────────
+
+pub async fn update_field_where(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<UpdateWhereQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.update_field_where(&[(q.filter_col, q.lo, q.hi)], q.target_col, q.val)
+        {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(n) => {
+                st.metrics.record_ok();
+                Json(UpdatedResp { updated: n }).into_response()
+            }
+        },
+    }
+}
+
+pub async fn increment_field_where(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<IncrDecrWhereQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => {
+            match eng.increment_field_where(&[(q.filter_col, q.lo, q.hi)], q.target_col, q.delta) {
+                Err(e) => engine_err(&st, e).into_response(),
+                Ok(n) => {
+                    st.metrics.record_ok();
+                    Json(UpdatedResp { updated: n }).into_response()
+                }
+            }
+        }
+    }
+}
+
+pub async fn decrement_field_where(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<IncrDecrWhereQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => {
+            match eng.decrement_field_where(&[(q.filter_col, q.lo, q.hi)], q.target_col, q.delta) {
+                Err(e) => engine_err(&st, e).into_response(),
+                Ok(n) => {
+                    st.metrics.record_ok();
+                    Json(UpdatedResp { updated: n }).into_response()
+                }
+            }
+        }
     }
 }

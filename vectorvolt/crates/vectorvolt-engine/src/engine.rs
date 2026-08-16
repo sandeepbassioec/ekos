@@ -524,29 +524,28 @@ impl TableEngine {
         let row_offset = desc.row_offset() as usize;
 
         if file_id == vectorvolt_txn::PENDING_FILE_ID {
-            // Still buffered. A miss here is not an error: a concurrent flush may
-            // have moved the row to a partition and republished the descriptor
-            // between the index read above and this lookup, so re-read the index
-            // and resolve again rather than reporting the row absent.
-            if let Some(values) = self.txn.buffered_row(pk, row_offset) {
+            // Still buffered (or in the in-flight set during a flush). A miss in
+            // the buffer alone is not an error: a concurrent flush may have drained
+            // the row into `in_flight` — or may have already moved it to a partition
+            // and republished the descriptor — between the index read above and this
+            // lookup. Check both the buffer and in-flight, then re-read the index.
+            if let Some(values) = self.txn.buffered_or_inflight_row(pk, row_offset) {
                 return Ok(Some(EngineRow { pk, values }));
             }
             let Some(fresh) = self.txn.pk_index.read().get(pk) else {
                 return Ok(None);
             };
             if fresh.file_id() == vectorvolt_txn::PENDING_FILE_ID {
-                if let Some(values) = self.txn.buffered_row(pk, fresh.row_offset() as usize) {
+                if let Some(values) = self
+                    .txn
+                    .buffered_or_inflight_row(pk, fresh.row_offset() as usize)
+                {
                     return Ok(Some(EngineRow { pk, values }));
                 }
-                // Still pending, and in neither the buffer nor the in-flight set,
-                // after two index reads. Rather than report the row absent — which
-                // is what an earlier version of this did, and which a concurrency
-                // test caught at roughly one run in eight — force the flush to
-                // complete and resolve against the result.
-                //
-                // This is the ONLY path that still flushes from a read, and it is
-                // reached when a flush is mid-publication. Rare by construction and
-                // self-limiting: after it, the descriptor is real.
+                // Still pending and in neither the buffer nor the in-flight set
+                // after two index reads — the flush completed between our reads.
+                // Force another flush to drain anything that snuck in, then
+                // resolve against whatever settled descriptor we find.
                 self.do_flush()?;
                 let Some(settled) = self.txn.pk_index.read().get(pk) else {
                     return Ok(None);
@@ -554,7 +553,7 @@ impl TableEngine {
                 if settled.file_id() == vectorvolt_txn::PENDING_FILE_ID {
                     return Ok(self
                         .txn
-                        .buffered_row(pk, settled.row_offset() as usize)
+                        .buffered_or_inflight_row(pk, settled.row_offset() as usize)
                         .map(|values| EngineRow { pk, values }));
                 }
                 let values = self.read_row_from(

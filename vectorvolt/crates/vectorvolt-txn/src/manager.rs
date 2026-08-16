@@ -751,6 +751,25 @@ impl TxnManager {
             .map(|v| v.to_vec())
     }
 
+    /// Check the write buffer first, then the in-flight set.
+    ///
+    /// Rows drained from the buffer during a flush live in `in_flight` until
+    /// their pk_index entries are rewritten from PENDING to real coordinates.
+    /// During that window `buffered_row` misses them; this method covers both
+    /// places so a reader with a PENDING descriptor never falsely reports the
+    /// row absent.
+    pub fn buffered_or_inflight_row(&self, pk: u64, offset: usize) -> Option<Vec<u64>> {
+        if let Some(vals) = self
+            .write_buf
+            .lock()
+            .row_for(pk, offset)
+            .map(|v| v.to_vec())
+        {
+            return Some(vals);
+        }
+        self.in_flight.lock().get(&pk).cloned()
+    }
+
     pub fn row_count_buffered(&self) -> usize {
         self.write_buf.lock().len()
     }

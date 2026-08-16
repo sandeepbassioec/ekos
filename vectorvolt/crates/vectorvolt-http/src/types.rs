@@ -210,6 +210,10 @@ pub enum QueryResp {
     ValueCounts {
         entries: Vec<ValueCountEntry>,
     },
+    /// UPDATE WHERE / INCREMENT WHERE / DECREMENT WHERE result.
+    Updated {
+        updated: usize,
+    },
 }
 
 // ── Layer 53 response types ───────────────────────────────────────────────────
@@ -228,6 +232,31 @@ pub struct ValueCountEntry {
 #[derive(Debug, Serialize)]
 pub struct ValueCountsResp {
     pub entries: Vec<ValueCountEntry>,
+}
+
+// ── Layer 54 query params + response types ────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateWhereQuery {
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub target_col: usize,
+    pub val: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IncrDecrWhereQuery {
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub target_col: usize,
+    pub delta: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdatedResp {
+    pub updated: usize,
 }
 
 // ── Layer 51 query params + response types ────────────────────────────────────
