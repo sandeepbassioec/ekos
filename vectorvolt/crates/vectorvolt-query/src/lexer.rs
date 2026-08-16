@@ -51,6 +51,13 @@ pub enum Keyword {
     FilterCol,
     GroupCol,
     AggCol,
+    // Layer 52 additions
+    Window,
+    RunningSUM,
+    RunningCount,
+    Rank,
+    DenseRank,
+    SortCol,
 }
 
 impl Keyword {
@@ -94,6 +101,12 @@ impl Keyword {
             "FILTER_COL" => Some(Self::FilterCol),
             "GROUP_COL" => Some(Self::GroupCol),
             "AGG_COL" => Some(Self::AggCol),
+            "WINDOW" => Some(Self::Window),
+            "RUNNING_SUM" => Some(Self::RunningSUM),
+            "RUNNING_COUNT" => Some(Self::RunningCount),
+            "RANK" => Some(Self::Rank),
+            "DENSE_RANK" => Some(Self::DenseRank),
+            "SORT_COL" => Some(Self::SortCol),
             _ => None,
         }
     }

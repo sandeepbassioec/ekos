@@ -154,6 +154,20 @@ fn build_router(
         .route("/tables/{table}/group/sum", get(handlers::group_sum))
         .route("/tables/{table}/group/min", get(handlers::group_min))
         .route("/tables/{table}/group/max", get(handlers::group_max))
+        // Layer 52: window functions
+        .route(
+            "/tables/{table}/window/running_sum",
+            get(handlers::window_running_sum),
+        )
+        .route(
+            "/tables/{table}/window/running_count",
+            get(handlers::window_running_count),
+        )
+        .route("/tables/{table}/window/rank", get(handlers::window_rank))
+        .route(
+            "/tables/{table}/window/dense_rank",
+            get(handlers::window_dense_rank),
+        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

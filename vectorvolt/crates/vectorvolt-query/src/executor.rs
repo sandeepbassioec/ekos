@@ -1,6 +1,8 @@
 //! Execute a [`Query`] against a [`TableEngine`], returning a [`QueryResponse`].
 
-use vectorvolt_engine::{EngineRow, EngineStats, HistogramBucket, PageResult, TableEngine, TxnId};
+use vectorvolt_engine::{
+    EngineRow, EngineStats, HistogramBucket, PageResult, TableEngine, TxnId, WindowRow,
+};
 
 use crate::error::QueryResult;
 use crate::parser::Query;
@@ -48,6 +50,10 @@ pub enum QueryResponse {
     // ── Layer 51 ──────────────────────────────────────────────────────────────
     /// Group-by result: Vec of (group_val, agg_val) pairs.
     GroupResult(Vec<(u64, u64)>),
+
+    // ── Layer 52 ──────────────────────────────────────────────────────────────
+    /// Window function result: Vec of (pk, window_val) rows.
+    WindowRows(Vec<WindowRow>),
 }
 
 /// Execute `query` against `engine`.
@@ -242,6 +248,44 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         } => {
             let pairs = engine.group_by_max(filter_col, lo, hi, group_col, agg_col)?;
             Ok(QueryResponse::GroupResult(pairs))
+        }
+
+        // ── Layer 52: window functions ─────────────────────────────────────────
+        Query::WindowRunningSum {
+            filter_col,
+            lo,
+            hi,
+            agg_col,
+        } => {
+            let rows = engine.running_sum(filter_col, lo, hi, agg_col)?;
+            Ok(QueryResponse::WindowRows(rows))
+        }
+
+        Query::WindowRunningCount { filter_col, lo, hi } => {
+            let rows = engine.running_count(filter_col, lo, hi)?;
+            Ok(QueryResponse::WindowRows(rows))
+        }
+
+        Query::WindowRank {
+            filter_col,
+            lo,
+            hi,
+            sort_col,
+            asc,
+        } => {
+            let rows = engine.rank_by(filter_col, lo, hi, sort_col, asc)?;
+            Ok(QueryResponse::WindowRows(rows))
+        }
+
+        Query::WindowDenseRank {
+            filter_col,
+            lo,
+            hi,
+            sort_col,
+            asc,
+        } => {
+            let rows = engine.dense_rank_by(filter_col, lo, hi, sort_col, asc)?;
+            Ok(QueryResponse::WindowRows(rows))
         }
     }
 }
