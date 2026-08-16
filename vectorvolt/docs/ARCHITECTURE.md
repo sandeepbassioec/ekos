@@ -132,6 +132,26 @@ AppState {
 
 Auth middleware runs on every request. `/health` and `/metrics` are excluded.
 
+### Endpoint Groups
+
+| Group | Routes | Layer |
+|---|---|---|
+| DDL | `/tables`, `/tables/{t}`, `/tables/{t}/schema` | 14 |
+| Core CRUD | `/rows/{pk}` (GET/POST/PUT/DELETE), `/rows/range` (DELETE), `/scan`, `/secondary` | 14 |
+| Aggregates | `/count`, `/sum`, `/min`, `/max`, `/avg`, `/scan/sorted`, `/scan/page` | 44 |
+| Auth | `PUT /rows/{pk}/field`, `DELETE /rows/range`, DSL `POST /query` | 42/43/44 |
+| Analytics | `/histogram`, `/percentile` | 48 |
+| Group-by | `/group/count`, `/group/sum`, `/group/min`, `/group/max` | 49 |
+| Window | `/window/running_sum`, `/window/running_count`, `/window/rank`, `/window/dense_rank` | 52 |
+| Distinct | `/distinct`, `/value_counts` | 53 |
+| Bulk mutations | `/update_where`, `/increment_where`, `/decrement_where` | 54 |
+| Batch ops | `/batch/get`, `/batch/delete`, `/batch/insert` | 55 |
+| Scan where | `/scan_where` (indexed `?col0=&lo0=&hi0=` params) | 56 |
+| Scan project | `/scan/project` (`?proj=<csv-col-indices>`) | 57 |
+| Cond writes | `/rows/{pk}/if_absent`, `/rows/{pk}/cas` | 58 |
+| TTL | `/rows/{pk}/ttl`, `/get_with_ttl/{pk}`, `/scan_with_ttl`, `/purge_expired` | 60 |
+| Observability | `/health`, `/metrics` | 17 |
+
 Prometheus metrics exported as text at `GET /metrics`:
 ```
 vv_requests_total{status="ok"}   <n>
@@ -164,6 +184,25 @@ The `run(engine, text)` function combines all three phases.
 
 `Query` is a plain enum — all variants are statically sized. No heap
 allocation in the tokenizer for inputs under 256 bytes.
+
+### Statement Coverage
+
+| Category | Statements | Layer |
+|---|---|---|
+| Core CRUD | `GET`, `INSERT`, `UPSERT`, `DELETE`, `UPDATE FIELD` | 19 |
+| Scans | `SCAN`, `SCAN SORTED`, `SCAN PAGE`, `SECONDARY`, `DELETE RANGE` | 19/43 |
+| Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` | 43 |
+| MVCC | `BEGIN TXN`, `INSERT/DELETE/GET TXN`, `COMMIT/ROLLBACK TXN` | 19 |
+| Analytics | `HISTOGRAM`, `PERCENTILE` | 50 |
+| Group-by | `GROUP COUNT/SUM/MIN/MAX` | 51 |
+| Window | `WINDOW RUNNING_SUM/COUNT/RANK/DENSE_RANK` | 52 |
+| Distinct | `DISTINCT`, `VALUE_COUNTS` | 53 |
+| Bulk mutations | `UPDATE WHERE`, `INCREMENT WHERE`, `DECREMENT WHERE` | 54 |
+| Scan + project | `SCAN WHERE`, `SCAN PROJECT` | 56/57 |
+| Cond writes | `INSERT IF_ABSENT`, `CAS` | 58 |
+| Batch | `BATCH INSERT/GET/DELETE` | 55/59 |
+| TTL | `INSERT TTL`, `GET TTL`, `SCAN TTL`, `PURGE EXPIRED` | 60 |
+| Introspection | `DESCRIBE`, `STATS` | 19 |
 
 ---
 
