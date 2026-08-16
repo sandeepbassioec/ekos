@@ -84,4 +84,17 @@ pub enum QueryResp {
     },
     Ok,
     NotFound,
+    /// COUNT or DELETE RANGE result.
+    Count {
+        count: u64,
+    },
+    /// SUM / MIN / MAX / AVG result (None when no rows matched).
+    Aggregate {
+        value: Option<u64>,
+    },
+    /// SCAN PAGE result with optional next-cursor.
+    Page {
+        rows: Vec<RowResp>,
+        next_cursor: Option<u64>,
+    },
 }
