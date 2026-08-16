@@ -61,6 +61,10 @@ pub enum QueryResponse {
 
     /// (value, count) pairs from VALUE_COUNTS.
     ValueCounts(Vec<(u64, u64)>),
+
+    // ── Layer 54 ──────────────────────────────────────────────────────────────
+    /// Number of rows updated by UPDATE WHERE / INCREMENT WHERE / DECREMENT WHERE.
+    UpdatedCount(usize),
 }
 
 /// Execute `query` against `engine`.
@@ -304,6 +308,40 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         Query::ValueCounts { col, lo, hi } => {
             let pairs = engine.value_counts(col, lo, hi)?;
             Ok(QueryResponse::ValueCounts(pairs))
+        }
+
+        // ── Layer 54: bulk predicate field updates ─────────────────────────────
+        Query::UpdateWhere {
+            filter_col,
+            lo,
+            hi,
+            target_col,
+            val,
+        } => {
+            let n = engine.update_field_where(&[(filter_col, lo, hi)], target_col, val)?;
+            Ok(QueryResponse::UpdatedCount(n))
+        }
+
+        Query::IncrementWhere {
+            filter_col,
+            lo,
+            hi,
+            target_col,
+            delta,
+        } => {
+            let n = engine.increment_field_where(&[(filter_col, lo, hi)], target_col, delta)?;
+            Ok(QueryResponse::UpdatedCount(n))
+        }
+
+        Query::DecrementWhere {
+            filter_col,
+            lo,
+            hi,
+            target_col,
+            delta,
+        } => {
+            let n = engine.decrement_field_where(&[(filter_col, lo, hi)], target_col, delta)?;
+            Ok(QueryResponse::UpdatedCount(n))
         }
     }
 }
