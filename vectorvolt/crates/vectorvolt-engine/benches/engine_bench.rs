@@ -2,15 +2,21 @@
 //!
 //! ## What is measured
 //!
-//! | Benchmark group       | What it exercises                                          |
-//! |-----------------------|------------------------------------------------------------|
-//! | `insert/buffered`     | WAL write + CuckooMap insert + secondary-index update      |
-//! | `get/buffered`        | CuckooMap probe + buffer slot read (no disk I/O)           |
-//! | `get/flushed`         | CuckooMap probe + mmap column read (page-cache hit)        |
-//! | `scan/buffered`       | Full buffer scan (zone-map path not exercised)             |
-//! | `scan/flushed`        | SIMD column filter + zone-map pruning + materialization     |
-//! | `secondary/buffered`  | SecondaryIndex probe + CuckooMap resolve per matching row   |
-//! | `flush`               | Drain buffer → encode columns → fsync-free write           |
+//! | Benchmark group        | What it exercises                                          |
+//! |------------------------|------------------------------------------------------------|
+//! | `insert/buffered`      | WAL write + CuckooMap insert + secondary-index update      |
+//! | `get/buffered`         | CuckooMap probe + buffer slot read (no disk I/O)           |
+//! | `get/flushed`          | CuckooMap probe + mmap column read (page-cache hit)        |
+//! | `scan/buffered`        | Full buffer scan (zone-map path not exercised)             |
+//! | `scan/flushed`         | SIMD column filter + zone-map pruning + materialization     |
+//! | `secondary/buffered`   | SecondaryIndex probe + CuckooMap resolve per matching row  |
+//! | `flush`                | Drain buffer → encode columns → fsync-free write          |
+//! | `aggregate/buffered`   | count/sum/min/max/avg over buffered partition               |
+//! | `aggregate/flushed`    | count/sum/min/max/avg with zone-map pruning                 |
+//! | `sorted_scan/buffered` | scan_sorted: cross-partition sort + limit                   |
+//! | `sorted_scan/flushed`  | scan_sorted after flush (page-cache hit)                   |
+//! | `scan_page/buffered`   | cursor-based page scan over buffer                         |
+//! | `scan_page/flushed`    | cursor-based page scan over flushed partition              |
 //!
 //! ## How to run
 //!
@@ -239,6 +245,130 @@ fn bench_flush(c: &mut Criterion) {
     group.finish();
 }
 
+// ── aggregate ─────────────────────────────────────────────────────────────────
+
+fn bench_aggregate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("aggregate");
+    const SEED: u64 = 10_000;
+
+    // buffered: aggregates walk the in-memory buffer (no disk I/O).
+    group.bench_function("count_buffered", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.count_range(1, 0, 49).unwrap()));
+    });
+
+    group.bench_function("sum_buffered", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.sum_range(1, 0, 99).unwrap()));
+    });
+
+    group.bench_function("min_buffered", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.min_range(1, 0, 99).unwrap()));
+    });
+
+    group.bench_function("max_buffered", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.max_range(1, 0, 99).unwrap()));
+    });
+
+    // flushed: zone-map pruning kicks in for out-of-range partitions.
+    group.bench_function("count_flushed", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        engine.flush().unwrap();
+        for pk in 0..SEED {
+            let _ = engine.get(pk);
+        }
+        b.iter(|| black_box(engine.count_range(1, 0, 49).unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── sorted_scan ───────────────────────────────────────────────────────────────
+
+fn bench_sorted_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sorted_scan");
+    const SEED: u64 = 10_000;
+
+    group.bench_function("buffered", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        // col=1 filter [0,99], sort by col=2 ascending, top 100
+        b.iter(|| black_box(engine.scan_sorted(1, 0, 99, 2, true, 100).unwrap()));
+    });
+
+    group.bench_function("flushed", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        engine.flush().unwrap();
+        for pk in 0..SEED {
+            let _ = engine.get(pk);
+        }
+        b.iter(|| black_box(engine.scan_sorted(1, 0, 99, 2, true, 100).unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── scan_page ─────────────────────────────────────────────────────────────────
+
+fn bench_scan_page(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scan_page");
+    const SEED: u64 = 10_000;
+
+    group.bench_function("buffered", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        // cursor=0 → first page of 100 rows
+        b.iter(|| black_box(engine.scan_page(1, 0, 99, 0, 100).unwrap()));
+    });
+
+    group.bench_function("flushed", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        engine.flush().unwrap();
+        for pk in 0..SEED {
+            let _ = engine.get(pk);
+        }
+        b.iter(|| black_box(engine.scan_page(1, 0, 99, 0, 100).unwrap()));
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert,
@@ -246,5 +376,8 @@ criterion_group!(
     bench_scan,
     bench_secondary,
     bench_flush,
+    bench_aggregate,
+    bench_sorted_scan,
+    bench_scan_page,
 );
 criterion_main!(benches);
