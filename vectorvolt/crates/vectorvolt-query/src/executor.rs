@@ -1,6 +1,6 @@
 //! Execute a [`Query`] against a [`TableEngine`], returning a [`QueryResponse`].
 
-use vectorvolt_engine::{EngineRow, EngineStats, PageResult, TableEngine, TxnId};
+use vectorvolt_engine::{EngineRow, EngineStats, HistogramBucket, PageResult, TableEngine, TxnId};
 
 use crate::error::QueryResult;
 use crate::parser::Query;
@@ -37,6 +37,13 @@ pub enum QueryResponse {
 
     /// Paginated result from SCAN PAGE.
     Page(PageResult),
+
+    // ── Layer 50 ──────────────────────────────────────────────────────────────
+    /// Histogram buckets from HISTOGRAM.
+    Histogram(Vec<HistogramBucket>),
+
+    /// Percentile value from PERCENTILE (None when no rows matched).
+    Percentile(Option<u64>),
 }
 
 /// Execute `query` against `engine`.
@@ -171,6 +178,22 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         Query::DeleteRange { col, lo, hi } => {
             let n = engine.delete_range(col, lo, hi)?;
             Ok(QueryResponse::Count(n as u64))
+        }
+
+        // ── Layer 50: histogram + percentile ─────────────────────────────────
+        Query::Histogram {
+            col,
+            lo,
+            hi,
+            buckets,
+        } => {
+            let buckets = engine.histogram_range(col, lo, hi, buckets)?;
+            Ok(QueryResponse::Histogram(buckets))
+        }
+
+        Query::Percentile { col, lo, hi, p } => {
+            let v = engine.percentile_range(col, lo, hi, p as f64)?;
+            Ok(QueryResponse::Percentile(v))
         }
     }
 }

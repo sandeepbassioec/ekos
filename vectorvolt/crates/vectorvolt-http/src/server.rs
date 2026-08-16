@@ -146,6 +146,9 @@ fn build_router(
             patch(handlers::update_field),
         )
         .route("/tables/{table}/rows/range", delete(handlers::delete_range))
+        // Layer 50: histogram + percentile
+        .route("/tables/{table}/histogram", get(handlers::histogram))
+        .route("/tables/{table}/percentile", get(handlers::percentile))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

@@ -17,6 +17,8 @@
 //! | `DELETE TXN <txn_id> <pk>` | `DELETE TXN 0 7` |
 //! | `DESCRIBE` | returns schema column names |
 //! | `STATS` | returns engine statistics |
+//! | `HISTOGRAM col=<n> lo=<lo> hi=<hi> buckets=<b>` | `HISTOGRAM col=1 lo=0 hi=100 buckets=5` |
+//! | `PERCENTILE col=<n> lo=<lo> hi=<hi> p=<0-100>` | `PERCENTILE col=1 lo=0 hi=100 p=95` |
 
 mod error;
 mod executor;

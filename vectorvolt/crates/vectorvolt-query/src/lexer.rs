@@ -41,6 +41,11 @@ pub enum Keyword {
     Update,
     Field,
     Range,
+    // Layer 50 additions
+    Histogram,
+    Percentile,
+    Buckets,
+    P,
 }
 
 impl Keyword {
@@ -76,6 +81,10 @@ impl Keyword {
             "UPDATE" => Some(Self::Update),
             "FIELD" => Some(Self::Field),
             "RANGE" => Some(Self::Range),
+            "HISTOGRAM" => Some(Self::Histogram),
+            "PERCENTILE" => Some(Self::Percentile),
+            "BUCKETS" => Some(Self::Buckets),
+            "P" => Some(Self::P),
             _ => None,
         }
     }

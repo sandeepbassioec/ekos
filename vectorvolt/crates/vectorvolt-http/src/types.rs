@@ -54,6 +54,44 @@ pub struct RangeQuery {
     pub hi: u64,
 }
 
+// ── Layer 50 query params ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct HistogramQuery {
+    pub col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub buckets: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PercentileQuery {
+    pub col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    /// Integer 0–100 (e.g. 95 means P95).
+    pub p: u64,
+}
+
+// ── Layer 50 response types ───────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct BucketResp {
+    pub lo: u64,
+    pub hi: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistogramResp {
+    pub buckets: Vec<BucketResp>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PercentileResp {
+    pub value: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ScanSortedQuery {
     pub col: usize,
@@ -147,5 +185,13 @@ pub enum QueryResp {
     Page {
         rows: Vec<RowResp>,
         next_cursor: Option<u64>,
+    },
+    /// HISTOGRAM result.
+    Histogram {
+        buckets: Vec<BucketResp>,
+    },
+    /// PERCENTILE result (None when no rows matched).
+    Percentile {
+        value: Option<u64>,
     },
 }

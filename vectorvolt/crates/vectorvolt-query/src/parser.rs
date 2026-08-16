@@ -93,6 +93,23 @@ pub enum Query {
 
     /// `DELETE RANGE col=<n> lo=<lo> hi=<hi>`
     DeleteRange { col: usize, lo: u64, hi: u64 },
+
+    // ── Layer 50: histogram + percentile ─────────────────────────────────────
+    /// `HISTOGRAM col=<n> lo=<lo> hi=<hi> buckets=<b>`
+    Histogram {
+        col: usize,
+        lo: u64,
+        hi: u64,
+        buckets: usize,
+    },
+
+    /// `PERCENTILE col=<n> lo=<lo> hi=<hi> p=<0-100>`
+    Percentile {
+        col: usize,
+        lo: u64,
+        hi: u64,
+        p: u64,
+    },
 }
 
 /// Parse a query string into a [`Query`].
@@ -298,6 +315,27 @@ impl Parser {
                     let pk = self.expect_int()?;
                     Ok(Query::Delete { pk })
                 }
+            }
+
+            Keyword::Histogram => {
+                let (col, lo, hi) = self.parse_col_lo_hi()?;
+                self.expect_keyword(Keyword::Buckets)?;
+                self.expect_eq()?;
+                let buckets = self.expect_int()? as usize;
+                Ok(Query::Histogram {
+                    col,
+                    lo,
+                    hi,
+                    buckets,
+                })
+            }
+
+            Keyword::Percentile => {
+                let (col, lo, hi) = self.parse_col_lo_hi()?;
+                self.expect_keyword(Keyword::P)?;
+                self.expect_eq()?;
+                let p = self.expect_int()?;
+                Ok(Query::Percentile { col, lo, hi, p })
             }
 
             other => Err(QueryError::Syntax(format!(
