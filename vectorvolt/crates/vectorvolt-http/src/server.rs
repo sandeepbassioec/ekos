@@ -219,6 +219,11 @@ fn build_router(
             "/tables/{table}/purge_expired",
             post(handlers::purge_expired),
         )
+        // Layer 65: CDC / SSE subscribe
+        .route(
+            "/tables/{table}/subscribe",
+            get(handlers::subscribe_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

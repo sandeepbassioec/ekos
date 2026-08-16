@@ -26,6 +26,7 @@ pub use vectorvolt_txn::{FlushResult, WalTip};
 use vectorvolt_txn::{Mutation, TxnManager};
 use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
 
+use crate::cdc::ChangeEvent;
 use crate::index_catalog;
 use crate::mvcc::MvccStore;
 use crate::{CompactResult, EngineError, EngineResult, EngineRow, EngineStats, TxnId};
@@ -70,6 +71,9 @@ pub struct TableEngine {
             std::collections::BTreeMap<u64, std::collections::BTreeSet<u64>>,
         >,
     >,
+    /// CDC broadcast sender.  Clones cheaply; `send` is sync and lock-free.
+    /// Lagging receivers are automatically dropped by the channel.
+    pub(crate) changes_tx: tokio::sync::broadcast::Sender<ChangeEvent>,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -406,6 +410,7 @@ impl TableEngine {
         }
 
         let catalog_path = index_catalog::catalog_path(&data_dir);
+        let (changes_tx, _) = tokio::sync::broadcast::channel(1024);
         let engine = TableEngine {
             txn,
             partitions: RwLock::new(partitions),
@@ -420,6 +425,7 @@ impl TableEngine {
             catalog_path,
             ttl_index: RwLock::new(std::collections::BTreeMap::new()),
             secondary_indexes: RwLock::new(std::collections::HashMap::new()),
+            changes_tx,
         };
 
         // Rebuild any secondary indexes that were persisted before shutdown.
@@ -434,6 +440,15 @@ impl TableEngine {
         Ok(engine)
     }
 
+    /// Subscribe to change events for this table.
+    ///
+    /// Each call returns an independent [`tokio::sync::broadcast::Receiver`].
+    /// All active receivers get every [`ChangeEvent`]; lagging receivers that
+    /// fall more than 1024 events behind are automatically dropped.
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<ChangeEvent> {
+        self.changes_tx.subscribe()
+    }
+
     // ── Write path ────────────────────────────────────────────────────────────
 
     /// Insert a row. `values.len()` must equal `schema.len()`.
@@ -444,6 +459,15 @@ impl TableEngine {
     /// All live secondary indexes are updated atomically after the write
     /// succeeds, at no extra cost when no indexes are built.
     pub fn insert(&self, pk: u64, values: Vec<u64>) -> EngineResult<WalTip> {
+        // Clone for CDC before values is moved.  Only pays the cost when at
+        // least one subscriber is active; the send itself is a no-op when the
+        // channel has no receivers.
+        let cdc_vals = if self.changes_tx.receiver_count() > 0 {
+            Some(values.clone())
+        } else {
+            None
+        };
+
         // Snapshot the old row and clone the new values for index maintenance.
         // Only pays the cost when at least one secondary index is live.
         let index_work = if !self.secondary_indexes.read().is_empty() {
@@ -464,6 +488,9 @@ impl TableEngine {
             self.secondary_maintain_insert(pk, old_row.as_ref(), &new_vals);
         }
 
+        if let Some(vals) = cdc_vals {
+            let _ = self.changes_tx.send(ChangeEvent::insert(pk, vals));
+        }
         Ok(tip)
     }
 
@@ -480,6 +507,7 @@ impl TableEngine {
         if let Some(row) = old_row {
             self.secondary_maintain_delete(pk, &row);
         }
+        let _ = self.changes_tx.send(ChangeEvent::delete(pk));
         Ok(tip)
     }
 

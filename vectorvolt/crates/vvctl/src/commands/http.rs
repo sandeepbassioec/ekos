@@ -286,6 +286,21 @@ pub enum HttpCommand {
         #[arg(long)]
         now: u64,
     },
+
+    /// Subscribe to a live stream of change events (SSE).
+    ///
+    /// Prints one JSON line per event until interrupted with Ctrl-C.
+    Subscribe {
+        /// Column index to filter on (requires --lo and --hi).
+        #[arg(long)]
+        col: Option<u64>,
+        /// Lower bound for the column filter (inclusive).
+        #[arg(long)]
+        lo: Option<u64>,
+        /// Upper bound for the column filter (inclusive).
+        #[arg(long)]
+        hi: Option<u64>,
+    },
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -725,6 +740,40 @@ pub fn run(args: HttpArgs) -> Result<()> {
             }
             let resp = req.send().context("HTTP POST /purge_expired failed")?;
             print_response(resp)?;
+        }
+
+        HttpCommand::Subscribe { col, lo, hi } => {
+            let url = format!("{base}/subscribe");
+            let mut params: Vec<(&str, String)> = Vec::new();
+            if let Some(c) = col {
+                params.push(("col", c.to_string()));
+            }
+            if let Some(l) = lo {
+                params.push(("lo", l.to_string()));
+            }
+            if let Some(h) = hi {
+                params.push(("hi", h.to_string()));
+            }
+            let mut req = client.get(&url);
+            if !params.is_empty() {
+                req = req.query(&params);
+            }
+            if let Some(auth) = auth_header(tok) {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            let resp = req.send().context("HTTP GET /subscribe failed")?;
+            if !resp.status().is_success() {
+                bail!("subscribe failed: {}", resp.status());
+            }
+            eprintln!("Subscribed. Listening for events (Ctrl-C to stop)…");
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(resp);
+            for line in reader.lines() {
+                let line = line.context("SSE read error")?;
+                if let Some(data) = line.strip_prefix("data:") {
+                    println!("{}", data.trim());
+                }
+            }
         }
     }
 
