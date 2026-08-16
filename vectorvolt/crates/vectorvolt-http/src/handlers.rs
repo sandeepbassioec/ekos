@@ -11,9 +11,9 @@ use crate::types::{
     DistinctResp, ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp, GroupResp,
     HistogramQuery, HistogramResp, IncrDecrWhereQuery, InsertBody, OkResp, PageResp,
     PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp, RowsResp, ScanPageQuery,
-    ScanQuery, ScanSortedQuery, ScanWhereQuery, SchemaResp, SecondaryQuery, TablesResp,
-    UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
-    WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
+    ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery, SchemaResp,
+    SecondaryQuery, TablesResp, UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry,
+    ValueCountsResp, WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -375,9 +375,49 @@ pub async fn query_handler(
                             .collect(),
                     })
                 }
+                vectorvolt_query::QueryResponse::ProjectedRows(rows) => {
+                    Json(QueryResp::ProjectedRows {
+                        rows: rows
+                            .into_iter()
+                            .map(|r| RowResp {
+                                pk: r.pk,
+                                values: r.values,
+                            })
+                            .collect(),
+                    })
+                }
             };
             json.into_response()
         }
+    }
+}
+
+// ── Layer 57: column projection scan ─────────────────────────────────────────
+
+pub async fn scan_project(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<ScanProjectQuery>,
+) -> impl IntoResponse {
+    let projection = q.into_projection();
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.scan_project(q.filter_col, q.lo, q.hi, &projection) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(rows) => {
+                st.metrics.record_ok();
+                Json(ScanProjectResp {
+                    rows: rows
+                        .into_iter()
+                        .map(|r| RowResp {
+                            pk: r.pk,
+                            values: r.values,
+                        })
+                        .collect(),
+                })
+                .into_response()
+            }
+        },
     }
 }
 

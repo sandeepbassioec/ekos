@@ -226,6 +226,10 @@ pub enum QueryResp {
     ScanWhere {
         rows: Vec<RowResp>,
     },
+    /// SCAN PROJECT result (values contain only the requested columns).
+    ProjectedRows {
+        rows: Vec<RowResp>,
+    },
 }
 
 // ── Layer 53 response types ───────────────────────────────────────────────────
@@ -302,6 +306,35 @@ pub struct ScanWhereQuery {
     pub col2: Option<usize>,
     pub lo2: Option<u64>,
     pub hi2: Option<u64>,
+}
+
+// ── Layer 57 query params + response types ────────────────────────────────────
+
+/// `?filter_col=<n>&lo=<lo>&hi=<hi>&proj=<csv>` — `proj` is comma-separated
+/// column indices (e.g. `"1,2,3"`); omitting it returns PKs only.
+#[derive(Debug, Deserialize)]
+pub struct ScanProjectQuery {
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub proj: Option<String>,
+}
+
+impl ScanProjectQuery {
+    pub fn into_projection(&self) -> Vec<usize> {
+        self.proj
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScanProjectResp {
+    pub rows: Vec<RowResp>,
 }
 
 impl ScanWhereQuery {

@@ -76,6 +76,10 @@ pub enum QueryResponse {
     // ── Layer 56 ──────────────────────────────────────────────────────────────
     /// Rows matching all predicates from SCAN WHERE.
     ScanWhereRows(Vec<EngineRow>),
+
+    // ── Layer 57 ──────────────────────────────────────────────────────────────
+    /// Projected rows from SCAN PROJECT (values contain only the requested cols).
+    ProjectedRows(Vec<EngineRow>),
 }
 
 /// Execute `query` against `engine`.
@@ -370,6 +374,17 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         Query::ScanWhere { predicates } => {
             let rows = engine.scan_where(&predicates)?;
             Ok(QueryResponse::ScanWhereRows(rows))
+        }
+
+        // ── Layer 57: column projection scan ───────────────────────────────────
+        Query::ScanProject {
+            filter_col,
+            lo,
+            hi,
+            projection,
+        } => {
+            let rows = engine.scan_project(filter_col, lo, hi, &projection)?;
+            Ok(QueryResponse::ProjectedRows(rows))
         }
     }
 }
