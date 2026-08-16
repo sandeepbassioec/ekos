@@ -11,6 +11,7 @@ use crate::types::{
     GroupEntryResp, GroupResp, HistogramQuery, HistogramResp, InsertBody, OkResp, PageResp,
     PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp, RowsResp, ScanPageQuery,
     ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp, UpdateFieldBody,
+    WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -321,6 +322,15 @@ pub async fn query_handler(
                         .map(|(g, a)| GroupEntryResp {
                             group_val: g,
                             agg_val: a,
+                        })
+                        .collect(),
+                }),
+                vectorvolt_query::QueryResponse::WindowRows(wrows) => Json(QueryResp::Window {
+                    rows: wrows
+                        .into_iter()
+                        .map(|w| WindowRowResp {
+                            pk: w.pk,
+                            window_val: w.window_val,
                         })
                         .collect(),
                 }),
@@ -669,6 +679,92 @@ pub async fn group_max(
             Ok(pairs) => {
                 st.metrics.record_ok();
                 Json(to_group_resp(pairs)).into_response()
+            }
+        },
+    }
+}
+
+// ── Layer 52: window function endpoints ───────────────────────────────────────
+
+fn to_window_resp(rows: Vec<vectorvolt_engine::WindowRow>) -> WindowResp {
+    WindowResp {
+        rows: rows
+            .into_iter()
+            .map(|w| WindowRowResp {
+                pk: w.pk,
+                window_val: w.window_val,
+            })
+            .collect(),
+    }
+}
+
+/// `GET /tables/{table}/window/running_sum?filter_col=&lo=&hi=&agg_col=`
+pub async fn window_running_sum(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<WindowAggQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.running_sum(q.filter_col, q.lo, q.hi, q.agg_col) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(rows) => {
+                st.metrics.record_ok();
+                Json(to_window_resp(rows)).into_response()
+            }
+        },
+    }
+}
+
+/// `GET /tables/{table}/window/running_count?filter_col=&lo=&hi=`
+pub async fn window_running_count(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<WindowCountQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.running_count(q.filter_col, q.lo, q.hi) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(rows) => {
+                st.metrics.record_ok();
+                Json(to_window_resp(rows)).into_response()
+            }
+        },
+    }
+}
+
+/// `GET /tables/{table}/window/rank?filter_col=&lo=&hi=&sort_col=&asc=`
+pub async fn window_rank(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<WindowRankQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.rank_by(q.filter_col, q.lo, q.hi, q.sort_col, q.asc != 0) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(rows) => {
+                st.metrics.record_ok();
+                Json(to_window_resp(rows)).into_response()
+            }
+        },
+    }
+}
+
+/// `GET /tables/{table}/window/dense_rank?filter_col=&lo=&hi=&sort_col=&asc=`
+pub async fn window_dense_rank(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<WindowRankQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.dense_rank_by(q.filter_col, q.lo, q.hi, q.sort_col, q.asc != 0) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(rows) => {
+                st.metrics.record_ok();
+                Json(to_window_resp(rows)).into_response()
             }
         },
     }

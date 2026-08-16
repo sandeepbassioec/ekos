@@ -146,6 +146,36 @@ pub enum Query {
         group_col: usize,
         agg_col: usize,
     },
+
+    // ── Layer 52: window functions ────────────────────────────────────────────
+    /// `WINDOW RUNNING_SUM filter_col=<n> lo=<lo> hi=<hi> agg_col=<a>`
+    WindowRunningSum {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        agg_col: usize,
+    },
+
+    /// `WINDOW RUNNING_COUNT filter_col=<n> lo=<lo> hi=<hi>`
+    WindowRunningCount { filter_col: usize, lo: u64, hi: u64 },
+
+    /// `WINDOW RANK filter_col=<n> lo=<lo> hi=<hi> sort_col=<s> asc=<0|1>`
+    WindowRank {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        sort_col: usize,
+        asc: bool,
+    },
+
+    /// `WINDOW DENSE_RANK filter_col=<n> lo=<lo> hi=<hi> sort_col=<s> asc=<0|1>`
+    WindowDenseRank {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        sort_col: usize,
+        asc: bool,
+    },
 }
 
 /// Parse a query string into a [`Query`].
@@ -434,6 +464,71 @@ impl Parser {
                     }
                     other => Err(QueryError::Syntax(format!(
                         "expected COUNT/SUM/MIN/MAX after GROUP, got {other:?}"
+                    ))),
+                }
+            }
+
+            // ── Layer 52: window functions ─────────────────────────────────
+            Keyword::Window => {
+                let fn_kw = match self.next() {
+                    Some(Token::Keyword(k)) => k,
+                    Some(t) => {
+                        return Err(QueryError::Syntax(format!(
+                            "expected RUNNING_SUM/RUNNING_COUNT/RANK/DENSE_RANK after WINDOW, got {t:?}"
+                        )))
+                    }
+                    None => return Err(QueryError::UnexpectedEof),
+                };
+                let (filter_col, lo, hi) = self.parse_filter_col_lo_hi()?;
+                match fn_kw {
+                    Keyword::RunningSUM => {
+                        self.expect_keyword(Keyword::AggCol)?;
+                        self.expect_eq()?;
+                        let agg_col = self.expect_int()? as usize;
+                        Ok(Query::WindowRunningSum {
+                            filter_col,
+                            lo,
+                            hi,
+                            agg_col,
+                        })
+                    }
+                    Keyword::RunningCount => Ok(Query::WindowRunningCount {
+                        filter_col,
+                        lo,
+                        hi,
+                    }),
+                    Keyword::Rank => {
+                        self.expect_keyword(Keyword::SortCol)?;
+                        self.expect_eq()?;
+                        let sort_col = self.expect_int()? as usize;
+                        self.expect_keyword(Keyword::Asc)?;
+                        self.expect_eq()?;
+                        let asc = self.expect_int()? != 0;
+                        Ok(Query::WindowRank {
+                            filter_col,
+                            lo,
+                            hi,
+                            sort_col,
+                            asc,
+                        })
+                    }
+                    Keyword::DenseRank => {
+                        self.expect_keyword(Keyword::SortCol)?;
+                        self.expect_eq()?;
+                        let sort_col = self.expect_int()? as usize;
+                        self.expect_keyword(Keyword::Asc)?;
+                        self.expect_eq()?;
+                        let asc = self.expect_int()? != 0;
+                        Ok(Query::WindowDenseRank {
+                            filter_col,
+                            lo,
+                            hi,
+                            sort_col,
+                            asc,
+                        })
+                    }
+                    other => Err(QueryError::Syntax(format!(
+                        "expected RUNNING_SUM/RUNNING_COUNT/RANK/DENSE_RANK after WINDOW, got {other:?}"
                     ))),
                 }
             }

@@ -198,6 +198,10 @@ pub enum QueryResp {
     Group {
         entries: Vec<GroupEntryResp>,
     },
+    /// Window function result.
+    Window {
+        rows: Vec<WindowRowResp>,
+    },
 }
 
 // ── Layer 51 query params + response types ────────────────────────────────────
@@ -228,4 +232,41 @@ pub struct GroupEntryResp {
 #[derive(Debug, Serialize)]
 pub struct GroupResp {
     pub entries: Vec<GroupEntryResp>,
+}
+
+// ── Layer 52 query params + response types ────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct WindowAggQuery {
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub agg_col: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WindowCountQuery {
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WindowRankQuery {
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub sort_col: usize,
+    pub asc: u8,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WindowRowResp {
+    pub pk: u64,
+    pub window_val: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WindowResp {
+    pub rows: Vec<WindowRowResp>,
 }
