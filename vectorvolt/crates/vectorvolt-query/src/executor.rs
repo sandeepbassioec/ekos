@@ -1,6 +1,6 @@
 //! Execute a [`Query`] against a [`TableEngine`], returning a [`QueryResponse`].
 
-use vectorvolt_engine::{EngineRow, EngineStats, TableEngine, TxnId};
+use vectorvolt_engine::{EngineRow, EngineStats, PageResult, TableEngine, TxnId};
 
 use crate::error::QueryResult;
 use crate::parser::Query;
@@ -11,7 +11,7 @@ pub enum QueryResponse {
     /// A single row was returned (GET, GET TXN).
     Row(EngineRow),
 
-    /// Multiple rows (SCAN, SECONDARY).
+    /// Multiple rows (SCAN, SECONDARY, SCAN SORTED).
     Rows(Vec<EngineRow>),
 
     /// A transaction was opened.
@@ -28,6 +28,15 @@ pub enum QueryResponse {
 
     /// The requested row was not found.
     NotFound,
+
+    /// Scalar count result (COUNT, DELETE RANGE).
+    Count(u64),
+
+    /// Scalar aggregate result (SUM, MIN, MAX, AVG — None when no rows match).
+    Aggregate(Option<u64>),
+
+    /// Paginated result from SCAN PAGE.
+    Page(PageResult),
 }
 
 /// Execute `query` against `engine`.
@@ -98,6 +107,71 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         Query::Describe => Ok(QueryResponse::Schema(engine.schema.clone())),
 
         Query::Stats => Ok(QueryResponse::Stats(engine.stats())),
+
+        // ── Layer 43: analytical ──────────────────────────────────────────────
+        Query::Count { col, lo, hi } => {
+            let n = engine.count_range(col, lo, hi)?;
+            Ok(QueryResponse::Count(n))
+        }
+
+        Query::Sum { col, lo, hi } => {
+            let v = engine.sum_range(col, lo, hi)?;
+            Ok(QueryResponse::Aggregate(Some(v)))
+        }
+
+        Query::Min { col, lo, hi } => {
+            let v = engine.min_range(col, lo, hi)?;
+            Ok(QueryResponse::Aggregate(v))
+        }
+
+        Query::Max { col, lo, hi } => {
+            let v = engine.max_range(col, lo, hi)?;
+            Ok(QueryResponse::Aggregate(v))
+        }
+
+        Query::Avg { col, lo, hi } => {
+            let v = engine.avg_range(col, lo, hi)?.map(|f| f.round() as u64);
+            Ok(QueryResponse::Aggregate(v))
+        }
+
+        Query::ScanSorted {
+            col,
+            lo,
+            hi,
+            sort,
+            asc,
+            limit,
+        } => {
+            let rows = engine.scan_sorted(col, lo, hi, sort, asc, limit)?;
+            Ok(QueryResponse::Rows(rows))
+        }
+
+        Query::ScanPage {
+            col,
+            lo,
+            hi,
+            after,
+            limit,
+        } => {
+            let page = engine.scan_page(col, lo, hi, after, limit)?;
+            Ok(QueryResponse::Page(page))
+        }
+
+        // ── Layer 43: write/mutate ────────────────────────────────────────────
+        Query::Upsert { pk, values } => {
+            engine.upsert(pk, values)?;
+            Ok(QueryResponse::Ok)
+        }
+
+        Query::UpdateField { pk, col, val } => {
+            engine.update_field(pk, col, val)?;
+            Ok(QueryResponse::Ok)
+        }
+
+        Query::DeleteRange { col, lo, hi } => {
+            let n = engine.delete_range(col, lo, hi)?;
+            Ok(QueryResponse::Count(n as u64))
+        }
     }
 }
 

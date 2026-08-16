@@ -48,6 +48,51 @@ pub enum Query {
 
     /// `STATS` — return engine statistics
     Stats,
+
+    // ── Layer 43: analytical ──────────────────────────────────────────────────
+    /// `COUNT col=<n> lo=<lo> hi=<hi>`
+    Count { col: usize, lo: u64, hi: u64 },
+
+    /// `SUM col=<n> lo=<lo> hi=<hi>`
+    Sum { col: usize, lo: u64, hi: u64 },
+
+    /// `MIN col=<n> lo=<lo> hi=<hi>`
+    Min { col: usize, lo: u64, hi: u64 },
+
+    /// `MAX col=<n> lo=<lo> hi=<hi>`
+    Max { col: usize, lo: u64, hi: u64 },
+
+    /// `AVG col=<n> lo=<lo> hi=<hi>`
+    Avg { col: usize, lo: u64, hi: u64 },
+
+    /// `SCAN SORTED col=<n> lo=<lo> hi=<hi> sort=<s> asc=<0|1> limit=<l>`
+    ScanSorted {
+        col: usize,
+        lo: u64,
+        hi: u64,
+        sort: usize,
+        asc: bool,
+        limit: usize,
+    },
+
+    /// `SCAN PAGE col=<n> lo=<lo> hi=<hi> after=<pk> limit=<l>`
+    ScanPage {
+        col: usize,
+        lo: u64,
+        hi: u64,
+        after: u64,
+        limit: usize,
+    },
+
+    // ── Layer 43: write/mutate ────────────────────────────────────────────────
+    /// `UPSERT <pk> <v1> [v2 ...]`
+    Upsert { pk: u64, values: Vec<u64> },
+
+    /// `UPDATE FIELD <pk> col=<n> val=<v>`
+    UpdateField { pk: u64, col: usize, val: u64 },
+
+    /// `DELETE RANGE col=<n> lo=<lo> hi=<hi>`
+    DeleteRange { col: usize, lo: u64, hi: u64 },
 }
 
 /// Parse a query string into a [`Query`].
@@ -134,29 +179,47 @@ impl Parser {
                 }
             }
 
-            Keyword::Delete => {
-                if matches!(self.peek(), Some(Token::Keyword(Keyword::Txn))) {
-                    self.next(); // consume TXN
-                    let txn_id = self.expect_int()?;
-                    let pk = self.expect_int()?;
-                    Ok(Query::DeleteTxn { txn_id, pk })
-                } else {
-                    let pk = self.expect_int()?;
-                    Ok(Query::Delete { pk })
-                }
-            }
-
             Keyword::Scan => {
-                self.expect_keyword(Keyword::Col)?;
-                self.expect_eq()?;
-                let col = self.expect_int()? as usize;
-                self.expect_keyword(Keyword::Lo)?;
-                self.expect_eq()?;
-                let lo = self.expect_int()?;
-                self.expect_keyword(Keyword::Hi)?;
-                self.expect_eq()?;
-                let hi = self.expect_int()?;
-                Ok(Query::Scan { col, lo, hi })
+                if matches!(self.peek(), Some(Token::Keyword(Keyword::Sorted))) {
+                    self.next(); // consume SORTED
+                    let (col, lo, hi) = self.parse_col_lo_hi()?;
+                    self.expect_keyword(Keyword::Sort)?;
+                    self.expect_eq()?;
+                    let sort = self.expect_int()? as usize;
+                    self.expect_keyword(Keyword::Asc)?;
+                    self.expect_eq()?;
+                    let asc = self.expect_int()? != 0;
+                    self.expect_keyword(Keyword::Limit)?;
+                    self.expect_eq()?;
+                    let limit = self.expect_int()? as usize;
+                    Ok(Query::ScanSorted {
+                        col,
+                        lo,
+                        hi,
+                        sort,
+                        asc,
+                        limit,
+                    })
+                } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Page))) {
+                    self.next(); // consume PAGE
+                    let (col, lo, hi) = self.parse_col_lo_hi()?;
+                    self.expect_keyword(Keyword::After)?;
+                    self.expect_eq()?;
+                    let after = self.expect_int()?;
+                    self.expect_keyword(Keyword::Limit)?;
+                    self.expect_eq()?;
+                    let limit = self.expect_int()? as usize;
+                    Ok(Query::ScanPage {
+                        col,
+                        lo,
+                        hi,
+                        after,
+                        limit,
+                    })
+                } else {
+                    let (col, lo, hi) = self.parse_col_lo_hi()?;
+                    Ok(Query::Scan { col, lo, hi })
+                }
             }
 
             Keyword::Secondary => {
@@ -182,10 +245,79 @@ impl Parser {
             Keyword::Describe => Ok(Query::Describe),
             Keyword::Stats => Ok(Query::Stats),
 
+            Keyword::Count => {
+                let (col, lo, hi) = self.parse_col_lo_hi()?;
+                Ok(Query::Count { col, lo, hi })
+            }
+            Keyword::Sum => {
+                let (col, lo, hi) = self.parse_col_lo_hi()?;
+                Ok(Query::Sum { col, lo, hi })
+            }
+            Keyword::Min => {
+                let (col, lo, hi) = self.parse_col_lo_hi()?;
+                Ok(Query::Min { col, lo, hi })
+            }
+            Keyword::Max => {
+                let (col, lo, hi) = self.parse_col_lo_hi()?;
+                Ok(Query::Max { col, lo, hi })
+            }
+            Keyword::Avg => {
+                let (col, lo, hi) = self.parse_col_lo_hi()?;
+                Ok(Query::Avg { col, lo, hi })
+            }
+
+            Keyword::Upsert => {
+                let pk = self.expect_int()?;
+                let values = self.collect_ints();
+                Ok(Query::Upsert { pk, values })
+            }
+
+            Keyword::Update => {
+                self.expect_keyword(Keyword::Field)?;
+                let pk = self.expect_int()?;
+                self.expect_keyword(Keyword::Col)?;
+                self.expect_eq()?;
+                let col = self.expect_int()? as usize;
+                self.expect_keyword(Keyword::Val)?;
+                self.expect_eq()?;
+                let val = self.expect_int()?;
+                Ok(Query::UpdateField { pk, col, val })
+            }
+
+            Keyword::Delete => {
+                if matches!(self.peek(), Some(Token::Keyword(Keyword::Range))) {
+                    self.next(); // consume RANGE
+                    let (col, lo, hi) = self.parse_col_lo_hi()?;
+                    Ok(Query::DeleteRange { col, lo, hi })
+                } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Txn))) {
+                    self.next(); // consume TXN
+                    let txn_id = self.expect_int()?;
+                    let pk = self.expect_int()?;
+                    Ok(Query::DeleteTxn { txn_id, pk })
+                } else {
+                    let pk = self.expect_int()?;
+                    Ok(Query::Delete { pk })
+                }
+            }
+
             other => Err(QueryError::Syntax(format!(
                 "{other:?} is not a statement keyword"
             ))),
         }
+    }
+
+    /// Parse `col=<n> lo=<lo> hi=<hi>` — shared by COUNT/SUM/MIN/MAX/AVG/SCAN.
+    fn parse_col_lo_hi(&mut self) -> QueryResult<(usize, u64, u64)> {
+        self.expect_keyword(Keyword::Col)?;
+        self.expect_eq()?;
+        let col = self.expect_int()? as usize;
+        self.expect_keyword(Keyword::Lo)?;
+        self.expect_eq()?;
+        let lo = self.expect_int()?;
+        self.expect_keyword(Keyword::Hi)?;
+        self.expect_eq()?;
+        let hi = self.expect_int()?;
+        Ok((col, lo, hi))
     }
 
     /// Consume remaining `Int` tokens from the input.

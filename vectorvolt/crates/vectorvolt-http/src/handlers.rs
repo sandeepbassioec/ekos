@@ -285,6 +285,21 @@ pub async fn query_handler(
                 }),
                 vectorvolt_query::QueryResponse::Ok => Json(QueryResp::Ok),
                 vectorvolt_query::QueryResponse::NotFound => Json(QueryResp::NotFound),
+                vectorvolt_query::QueryResponse::Count(n) => Json(QueryResp::Count { count: n }),
+                vectorvolt_query::QueryResponse::Aggregate(v) => {
+                    Json(QueryResp::Aggregate { value: v })
+                }
+                vectorvolt_query::QueryResponse::Page(page) => Json(QueryResp::Page {
+                    rows: page
+                        .rows
+                        .into_iter()
+                        .map(|r| RowResp {
+                            pk: r.pk,
+                            values: r.values,
+                        })
+                        .collect(),
+                    next_cursor: page.next_cursor,
+                }),
             };
             json.into_response()
         }
