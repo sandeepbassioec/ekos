@@ -189,6 +189,8 @@ fn build_router(
         .route("/tables/{table}/batch/delete", post(handlers::batch_delete))
         // Layer 56: multi-predicate compound scan
         .route("/tables/{table}/scan_where", get(handlers::scan_where))
+        // Layer 57: column projection scan
+        .route("/tables/{table}/scan/project", get(handlers::scan_project))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

@@ -222,6 +222,15 @@ pub enum Query {
     // ── Layer 56: multi-predicate compound scan ───────────────────────────────
     /// `SCAN WHERE col=<n> lo=<lo> hi=<hi> [AND col=<n> lo=<lo> hi=<hi> ...]`
     ScanWhere { predicates: Vec<(usize, u64, u64)> },
+
+    // ── Layer 57: column projection scan ─────────────────────────────────────
+    /// `SCAN PROJECT col=<n> lo=<lo> hi=<hi> COLS <c1> [c2 ...]`
+    ScanProject {
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        projection: Vec<usize>,
+    },
 }
 
 /// Parse a query string into a [`Query`].
@@ -344,6 +353,29 @@ impl Parser {
                         hi,
                         after,
                         limit,
+                    })
+                } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Project))) {
+                    self.next(); // consume PROJECT
+                    self.expect_keyword(Keyword::Col)?;
+                    self.expect_eq()?;
+                    let filter_col = self.expect_int()? as usize;
+                    self.expect_keyword(Keyword::Lo)?;
+                    self.expect_eq()?;
+                    let lo = self.expect_int()?;
+                    self.expect_keyword(Keyword::Hi)?;
+                    self.expect_eq()?;
+                    let hi = self.expect_int()?;
+                    self.expect_keyword(Keyword::Cols)?;
+                    let projection: Vec<usize> = self
+                        .collect_ints()
+                        .into_iter()
+                        .map(|n| n as usize)
+                        .collect();
+                    Ok(Query::ScanProject {
+                        filter_col,
+                        lo,
+                        hi,
+                        projection,
                     })
                 } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
                     self.next(); // consume WHERE
