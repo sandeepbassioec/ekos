@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use store::OutputFormat;
-use vvctl::commands::{bench, connect, hal, keygen, serve, store, table, wal};
+use vvctl::commands::{bench, connect, hal, http, keygen, serve, store, table, wal};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOMEPAGE: &str = "https://workerruntime.com";
@@ -54,6 +54,9 @@ enum Commands {
     /// WAL inspection and verification commands.
     #[command(subcommand)]
     Wal(wal::WalCommand),
+
+    /// Send commands to the VectorVolt HTTP gateway (analytics, TTL, batch ops, DSL).
+    Http(http::HttpArgs),
 
     /// Generate a cryptographically random 32-byte hex secret (for use with --secret).
     Keygen(keygen::KeygenArgs),
@@ -169,6 +172,8 @@ fn main() -> Result<()> {
             StoreCommand::Stats { dir } => store::cmd_stats(dir, fmt)?,
             StoreCommand::Compact { dir } => store::cmd_compact(dir, fmt)?,
         },
+
+        Commands::Http(args) => http::run(args)?,
 
         Commands::Keygen(args) => keygen::run(args)?,
 
