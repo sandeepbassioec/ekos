@@ -1,0 +1,452 @@
+/// Layer 49 — End-to-end integration tests exercising the full stack:
+/// TCP server (vectorvolt-net), HTTP gateway (vectorvolt-http), and
+/// the DSL query bridge, all started in the same process.
+///
+/// Schema: pk(u64), age(u64), score(u64)
+/// TCP ops use `vectorvolt_net::Client`; HTTP ops use `reqwest`.
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use reqwest::Client as HttpClient;
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use vectorvolt_net::Client as TcpClient;
+
+// ── harness ───────────────────────────────────────────────────────────────────
+
+struct E2EHarness {
+    tcp_addr: SocketAddr,
+    base_url: String,
+    http: HttpClient,
+    _tcp_dir: TempDir,
+    _http_dir: TempDir,
+}
+
+impl E2EHarness {
+    async fn start() -> Self {
+        use vectorvolt_engine::{EngineOptions, TableRegistry};
+        use vectorvolt_http::{HttpServer, HttpServerConfig};
+        use vvctl::commands::serve::{ServeArgs, bind};
+
+        let tcp_dir = TempDir::new().unwrap();
+
+        // TCP server (single-table, schema-driven)
+        let tcp_args = ServeArgs {
+            dir: tcp_dir.path().to_path_buf(),
+            columns: vec!["pk".into(), "age".into(), "score".into()],
+            addr: "127.0.0.1:0".parse().unwrap(),
+            max_connections: 32,
+            secret: None,
+            key_id: "default".into(),
+            cert: None,
+            key: None,
+            multi: false,
+            http_addr: None,
+            http_token: None,
+        };
+        let bound = bind(&tcp_args).expect("bind tcp");
+        let tcp_addr = bound.server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = bound.server.serve();
+        });
+
+        // HTTP gateway backed by its own multi-table registry
+        const FLUSH: usize = 1_048_576;
+        let opts = EngineOptions::new(FLUSH);
+        let http_dir = TempDir::new().unwrap();
+        let reg = Arc::new(TableRegistry::open(http_dir.path(), opts).unwrap());
+
+        // Seed "items" table for HTTP tests
+        reg.create_table(
+            "items",
+            vec!["pk".to_string(), "age".to_string(), "score".to_string()],
+        )
+        .expect("create items table");
+
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap());
+        let srv = HttpServer::bind(reg, cfg).await.unwrap();
+        let http_addr = srv.local_addr().unwrap();
+        tokio::spawn(async move { srv.serve().await.unwrap() });
+
+        // Small settle for TCP listener
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let http = HttpClient::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        E2EHarness {
+            tcp_addr,
+            base_url: format!("http://{http_addr}"),
+            http,
+            _tcp_dir: tcp_dir,
+            _http_dir: http_dir,
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    fn tcp(&self) -> TcpClient {
+        TcpClient::connect(self.tcp_addr).unwrap()
+    }
+}
+
+// ── TCP tests ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tcp_insert_and_get_round_trip() {
+    let h = E2EHarness::start().await;
+    let mut c = h.tcp();
+    c.insert(1, vec![1, 25, 100]).unwrap();
+    let row = c.get(1).unwrap().expect("row must exist");
+    assert_eq!(row, vec![1, 25, 100]);
+}
+
+#[tokio::test]
+async fn tcp_delete_removes_row() {
+    let h = E2EHarness::start().await;
+    let mut c = h.tcp();
+    c.insert(2, vec![2, 30, 200]).unwrap();
+    let existed = c.delete(2).unwrap();
+    let after = c.get(2).unwrap();
+    assert!(existed, "row must have existed");
+    assert!(after.is_none(), "row must be gone after delete");
+}
+
+#[tokio::test]
+async fn tcp_range_scan_respects_limit() {
+    let h = E2EHarness::start().await;
+    let mut c = h.tcp();
+    for pk in 1u64..=10 {
+        c.insert(pk, vec![pk, pk * 10, pk * 100]).unwrap();
+    }
+    let rows = c.range_scan(0, 1, 10, 3).unwrap();
+    assert_eq!(rows.len(), 3);
+}
+
+#[tokio::test]
+async fn tcp_stats_reflect_inserted_rows() {
+    let h = E2EHarness::start().await;
+    let mut c = h.tcp();
+    for pk in [10u64, 20, 30] {
+        c.insert(pk, vec![pk, pk, pk]).unwrap();
+    }
+    c.flush().unwrap();
+    let (rows, _parts, _bytes) = c.stats().unwrap();
+    assert!(rows >= 3, "stats must report ≥3 rows; got {rows}");
+}
+
+// ── HTTP tests ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn http_health_returns_200() {
+    let h = E2EHarness::start().await;
+    let resp = h.http.get(h.url("/health")).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn http_metrics_contains_expected_counter() {
+    let h = E2EHarness::start().await;
+    let body = h
+        .http
+        .get(h.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("vectorvolt_http_requests_total"),
+        "metrics must expose vectorvolt_http_requests_total; body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn http_insert_and_get_round_trip() {
+    let h = E2EHarness::start().await;
+    let ins = h
+        .http
+        .post(h.url("/tables/items/rows/10"))
+        .json(&json!({ "values": [10u64, 25u64, 99u64] }))
+        .send()
+        .await
+        .unwrap();
+    // insert_row returns 200 OK with the inserted row body
+    assert_eq!(ins.status().as_u16(), 200);
+
+    let row: Value = h
+        .http
+        .get(h.url("/tables/items/rows/10"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(row["pk"], json!(10u64));
+}
+
+#[tokio::test]
+async fn http_delete_removes_row() {
+    let h = E2EHarness::start().await;
+    h.http
+        .post(h.url("/tables/items/rows/20"))
+        .json(&json!({ "values": [20u64, 1u64, 2u64] }))
+        .send()
+        .await
+        .unwrap();
+    let del = h
+        .http
+        .delete(h.url("/tables/items/rows/20"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 200);
+
+    let get = h
+        .http
+        .get(h.url("/tables/items/rows/20"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn http_count_returns_correct_value() {
+    let h = E2EHarness::start().await;
+    for pk in 1u64..=5 {
+        h.http
+            .post(h.url(&format!("/tables/items/rows/{pk}")))
+            .json(&json!({ "values": [pk, pk * 10, pk * 100] }))
+            .send()
+            .await
+            .unwrap();
+    }
+    let resp: Value = h
+        .http
+        .get(h.url("/tables/items/count?col=0&lo=1&hi=5"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["count"], json!(5u64));
+}
+
+#[tokio::test]
+async fn http_sum_range_is_correct() {
+    let h = E2EHarness::start().await;
+    for pk in [10u64, 20, 30] {
+        h.http
+            .post(h.url(&format!("/tables/items/rows/{pk}")))
+            .json(&json!({ "values": [pk, pk, pk] }))
+            .send()
+            .await
+            .unwrap();
+    }
+    let resp: Value = h
+        .http
+        .get(h.url("/tables/items/sum?col=0&lo=10&hi=30"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // AggResp { value: Some(60) } — sum of col[0] for pks 10, 20, 30
+    assert_eq!(resp["value"], json!(60u64));
+}
+
+#[tokio::test]
+async fn http_scan_sorted_ascending_order() {
+    let h = E2EHarness::start().await;
+    for pk in [30u64, 10, 20] {
+        h.http
+            .post(h.url(&format!("/tables/items/rows/{pk}")))
+            .json(&json!({ "values": [pk, pk, pk] }))
+            .send()
+            .await
+            .unwrap();
+    }
+    // asc is a u8 query param: 1 = ascending
+    let resp: Value = h
+        .http
+        .get(h.url("/tables/items/scan/sorted?col=0&lo=10&hi=30&sort=0&asc=1&limit=10"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = resp["rows"].as_array().expect("rows array");
+    let pks: Vec<u64> = rows.iter().map(|r| r["pk"].as_u64().unwrap()).collect();
+    assert_eq!(pks, vec![10, 20, 30]);
+}
+
+#[tokio::test]
+async fn http_scan_page_returns_cursor() {
+    let h = E2EHarness::start().await;
+    for pk in 1u64..=5 {
+        h.http
+            .post(h.url(&format!("/tables/items/rows/{pk}")))
+            .json(&json!({ "values": [pk, pk, pk] }))
+            .send()
+            .await
+            .unwrap();
+    }
+    let resp: Value = h
+        .http
+        .get(h.url("/tables/items/scan/page?col=0&lo=1&hi=5&after=0&limit=3"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = resp["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 3);
+    assert!(
+        resp["next_cursor"].is_number(),
+        "must return a next_cursor for pagination"
+    );
+}
+
+#[tokio::test]
+async fn http_upsert_then_update_field_then_verify() {
+    let h = E2EHarness::start().await;
+    // upsert via PUT
+    let up = h
+        .http
+        .put(h.url("/tables/items/rows/50"))
+        .json(&json!({ "values": [50u64, 10u64, 20u64] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        up.status().is_success(),
+        "upsert must succeed; status={}",
+        up.status()
+    );
+
+    // update col 1 (age) to 99
+    let patch = h
+        .http
+        .patch(h.url("/tables/items/rows/50/field"))
+        .json(&json!({ "col": 1u64, "val": 99u64 }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        patch.status().is_success(),
+        "update_field must succeed; status={}",
+        patch.status()
+    );
+
+    let row: Value = h
+        .http
+        .get(h.url("/tables/items/rows/50"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(row["values"][1], json!(99u64), "age must be updated to 99");
+}
+
+#[tokio::test]
+async fn http_delete_range_removes_rows() {
+    let h = E2EHarness::start().await;
+    for pk in 100u64..=105 {
+        h.http
+            .post(h.url(&format!("/tables/items/rows/{pk}")))
+            .json(&json!({ "values": [pk, pk, pk] }))
+            .send()
+            .await
+            .unwrap();
+    }
+    let del = h
+        .http
+        .delete(h.url("/tables/items/rows/range?col=0&lo=100&hi=105"))
+        .send()
+        .await
+        .unwrap();
+    assert!(del.status().is_success());
+
+    let resp: Value = h
+        .http
+        .get(h.url("/tables/items/count?col=0&lo=100&hi=105"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["count"], json!(0u64));
+}
+
+// ── DSL bridge via HTTP ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn http_dsl_get_returns_inserted_row() {
+    let h = E2EHarness::start().await;
+    h.http
+        .post(h.url("/tables/items/rows/77"))
+        .json(&json!({ "values": [77u64, 42u64, 55u64] }))
+        .send()
+        .await
+        .unwrap();
+
+    // DSL handler takes plain-text body, not JSON
+    let resp = h
+        .http
+        .post(h.url("/tables/items/query"))
+        .header("content-type", "text/plain")
+        .body("GET 77")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "DSL GET must succeed; status={}",
+        resp.status()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body.get("pk").is_some() || body.get("rows").is_some(),
+        "DSL response must have pk (Row) or rows; got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn http_dsl_scan_returns_results() {
+    let h = E2EHarness::start().await;
+    for pk in [5u64, 10, 15] {
+        h.http
+            .post(h.url(&format!("/tables/items/rows/{pk}")))
+            .json(&json!({ "values": [pk, pk, pk] }))
+            .send()
+            .await
+            .unwrap();
+    }
+    let resp = h
+        .http
+        .post(h.url("/tables/items/query"))
+        .header("content-type", "text/plain")
+        .body("SCAN col=0 lo=5 hi=15")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "DSL SCAN must succeed; status={}",
+        resp.status()
+    );
+}
