@@ -7,8 +7,9 @@ use axum::response::IntoResponse;
 
 use crate::server::AppState;
 use crate::types::{
-    CreateTableBody, ErrorResp, InsertBody, OkResp, QueryResp, RowResp, RowsResp, ScanQuery,
-    SchemaResp, SecondaryQuery, TablesResp,
+    AggResp, CountResp, CreateTableBody, ErrorResp, InsertBody, OkResp, PageResp, QueryResp,
+    RangeQuery, RowResp, RowsResp, ScanPageQuery, ScanQuery, ScanSortedQuery, SchemaResp,
+    SecondaryQuery, TablesResp, UpdateFieldBody,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -303,5 +304,215 @@ pub async fn query_handler(
             };
             json.into_response()
         }
+    }
+}
+
+// ── Layer 44: analytical endpoints ───────────────────────────────────────────
+
+pub async fn count_rows(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.count_range(q.col, q.lo, q.hi) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(n) => {
+                st.metrics.record_ok();
+                Json(CountResp { count: n }).into_response()
+            }
+        },
+    }
+}
+
+pub async fn sum_rows(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.sum_range(q.col, q.lo, q.hi) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(v) => {
+                st.metrics.record_ok();
+                Json(AggResp { value: Some(v) }).into_response()
+            }
+        },
+    }
+}
+
+pub async fn min_rows(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.min_range(q.col, q.lo, q.hi) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(v) => {
+                st.metrics.record_ok();
+                Json(AggResp { value: v }).into_response()
+            }
+        },
+    }
+}
+
+pub async fn max_rows(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.max_range(q.col, q.lo, q.hi) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(v) => {
+                st.metrics.record_ok();
+                Json(AggResp { value: v }).into_response()
+            }
+        },
+    }
+}
+
+pub async fn avg_rows(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.avg_range(q.col, q.lo, q.hi) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(v) => {
+                st.metrics.record_ok();
+                Json(AggResp {
+                    value: v.map(|f| f.round() as u64),
+                })
+                .into_response()
+            }
+        },
+    }
+}
+
+pub async fn scan_sorted(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<ScanSortedQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.scan_sorted(q.col, q.lo, q.hi, q.sort, q.asc != 0, q.limit) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(rows) => {
+                st.metrics.record_ok();
+                Json(RowsResp {
+                    rows: rows
+                        .into_iter()
+                        .map(|r| RowResp {
+                            pk: r.pk,
+                            values: r.values,
+                        })
+                        .collect(),
+                })
+                .into_response()
+            }
+        },
+    }
+}
+
+pub async fn scan_page(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<ScanPageQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.scan_page(q.col, q.lo, q.hi, q.after, q.limit) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(page) => {
+                st.metrics.record_ok();
+                Json(PageResp {
+                    rows: page
+                        .rows
+                        .into_iter()
+                        .map(|r| RowResp {
+                            pk: r.pk,
+                            values: r.values,
+                        })
+                        .collect(),
+                    next_cursor: page.next_cursor,
+                })
+                .into_response()
+            }
+        },
+    }
+}
+
+// ── Layer 44: write/mutate endpoints ─────────────────────────────────────────
+
+/// `PUT /tables/{table}/rows/{pk}` — upsert: insert or overwrite a row.
+pub async fn upsert_row(
+    State(st): State<Arc<AppState>>,
+    Path((table, pk)): Path<(String, u64)>,
+    Json(body): Json<InsertBody>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.upsert(pk, body.values.clone()) {
+            Ok(_) => {
+                st.metrics
+                    .rows_inserted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.metrics.record_ok();
+                Json(RowResp {
+                    pk,
+                    values: body.values,
+                })
+                .into_response()
+            }
+            Err(e) => engine_err(&st, e).into_response(),
+        },
+    }
+}
+
+/// `PATCH /tables/{table}/rows/{pk}/field` — update a single field in a row.
+pub async fn update_field(
+    State(st): State<Arc<AppState>>,
+    Path((table, pk)): Path<(String, u64)>,
+    Json(body): Json<UpdateFieldBody>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.update_field(pk, body.col, body.val) {
+            Ok(_) => {
+                st.metrics.record_ok();
+                Json(OkResp { ok: true }).into_response()
+            }
+            Err(e) => engine_err(&st, e).into_response(),
+        },
+    }
+}
+
+/// `DELETE /tables/{table}/rows/range?col=&lo=&hi=` — delete all rows in range.
+pub async fn delete_range(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.delete_range(q.col, q.lo, q.hi) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(n) => {
+                st.metrics
+                    .rows_deleted
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                st.metrics.record_ok();
+                Json(CountResp { count: n as u64 }).into_response()
+            }
+        },
     }
 }

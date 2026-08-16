@@ -704,4 +704,3 @@ fn client_fk_exists_true_after_insert() {
     assert!(found, "pk=55 must be found");
     assert!(!not_found, "pk=9999 must not be found");
 }
-

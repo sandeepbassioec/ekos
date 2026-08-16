@@ -71,7 +71,9 @@ impl TableEngine {
         let mut counts: BTreeMap<u64, u64> = BTreeMap::new();
 
         for row in self.scan(col_idx, 0, u64::MAX)? {
-            if seen.insert(row.pk) && let Some(current) = self.get(row.pk)? {
+            if seen.insert(row.pk)
+                && let Some(current) = self.get(row.pk)?
+            {
                 let val = current.values[col_idx];
                 if val >= lo && val <= hi {
                     *counts.entry(val).or_insert(0) += 1;
