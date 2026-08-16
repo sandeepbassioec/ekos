@@ -6,10 +6,100 @@ All notable changes to VectorVolt are documented here.
 
 ## [Unreleased]
 
-### Layer 47 — Packaging & Docs
-- `README.md`: project overview, architecture, quick-start, REST API reference,
+### Layer 64 — Packaging & Docs Refresh
+- `README.md`: updated architecture diagram, REST API reference (all 50+ endpoints),
+  DSL reference (all Layer 50-60 statements), Python/C# SDK v0.2.0 examples,
+  `vvctl http` quick-start, feature matrix refresh
+- `CHANGELOG.md`: entries for Layers 47-64
+- `docs/ARCHITECTURE.md`: HTTP gateway endpoint group table, DSL statement coverage table
+
+### Layer 63 — Benchmarking Pass (Layers 50-60)
+- `engine_bench.rs`: 11 new Criterion groups — `histogram` (2 cases), `percentile` (p50/p90/p99),
+  `group_by` (count/sum/min/max), `window` (running_sum/count/rank/dense_rank),
+  `distinct` (distinct_values + value_counts), `update_where` (update/increment/decrement),
+  `scan_where` (1 + 2 predicates), `scan_project` (1/2 cols), `cond_write` (if_absent ×2 + cas),
+  `batch_insert` (10/100/1000 rows), `ttl` (insert/get/scan/purge_none/purge_all)
+- `query_bench.rs`: 4 new groups — `dsl/analytics` (13 cases), `dsl/predicate` (6 cases),
+  `dsl/cond_batch_ttl` (8 cases), `dsl/parse_layer50` (19 parse-only cases)
+
+### Layer 62 — Python + C# SDK Expansion
+- **Python** (`sdk/python/`): `__version__ = "0.2.0"`; 4 new dataclasses
+  (`HistogramBucket`, `GroupEntry`, `WindowRow`, `ValueCountEntry`); 25 new methods
+  covering histogram, percentile, group-by ×4, window ×4, distinct, value_counts,
+  update/increment/decrement_where, batch_get/delete, scan_where, scan_project,
+  insert_if_absent, compare_and_swap, batch_insert, TTL ×4, raw query; 29 integration tests
+- **C#** (`sdk/csharp/VectorVolt.Client/`): 25 new async methods with matching coverage;
+  4 new record types; 29 xUnit integration tests in `HttpClientTests2.cs`
+
+### Layer 61 — vvctl HTTP Integration
+- `vvctl http` top-level subcommand with 24 dedicated subcommands + raw `query` pass-through
+- Covers all HTTP-gateway-only ops from Layers 44-60: histogram, percentile, group-by ×4,
+  window ×4, distinct, value-counts, update/increment/decrement-where, scan-where,
+  scan-project, if-absent, CAS, batch-insert, insert-ttl, get-ttl, scan-ttl, purge-expired
+- Uses `reqwest::blocking`; `reqwest` added to vvctl regular `[dependencies]`
+
+### Layer 60 — TTL Operations (HTTP + DSL)
+- 4 HTTP endpoints: `POST /rows/{pk}/ttl`, `GET /get_with_ttl/{pk}?now=`,
+  `GET /scan_with_ttl?now=`, `POST /purge_expired?now=`
+- DSL: `INSERT TTL pk v... expire=n`, `GET TTL pk now=n`, `SCAN TTL now=n`,
+  `PURGE EXPIRED now=n`; 5 new keywords (`Ttl`, `Expire`, `Purge`, `Expired`, `Now`)
+- 13 integration tests
+
+### Layer 59 — Batch Insert (HTTP + DSL)
+- 1 HTTP endpoint: `POST /batch/insert` — body `{"rows":[{"pk":n,"values":[...]},...] }`
+- DSL: `BATCH INSERT row pk v... [row pk v...]`; 1 new keyword (`Row`)
+- 11 integration tests
+
+### Layer 58 — Conditional Writes (HTTP + DSL)
+- 2 HTTP endpoints: `POST /rows/{pk}/if_absent`, `POST /rows/{pk}/cas`
+- DSL: `INSERT IF_ABSENT pk v...`, `CAS pk expected v... new v...`
+- 4 new keywords (`IfAbsent`, `Cas`, `Expected`, `New`); 10 integration tests
+
+### Layer 57 — Column Projection Scan (HTTP + DSL)
+- 1 HTTP endpoint: `GET /scan/project?filter_col=&lo=&hi=&proj=<csv>`
+- DSL: `SCAN PROJECT col=n lo=lo hi=hi cols c1 [c2...]`
+- 2 new keywords (`Project`, `Cols`); 15 integration tests
+
+### Layer 56 — Multi-Predicate Scan (HTTP + DSL)
+- 1 HTTP endpoint: `GET /scan_where?col0=&lo0=&hi0=[&col1=...]` (dynamic indexed params)
+- DSL: `SCAN WHERE col=n lo=lo hi=hi [AND col=n lo=lo hi=hi ...]`
+- 15 integration tests
+
+### Layer 55 — Batch HTTP Endpoints
+- 2 HTTP endpoints: `POST /batch/get`, `POST /batch/delete`
+- Consistent with engine Layer 26 batch ops
+- 11 integration tests
+
+### Layer 54 — Bulk Field Updates (HTTP + DSL)
+- 3 HTTP endpoints: `GET /update_where`, `GET /increment_where`, `GET /decrement_where`
+- DSL: `UPDATE WHERE`, `INCREMENT WHERE`, `DECREMENT WHERE`
+- 15 integration tests
+
+### Layer 53 — Distinct + Value Counts (HTTP + DSL)
+- 2 HTTP endpoints: `GET /distinct?col=&lo=&hi=`, `GET /value_counts?col=&lo=&hi=`
+- DSL: `DISTINCT col=n lo=lo hi=hi`, `VALUE_COUNTS col=n lo=lo hi=hi`
+- 15 integration tests
+
+### Layer 52 — Window Functions (HTTP + DSL)
+- 4 HTTP endpoints: `GET /window/running_sum`, `/window/running_count`,
+  `/window/rank`, `/window/dense_rank`
+- DSL: `WINDOW RUNNING_SUM/RUNNING_COUNT/RANK/DENSE_RANK filter_col=n lo=lo hi=hi [...]`
+- 17 integration tests
+
+### Layer 51 — Group-By Aggregates (HTTP + DSL)
+- 4 HTTP endpoints: `GET /group/count`, `/group/sum`, `/group/min`, `/group/max`
+- DSL: `GROUP COUNT/SUM/MIN/MAX filter_col=n lo=lo hi=hi group_col=n [agg_col=n]`
+- 17 integration tests
+
+### Layer 50 — Histogram + Percentile (HTTP + DSL)
+- 2 HTTP endpoints: `GET /histogram?col=&lo=&hi=&buckets=`, `GET /percentile?col=&lo=&hi=&p=`
+- DSL: `HISTOGRAM col=n lo=lo hi=hi buckets=n`, `PERCENTILE col=n lo=lo hi=hi p=0-100`
+- 14 integration tests
+
+### Layer 47 — Packaging & Docs (initial)
+- `README.md`: project overview, architecture, quick-start, REST API reference (Layers 1-46),
   DSL reference, SDK examples, benchmark numbers, feature matrix
-- `CHANGELOG.md`: full release history
+- `CHANGELOG.md`: full release history through Layer 46
 - `docs/ARCHITECTURE.md`: deep-dive on storage, WAL, compaction, and networking
 
 ### Layer 46 — Benchmark Suite Expansion
