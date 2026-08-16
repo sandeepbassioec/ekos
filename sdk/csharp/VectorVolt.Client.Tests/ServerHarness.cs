@@ -20,13 +20,16 @@ internal sealed class ServerHarness : IDisposable
     public string KeyId  { get; }
     public string Secret { get; }
 
-    private ServerHarness(Process proc, string tempDir, int port, string keyId, string secret)
+    public int HttpPort { get; }
+
+    private ServerHarness(Process proc, string tempDir, int port, string keyId, string secret, int httpPort = 0)
     {
         _proc    = proc;
         _tempDir = tempDir;
         Port     = port;
         KeyId    = keyId;
         Secret   = secret;
+        HttpPort = httpPort;
     }
 
     /// <summary>
@@ -40,6 +43,35 @@ internal sealed class ServerHarness : IDisposable
     public static ServerHarness StartWithAuth(
         string[] columns, string keyId, string secret, int timeoutMs = 5_000)
         => StartCore(columns, keyId, secret, timeoutMs);
+
+    /// <summary>
+    /// Start a multi-table server with both TCP and HTTP listeners.
+    /// Use <see cref="HttpPort"/> to connect <see cref="VectorVoltHttpClient"/>.
+    /// </summary>
+    public static ServerHarness StartWithHttp(int timeoutMs = 5_000)
+    {
+        int tcpPort  = GetFreePort();
+        int httpPort = GetFreePort();
+        string dir   = Path.Combine(Path.GetTempPath(), $"vv_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName               = VvctlPath(),
+            Arguments              = $"serve {dir} --addr 127.0.0.1:{tcpPort}" +
+                                     $" --http-addr 127.0.0.1:{httpPort} --multi",
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            UseShellExecute        = false,
+            CreateNoWindow         = true,
+        };
+
+        var proc = Process.Start(psi)
+            ?? throw new InvalidOperationException($"Failed to start vvctl: {psi.FileName}");
+
+        WaitForPort(httpPort, timeoutMs, proc);
+        return new ServerHarness(proc, dir, tcpPort, "", "", httpPort);
+    }
 
     /// <summary>Start a multi-table server (--multi flag). No initial schema needed.</summary>
     public static ServerHarness StartMultiTable(int timeoutMs = 5_000)
@@ -62,7 +94,7 @@ internal sealed class ServerHarness : IDisposable
             ?? throw new InvalidOperationException($"Failed to start vvctl: {psi.FileName}");
 
         WaitForPort(port, timeoutMs, proc);
-        return new ServerHarness(proc, dir, port, "", "");
+        return new ServerHarness(proc, dir, port, "", "", httpPort: 0);
     }
 
     private static ServerHarness StartCore(

@@ -27,6 +27,12 @@ class Row:
     values: list[int]
 
 
+@dataclass
+class PageResult:
+    rows: list[Row]
+    next_cursor: Optional[int]
+
+
 class VectorVoltClient:
     """HTTP client for a running VectorVolt server with the REST gateway enabled.
 
@@ -142,6 +148,140 @@ class VectorVoltClient:
         name = table or self._table
         resp = self._req("GET", f"/tables/{name}/secondary?col={col}&val={val}")
         return [Row(pk=r["pk"], values=r["values"]) for r in resp["rows"]]
+
+    # ── Layer 44 / 45: analytical + write/mutate ──────────────────────────────
+
+    def upsert(
+        self,
+        pk: int,
+        values: list[int],
+        table: Optional[str] = None,
+    ) -> None:
+        """Insert or overwrite a row (upsert semantics)."""
+        name = table or self._table
+        self._req("PUT", f"/tables/{name}/rows/{pk}", body={"values": values})
+
+    def update_field(
+        self,
+        pk: int,
+        col: int,
+        val: int,
+        table: Optional[str] = None,
+    ) -> None:
+        """Update a single column of an existing row."""
+        name = table or self._table
+        self._req("PATCH", f"/tables/{name}/rows/{pk}/field", body={"col": col, "val": val})
+
+    def delete_range(
+        self,
+        col: int,
+        lo: int,
+        hi: int,
+        table: Optional[str] = None,
+    ) -> int:
+        """Delete all rows where ``col`` is in ``[lo, hi]``. Returns deleted count."""
+        name = table or self._table
+        resp = self._req("DELETE", f"/tables/{name}/rows/range?col={col}&lo={lo}&hi={hi}")
+        return resp["count"]
+
+    def count(
+        self,
+        col: int,
+        lo: int,
+        hi: int,
+        table: Optional[str] = None,
+    ) -> int:
+        """Count rows where ``col`` is in ``[lo, hi]``."""
+        name = table or self._table
+        resp = self._req("GET", f"/tables/{name}/count?col={col}&lo={lo}&hi={hi}")
+        return resp["count"]
+
+    def sum_range(
+        self,
+        col: int,
+        lo: int,
+        hi: int,
+        table: Optional[str] = None,
+    ) -> Optional[int]:
+        """Sum of ``col`` values for rows in ``[lo, hi]``. None if no rows match."""
+        name = table or self._table
+        resp = self._req("GET", f"/tables/{name}/sum?col={col}&lo={lo}&hi={hi}")
+        return resp["value"]
+
+    def min_range(
+        self,
+        col: int,
+        lo: int,
+        hi: int,
+        table: Optional[str] = None,
+    ) -> Optional[int]:
+        """Minimum ``col`` value for rows in ``[lo, hi]``. None if no rows match."""
+        name = table or self._table
+        resp = self._req("GET", f"/tables/{name}/min?col={col}&lo={lo}&hi={hi}")
+        return resp["value"]
+
+    def max_range(
+        self,
+        col: int,
+        lo: int,
+        hi: int,
+        table: Optional[str] = None,
+    ) -> Optional[int]:
+        """Maximum ``col`` value for rows in ``[lo, hi]``. None if no rows match."""
+        name = table or self._table
+        resp = self._req("GET", f"/tables/{name}/max?col={col}&lo={lo}&hi={hi}")
+        return resp["value"]
+
+    def avg(
+        self,
+        col: int,
+        lo: int,
+        hi: int,
+        table: Optional[str] = None,
+    ) -> Optional[int]:
+        """Rounded average of ``col`` for rows in ``[lo, hi]``. None if empty."""
+        name = table or self._table
+        resp = self._req("GET", f"/tables/{name}/avg?col={col}&lo={lo}&hi={hi}")
+        return resp["value"]
+
+    def scan_sorted(
+        self,
+        col: int,
+        lo: int,
+        hi: int,
+        sort: int,
+        asc: bool = True,
+        limit: int = 100,
+        table: Optional[str] = None,
+    ) -> list[Row]:
+        """Scan rows filtered by ``col`` in ``[lo, hi]``, sorted by ``sort`` column."""
+        name = table or self._table
+        asc_int = 1 if asc else 0
+        resp = self._req(
+            "GET",
+            f"/tables/{name}/scan/sorted?col={col}&lo={lo}&hi={hi}"
+            f"&sort={sort}&asc={asc_int}&limit={limit}",
+        )
+        return [Row(pk=r["pk"], values=r["values"]) for r in resp["rows"]]
+
+    def scan_page(
+        self,
+        col: int,
+        lo: int,
+        hi: int,
+        after: int = 0,
+        limit: int = 100,
+        table: Optional[str] = None,
+    ) -> PageResult:
+        """Cursor-based page scan. Pass ``after=result.next_cursor`` for the next page."""
+        name = table or self._table
+        resp = self._req(
+            "GET",
+            f"/tables/{name}/scan/page?col={col}&lo={lo}&hi={hi}"
+            f"&after={after}&limit={limit}",
+        )
+        rows = [Row(pk=r["pk"], values=r["values"]) for r in resp["rows"]]
+        return PageResult(rows=rows, next_cursor=resp.get("next_cursor"))
 
     # ── internals ─────────────────────────────────────────────────────────────
 
