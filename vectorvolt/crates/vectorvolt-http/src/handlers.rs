@@ -11,9 +11,9 @@ use crate::types::{
     DistinctResp, ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp, GroupResp,
     HistogramQuery, HistogramResp, IncrDecrWhereQuery, InsertBody, OkResp, PageResp,
     PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp, RowsResp, ScanPageQuery,
-    ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp, UpdateFieldBody,
-    UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp, WindowAggQuery,
-    WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
+    ScanQuery, ScanSortedQuery, ScanWhereQuery, SchemaResp, SecondaryQuery, TablesResp,
+    UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
+    WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -363,6 +363,17 @@ pub async fn query_handler(
                 }),
                 vectorvolt_query::QueryResponse::BatchDeleted(n) => {
                     Json(QueryResp::BatchDeleted { deleted: n })
+                }
+                vectorvolt_query::QueryResponse::ScanWhereRows(rows) => {
+                    Json(QueryResp::ScanWhere {
+                        rows: rows
+                            .into_iter()
+                            .map(|r| RowResp {
+                                pk: r.pk,
+                                values: r.values,
+                            })
+                            .collect(),
+                    })
                 }
             };
             json.into_response()
@@ -944,6 +955,35 @@ pub async fn batch_delete(
             Ok(n) => {
                 st.metrics.record_ok();
                 Json(BatchDeleteResp { deleted: n }).into_response()
+            }
+        },
+    }
+}
+
+// ── Layer 56: multi-predicate compound scan ───────────────────────────────────
+
+pub async fn scan_where(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<ScanWhereQuery>,
+) -> impl IntoResponse {
+    let predicates = q.into_predicates();
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.scan_where(&predicates) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(rows) => {
+                st.metrics.record_ok();
+                Json(RowsResp {
+                    rows: rows
+                        .into_iter()
+                        .map(|r| RowResp {
+                            pk: r.pk,
+                            values: r.values,
+                        })
+                        .collect(),
+                })
+                .into_response()
             }
         },
     }

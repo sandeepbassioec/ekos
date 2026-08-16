@@ -69,6 +69,8 @@ pub enum Keyword {
     TargetCol,
     // Layer 55 additions
     Batch,
+    // Layer 56 additions
+    And,
 }
 
 impl Keyword {
@@ -126,6 +128,7 @@ impl Keyword {
             "DELTA" => Some(Self::Delta),
             "TARGET_COL" => Some(Self::TargetCol),
             "BATCH" => Some(Self::Batch),
+            "AND" => Some(Self::And),
             _ => None,
         }
     }

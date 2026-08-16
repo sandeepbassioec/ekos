@@ -72,6 +72,10 @@ pub enum QueryResponse {
 
     /// Number of rows deleted by BATCH DELETE.
     BatchDeleted(usize),
+
+    // ── Layer 56 ──────────────────────────────────────────────────────────────
+    /// Rows matching all predicates from SCAN WHERE.
+    ScanWhereRows(Vec<EngineRow>),
 }
 
 /// Execute `query` against `engine`.
@@ -360,6 +364,12 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         Query::BatchDelete { pks } => {
             let n = engine.batch_delete(&pks)?;
             Ok(QueryResponse::BatchDeleted(n))
+        }
+
+        // ── Layer 56: multi-predicate compound scan ────────────────────────────
+        Query::ScanWhere { predicates } => {
+            let rows = engine.scan_where(&predicates)?;
+            Ok(QueryResponse::ScanWhereRows(rows))
         }
     }
 }

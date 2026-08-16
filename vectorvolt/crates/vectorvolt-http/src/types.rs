@@ -222,6 +222,10 @@ pub enum QueryResp {
     BatchDeleted {
         deleted: usize,
     },
+    /// SCAN WHERE multi-predicate result.
+    ScanWhere {
+        rows: Vec<RowResp>,
+    },
 }
 
 // ── Layer 53 response types ───────────────────────────────────────────────────
@@ -282,6 +286,35 @@ pub struct BatchGetResp {
 #[derive(Debug, Serialize)]
 pub struct BatchDeleteResp {
     pub deleted: usize,
+}
+
+// ── Layer 56 request + response types ────────────────────────────────────────
+
+/// Up to 3 AND-predicates: col0/lo0/hi0 required; col1/lo1/hi1 and col2/lo2/hi2 optional.
+#[derive(Debug, Deserialize)]
+pub struct ScanWhereQuery {
+    pub col0: usize,
+    pub lo0: u64,
+    pub hi0: u64,
+    pub col1: Option<usize>,
+    pub lo1: Option<u64>,
+    pub hi1: Option<u64>,
+    pub col2: Option<usize>,
+    pub lo2: Option<u64>,
+    pub hi2: Option<u64>,
+}
+
+impl ScanWhereQuery {
+    pub fn into_predicates(self) -> Vec<(usize, u64, u64)> {
+        let mut v = vec![(self.col0, self.lo0, self.hi0)];
+        if let (Some(c), Some(lo), Some(hi)) = (self.col1, self.lo1, self.hi1) {
+            v.push((c, lo, hi));
+        }
+        if let (Some(c), Some(lo), Some(hi)) = (self.col2, self.lo2, self.hi2) {
+            v.push((c, lo, hi));
+        }
+        v
+    }
 }
 
 // ── Layer 51 query params + response types ────────────────────────────────────
