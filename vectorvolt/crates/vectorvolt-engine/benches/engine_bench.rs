@@ -369,6 +369,428 @@ fn bench_scan_page(c: &mut Criterion) {
     group.finish();
 }
 
+// ── histogram ─────────────────────────────────────────────────────────────────
+
+fn bench_histogram(c: &mut Criterion) {
+    let mut group = c.benchmark_group("histogram");
+    const SEED: u64 = 10_000;
+
+    group.bench_function("10_buckets", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.histogram_range(1, 0, 99, 10).unwrap()));
+    });
+
+    group.bench_function("100_buckets", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.histogram_range(1, 0, 99, 100).unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── percentile ────────────────────────────────────────────────────────────────
+
+fn bench_percentile(c: &mut Criterion) {
+    let mut group = c.benchmark_group("percentile");
+    const SEED: u64 = 10_000;
+
+    for &p in &[50.0f64, 90.0, 99.0] {
+        let label = format!("p{}", p as u64);
+        group.bench_function(label, |b| {
+            let dir = TempDir::new().unwrap();
+            let engine = open(&dir);
+            for pk in 0..SEED {
+                engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+            }
+            b.iter(|| black_box(engine.percentile_range(1, 0, 99, p).unwrap()));
+        });
+    }
+
+    group.finish();
+}
+
+// ── group_by ──────────────────────────────────────────────────────────────────
+
+fn bench_group_by(c: &mut Criterion) {
+    let mut group = c.benchmark_group("group_by");
+    const SEED: u64 = 10_000;
+
+    group.bench_function("count", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.group_by_count(1, 0, 99, 1).unwrap()));
+    });
+
+    group.bench_function("sum", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.group_by_sum(1, 0, 99, 1, 2).unwrap()));
+    });
+
+    group.bench_function("min", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.group_by_min(1, 0, 99, 1, 2).unwrap()));
+    });
+
+    group.bench_function("max", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.group_by_max(1, 0, 99, 1, 2).unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── window ────────────────────────────────────────────────────────────────────
+
+fn bench_window(c: &mut Criterion) {
+    let mut group = c.benchmark_group("window");
+    const SEED: u64 = 10_000;
+
+    group.bench_function("running_sum", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.running_sum(1, 0, 99, 2).unwrap()));
+    });
+
+    group.bench_function("running_count", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.running_count(1, 0, 99).unwrap()));
+    });
+
+    group.bench_function("rank_by", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.rank_by(1, 0, 99, 2, true).unwrap()));
+    });
+
+    group.bench_function("dense_rank_by", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.dense_rank_by(1, 0, 99, 2, true).unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── distinct ──────────────────────────────────────────────────────────────────
+
+fn bench_distinct(c: &mut Criterion) {
+    let mut group = c.benchmark_group("distinct");
+    const SEED: u64 = 10_000;
+
+    group.bench_function("distinct_values", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.distinct_values(1, 0, 99).unwrap()));
+    });
+
+    group.bench_function("value_counts", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.value_counts(1, 0, 99).unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── update_where ──────────────────────────────────────────────────────────────
+
+fn bench_update_where(c: &mut Criterion) {
+    let mut group = c.benchmark_group("update_where");
+    const SEED: u64 = 10_000;
+
+    group.bench_function("update_field_where", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        let mut v = 0u64;
+        b.iter(|| {
+            // update score (col 2) for all rows where age (col 1) in [0, 9] (~10%)
+            black_box(engine.update_field_where(&[(1, 0, 9)], 2, v).unwrap());
+            v = v.wrapping_add(1);
+        });
+    });
+
+    group.bench_function("increment_field_where", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| {
+            black_box(engine.increment_field_where(&[(1, 0, 9)], 2, 1).unwrap());
+        });
+    });
+
+    group.bench_function("decrement_field_where", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| {
+            black_box(engine.decrement_field_where(&[(1, 0, 9)], 2, 1).unwrap());
+        });
+    });
+
+    group.finish();
+}
+
+// ── scan_where ────────────────────────────────────────────────────────────────
+
+fn bench_scan_where(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scan_where");
+    const SEED: u64 = 10_000;
+
+    group.bench_function("single_predicate", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.scan_where(&[(1, 0, 9)]).unwrap()));
+    });
+
+    group.bench_function("two_predicates", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        // age in [0,49] AND score in [0, 100]
+        b.iter(|| black_box(engine.scan_where(&[(1, 0, 49), (2, 0, 100)]).unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── scan_project ──────────────────────────────────────────────────────────────
+
+fn bench_scan_project(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scan_project");
+    const SEED: u64 = 10_000;
+
+    group.bench_function("2_cols", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.scan_project(1, 0, 99, &[0, 2]).unwrap()));
+    });
+
+    group.bench_function("1_col", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.scan_project(1, 0, 99, &[0]).unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── cond_write ────────────────────────────────────────────────────────────────
+
+fn bench_cond_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cond_write");
+    const SEED: u64 = 10_000;
+
+    // insert_if_absent: pk already exists → fast false return
+    group.bench_function("insert_if_absent_existing", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        b.iter(|| black_box(engine.insert_if_absent(0, vec![0, 0, 0, 0]).unwrap()));
+    });
+
+    // insert_if_absent: unique pk each call → always inserts
+    group.bench_function("insert_if_absent_new", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        let mut pk = SEED;
+        b.iter(|| {
+            black_box(
+                engine
+                    .insert_if_absent(black_box(pk), vec![pk, pk % 100, pk * 2, pk])
+                    .unwrap(),
+            );
+            pk = pk.wrapping_add(1);
+        });
+    });
+
+    // compare_and_swap: wrong expected → fast false return
+    group.bench_function("cas_mismatch", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine.insert(pk, vec![pk, pk % 100, pk * 2, pk]).unwrap();
+        }
+        // pk=0 has values [0,0,0,0]; we pass wrong expected [1,1,1,1]
+        b.iter(|| {
+            black_box(
+                engine
+                    .compare_and_swap(0, &[1, 1, 1, 1], vec![0, 1, 2, 3])
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.finish();
+}
+
+// ── batch_insert ──────────────────────────────────────────────────────────────
+
+fn bench_batch_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_insert");
+
+    for &n in &[10u64, 100, 1_000] {
+        group.throughput(Throughput::Elements(n));
+        group.bench_with_input(BenchmarkId::new("rows", n), &n, |b, &n| {
+            b.iter_with_setup(
+                || {
+                    let dir = TempDir::new().unwrap();
+                    let engine = open(&dir);
+                    let rows: Vec<(u64, Vec<u64>)> = (0..n)
+                        .map(|pk| (pk, vec![pk, pk % 100, pk * 2, pk]))
+                        .collect();
+                    (dir, engine, rows)
+                },
+                |(_dir, engine, rows)| {
+                    black_box(engine.batch_insert(rows).unwrap());
+                },
+            );
+        });
+    }
+
+    group.finish();
+}
+
+// ── ttl ───────────────────────────────────────────────────────────────────────
+
+fn bench_ttl(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ttl");
+    const SEED: u64 = 10_000;
+    const FAR_FUTURE: u64 = u64::MAX;
+    const PAST: u64 = 0;
+    const NOW: u64 = 1_000_000;
+
+    group.bench_function("insert_with_ttl", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        let mut pk = 0u64;
+        b.iter(|| {
+            engine
+                .insert_with_ttl(black_box(pk), vec![pk, pk % 100, pk * 2, pk], FAR_FUTURE)
+                .unwrap();
+            pk = pk.wrapping_add(1);
+        });
+    });
+
+    group.bench_function("get_with_ttl_hit", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine
+                .insert_with_ttl(pk, vec![pk, pk % 100, pk * 2, pk], FAR_FUTURE)
+                .unwrap();
+        }
+        let mut pk = 0u64;
+        b.iter(|| {
+            black_box(engine.get_with_ttl(pk % SEED, NOW).unwrap());
+            pk = pk.wrapping_add(1);
+        });
+    });
+
+    group.bench_function("scan_with_ttl", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine
+                .insert_with_ttl(pk, vec![pk, pk % 100, pk * 2, pk], FAR_FUTURE)
+                .unwrap();
+        }
+        b.iter(|| black_box(engine.scan_with_ttl(NOW).unwrap()));
+    });
+
+    // purge with nothing to purge (all entries have expire_at = FAR_FUTURE)
+    group.bench_function("purge_expired_none", |b| {
+        let dir = TempDir::new().unwrap();
+        let engine = open(&dir);
+        for pk in 0..SEED {
+            engine
+                .insert_with_ttl(pk, vec![pk, pk % 100, pk * 2, pk], FAR_FUTURE)
+                .unwrap();
+        }
+        b.iter(|| black_box(engine.purge_expired(NOW).unwrap()));
+    });
+
+    // purge everything (all entries are expired)
+    group.bench_function("purge_expired_all", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = TempDir::new().unwrap();
+                let engine = open(&dir);
+                for pk in 0..100u64 {
+                    engine
+                        .insert_with_ttl(pk, vec![pk, pk % 100, pk * 2, pk], PAST)
+                        .unwrap();
+                }
+                (dir, engine)
+            },
+            |(_dir, engine)| black_box(engine.purge_expired(NOW).unwrap()),
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert,
@@ -379,5 +801,16 @@ criterion_group!(
     bench_aggregate,
     bench_sorted_scan,
     bench_scan_page,
+    bench_histogram,
+    bench_percentile,
+    bench_group_by,
+    bench_window,
+    bench_distinct,
+    bench_update_where,
+    bench_scan_where,
+    bench_scan_project,
+    bench_cond_write,
+    bench_batch_insert,
+    bench_ttl,
 );
 criterion_main!(benches);

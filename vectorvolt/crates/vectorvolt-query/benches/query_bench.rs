@@ -165,5 +165,366 @@ fn bench_dsl_parse(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_dsl_read, bench_dsl_write, bench_dsl_parse);
+// ── analytics queries (Layers 50-53) ─────────────────────────────────────────
+
+fn bench_dsl_analytics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dsl/analytics");
+    let (engine, _dir) = open_seeded();
+
+    group.bench_function("histogram", |b| {
+        b.iter(|| black_box(run(&engine, "HISTOGRAM col=1 lo=0 hi=99 buckets=10").unwrap()));
+    });
+
+    group.bench_function("percentile_p50", |b| {
+        b.iter(|| black_box(run(&engine, "PERCENTILE col=1 lo=0 hi=99 p=50").unwrap()));
+    });
+
+    group.bench_function("percentile_p99", |b| {
+        b.iter(|| black_box(run(&engine, "PERCENTILE col=1 lo=0 hi=99 p=99").unwrap()));
+    });
+
+    group.bench_function("group_count", |b| {
+        b.iter(|| {
+            black_box(run(&engine, "GROUP COUNT filter_col=1 lo=0 hi=99 group_col=1").unwrap())
+        });
+    });
+
+    group.bench_function("group_sum", |b| {
+        b.iter(|| {
+            black_box(
+                run(
+                    &engine,
+                    "GROUP SUM filter_col=1 lo=0 hi=99 group_col=1 agg_col=2",
+                )
+                .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("group_min", |b| {
+        b.iter(|| {
+            black_box(
+                run(
+                    &engine,
+                    "GROUP MIN filter_col=1 lo=0 hi=99 group_col=1 agg_col=2",
+                )
+                .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("group_max", |b| {
+        b.iter(|| {
+            black_box(
+                run(
+                    &engine,
+                    "GROUP MAX filter_col=1 lo=0 hi=99 group_col=1 agg_col=2",
+                )
+                .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("window_running_sum", |b| {
+        b.iter(|| {
+            black_box(
+                run(
+                    &engine,
+                    "WINDOW RUNNING_SUM filter_col=1 lo=0 hi=9 agg_col=2",
+                )
+                .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("window_running_count", |b| {
+        b.iter(|| black_box(run(&engine, "WINDOW RUNNING_COUNT filter_col=1 lo=0 hi=9").unwrap()));
+    });
+
+    group.bench_function("window_rank", |b| {
+        b.iter(|| {
+            black_box(
+                run(
+                    &engine,
+                    "WINDOW RANK filter_col=1 lo=0 hi=9 sort_col=2 asc=1",
+                )
+                .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("window_dense_rank", |b| {
+        b.iter(|| {
+            black_box(
+                run(
+                    &engine,
+                    "WINDOW DENSE_RANK filter_col=1 lo=0 hi=9 sort_col=2 asc=1",
+                )
+                .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("distinct", |b| {
+        b.iter(|| black_box(run(&engine, "DISTINCT col=1 lo=0 hi=99").unwrap()));
+    });
+
+    group.bench_function("value_counts", |b| {
+        b.iter(|| black_box(run(&engine, "VALUE_COUNTS col=1 lo=0 hi=99").unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── predicate mutate + scan queries (Layers 54-57) ────────────────────────────
+
+fn bench_dsl_predicate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dsl/predicate");
+    let (engine, _dir) = open_seeded();
+
+    group.bench_function("update_where", |b| {
+        b.iter(|| {
+            black_box(
+                run(
+                    &engine,
+                    "UPDATE WHERE filter_col=1 lo=0 hi=9 target_col=2 val=42",
+                )
+                .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("increment_where", |b| {
+        b.iter(|| {
+            black_box(
+                run(
+                    &engine,
+                    "INCREMENT WHERE filter_col=1 lo=0 hi=9 target_col=2 delta=1",
+                )
+                .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("decrement_where", |b| {
+        b.iter(|| {
+            black_box(
+                run(
+                    &engine,
+                    "DECREMENT WHERE filter_col=1 lo=0 hi=9 target_col=2 delta=1",
+                )
+                .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("scan_where_1pred", |b| {
+        b.iter(|| black_box(run(&engine, "SCAN WHERE col=1 lo=0 hi=9").unwrap()));
+    });
+
+    group.bench_function("scan_where_2pred", |b| {
+        b.iter(|| {
+            black_box(run(&engine, "SCAN WHERE col=1 lo=0 hi=49 AND col=2 lo=0 hi=100").unwrap())
+        });
+    });
+
+    group.bench_function("scan_project", |b| {
+        b.iter(|| black_box(run(&engine, "SCAN PROJECT col=1 lo=0 hi=99 cols=0 2").unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── conditional writes + batch + TTL (Layers 58-60) ──────────────────────────
+
+fn bench_dsl_cond_batch_ttl(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dsl/cond_batch_ttl");
+    let (engine, _dir) = open_seeded();
+
+    // insert_if_absent on existing pk → fast false return
+    group.bench_function("insert_if_absent_existing", |b| {
+        b.iter(|| black_box(run(&engine, "INSERT IF_ABSENT 1 1 1 2").unwrap()));
+    });
+
+    // insert_if_absent on a fresh pk each time
+    group.bench_function("insert_if_absent_new", |b| {
+        let (e2, _d2) = open_empty();
+        let mut pk = 500_000u64;
+        b.iter(|| {
+            let q = format!("INSERT IF_ABSENT {} {} {} {}", pk, pk, pk % 100, pk * 2);
+            black_box(run(&e2, &q).unwrap());
+            pk = pk.wrapping_add(1);
+        });
+    });
+
+    // CAS with wrong expected → fast mismatch return
+    group.bench_function("cas_mismatch", |b| {
+        b.iter(|| {
+            // pk=1 has values [1,1,2]; expected [9,9,9] won't match
+            black_box(run(&engine, "CAS 1 expected 9 9 9 new 1 99 200").unwrap())
+        });
+    });
+
+    group.bench_function("batch_insert_10", |b| {
+        b.iter_with_setup(
+            || {
+                // build a fresh batch statement each setup
+                let rows: String = (0u64..10)
+                    .map(|i| format!("row {} {} {} {}", 900_000 + i, 900_000 + i, i % 100, i * 2))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("BATCH INSERT {rows}")
+            },
+            |q| black_box(run(&engine, &q).unwrap()),
+        );
+    });
+
+    // TTL: insert + get + scan + purge (nothing to purge)
+    group.bench_function("insert_ttl", |b| {
+        let (e3, _d3) = open_empty();
+        let mut pk = 700_000u64;
+        b.iter(|| {
+            let q = format!(
+                "INSERT TTL {} {} {} {} expire={}",
+                pk,
+                pk,
+                pk % 100,
+                pk * 2,
+                u64::MAX
+            );
+            black_box(run(&e3, &q).unwrap());
+            pk = pk.wrapping_add(1);
+        });
+    });
+
+    group.bench_function("get_ttl", |b| {
+        let (e4, _d4) = open_empty();
+        for pk in 0u64..1000 {
+            run(
+                &e4,
+                &format!(
+                    "INSERT TTL {} {} {} {} expire={}",
+                    pk,
+                    pk,
+                    pk % 100,
+                    pk * 2,
+                    u64::MAX
+                ),
+            )
+            .ok();
+        }
+        let mut pk = 0u64;
+        b.iter(|| {
+            let q = format!("GET TTL {} now=0", pk % 1000);
+            black_box(run(&e4, &q).unwrap());
+            pk = pk.wrapping_add(1);
+        });
+    });
+
+    group.bench_function("scan_ttl", |b| {
+        let (e5, _d5) = open_empty();
+        for pk in 0u64..1000 {
+            run(
+                &e5,
+                &format!(
+                    "INSERT TTL {} {} {} {} expire={}",
+                    pk,
+                    pk,
+                    pk % 100,
+                    pk * 2,
+                    u64::MAX
+                ),
+            )
+            .ok();
+        }
+        b.iter(|| black_box(run(&e5, "SCAN TTL now=0").unwrap()));
+    });
+
+    // purge with nothing expired
+    group.bench_function("purge_expired_none", |b| {
+        let (e6, _d6) = open_empty();
+        for pk in 0u64..1000 {
+            run(
+                &e6,
+                &format!(
+                    "INSERT TTL {} {} {} {} expire={}",
+                    pk,
+                    pk,
+                    pk % 100,
+                    pk * 2,
+                    u64::MAX
+                ),
+            )
+            .ok();
+        }
+        b.iter(|| black_box(run(&e6, "PURGE EXPIRED now=0").unwrap()));
+    });
+
+    group.finish();
+}
+
+// ── parse-only for new statements ─────────────────────────────────────────────
+
+fn bench_dsl_parse_layer50(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dsl/parse_layer50");
+
+    let stmts: &[(&str, &str)] = &[
+        ("histogram", "HISTOGRAM col=1 lo=0 hi=99 buckets=10"),
+        ("percentile", "PERCENTILE col=1 lo=0 hi=99 p=50"),
+        (
+            "group_count",
+            "GROUP COUNT filter_col=1 lo=0 hi=99 group_col=1",
+        ),
+        (
+            "group_sum",
+            "GROUP SUM filter_col=1 lo=0 hi=99 group_col=1 agg_col=2",
+        ),
+        (
+            "window_running_sum",
+            "WINDOW RUNNING_SUM filter_col=1 lo=0 hi=9 agg_col=2",
+        ),
+        (
+            "window_rank",
+            "WINDOW RANK filter_col=1 lo=0 hi=9 sort_col=2 asc=1",
+        ),
+        ("distinct", "DISTINCT col=1 lo=0 hi=99"),
+        ("value_counts", "VALUE_COUNTS col=1 lo=0 hi=99"),
+        (
+            "update_where",
+            "UPDATE WHERE filter_col=1 lo=0 hi=9 target_col=2 val=42",
+        ),
+        (
+            "increment_where",
+            "INCREMENT WHERE filter_col=1 lo=0 hi=9 target_col=2 delta=1",
+        ),
+        ("scan_where", "SCAN WHERE col=1 lo=0 hi=9"),
+        ("scan_project", "SCAN PROJECT col=1 lo=0 hi=99 cols=0 2"),
+        ("insert_if_absent", "INSERT IF_ABSENT 42 42 50 100"),
+        ("cas", "CAS 1 expected 9 9 9 new 1 99 200"),
+        ("batch_insert", "BATCH INSERT row 1 1 50 100 row 2 2 60 120"),
+        ("insert_ttl", "INSERT TTL 1 1 50 100 expire=9999999"),
+        ("get_ttl", "GET TTL 1 now=0"),
+        ("scan_ttl", "SCAN TTL now=0"),
+        ("purge_expired", "PURGE EXPIRED now=500"),
+    ];
+
+    for &(name, stmt) in stmts {
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(parse(stmt).unwrap()));
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_dsl_read,
+    bench_dsl_write,
+    bench_dsl_parse,
+    bench_dsl_analytics,
+    bench_dsl_predicate,
+    bench_dsl_cond_batch_ttl,
+    bench_dsl_parse_layer50,
+);
 criterion_main!(benches);
