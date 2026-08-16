@@ -2,6 +2,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use tokio::net::TcpListener;
 use vectorvolt_engine::TableRegistry;
@@ -14,16 +19,30 @@ use crate::obs;
 pub struct AppState {
     pub registry: Arc<TableRegistry>,
     pub metrics: Arc<Metrics>,
+    /// When `Some`, every non-observability request must carry
+    /// `Authorization: Bearer <token>`.
+    pub api_token: Option<String>,
 }
 
 /// Configuration for the HTTP gateway.
 pub struct HttpServerConfig {
     pub addr: SocketAddr,
+    /// Optional Bearer token. When set, every request to data/DDL routes
+    /// must supply `Authorization: Bearer <token>`.
+    pub api_token: Option<String>,
 }
 
 impl HttpServerConfig {
     pub fn new(addr: SocketAddr) -> Self {
-        Self { addr }
+        Self {
+            addr,
+            api_token: None,
+        }
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.api_token = Some(token.into());
+        self
     }
 }
 
@@ -40,7 +59,7 @@ impl HttpServer {
         config: HttpServerConfig,
     ) -> std::io::Result<Self> {
         let metrics = Metrics::new();
-        let app = build_router(registry, metrics);
+        let app = build_router(registry, metrics, config.api_token);
         let listener = TcpListener::bind(config.addr).await?;
         Ok(Self { listener, app })
     }
@@ -56,8 +75,44 @@ impl HttpServer {
     }
 }
 
-fn build_router(registry: Arc<TableRegistry>, metrics: Arc<Metrics>) -> Router {
-    let state = Arc::new(AppState { registry, metrics });
+/// Middleware that enforces `Authorization: Bearer <token>` when the gateway
+/// was configured with a token.  `/health` and `/metrics` are always public.
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Some(expected) = &state.api_token {
+        let path = req.uri().path();
+        if path != "/health" && path != "/metrics" {
+            let ok = req
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == format!("Bearer {expected}"))
+                .unwrap_or(false);
+            if !ok {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({ "error": "unauthorized" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+fn build_router(
+    registry: Arc<TableRegistry>,
+    metrics: Arc<Metrics>,
+    api_token: Option<String>,
+) -> Router {
+    let state = Arc::new(AppState {
+        registry,
+        metrics,
+        api_token,
+    });
     Router::new()
         // Observability
         .route("/health", get(obs::health))
@@ -76,5 +131,9 @@ fn build_router(registry: Arc<TableRegistry>, metrics: Arc<Metrics>) -> Router {
         .route("/tables/{table}/secondary", get(handlers::secondary_lookup))
         // Text query DSL
         .route("/tables/{table}/query", post(handlers::query_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth_middleware,
+        ))
         .with_state(state)
 }

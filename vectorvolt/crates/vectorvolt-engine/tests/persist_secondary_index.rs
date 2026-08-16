@@ -22,6 +22,21 @@ fn open(dir: &TempDir) -> TableEngine {
     .unwrap()
 }
 
+/// Open with flush_threshold=1 and auto_compact=2 so every update immediately
+/// produces a new SST and two SSTs are always compacted into one.  This
+/// eliminates the non-deterministic restart ambiguity caused by two SSTs
+/// holding different versions of the same PK.
+fn open_auto_compact(dir: &TempDir) -> TableEngine {
+    TableEngine::open_with(
+        vec!["pk".into(), "category".into(), "score".into()],
+        dir.path(),
+        EngineOptions::new(1)
+            .with_durability(Durability::WriteOnly)
+            .with_auto_compact(2),
+    )
+    .unwrap()
+}
+
 // ── catalog file absent ───────────────────────────────────────────────────────
 
 #[test]
@@ -256,19 +271,18 @@ fn secondary_get_correct_after_restart() {
 
 #[test]
 fn rebuilt_index_reflects_updates_not_stale_values() {
-    // pk=1 starts with category=1, updated to category=2, then compacted
-    // (single SST) before restart.  The rebuilt index must map value=2 → pk=1.
+    // pk=1 starts with category=1, updated to category=2.
+    // flush_threshold=1 + auto_compact=2 guarantees the engine auto-compacts
+    // after the update flush, leaving one canonical SST for the restart.
     let dir = TempDir::new().unwrap();
     {
-        let eng = open(&dir);
-        eng.insert(1, vec![1, 1, 0]).unwrap(); // category=1
-        eng.flush().unwrap();
-        eng.update_field(1, 1, 2).unwrap(); // category: 1 → 2
-        eng.compact().unwrap(); // merge to single SST so restart sees one version
+        let eng = open_auto_compact(&dir);
+        eng.insert(1, vec![1, 1, 0]).unwrap(); // category=1 → SST1
+        eng.update_field(1, 1, 2).unwrap(); // category: 1 → 2 → SST2 → auto-compact → single SST
         eng.build_secondary_index(1).unwrap();
     }
 
-    let eng2 = open(&dir);
+    let eng2 = open_auto_compact(&dir);
     assert_eq!(
         eng2.secondary_lookup(1, 1).unwrap(),
         vec![],

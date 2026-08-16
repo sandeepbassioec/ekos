@@ -81,6 +81,14 @@ pub struct ServeArgs {
     /// making VectorVolt accessible from any HTTP client. Disabled if omitted.
     #[arg(long)]
     pub http_addr: Option<SocketAddr>,
+
+    /// Bearer token required on every HTTP gateway request.
+    ///
+    /// When set, every non-observability request to the HTTP gateway must
+    /// carry `Authorization: Bearer <token>`.  Has no effect when
+    /// `--http-addr` is not specified.
+    #[arg(long)]
+    pub http_token: Option<String>,
 }
 
 /// Everything needed to run the server, extracted so tests can bind without blocking.
@@ -254,6 +262,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     eprintln!("  flush thr : {} rows", FLUSH_THRESHOLD);
 
     // ── HTTP gateway (optional) ───────────────────────────────────────────────
+    let http_token = args.http_token.clone();
     if let Some(http_addr) = args.http_addr {
         // Build a TableRegistry view for the HTTP layer.
         // In multi-table mode reuse the existing registry; in single-table mode
@@ -274,7 +283,11 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .spawn(move || {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async move {
-                    let cfg = HttpServerConfig::new(http_addr);
+                    let mut cfg = HttpServerConfig::new(http_addr);
+                    if let Some(tok) = http_token {
+                        cfg = cfg.with_token(tok);
+                    }
+                    let cfg = cfg;
                     match HttpServer::bind(http_reg, cfg).await {
                         Ok(srv) => {
                             eprintln!(
