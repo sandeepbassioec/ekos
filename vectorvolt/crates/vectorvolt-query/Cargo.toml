@@ -9,3 +9,10 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[dev-dependencies.criterion]
+workspace = true
+
+[[bench]]
+name    = "query_bench"
+harness = false
