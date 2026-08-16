@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post, put};
 use tokio::net::TcpListener;
 use vectorvolt_engine::TableRegistry;
 
@@ -131,6 +131,21 @@ fn build_router(
         .route("/tables/{table}/secondary", get(handlers::secondary_lookup))
         // Text query DSL
         .route("/tables/{table}/query", post(handlers::query_handler))
+        // Layer 44: analytical endpoints
+        .route("/tables/{table}/count", get(handlers::count_rows))
+        .route("/tables/{table}/sum", get(handlers::sum_rows))
+        .route("/tables/{table}/min", get(handlers::min_rows))
+        .route("/tables/{table}/max", get(handlers::max_rows))
+        .route("/tables/{table}/avg", get(handlers::avg_rows))
+        .route("/tables/{table}/scan/sorted", get(handlers::scan_sorted))
+        .route("/tables/{table}/scan/page", get(handlers::scan_page))
+        // Layer 44: write/mutate endpoints
+        .route("/tables/{table}/rows/{pk}", put(handlers::upsert_row))
+        .route(
+            "/tables/{table}/rows/{pk}/field",
+            patch(handlers::update_field),
+        )
+        .route("/tables/{table}/rows/range", delete(handlers::delete_range))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

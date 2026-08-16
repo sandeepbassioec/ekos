@@ -6,6 +6,24 @@ pub struct RowResp {
     pub values: Vec<u64>,
 }
 
+// ── Layer 44 response types ───────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct CountResp {
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AggResp {
+    pub value: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PageResp {
+    pub rows: Vec<RowResp>,
+    pub next_cursor: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RowsResp {
     pub rows: Vec<RowResp>,
@@ -26,6 +44,39 @@ pub struct ScanQuery {
     pub col: u32,
     pub lo: u64,
     pub hi: u64,
+}
+
+// shared col/lo/hi filter used by aggregate + delete-range endpoints
+#[derive(Debug, Deserialize)]
+pub struct RangeQuery {
+    pub col: usize,
+    pub lo: u64,
+    pub hi: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScanSortedQuery {
+    pub col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub sort: usize,
+    pub asc: u8,
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScanPageQuery {
+    pub col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub after: u64,
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateFieldBody {
+    pub col: usize,
+    pub val: u64,
 }
 
 #[derive(Debug, Deserialize)]
