@@ -218,6 +218,10 @@ pub enum Query {
 
     /// `BATCH DELETE pk1 pk2 ...`
     BatchDelete { pks: Vec<u64> },
+
+    // ── Layer 56: multi-predicate compound scan ───────────────────────────────
+    /// `SCAN WHERE col=<n> lo=<lo> hi=<hi> [AND col=<n> lo=<lo> hi=<hi> ...]`
+    ScanWhere { predicates: Vec<(usize, u64, u64)> },
 }
 
 /// Parse a query string into a [`Query`].
@@ -341,6 +345,28 @@ impl Parser {
                         after,
                         limit,
                     })
+                } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
+                    self.next(); // consume WHERE
+                                 // parse 1..N  col=<n> lo=<lo> hi=<hi>  triplets separated by optional AND
+                    let mut predicates = Vec::new();
+                    loop {
+                        self.expect_keyword(Keyword::Col)?;
+                        self.expect_eq()?;
+                        let col = self.expect_int()? as usize;
+                        self.expect_keyword(Keyword::Lo)?;
+                        self.expect_eq()?;
+                        let lo = self.expect_int()?;
+                        self.expect_keyword(Keyword::Hi)?;
+                        self.expect_eq()?;
+                        let hi = self.expect_int()?;
+                        predicates.push((col, lo, hi));
+                        if matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
+                            self.next(); // consume AND
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(Query::ScanWhere { predicates })
                 } else {
                     let (col, lo, hi) = self.parse_col_lo_hi()?;
                     Ok(Query::Scan { col, lo, hi })

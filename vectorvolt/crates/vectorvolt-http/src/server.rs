@@ -187,6 +187,8 @@ fn build_router(
         // Layer 55: batch operations
         .route("/tables/{table}/batch/get", post(handlers::batch_get))
         .route("/tables/{table}/batch/delete", post(handlers::batch_delete))
+        // Layer 56: multi-predicate compound scan
+        .route("/tables/{table}/scan_where", get(handlers::scan_where))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
