@@ -26,6 +26,7 @@ pub use vectorvolt_txn::{FlushResult, WalTip};
 use vectorvolt_txn::{Mutation, TxnManager};
 use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
 
+use crate::index_catalog;
 use crate::mvcc::MvccStore;
 use crate::{CompactResult, EngineError, EngineResult, EngineRow, EngineStats, TxnId};
 
@@ -54,6 +55,9 @@ pub struct TableEngine {
     /// Auto-compact trigger: compact after any flush that produces ≥ N partitions.
     /// `None` means manual compaction only.
     auto_compact_threshold: Option<usize>,
+    /// Path of the secondary-index catalog file.  Updated on every
+    /// `build_secondary_index` and `drop_secondary_index` call.
+    pub(crate) catalog_path: PathBuf,
     /// Per-row TTL deadlines: pk → expire_at (opaque u64 timestamp, caller's epoch).
     /// Rows absent from this map never expire.
     pub(crate) ttl_index: RwLock<std::collections::BTreeMap<u64, u64>>,
@@ -401,7 +405,8 @@ impl TableEngine {
             partitions.retain(|k, _| known.contains(k));
         }
 
-        Ok(TableEngine {
+        let catalog_path = index_catalog::catalog_path(&data_dir);
+        let engine = TableEngine {
             txn,
             partitions: RwLock::new(partitions),
             partition_dir,
@@ -412,9 +417,21 @@ impl TableEngine {
             mvcc: MvccStore::new(),
             cas_lock: parking_lot::Mutex::new(()),
             auto_compact_threshold: options.auto_compact_threshold,
+            catalog_path,
             ttl_index: RwLock::new(std::collections::BTreeMap::new()),
             secondary_indexes: RwLock::new(std::collections::HashMap::new()),
-        })
+        };
+
+        // Rebuild any secondary indexes that were persisted before shutdown.
+        // Done after full construction so build_secondary_index can call
+        // flush_if_needed, get, and scan normally.
+        for col in index_catalog::load(&engine.catalog_path) {
+            if col < engine.schema.len() {
+                engine.build_secondary_index(col)?;
+            }
+        }
+
+        Ok(engine)
     }
 
     // ── Write path ────────────────────────────────────────────────────────────
