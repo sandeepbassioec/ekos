@@ -58,6 +58,9 @@ pub enum Keyword {
     Rank,
     DenseRank,
     SortCol,
+    // Layer 53 additions
+    Distinct,
+    ValueCounts,
 }
 
 impl Keyword {
@@ -107,6 +110,8 @@ impl Keyword {
             "RANK" => Some(Self::Rank),
             "DENSE_RANK" => Some(Self::DenseRank),
             "SORT_COL" => Some(Self::SortCol),
+            "DISTINCT" => Some(Self::Distinct),
+            "VALUE_COUNTS" => Some(Self::ValueCounts),
             _ => None,
         }
     }

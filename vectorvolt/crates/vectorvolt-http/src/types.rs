@@ -202,6 +202,32 @@ pub enum QueryResp {
     Window {
         rows: Vec<WindowRowResp>,
     },
+    /// DISTINCT result.
+    Distinct {
+        values: Vec<u64>,
+    },
+    /// VALUE_COUNTS result.
+    ValueCounts {
+        entries: Vec<ValueCountEntry>,
+    },
+}
+
+// ── Layer 53 response types ───────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct DistinctResp {
+    pub values: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValueCountEntry {
+    pub value: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValueCountsResp {
+    pub entries: Vec<ValueCountEntry>,
 }
 
 // ── Layer 51 query params + response types ────────────────────────────────────

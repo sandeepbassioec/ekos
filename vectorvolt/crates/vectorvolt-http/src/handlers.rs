@@ -7,11 +7,12 @@ use axum::response::IntoResponse;
 
 use crate::server::AppState;
 use crate::types::{
-    AggResp, BucketResp, CountResp, CreateTableBody, ErrorResp, GroupByAggQuery, GroupByQuery,
-    GroupEntryResp, GroupResp, HistogramQuery, HistogramResp, InsertBody, OkResp, PageResp,
-    PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp, RowsResp, ScanPageQuery,
-    ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp, UpdateFieldBody,
-    WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
+    AggResp, BucketResp, CountResp, CreateTableBody, DistinctResp, ErrorResp, GroupByAggQuery,
+    GroupByQuery, GroupEntryResp, GroupResp, HistogramQuery, HistogramResp, InsertBody, OkResp,
+    PageResp, PercentileQuery, PercentileResp, QueryResp, RangeQuery, RowResp, RowsResp,
+    ScanPageQuery, ScanQuery, ScanSortedQuery, SchemaResp, SecondaryQuery, TablesResp,
+    UpdateFieldBody, ValueCountEntry, ValueCountsResp, WindowAggQuery, WindowCountQuery,
+    WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -334,6 +335,17 @@ pub async fn query_handler(
                         })
                         .collect(),
                 }),
+                vectorvolt_query::QueryResponse::DistinctValues(vals) => {
+                    Json(QueryResp::Distinct { values: vals })
+                }
+                vectorvolt_query::QueryResponse::ValueCounts(pairs) => {
+                    Json(QueryResp::ValueCounts {
+                        entries: pairs
+                            .into_iter()
+                            .map(|(v, c)| ValueCountEntry { value: v, count: c })
+                            .collect(),
+                    })
+                }
             };
             json.into_response()
         }
@@ -765,6 +777,50 @@ pub async fn window_dense_rank(
             Ok(rows) => {
                 st.metrics.record_ok();
                 Json(to_window_resp(rows)).into_response()
+            }
+        },
+    }
+}
+
+// ── Layer 53: distinct + value_counts endpoints ───────────────────────────────
+
+/// `GET /tables/{table}/distinct?col=&lo=&hi=`
+pub async fn distinct(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.distinct_values(q.col, q.lo, q.hi) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(vals) => {
+                st.metrics.record_ok();
+                Json(DistinctResp { values: vals }).into_response()
+            }
+        },
+    }
+}
+
+/// `GET /tables/{table}/value_counts?col=&lo=&hi=`
+pub async fn value_counts(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.value_counts(q.col, q.lo, q.hi) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(pairs) => {
+                st.metrics.record_ok();
+                Json(ValueCountsResp {
+                    entries: pairs
+                        .into_iter()
+                        .map(|(v, c)| ValueCountEntry { value: v, count: c })
+                        .collect(),
+                })
+                .into_response()
             }
         },
     }

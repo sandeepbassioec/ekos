@@ -168,6 +168,9 @@ fn build_router(
             "/tables/{table}/window/dense_rank",
             get(handlers::window_dense_rank),
         )
+        // Layer 53: distinct + value_counts
+        .route("/tables/{table}/distinct", get(handlers::distinct))
+        .route("/tables/{table}/value_counts", get(handlers::value_counts))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
