@@ -2030,6 +2030,7 @@ name = "vectorvolt-http"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

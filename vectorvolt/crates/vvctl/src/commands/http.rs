@@ -372,6 +372,22 @@ pub enum HttpCommand {
     TakeSnapshot,
     /// Show snapshot metadata for a table (exists, row_count, byte_size).
     SnapshotInfo,
+
+    // ── Layer 70: CDC Webhook Sinks ───────────────────────────────────────────
+    /// Register a webhook sink URL for a table.
+    AddWebhook {
+        /// HTTP/HTTPS URL to POST change events to.
+        #[arg(long)]
+        url: String,
+    },
+    /// List all webhook sinks for a table.
+    ListWebhooks,
+    /// Remove a webhook sink by ID.
+    DeleteWebhook {
+        /// Webhook sink ID to remove.
+        #[arg(long)]
+        id: u64,
+    },
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -897,6 +913,28 @@ pub fn run(args: HttpArgs) -> Result<()> {
         HttpCommand::SnapshotInfo => {
             let url = format!("{base}/snapshot");
             let resp = get_req(&client, &url, &[], tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::AddWebhook { url: sink_url } => {
+            let url = format!("{base}/webhooks");
+            let resp = post_json(&client, &url, serde_json::json!({ "url": sink_url }), tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::ListWebhooks => {
+            let url = format!("{base}/webhooks");
+            let resp = get_req(&client, &url, &[], tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::DeleteWebhook { id } => {
+            let url = format!("{base}/webhooks/{id}");
+            let mut req = client.delete(&url);
+            if let Some(auth) = auth_header(tok) {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            let resp = req.send().context("HTTP DELETE /webhooks/{id} failed")?;
             print_response(resp)?;
         }
 

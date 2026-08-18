@@ -14,12 +14,14 @@ use vectorvolt_engine::{TableRegistry, ViewRegistry};
 use crate::handlers;
 use crate::metrics::Metrics;
 use crate::obs;
+use crate::webhook::WebhookRegistry;
 
 /// Shared state injected into every axum handler.
 pub struct AppState {
     pub registry: Arc<TableRegistry>,
     pub views: Arc<ViewRegistry>,
     pub metrics: Arc<Metrics>,
+    pub webhooks: Arc<WebhookRegistry>,
     /// When `Some`, every non-observability request must carry
     /// `Authorization: Bearer <token>`.
     pub api_token: Option<String>,
@@ -61,7 +63,8 @@ impl HttpServer {
     ) -> std::io::Result<Self> {
         let metrics = Metrics::new();
         let views = Arc::new(ViewRegistry::new());
-        let app = build_router(registry, views, metrics, config.api_token);
+        let webhooks = Arc::new(WebhookRegistry::new());
+        let app = build_router(registry, views, webhooks, metrics, config.api_token);
         let listener = TcpListener::bind(config.addr).await?;
         Ok(Self { listener, app })
     }
@@ -108,12 +111,14 @@ async fn auth_middleware(
 fn build_router(
     registry: Arc<TableRegistry>,
     views: Arc<ViewRegistry>,
+    webhooks: Arc<WebhookRegistry>,
     metrics: Arc<Metrics>,
     api_token: Option<String>,
 ) -> Router {
     let state = Arc::new(AppState {
         registry,
         views,
+        webhooks,
         metrics,
         api_token,
     });
@@ -248,6 +253,15 @@ fn build_router(
         .route(
             "/tables/{table}/snapshot",
             post(handlers::take_snapshot_handler).get(handlers::snapshot_info_handler),
+        )
+        // Layer 70: CDC Webhook Sinks
+        .route(
+            "/tables/{table}/webhooks",
+            post(handlers::register_webhook_handler).get(handlers::list_webhooks_handler),
+        )
+        .route(
+            "/tables/{table}/webhooks/{id}",
+            delete(handlers::delete_webhook_handler),
         )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
