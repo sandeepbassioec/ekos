@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use store::OutputFormat;
 use vvctl::commands::{bench, connect, hal, http, keygen, serve, store, table, wal};
+use vvctl::ui;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOMEPAGE: &str = "https://workerruntime.com";
@@ -24,6 +25,15 @@ struct Cli {
     /// Output format.
     #[arg(long, global = true, value_enum, default_value = "text")]
     output: OutputFormat,
+
+    /// Disable all ANSI color codes (also honoured via the NO_COLOR env var).
+    #[arg(long, global = true)]
+    no_color: bool,
+
+    /// Suppress decorative output (banners, spinners, table borders).
+    /// Machine-readable values are still printed.
+    #[arg(short, long, global = true)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -132,6 +142,8 @@ enum StoreCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    ui::init(cli.no_color, cli.quiet);
+
     let level = if cli.verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -184,9 +196,15 @@ fn main() -> Result<()> {
 }
 
 fn print_version() {
-    println!("vvctl {VERSION}");
-    println!("VectorVolt — ultra-low-latency kernel-bypass data engine");
-    println!("{HOMEPAGE}");
+    println!("{}", ui::banner());
     println!();
-    println!("Build: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    if !ui::quiet_mode() {
+        println!("  {HOMEPAGE}");
+        println!(
+            "  build: {} {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        println!("  hal:   {}", vectorvolt_hal::describe());
+    }
 }

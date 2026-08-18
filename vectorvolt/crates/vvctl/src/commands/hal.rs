@@ -9,6 +9,7 @@
 //!    data. If the speedup is ~1.0×, the SIMD path silently is not engaging and
 //!    that is a bug worth seeing immediately rather than discovering later.
 
+use crate::ui;
 use anyhow::{Result, bail};
 use clap::Args;
 use vectorvolt_hal::{
@@ -51,47 +52,54 @@ pub fn run(args: HalArgs) -> Result<()> {
     let tier = simd::tier();
     let timer = CycleTimer::calibrate();
 
-    println!("\nVectorVolt HAL — detected hardware");
-    println!("{}", "─".repeat(62));
+    ui::section_header("VectorVolt HAL — detected hardware");
+
     if simd::is_capped() {
-        // Loud, because a capped run is NOT this machine's best and a reader
-        // pasting this output elsewhere must not mistake it for hardware limits.
-        println!(
-            "  SIMD tier      : {}   << CAPPED from {} via {}",
+        ui::print_warn(&format!(
+            "SIMD tier: {}   << CAPPED from {} via {}",
             tier.name(),
             simd::detect().name(),
             simd::TIER_ENV
-        );
-        println!("  !! Speedups below will read 1.00x — both columns run the same kernel.");
+        ));
+        ui::print_warn("Speedups below will read 1.00x — both columns run the same kernel.");
     } else {
-        println!("  SIMD tier      : {}", tier.name());
+        ui::print_ok(&format!("SIMD tier: {}", tier.name()));
     }
-    println!("  u64 lanes/instr: {}", tier.lanes_u64());
-    println!("  hw CRC-32C     : {}", simd::has_hw_crc32c());
-    println!("  cache line     : {} bytes", vectorvolt_hal::CACHE_LINE);
-    println!(
-        "  base clock     : {:.2} GHz (RDTSC-calibrated)",
-        timer.ghz()
-    );
-    // ── Topology ──────────────────────────────────────────────────────────────
+
     let topo = vectorvolt_hal::CpuTopology::detect();
-    println!("  topology       : {}", topo.summary());
-    if let Some(l1) = topo.cache.l1d_bytes {
-        println!("  L1d / L2 / L3  : {}", fmt_cache(&topo.cache));
-        let _ = l1;
+
+    {
+        let mut t = ui::styled_table();
+        t.set_header(["Property", "Value"]);
+        t.add_row(["u64 lanes / instr", &tier.lanes_u64().to_string()]);
+        t.add_row(["hw CRC-32C", &simd::has_hw_crc32c().to_string()]);
+        t.add_row([
+            "cache line",
+            &format!("{} bytes", vectorvolt_hal::CACHE_LINE),
+        ]);
+        t.add_row([
+            "base clock",
+            &format!("{:.2} GHz (RDTSC-calibrated)", timer.ghz()),
+        ]);
+        t.add_row(["topology", &topo.summary()]);
+        if topo.cache.l1d_bytes.is_some() {
+            t.add_row(["L1d / L2 / L3", &fmt_cache(&topo.cache)]);
+        }
+        println!("{t}");
     }
+
     if topo.hybrid {
-        println!(
-            "  P-cores        : {:?}",
+        ui::print_warn(&format!(
+            "P-cores: {:?}",
             topo.cores_of_class(vectorvolt_hal::CoreClass::Performance)
-        );
-        println!(
-            "  E-cores        : {:?}",
+        ));
+        ui::print_warn(&format!(
+            "E-cores: {:?}",
             topo.cores_of_class(vectorvolt_hal::CoreClass::Efficient)
-        );
-        println!(
-            "  !! hybrid CPU — latency figures from this machine are unreliable:\n     \
-             a thread migrating P-core -> E-core can swing a measurement ~2x."
+        ));
+        ui::print_warn(
+            "hybrid CPU — latency figures from this machine are unreliable: \
+             a thread migrating P-core -> E-core can swing a measurement ~2x.",
         );
     }
 
@@ -100,9 +108,11 @@ pub fn run(args: HalArgs) -> Result<()> {
     println!("  {}", roles.summary());
     let conflicts = roles.writer_reader_conflicts(&topo);
     if conflicts.is_empty() {
-        println!("  writer/reader physical-core isolation: OK");
+        ui::print_ok("writer/reader physical-core isolation: OK");
     } else {
-        println!("  !! writer/reader share a physical core: {conflicts:?}");
+        ui::print_warn(&format!(
+            "writer/reader share a physical core: {conflicts:?}"
+        ));
     }
 
     if args.no_bench {
@@ -117,34 +127,32 @@ pub fn run(args: HalArgs) -> Result<()> {
             Some(&core) => match vectorvolt_hal::pin_current_thread_to(core) {
                 Ok(guard) => {
                     let observed = vectorvolt_hal::current_core();
-                    println!("\n  pinned to writer core {core} (now running on {observed:?})");
+                    ui::print_ok(&format!(
+                        "pinned to writer core {core} (now running on {observed:?})"
+                    ));
                     if observed != Some(core) {
-                        // Affinity takes effect at the next scheduling decision,
-                        // so a mismatch here is usually just timing — say so
-                        // rather than implying the pin failed.
-                        println!("  (not yet migrated — affinity applies at the next reschedule)");
+                        ui::print_warn(
+                            "not yet migrated — affinity applies at the next reschedule",
+                        );
                     }
                     Some(guard)
                 }
                 Err(e) => {
-                    println!("\n  !! pin to core {core} failed: {e}");
+                    ui::print_warn(&format!("pin to core {core} failed: {e}"));
                     None
                 }
             },
             None => {
-                println!("\n  !! no writer cores recommended — nothing to pin to");
+                ui::print_warn("no writer cores recommended — nothing to pin to");
                 None
             }
         }
     } else {
-        println!(
-            "\n  unpinned{}",
-            if topo.hybrid {
-                " — on this hybrid CPU the thread may migrate P<->E mid-run; try --pin"
-            } else {
-                ""
-            }
-        );
+        if topo.hybrid {
+            ui::print_warn(
+                "unpinned — on this hybrid CPU the thread may migrate P<->E mid-run; try --pin",
+            );
+        }
         None
     };
 
@@ -170,13 +178,12 @@ pub fn run(args: HalArgs) -> Result<()> {
         std::hint::black_box(scalar::sum(&values));
     }
 
-    println!(
-        "\nScalar vs {} — {} elements, best of {}",
+    ui::section_header(&format!(
+        "Scalar vs {} — {} elements, best of {}",
         tier.name(),
         args.rows,
         args.iters
-    );
-    println!("{}", "─".repeat(62));
+    ));
     println!(
         "  {:<16} {:>11} {:>11} {:>9} {:>9}",
         "kernel",
@@ -320,11 +327,11 @@ fn print_row(label: &str, scalar: Sample, simd_s: Sample) {
         f64::INFINITY
     };
     println!(
-        "  {:<16} {:>11} {:>11} {:>8.2}x {:>8.2}x",
+        "  {:<16} {:>11} {:>11} {:>9} {:>8.2}x",
         label,
         fmt_ns(scalar.min_ns),
         fmt_ns(simd_s.min_ns),
-        speedup,
+        ui::fmt_speedup(speedup),
         simd_s.jitter()
     );
 }
