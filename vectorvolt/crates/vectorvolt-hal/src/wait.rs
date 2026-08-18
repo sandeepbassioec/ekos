@@ -182,18 +182,27 @@ impl Blocking {
 
 impl WaitStrategy for Blocking {
     fn wait(&self, _spin_count: u64) {
-        // Park until the producer signals. We hold the mutex for the minimal
-        // duration required by the condvar API.
+        // Park the thread with a 1 ms fallback timeout.
+        //
+        // The timeout is the missed-signal guard: if signal_all_when_blocking()
+        // fires after the producer publishes but BEFORE this thread reaches
+        // condvar.wait() (a race that is possible on a loaded CI runner), the
+        // notify_all() wakes nobody. Without a timeout the consumer would park
+        // forever. With a 1 ms timeout the consumer wakes, the outer
+        // ring-buffer loop re-checks availability, and processing continues.
+        //
+        // 1 ms matches the LMAX Disruptor BlockingWaitStrategy (Java uses
+        // mutex.wait(1)) and sits well within the "50–500 µs Linux / 15.6 ms
+        // Windows worst-case" latency budget documented for this strategy.
         let guard = self.inner.mutex.lock().unwrap_or_else(|e| e.into_inner());
-        // `wait` atomically releases the lock and suspends the thread.
-        // We ignore the `WaitTimeoutResult` — spurious wakeups are fine because
-        // the caller will re-check availability and call us again if needed.
-        drop(self.inner.condvar.wait(guard));
+        drop(
+            self.inner
+                .condvar
+                .wait_timeout(guard, std::time::Duration::from_millis(1)),
+        );
     }
 
     fn signal_all_when_blocking(&self) {
-        // Advance the epoch counter so `wait` returns a new value on re-lock,
-        // then wake all parked consumers.
         {
             let mut guard = self.inner.mutex.lock().unwrap_or_else(|e| e.into_inner());
             *guard = guard.wrapping_add(1);
