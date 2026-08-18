@@ -648,3 +648,47 @@ pub struct RegisterWebhookResp {
 pub struct WebhooksListResp {
     pub webhooks: Vec<WebhookEntryResp>,
 }
+
+// ── Layer 71 types ────────────────────────────────────────────────────────────
+
+/// Response body for `POST /multi_txn`.
+#[derive(Debug, Serialize)]
+pub struct MultiTxnBeginResp {
+    pub txn_id: u64,
+}
+
+/// One operation staged into a multi-table transaction.
+#[derive(Debug, Deserialize)]
+pub struct MultiTxnOpBody {
+    pub table: String,
+    /// `"insert"` or `"delete"`.
+    pub op: String,
+    pub pk: u64,
+    /// Required when `op` is `"insert"`.
+    pub values: Option<Vec<u64>>,
+}
+
+/// Response body for `POST /multi_txn/{id}/ops`.
+#[derive(Debug, Serialize)]
+pub struct MultiTxnStagedResp {
+    pub staged: usize,
+}
+
+/// Response body for `POST /multi_txn/{id}/commit`.
+#[derive(Debug, Serialize)]
+pub struct MultiTxnCommitResp {
+    pub committed: usize,
+}
+
+/// Response body for `POST /multi_txn/{id}/rollback`.
+#[derive(Debug, Serialize)]
+pub struct MultiTxnRollbackResp {
+    pub rolled_back: bool,
+}
+
+/// Response body for `GET /multi_txn/{id}`.
+#[derive(Debug, Serialize)]
+pub struct MultiTxnInfoResp {
+    pub txn_id: u64,
+    pub pending_ops: usize,
+}

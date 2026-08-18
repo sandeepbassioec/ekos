@@ -18,6 +18,7 @@
 
 pub mod handlers;
 pub mod metrics;
+pub mod multi_txn;
 pub mod obs;
 pub mod server;
 pub mod types;
