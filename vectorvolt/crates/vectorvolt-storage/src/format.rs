@@ -97,6 +97,15 @@ pub const COMPRESSION_NONE: u8 = 0;
 /// the tiering work defines what a cold partition actually looks like.
 pub const COMPRESSION_LZ4: u8 = 1;
 
+/// Column payload is Zstd-compressed (VV-STO-013).
+///
+/// Zstd offers a significantly better compression ratio than LZ4 at comparable
+/// decode throughput for cold/archival partitions. The same O(column) point-read
+/// caveat as [`COMPRESSION_LZ4`] applies — use only on scan-heavy or archival
+/// partitions. Default compression level is 3 (Zstd default); higher levels
+/// yield better ratio at the cost of encode time.
+pub const COMPRESSION_ZSTD: u8 = 2;
+
 /// Byte length of the fixed header.
 pub const HEADER_FIXED_SIZE: usize = 32;
 

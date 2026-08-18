@@ -26,9 +26,9 @@ use crate::{
     column::ColumnValues,
     column::FRAME_BLOCK,
     format::{
-        COL_META_SIZE, COMPRESSION_LZ4, COMPRESSION_NONE, ENCODING_BLOCKED_FRAME, ENCODING_DICT,
-        ENCODING_FRAME, ENCODING_RAW, ENCODING_RLE, HEADER_FIXED_SIZE, MAGIC, MIN_READABLE_VERSION,
-        VERSION,
+        COL_META_SIZE, COMPRESSION_LZ4, COMPRESSION_NONE, COMPRESSION_ZSTD, ENCODING_BLOCKED_FRAME,
+        ENCODING_DICT, ENCODING_FRAME, ENCODING_RAW, ENCODING_RLE, HEADER_FIXED_SIZE, MAGIC,
+        MIN_READABLE_VERSION, VERSION,
     },
 };
 
@@ -38,7 +38,7 @@ struct ColMeta {
     encoding: u8,
     /// Bits per packed value, for the frame encodings. Zero for the others.
     bit_width: u8,
-    /// `COMPRESSION_NONE` or `COMPRESSION_LZ4`.
+    /// `COMPRESSION_NONE`, `COMPRESSION_LZ4`, or `COMPRESSION_ZSTD`.
     compression: u8,
     data_offset: u64,
     /// Bytes actually stored in the file (compressed length, when compressed).
@@ -316,6 +316,18 @@ impl PartitionReader {
                 }
                 let out = lz4_flex::block::decompress(raw, m.uncompressed_len as usize)
                     .map_err(|e| StorageError::InvalidData(format!("LZ4 decompress: {e}")))?;
+                Ok(Cow::Owned(out))
+            }
+            COMPRESSION_ZSTD => {
+                const MAX_PAYLOAD: u64 = 1 << 34; // 16 GiB
+                if m.uncompressed_len > MAX_PAYLOAD {
+                    return Err(StorageError::InvalidData(format!(
+                        "declared uncompressed length {} exceeds the {MAX_PAYLOAD}-byte cap",
+                        m.uncompressed_len
+                    )));
+                }
+                let out = zstd::bulk::decompress(raw, m.uncompressed_len as usize)
+                    .map_err(|e| StorageError::InvalidData(format!("Zstd decompress: {e}")))?;
                 Ok(Cow::Owned(out))
             }
             other => Err(StorageError::InvalidData(format!(
