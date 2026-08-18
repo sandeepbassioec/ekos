@@ -347,6 +347,14 @@ pub enum HttpCommand {
         #[arg(long)]
         name: String,
     },
+
+    // ── Layer 67: CDC Event Log ───────────────────────────────────────────────
+    /// Fetch the persistent CDC event log for a table.
+    Replay {
+        /// Start replaying from this LSN (inclusive).  Omit for all events.
+        #[arg(long)]
+        from: Option<u64>,
+    },
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -835,6 +843,15 @@ pub fn run(args: HttpArgs) -> Result<()> {
                 req = req.header(AUTHORIZATION, auth);
             }
             let resp = req.send().context("HTTP DELETE /views failed")?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::Replay { from } => {
+            let mut url = format!("{base}/cdc/log");
+            if let Some(f) = from {
+                url = format!("{url}?from={f}");
+            }
+            let resp = get_req(&client, &url, &[], tok)?;
             print_response(resp)?;
         }
 

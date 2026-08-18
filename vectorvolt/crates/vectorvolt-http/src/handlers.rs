@@ -11,13 +11,13 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::server::AppState;
 use crate::types::{
     AggResp, BatchDeleteResp, BatchGetResp, BatchInsertBody, BatchInsertResp, BatchPksBody,
-    BucketResp, CasBody, CasResp, ConditionalInsertResp, CountResp, CreateTableBody,
-    CreateViewBody, DistinctResp, ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp,
-    GroupResp, HistogramQuery, HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody,
-    OkResp, PageResp, PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RowResp,
-    RowsResp, ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery,
-    ScanWhereQuery, SchemaResp, SecondaryQuery, SubscribeQuery, TablesResp, TtlNowQuery,
-    UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
+    BucketResp, CasBody, CasResp, CdcLogQuery, CdcLogResp, ConditionalInsertResp, CountResp,
+    CreateTableBody, CreateViewBody, DistinctResp, ErrorResp, GroupByAggQuery, GroupByQuery,
+    GroupEntryResp, GroupResp, HistogramQuery, HistogramResp, IncrDecrWhereQuery, InsertBody,
+    InsertTtlBody, OkResp, PageResp, PercentileQuery, PercentileResp, PurgedResp, QueryResp,
+    RangeQuery, RowResp, RowsResp, ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery,
+    ScanSortedQuery, ScanWhereQuery, SchemaResp, SecondaryQuery, SubscribeQuery, TablesResp,
+    TtlNowQuery, UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
     ViewEntryResp, ViewInfoResp, ViewStateResp, ViewsListResp, WindowAggQuery, WindowCountQuery,
     WindowRankQuery, WindowResp, WindowRowResp,
 };
@@ -1223,11 +1223,33 @@ pub async fn subscribe_handler(
     match st.registry.get(&table) {
         Err(e) => engine_err(&st, e).into_response(),
         Ok(eng) => {
+            // Subscribe FIRST (before reading the log) so we don't miss events
+            // that arrive while we're replaying history.
             let rx = eng.subscribe_changes();
-            let stream = BroadcastStream::new(rx).filter_map(move |result| {
+
+            // Build historical prefix when ?from=<lsn> is present.
+            let history: Vec<_> = if let Some(from_lsn) = query.from {
+                eng.read_log_from(from_lsn).unwrap_or_default()
+            } else {
+                vec![]
+            };
+            let last_replayed = history.last().map(|e| e.lsn).unwrap_or(0);
+
+            let hist_stream =
+                tokio_stream::iter(history).map(Ok::<_, std::convert::Infallible>);
+
+            let live_stream = BroadcastStream::new(rx).filter_map(move |result| {
+                match result {
+                    Ok(e) if e.lsn > last_replayed => Some(Ok(e)),
+                    Ok(_) => None,  // already covered by the historical prefix
+                    Err(_) => None, // lagged receiver — skip and continue
+                }
+            });
+
+            let combined = hist_stream.chain(live_stream).filter_map(move |result| {
                 let ev = match result {
                     Ok(e) => e,
-                    Err(_) => return None, // lagged receiver — skip and continue
+                    Err(_) => return None,
                 };
                 if let (Some(col), Some(lo), Some(hi)) = (query.col, query.lo, query.hi) {
                     match &ev.values {
@@ -1240,7 +1262,8 @@ pub async fn subscribe_handler(
                     Event::default().data(json),
                 ))
             });
-            Sse::new(stream)
+
+            Sse::new(combined)
                 .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(30)))
                 .into_response()
         }
@@ -1313,7 +1336,8 @@ pub async fn create_view(
         group_col: body.group_col,
         kind,
     };
-    match st.views.create(def, &st.registry) {
+    let backfill = body.backfill.unwrap_or(false);
+    match st.views.create(def, &st.registry, backfill) {
         Ok(()) => (StatusCode::CREATED, Json(OkResp { ok: true })).into_response(),
         Err(e) => {
             let status = if e.contains("already exists") {
@@ -1380,5 +1404,35 @@ pub async fn drop_view(
             Json(serde_json::json!({"error": format!("view '{name}' not found")})),
         )
             .into_response()
+    }
+}
+
+// ── Layer 67: CDC Event Log ───────────────────────────────────────────────────
+
+pub async fn cdc_log_handler(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(query): Query<CdcLogQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => {
+            let from_lsn = query.from.unwrap_or(0);
+            match eng.read_log_from(from_lsn) {
+                Err(e) => engine_err(&st, e).into_response(),
+                Ok(events) => {
+                    let count = events.len();
+                    let serialized: Vec<serde_json::Value> = events
+                        .into_iter()
+                        .filter_map(|e| serde_json::to_value(e).ok())
+                        .collect();
+                    Json(CdcLogResp {
+                        events: serialized,
+                        count,
+                    })
+                    .into_response()
+                }
+            }
+        }
     }
 }

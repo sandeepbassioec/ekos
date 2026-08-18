@@ -27,6 +27,7 @@ use vectorvolt_txn::{Mutation, TxnManager};
 use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
 
 use crate::cdc::ChangeEvent;
+use crate::cdc_log::CdcLog;
 use crate::index_catalog;
 use crate::mvcc::MvccStore;
 use crate::{CompactResult, EngineError, EngineResult, EngineRow, EngineStats, TxnId};
@@ -74,6 +75,13 @@ pub struct TableEngine {
     /// CDC broadcast sender.  Clones cheaply; `send` is sync and lock-free.
     /// Lagging receivers are automatically dropped by the channel.
     pub(crate) changes_tx: tokio::sync::broadcast::Sender<ChangeEvent>,
+    /// Monotonically increasing log sequence number.  Starts at the highest
+    /// LSN found in the on-disk CDC log, ensuring LSNs are globally unique
+    /// across process restarts.
+    pub(crate) lsn_counter: std::sync::atomic::AtomicU64,
+    /// Durable append-only log of every [`ChangeEvent`] published by this
+    /// table.  Enables SSE replay (`?from=<lsn>`) and view backfill.
+    pub(crate) cdc_log: CdcLog,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -410,6 +418,9 @@ impl TableEngine {
         }
 
         let catalog_path = index_catalog::catalog_path(&data_dir);
+        let cdc_log_path = data_dir.join("cdc.log");
+        let cdc_log = CdcLog::open(cdc_log_path)?;
+        let max_lsn = cdc_log.max_lsn()?;
         let (changes_tx, _) = tokio::sync::broadcast::channel(1024);
         let engine = TableEngine {
             txn,
@@ -426,6 +437,8 @@ impl TableEngine {
             ttl_index: RwLock::new(std::collections::BTreeMap::new()),
             secondary_indexes: RwLock::new(std::collections::HashMap::new()),
             changes_tx,
+            lsn_counter: std::sync::atomic::AtomicU64::new(max_lsn),
+            cdc_log,
         };
 
         // Rebuild any secondary indexes that were persisted before shutdown.
@@ -438,6 +451,14 @@ impl TableEngine {
         }
 
         Ok(engine)
+    }
+
+    /// Read stored CDC events from `from_lsn` onwards.
+    ///
+    /// Returns all [`ChangeEvent`]s with `lsn >= from_lsn` in log order.
+    /// Use `from_lsn = 0` to replay the full history.
+    pub fn read_log_from(&self, from_lsn: u64) -> EngineResult<Vec<ChangeEvent>> {
+        Ok(self.cdc_log.read_from(from_lsn)?)
     }
 
     /// Subscribe to change events for this table.
@@ -459,14 +480,9 @@ impl TableEngine {
     /// All live secondary indexes are updated atomically after the write
     /// succeeds, at no extra cost when no indexes are built.
     pub fn insert(&self, pk: u64, values: Vec<u64>) -> EngineResult<WalTip> {
-        // Clone for CDC before values is moved.  Only pays the cost when at
-        // least one subscriber is active; the send itself is a no-op when the
-        // channel has no receivers.
-        let cdc_vals = if self.changes_tx.receiver_count() > 0 {
-            Some(values.clone())
-        } else {
-            None
-        };
+        // Clone for CDC — always needed for log persistence; also used for
+        // broadcasting to live SSE subscribers when any are active.
+        let cdc_vals = Some(values.clone());
 
         // Snapshot the old row and clone the new values for index maintenance.
         // Only pays the cost when at least one secondary index is live.
@@ -489,7 +505,13 @@ impl TableEngine {
         }
 
         if let Some(vals) = cdc_vals {
-            let _ = self.changes_tx.send(ChangeEvent::insert(pk, vals));
+            let lsn = self
+                .lsn_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let ev = ChangeEvent::insert(lsn, pk, vals);
+            let _ = self.cdc_log.append(&ev);
+            let _ = self.changes_tx.send(ev);
         }
         Ok(tip)
     }
@@ -507,7 +529,13 @@ impl TableEngine {
         if let Some(row) = old_row {
             self.secondary_maintain_delete(pk, &row);
         }
-        let _ = self.changes_tx.send(ChangeEvent::delete(pk));
+        let lsn = self
+            .lsn_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let ev = ChangeEvent::delete(lsn, pk);
+        let _ = self.cdc_log.append(&ev);
+        let _ = self.changes_tx.send(ev);
         Ok(tip)
     }
 
