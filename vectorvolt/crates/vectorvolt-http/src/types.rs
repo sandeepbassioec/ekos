@@ -577,3 +577,28 @@ pub struct CdcLogResp {
     pub events: Vec<serde_json::Value>,
     pub count: usize,
 }
+
+// ── Layer 68 types ────────────────────────────────────────────────────────────
+
+/// Response body for `GET /tables/{t}/cdc/stats`.
+#[derive(Debug, Serialize)]
+pub struct CdcStatsResp {
+    pub event_count: u64,
+    pub byte_size: u64,
+    pub min_lsn: u64,
+    pub max_lsn: u64,
+}
+
+/// Query params for `POST /tables/{t}/cdc/compact`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct CdcCompactQuery {
+    /// Remove events with `lsn < retain_lsn`.
+    pub retain_lsn: u64,
+}
+
+/// Response body for `POST /tables/{t}/cdc/compact`.
+#[derive(Debug, Serialize)]
+pub struct CdcCompactResp {
+    /// Number of events removed (lsn < retain_lsn).
+    pub removed: usize,
+}

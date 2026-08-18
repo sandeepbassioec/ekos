@@ -235,6 +235,15 @@ fn build_router(
         .route("/views/{name}", delete(handlers::drop_view))
         // Layer 67: CDC Event Log
         .route("/tables/{table}/cdc/log", get(handlers::cdc_log_handler))
+        // Layer 68: CDC Stats + Compaction
+        .route(
+            "/tables/{table}/cdc/stats",
+            get(handlers::cdc_stats_handler),
+        )
+        .route(
+            "/tables/{table}/cdc/compact",
+            post(handlers::cdc_compact_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

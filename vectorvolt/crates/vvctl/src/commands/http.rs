@@ -355,6 +355,17 @@ pub enum HttpCommand {
         #[arg(long)]
         from: Option<u64>,
     },
+
+    // ── Layer 68: CDC Stats + Compaction ─────────────────────────────────────
+    /// Show statistics for the CDC event log (event count, size, LSN range).
+    CdcStats,
+
+    /// Compact the CDC log, removing events older than `retain_lsn`.
+    CdcCompact {
+        /// Remove all events with lsn < retain_lsn.
+        #[arg(long)]
+        retain_lsn: u64,
+    },
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -852,6 +863,22 @@ pub fn run(args: HttpArgs) -> Result<()> {
                 url = format!("{url}?from={f}");
             }
             let resp = get_req(&client, &url, &[], tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::CdcStats => {
+            let url = format!("{base}/cdc/stats");
+            let resp = get_req(&client, &url, &[], tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::CdcCompact { retain_lsn } => {
+            let url = format!("{base}/cdc/compact?retain_lsn={retain_lsn}");
+            let mut req = client.post(&url);
+            if let Some(auth) = auth_header(tok) {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            let resp = req.send().context("HTTP POST /cdc/compact failed")?;
             print_response(resp)?;
         }
 

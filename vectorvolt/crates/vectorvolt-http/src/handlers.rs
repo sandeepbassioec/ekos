@@ -11,15 +11,16 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::server::AppState;
 use crate::types::{
     AggResp, BatchDeleteResp, BatchGetResp, BatchInsertBody, BatchInsertResp, BatchPksBody,
-    BucketResp, CasBody, CasResp, CdcLogQuery, CdcLogResp, ConditionalInsertResp, CountResp,
-    CreateTableBody, CreateViewBody, DistinctResp, ErrorResp, GroupByAggQuery, GroupByQuery,
-    GroupEntryResp, GroupResp, HistogramQuery, HistogramResp, IncrDecrWhereQuery, InsertBody,
-    InsertTtlBody, OkResp, PageResp, PercentileQuery, PercentileResp, PurgedResp, QueryResp,
-    RangeQuery, RowResp, RowsResp, ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery,
-    ScanSortedQuery, ScanWhereQuery, SchemaResp, SecondaryQuery, SubscribeQuery, TablesResp,
-    TtlNowQuery, UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
-    ViewEntryResp, ViewInfoResp, ViewStateResp, ViewsListResp, WindowAggQuery, WindowCountQuery,
-    WindowRankQuery, WindowResp, WindowRowResp,
+    BucketResp, CasBody, CasResp, CdcCompactQuery, CdcCompactResp, CdcLogQuery, CdcLogResp,
+    CdcStatsResp, ConditionalInsertResp, CountResp, CreateTableBody, CreateViewBody, DistinctResp,
+    ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp, GroupResp, HistogramQuery,
+    HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody, OkResp, PageResp,
+    PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RowResp, RowsResp,
+    ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery,
+    SchemaResp, SecondaryQuery, SubscribeQuery, TablesResp, TtlNowQuery, UpdateFieldBody,
+    UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp, ViewEntryResp, ViewInfoResp,
+    ViewStateResp, ViewsListResp, WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp,
+    WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -1433,5 +1434,40 @@ pub async fn cdc_log_handler(
                 }
             }
         }
+    }
+}
+
+// ── Layer 68: CDC Log Stats + Compaction ─────────────────────────────────────
+
+pub async fn cdc_stats_handler(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.cdc_log_stats() {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(s) => Json(CdcStatsResp {
+                event_count: s.event_count,
+                byte_size: s.byte_size,
+                min_lsn: s.min_lsn,
+                max_lsn: s.max_lsn,
+            })
+            .into_response(),
+        },
+    }
+}
+
+pub async fn cdc_compact_handler(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(query): Query<CdcCompactQuery>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.compact_cdc_log(query.retain_lsn) {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(removed) => Json(CdcCompactResp { removed }).into_response(),
+        },
     }
 }
