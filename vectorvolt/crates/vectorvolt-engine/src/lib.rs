@@ -46,6 +46,7 @@ mod sort;
 mod stats;
 mod ttl;
 mod update_where;
+pub mod views;
 mod window;
 
 pub use aggregate::HistogramBucket;
@@ -60,4 +61,5 @@ pub use pagination::PageResult;
 pub use registry::{SCHEMA_FILE, TableRegistry};
 pub use row::EngineRow;
 pub use stats::EngineStats;
+pub use views::{ViewDefinition, ViewEntry, ViewKind, ViewRegistry};
 pub use window::WindowRow;

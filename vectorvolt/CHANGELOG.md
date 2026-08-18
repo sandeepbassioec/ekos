@@ -6,6 +6,30 @@ All notable changes to VectorVolt are documented here.
 
 ## [Unreleased]
 
+### Layer 66 — Materialized Views over CDC
+- `views` module in `vectorvolt-engine`: `ViewKind` (Count / Sum / Min / Max),
+  `ViewDefinition`, `ViewEntry`, `ViewRegistry`
+- Each view runs a background tokio task subscribed to the source table's CDC
+  broadcast channel; events are applied to an in-memory group-by aggregate
+- Row mirror (`HashMap<pk, Vec<u64>>`) enables correct delete/upsert undo;
+  multiset (`BTreeMap<agg_val, count>`) for correct min/max recomputation on delete
+- `AppState` gains `Arc<ViewRegistry>`; routes wired into `build_router`
+- HTTP DDL: `POST /views`, `GET /views`, `GET /views/{name}`, `DELETE /views/{name}`
+- `vvctl http create-view / list-views / get-view / drop-view`
+- 19 integration tests
+
+### Layer 65 — CDC + SSE Streaming Subscriptions
+- `cdc` module in `vectorvolt-engine`: `ChangeEvent` { kind, pk, values } + `ChangeKind` enum
+- `TableEngine::subscribe_changes()` → `tokio::sync::broadcast::Receiver<ChangeEvent>`
+- `insert()` and `delete()` publish CDC events; zero-cost when no active subscribers
+- All mutation paths (upsert, CAS, insert_if_absent, field_update, batch_insert, TTL, purge_expired)
+  propagate automatically through the `insert`/`delete` publication points
+- HTTP: `GET /tables/{t}/subscribe[?col=&lo=&hi=]` — Server-Sent Events endpoint
+- Optional column-range filter: events whose `values[col] ∉ [lo, hi]` are suppressed;
+  delete events (no values) are suppressed when a filter is active
+- `vvctl http subscribe [--col N --lo N --hi N]` — streams events to stdout
+- 15 integration tests
+
 ### Layer 64 — Packaging & Docs Refresh
 - `README.md`: updated architecture diagram, REST API reference (all 50+ endpoints),
   DSL reference (all Layer 50-60 statements), Python/C# SDK v0.2.0 examples,

@@ -9,7 +9,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use tokio::net::TcpListener;
-use vectorvolt_engine::TableRegistry;
+use vectorvolt_engine::{TableRegistry, ViewRegistry};
 
 use crate::handlers;
 use crate::metrics::Metrics;
@@ -18,6 +18,7 @@ use crate::obs;
 /// Shared state injected into every axum handler.
 pub struct AppState {
     pub registry: Arc<TableRegistry>,
+    pub views: Arc<ViewRegistry>,
     pub metrics: Arc<Metrics>,
     /// When `Some`, every non-observability request must carry
     /// `Authorization: Bearer <token>`.
@@ -59,7 +60,8 @@ impl HttpServer {
         config: HttpServerConfig,
     ) -> std::io::Result<Self> {
         let metrics = Metrics::new();
-        let app = build_router(registry, metrics, config.api_token);
+        let views = Arc::new(ViewRegistry::new());
+        let app = build_router(registry, views, metrics, config.api_token);
         let listener = TcpListener::bind(config.addr).await?;
         Ok(Self { listener, app })
     }
@@ -105,11 +107,13 @@ async fn auth_middleware(
 
 fn build_router(
     registry: Arc<TableRegistry>,
+    views: Arc<ViewRegistry>,
     metrics: Arc<Metrics>,
     api_token: Option<String>,
 ) -> Router {
     let state = Arc::new(AppState {
         registry,
+        views,
         metrics,
         api_token,
     });
@@ -224,6 +228,11 @@ fn build_router(
             "/tables/{table}/subscribe",
             get(handlers::subscribe_handler),
         )
+        // Layer 66: Materialized Views DDL
+        .route("/views", post(handlers::create_view))
+        .route("/views", get(handlers::list_views))
+        .route("/views/{name}", get(handlers::get_view))
+        .route("/views/{name}", delete(handlers::drop_view))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

@@ -11,14 +11,15 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::server::AppState;
 use crate::types::{
     AggResp, BatchDeleteResp, BatchGetResp, BatchInsertBody, BatchInsertResp, BatchPksBody,
-    BucketResp, CasBody, CasResp, ConditionalInsertResp, CountResp, CreateTableBody, DistinctResp,
-    ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp, GroupResp, HistogramQuery,
-    HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody, OkResp, PageResp,
-    PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RowResp, RowsResp,
-    ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery,
-    SchemaResp, SecondaryQuery, SubscribeQuery, TablesResp, TtlNowQuery, UpdateFieldBody,
-    UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp, WindowAggQuery,
-    WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
+    BucketResp, CasBody, CasResp, ConditionalInsertResp, CountResp, CreateTableBody,
+    CreateViewBody, DistinctResp, ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp,
+    GroupResp, HistogramQuery, HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody,
+    OkResp, PageResp, PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RowResp,
+    RowsResp, ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery,
+    ScanWhereQuery, SchemaResp, SecondaryQuery, SubscribeQuery, TablesResp, TtlNowQuery,
+    UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
+    ViewEntryResp, ViewInfoResp, ViewStateResp, ViewsListResp, WindowAggQuery, WindowCountQuery,
+    WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -1243,5 +1244,141 @@ pub async fn subscribe_handler(
                 .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(30)))
                 .into_response()
         }
+    }
+}
+
+// ── Layer 66: Materialized Views ──────────────────────────────────────────────
+
+use vectorvolt_engine::{ViewDefinition, ViewKind};
+
+fn kind_to_str(k: &ViewKind) -> &'static str {
+    match k {
+        ViewKind::Count => "count",
+        ViewKind::Sum { .. } => "sum",
+        ViewKind::Min { .. } => "min",
+        ViewKind::Max { .. } => "max",
+    }
+}
+
+pub async fn create_view(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<CreateViewBody>,
+) -> impl IntoResponse {
+    let kind = match body.kind.as_str() {
+        "count" => ViewKind::Count,
+        "sum" => match body.agg_col {
+            Some(c) => ViewKind::Sum { agg_col: c },
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "agg_col required for sum"})),
+                )
+                    .into_response();
+            }
+        },
+        "min" => match body.agg_col {
+            Some(c) => ViewKind::Min { agg_col: c },
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "agg_col required for min"})),
+                )
+                    .into_response();
+            }
+        },
+        "max" => match body.agg_col {
+            Some(c) => ViewKind::Max { agg_col: c },
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "agg_col required for max"})),
+                )
+                    .into_response();
+            }
+        },
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("unknown kind '{other}'")})),
+            )
+                .into_response();
+        }
+    };
+    let def = ViewDefinition {
+        name: body.name,
+        table: body.table,
+        filter_col: body.filter_col,
+        lo: body.lo,
+        hi: body.hi,
+        group_col: body.group_col,
+        kind,
+    };
+    match st.views.create(def, &st.registry) {
+        Ok(()) => (StatusCode::CREATED, Json(OkResp { ok: true })).into_response(),
+        Err(e) => {
+            let status = if e.contains("already exists") {
+                StatusCode::CONFLICT
+            } else if e.contains("not found") || e.contains("NotFound") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(serde_json::json!({"error": e}))).into_response()
+        }
+    }
+}
+
+pub async fn list_views(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let defs = st.views.list();
+    let views: Vec<ViewInfoResp> = defs
+        .into_iter()
+        .map(|d| ViewInfoResp {
+            name: d.name,
+            table: d.table,
+            kind: kind_to_str(&d.kind).to_string(),
+            filter_col: d.filter_col,
+            lo: d.lo,
+            hi: d.hi,
+            group_col: d.group_col,
+        })
+        .collect();
+    Json(ViewsListResp { views })
+}
+
+pub async fn get_view(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match st.views.get_entries(&name) {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("view '{name}' not found")})),
+        )
+            .into_response(),
+        Some(entries) => {
+            let entries: Vec<ViewEntryResp> = entries
+                .into_iter()
+                .map(|e| ViewEntryResp {
+                    group_val: e.group_val,
+                    agg_val: e.agg_val,
+                })
+                .collect();
+            Json(ViewStateResp { name, entries }).into_response()
+        }
+    }
+}
+
+pub async fn drop_view(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if st.views.drop_view(&name) {
+        Json(OkResp { ok: true }).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("view '{name}' not found")})),
+        )
+            .into_response()
     }
 }
