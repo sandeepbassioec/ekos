@@ -244,6 +244,11 @@ fn build_router(
             "/tables/{table}/cdc/compact",
             post(handlers::cdc_compact_handler),
         )
+        // Layer 69: WAL Snapshot
+        .route(
+            "/tables/{table}/snapshot",
+            post(handlers::take_snapshot_handler).get(handlers::snapshot_info_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

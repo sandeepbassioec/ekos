@@ -366,6 +366,12 @@ pub enum HttpCommand {
         #[arg(long)]
         retain_lsn: u64,
     },
+
+    // ── Layer 69: WAL Snapshot ────────────────────────────────────────────────
+    /// Flush, compact, and write a WAL snapshot marker for a table.
+    TakeSnapshot,
+    /// Show snapshot metadata for a table (exists, row_count, byte_size).
+    SnapshotInfo,
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -879,6 +885,18 @@ pub fn run(args: HttpArgs) -> Result<()> {
                 req = req.header(AUTHORIZATION, auth);
             }
             let resp = req.send().context("HTTP POST /cdc/compact failed")?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::TakeSnapshot => {
+            let url = format!("{base}/snapshot");
+            let resp = post_json(&client, &url, serde_json::Value::Null, tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::SnapshotInfo => {
+            let url = format!("{base}/snapshot");
+            let resp = get_req(&client, &url, &[], tok)?;
             print_response(resp)?;
         }
 
