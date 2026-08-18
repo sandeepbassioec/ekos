@@ -619,3 +619,32 @@ pub struct SnapshotInfoResp {
     pub row_count: u64,
     pub byte_size: u64,
 }
+
+// ── Layer 70 types ────────────────────────────────────────────────────────────
+
+/// Request body for `POST /tables/{t}/webhooks`.
+#[derive(Debug, Deserialize)]
+pub struct RegisterWebhookBody {
+    /// HTTP/HTTPS URL to POST change events to.
+    pub url: String,
+}
+
+/// One webhook sink entry in list/register responses.
+#[derive(Debug, Serialize)]
+pub struct WebhookEntryResp {
+    pub id: u64,
+    pub table: String,
+    pub url: String,
+}
+
+/// Response body for `POST /tables/{t}/webhooks`.
+#[derive(Debug, Serialize)]
+pub struct RegisterWebhookResp {
+    pub id: u64,
+}
+
+/// Response body for `GET /tables/{t}/webhooks`.
+#[derive(Debug, Serialize)]
+pub struct WebhooksListResp {
+    pub webhooks: Vec<WebhookEntryResp>,
+}

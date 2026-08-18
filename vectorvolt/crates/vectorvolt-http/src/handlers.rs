@@ -15,11 +15,12 @@ use crate::types::{
     CdcStatsResp, ConditionalInsertResp, CountResp, CreateTableBody, CreateViewBody, DistinctResp,
     ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp, GroupResp, HistogramQuery,
     HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody, OkResp, PageResp,
-    PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RowResp, RowsResp,
-    ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery,
-    SchemaResp, SecondaryQuery, SnapshotInfoResp, SnapshotResp, SubscribeQuery, TablesResp,
-    TtlNowQuery, UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
-    ViewEntryResp, ViewInfoResp, ViewStateResp, ViewsListResp, WindowAggQuery, WindowCountQuery,
+    PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RegisterWebhookBody,
+    RegisterWebhookResp, RowResp, RowsResp, ScanPageQuery, ScanProjectQuery, ScanProjectResp,
+    ScanQuery, ScanSortedQuery, ScanWhereQuery, SchemaResp, SecondaryQuery, SnapshotInfoResp,
+    SnapshotResp, SubscribeQuery, TablesResp, TtlNowQuery, UpdateFieldBody, UpdateWhereQuery,
+    UpdatedResp, ValueCountEntry, ValueCountsResp, ViewEntryResp, ViewInfoResp, ViewStateResp,
+    ViewsListResp, WebhookEntryResp, WebhooksListResp, WindowAggQuery, WindowCountQuery,
     WindowRankQuery, WindowResp, WindowRowResp,
 };
 
@@ -1520,5 +1521,70 @@ pub async fn snapshot_info_handler(
                 .into_response()
             }
         },
+    }
+}
+
+// ── Layer 70: CDC Webhook Sinks ───────────────────────────────────────────────
+
+/// `POST /tables/{table}/webhooks` — register a new webhook sink.
+pub async fn register_webhook_handler(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Json(body): Json<RegisterWebhookBody>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => {
+            let rx = eng.subscribe_changes();
+            let id = st.webhooks.register(table, body.url, rx);
+            st.metrics.record_ok();
+            Json(RegisterWebhookResp { id }).into_response()
+        }
+    }
+}
+
+/// `GET /tables/{table}/webhooks` — list all sinks for a table.
+pub async fn list_webhooks_handler(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(_) => {
+            let webhooks = st
+                .webhooks
+                .list_for_table(&table)
+                .into_iter()
+                .map(|e| WebhookEntryResp {
+                    id: e.id,
+                    table: e.table,
+                    url: e.url,
+                })
+                .collect();
+            Json(WebhooksListResp { webhooks }).into_response()
+        }
+    }
+}
+
+/// `DELETE /tables/{table}/webhooks/{id}` — remove a sink.
+pub async fn delete_webhook_handler(
+    State(st): State<Arc<AppState>>,
+    Path((table, id)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(_) => {
+            if !st.webhooks.belongs_to(id, &table) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResp {
+                        error: format!("webhook {id} not found for table '{table}'"),
+                    }),
+                )
+                    .into_response();
+            }
+            st.webhooks.remove(id);
+            Json(OkResp { ok: true }).into_response()
+        }
     }
 }
