@@ -17,10 +17,10 @@ use crate::types::{
     HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody, OkResp, PageResp,
     PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RowResp, RowsResp,
     ScanPageQuery, ScanProjectQuery, ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery,
-    SchemaResp, SecondaryQuery, SubscribeQuery, TablesResp, TtlNowQuery, UpdateFieldBody,
-    UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp, ViewEntryResp, ViewInfoResp,
-    ViewStateResp, ViewsListResp, WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp,
-    WindowRowResp,
+    SchemaResp, SecondaryQuery, SnapshotInfoResp, SnapshotResp, SubscribeQuery, TablesResp,
+    TtlNowQuery, UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
+    ViewEntryResp, ViewInfoResp, ViewStateResp, ViewsListResp, WindowAggQuery, WindowCountQuery,
+    WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -1468,6 +1468,57 @@ pub async fn cdc_compact_handler(
         Ok(eng) => match eng.compact_cdc_log(query.retain_lsn) {
             Err(e) => engine_err(&st, e).into_response(),
             Ok(removed) => Json(CdcCompactResp { removed }).into_response(),
+        },
+    }
+}
+
+// ── Layer 69: WAL Snapshot ────────────────────────────────────────────────────
+
+/// `POST /tables/{table}/snapshot` — flush, compact, and write snapshot marker.
+pub async fn take_snapshot_handler(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.take_snapshot() {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(meta) => {
+                st.metrics.record_ok();
+                Json(SnapshotResp {
+                    row_count: meta.row_count,
+                    byte_size: meta.byte_size,
+                })
+                .into_response()
+            }
+        },
+    }
+}
+
+/// `GET /tables/{table}/snapshot` — return snapshot metadata if one exists.
+pub async fn snapshot_info_handler(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+) -> impl IntoResponse {
+    match st.registry.get(&table) {
+        Err(e) => engine_err(&st, e).into_response(),
+        Ok(eng) => match eng.snapshot_info() {
+            Err(e) => engine_err(&st, e).into_response(),
+            Ok(None) => Json(SnapshotInfoResp {
+                exists: false,
+                row_count: 0,
+                byte_size: 0,
+            })
+            .into_response(),
+            Ok(Some(meta)) => {
+                st.metrics.record_ok();
+                Json(SnapshotInfoResp {
+                    exists: true,
+                    row_count: meta.row_count,
+                    byte_size: meta.byte_size,
+                })
+                .into_response()
+            }
         },
     }
 }

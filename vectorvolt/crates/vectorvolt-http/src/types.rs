@@ -602,3 +602,20 @@ pub struct CdcCompactResp {
     /// Number of events removed (lsn < retain_lsn).
     pub removed: usize,
 }
+
+// ── Layer 69 types ────────────────────────────────────────────────────────────
+
+/// Response body for `POST /tables/{t}/snapshot`.
+#[derive(Debug, Serialize)]
+pub struct SnapshotResp {
+    pub row_count: u64,
+    pub byte_size: u64,
+}
+
+/// Response body for `GET /tables/{t}/snapshot`.
+#[derive(Debug, Serialize)]
+pub struct SnapshotInfoResp {
+    pub exists: bool,
+    pub row_count: u64,
+    pub byte_size: u64,
+}
