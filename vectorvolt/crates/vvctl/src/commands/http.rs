@@ -301,6 +301,52 @@ pub enum HttpCommand {
         #[arg(long)]
         hi: Option<u64>,
     },
+
+    // ── Layer 66: Materialized Views ─────────────────────────────────────────
+    /// Create a new materialized view over a table.
+    CreateView {
+        /// Unique view name.
+        #[arg(long)]
+        name: String,
+        /// Source table.
+        #[arg(long)]
+        table: String,
+        /// Column index used to filter rows fed into this view.
+        #[arg(long)]
+        filter_col: usize,
+        /// Inclusive lower bound on filter_col.
+        #[arg(long)]
+        lo: u64,
+        /// Inclusive upper bound on filter_col.
+        #[arg(long)]
+        hi: u64,
+        /// Column whose value becomes the group key.
+        #[arg(long)]
+        group_col: usize,
+        /// Aggregate function: count, sum, min, or max.
+        #[arg(long)]
+        kind: String,
+        /// Aggregate column index (required for sum, min, max).
+        #[arg(long)]
+        agg_col: Option<usize>,
+    },
+
+    /// List all materialized views.
+    ListViews,
+
+    /// Get the current aggregate state of a materialized view.
+    GetView {
+        /// View name.
+        #[arg(long)]
+        name: String,
+    },
+
+    /// Drop a materialized view.
+    DropView {
+        /// View name.
+        #[arg(long)]
+        name: String,
+    },
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -739,6 +785,56 @@ pub fn run(args: HttpArgs) -> Result<()> {
                 req = req.header(AUTHORIZATION, auth);
             }
             let resp = req.send().context("HTTP POST /purge_expired failed")?;
+            print_response(resp)?;
+        }
+
+        // ── Layer 66 view commands ────────────────────────────────────────────
+        HttpCommand::CreateView {
+            name,
+            table,
+            filter_col,
+            lo,
+            hi,
+            group_col,
+            kind,
+            agg_col,
+        } => {
+            let url = format!("{}/views", args.addr);
+            let mut body = serde_json::json!({
+                "name": name,
+                "table": table,
+                "filter_col": filter_col,
+                "lo": lo,
+                "hi": hi,
+                "group_col": group_col,
+                "kind": kind,
+            });
+            if let Some(ac) = agg_col {
+                body["agg_col"] = serde_json::json!(ac);
+            }
+            let resp = post_json(&client, &url, body, tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::ListViews => {
+            let url = format!("{}/views", args.addr);
+            let resp = get_req(&client, &url, &[], tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::GetView { name } => {
+            let url = format!("{}/views/{name}", args.addr);
+            let resp = get_req(&client, &url, &[], tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::DropView { name } => {
+            let url = format!("{}/views/{name}", args.addr);
+            let mut req = client.delete(&url);
+            if let Some(auth) = auth_header(tok) {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            let resp = req.send().context("HTTP DELETE /views failed")?;
             print_response(resp)?;
         }
 

@@ -496,6 +496,51 @@ pub struct WindowResp {
     pub rows: Vec<WindowRowResp>,
 }
 
+// ── Layer 66 — Materialized Views ────────────────────────────────────────────
+
+/// Request body for `POST /views`.
+#[derive(Debug, Deserialize)]
+pub struct CreateViewBody {
+    pub name: String,
+    pub table: String,
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub group_col: usize,
+    /// One of "count", "sum", "min", "max".
+    pub kind: String,
+    /// Required when `kind` is "sum", "min", or "max".
+    pub agg_col: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ViewEntryResp {
+    pub group_val: u64,
+    pub agg_val: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ViewStateResp {
+    pub name: String,
+    pub entries: Vec<ViewEntryResp>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ViewInfoResp {
+    pub name: String,
+    pub table: String,
+    pub kind: String,
+    pub filter_col: usize,
+    pub lo: u64,
+    pub hi: u64,
+    pub group_col: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ViewsListResp {
+    pub views: Vec<ViewInfoResp>,
+}
+
 // ── Layer 65 query params ─────────────────────────────────────────────────────
 
 /// Optional column-range filter for `GET /tables/{t}/subscribe`.
