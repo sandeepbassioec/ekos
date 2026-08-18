@@ -12,6 +12,7 @@
 //! |---|---|
 //! | [`cache`] | Cache-line alignment and false-sharing elimination |
 //! | [`memory`] | NUMA-local arena, huge pages, mlock, pre-fault |
+//! | [`wait`] | Ring-buffer consumer wait strategies (BusySpin / Yielding / Blocking) |
 //! | [`prefetch`] | Explicit L1 / L2 / L3 / streaming prefetch |
 //! | [`simd`] | Runtime-dispatched AVX2 and scalar kernels |
 //! | [`timer`] | `RDTSC` cycle-accurate measurement |
@@ -53,6 +54,7 @@ pub mod prefetch;
 pub mod simd;
 pub mod timer;
 pub mod topology;
+pub mod wait;
 
 pub use affinity::{
     AffinityError, AffinityGuard, cached_topology, current_core, pin_current_thread_to,
@@ -67,6 +69,7 @@ pub use prefetch::{Locality, prefetch, prefetch_ahead, prefetch_write};
 pub use simd::SimdTier;
 pub use timer::{CycleTimer, Stopwatch, cycles};
 pub use topology::{CacheHierarchy, CoreClass, CoreRoleMap, CpuTopology, LogicalCore, NumaNode};
+pub use wait::{Blocking, BoxedWaitStrategy, BusySpin, WaitStrategy, Yielding, boxed};
 
 /// One-line summary of detected hardware capabilities.
 ///
