@@ -6,6 +6,18 @@ All notable changes to VectorVolt are documented here.
 
 ## [Unreleased]
 
+### Layer 68 — CDC Log Compaction + Stats
+- `CdcLog::stats()` — header-only scan (no JSON parsing) returning `CdcLogStats`
+  { event_count, byte_size, min_lsn, max_lsn }
+- `CdcLog::compact(retain_lsn)` — atomic rewrite via temp file + rename; holds the
+  writer lock throughout so no concurrent append can interleave; returns events removed
+- `TableEngine::cdc_log_stats()` and `compact_cdc_log(retain_lsn)` expose both on the engine
+- HTTP: `GET /tables/{t}/cdc/stats` returns stats; `POST /tables/{t}/cdc/compact?retain_lsn=<n>`
+  removes events older than `retain_lsn` and reports count removed
+- `vvctl http cdc-stats` and `vvctl http cdc-compact --retain-lsn <n>` CLI subcommands
+- 14 integration tests: empty table, byte-size growth, min/max LSN tracking, retain-all,
+  retain-none, partial compaction, readability after compact, insert-after-compact
+
 ### Layer 67 — Persistent CDC Event Log
 - `cdc_log` module in `vectorvolt-engine`: `CdcLog` — append-only binary log per table
 - Wire format: `[lsn:u64LE][len:u32LE][json:bytes]` per event; flushed after every write
