@@ -511,6 +511,8 @@ pub struct CreateViewBody {
     pub kind: String,
     /// Required when `kind` is "sum", "min", or "max".
     pub agg_col: Option<usize>,
+    /// When `true`, replay the table's CDC log into the view before going live.
+    pub backfill: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -548,9 +550,30 @@ pub struct ViewsListResp {
 /// When all three fields are present, only events whose `values[col]` falls in
 /// `[lo, hi]` are forwarded.  Delete events (no values) are suppressed when a
 /// filter is active.
+///
+/// When `from` is set, historical events from the CDC log (lsn >= from) are
+/// streamed before switching to the live broadcast.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct SubscribeQuery {
     pub col: Option<usize>,
     pub lo: Option<u64>,
     pub hi: Option<u64>,
+    /// Replay CDC log starting from this LSN before switching to live events.
+    pub from: Option<u64>,
+}
+
+// ── Layer 67 types ────────────────────────────────────────────────────────────
+
+/// Query params for `GET /tables/{t}/cdc/log`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct CdcLogQuery {
+    /// Return only events with `lsn >= from`.  Defaults to 0 (all events).
+    pub from: Option<u64>,
+}
+
+/// Response body for `GET /tables/{t}/cdc/log`.
+#[derive(Debug, Serialize)]
+pub struct CdcLogResp {
+    pub events: Vec<serde_json::Value>,
+    pub count: usize,
 }

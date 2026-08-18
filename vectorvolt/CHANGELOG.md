@@ -6,6 +6,22 @@ All notable changes to VectorVolt are documented here.
 
 ## [Unreleased]
 
+### Layer 67 — Persistent CDC Event Log
+- `cdc_log` module in `vectorvolt-engine`: `CdcLog` — append-only binary log per table
+- Wire format: `[lsn:u64LE][len:u32LE][json:bytes]` per event; flushed after every write
+- `ChangeEvent` gains `lsn: u64` field; `AtomicU64` counter on `TableEngine` seeded from
+  `max_lsn()` on restart for gap-free LSN continuity across process restarts
+- Engine always writes to log (removed `receiver_count` guard — log is always written)
+- `TableEngine::read_log_from(lsn)` replays all events with `lsn >= from`
+- HTTP: `GET /tables/{t}/cdc/log[?from=<lsn>]` returns stored events as JSON array
+- SSE subscribe gains `?from=<lsn>`: subscribe-first then chain historical prefix with
+  live stream, deduped by LSN (prevents gaps during replay handoff)
+- `POST /views` gains `"backfill": true` — replays entire CDC log into view before
+  going live, so initial aggregate state reflects all committed mutations
+- `vvctl http replay [--from <lsn>]` — fetches stored CDC log from the server
+- 14 integration tests covering: log persistence, LSN monotonicity, `?from` filtering,
+  multi-table isolation, insert/delete field shapes, backfill vs no-backfill views
+
 ### Layer 66 — Materialized Views over CDC
 - `views` module in `vectorvolt-engine`: `ViewKind` (Count / Sum / Min / Max),
   `ViewDefinition`, `ViewEntry`, `ViewRegistry`

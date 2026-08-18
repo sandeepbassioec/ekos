@@ -285,7 +285,7 @@ fn rebuilt_index_reflects_updates_not_stale_values() {
     let eng2 = open_auto_compact(&dir);
     assert_eq!(
         eng2.secondary_lookup(1, 1).unwrap(),
-        vec![],
+        Vec::<u64>::new(),
         "stale value=1 must be absent"
     );
     assert_eq!(

@@ -236,7 +236,16 @@ impl ViewRegistry {
 
     /// Create a new materialized view.  Fails if the name is taken or the
     /// source table does not exist.
-    pub fn create(&self, def: ViewDefinition, registry: &Arc<TableRegistry>) -> Result<(), String> {
+    ///
+    /// When `backfill` is `true`, the table's CDC log is replayed into the
+    /// view before it starts consuming live events, so the initial state
+    /// reflects all committed mutations rather than only future ones.
+    pub fn create(
+        &self,
+        def: ViewDefinition,
+        registry: &Arc<TableRegistry>,
+        backfill: bool,
+    ) -> Result<(), String> {
         let mut inner = self.inner.lock();
         if inner.contains_key(&def.name) {
             return Err(format!("view '{}' already exists", def.name));
@@ -244,6 +253,13 @@ impl ViewRegistry {
         let eng = registry.get(&def.table).map_err(|e| e.to_string())?;
         let rx = eng.subscribe_changes();
         let state = Arc::new(RwLock::new(ViewState::new(def.clone())));
+        if backfill {
+            let history = eng.read_log_from(0).map_err(|e| e.to_string())?;
+            let mut st = state.write();
+            for ev in history {
+                st.apply(ev);
+            }
+        }
         let state2 = Arc::clone(&state);
         let handle = tokio::spawn(run_view_task(state2, rx));
         inner.insert(
