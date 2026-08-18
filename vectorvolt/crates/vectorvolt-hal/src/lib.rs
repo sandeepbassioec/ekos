@@ -11,6 +11,7 @@
 //! | Module | Controls |
 //! |---|---|
 //! | [`cache`] | Cache-line alignment and false-sharing elimination |
+//! | [`memory`] | NUMA-local arena, huge pages, mlock, pre-fault |
 //! | [`prefetch`] | Explicit L1 / L2 / L3 / streaming prefetch |
 //! | [`simd`] | Runtime-dispatched AVX2 and scalar kernels |
 //! | [`timer`] | `RDTSC` cycle-accurate measurement |
@@ -47,6 +48,7 @@
 
 pub mod affinity;
 pub mod cache;
+pub mod memory;
 pub mod prefetch;
 pub mod simd;
 pub mod timer;
@@ -57,6 +59,10 @@ pub use affinity::{
     pin_current_thread_to_set,
 };
 pub use cache::{CACHE_LINE, CacheAligned, CachePadded};
+pub use memory::{
+    HugePageBuf, HugePageError, LocalNumaArena, MlockError, MlockGuard, mlock_range,
+    prefetch_populate,
+};
 pub use prefetch::{Locality, prefetch, prefetch_ahead, prefetch_write};
 pub use simd::SimdTier;
 pub use timer::{CycleTimer, Stopwatch, cycles};

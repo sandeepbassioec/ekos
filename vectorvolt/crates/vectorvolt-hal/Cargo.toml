@@ -26,6 +26,9 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_SystemInformation",
-    # SetThreadAffinityMask, GetCurrentThread.
+    # SetThreadAffinityMask, GetCurrentThread, GetCurrentProcess.
     "Win32_System_Threading",
+    # VirtualAlloc, VirtualAllocExNuma, VirtualFree, VirtualLock, VirtualUnlock,
+    # PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY, MEM_*, PAGE_*.
+    "Win32_System_Memory",
 ] }
