@@ -1235,8 +1235,7 @@ pub async fn subscribe_handler(
             };
             let last_replayed = history.last().map(|e| e.lsn).unwrap_or(0);
 
-            let hist_stream =
-                tokio_stream::iter(history).map(Ok::<_, std::convert::Infallible>);
+            let hist_stream = tokio_stream::iter(history).map(Ok::<_, std::convert::Infallible>);
 
             let live_stream = BroadcastStream::new(rx).filter_map(move |result| {
                 match result {

@@ -48,8 +48,7 @@ impl CdcLog {
     /// Append a [`ChangeEvent`] to the log.  The write is flushed immediately
     /// so the entry is visible to concurrent readers.
     pub fn append(&self, event: &ChangeEvent) -> std::io::Result<()> {
-        let json = serde_json::to_vec(event)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_vec(event).map_err(std::io::Error::other)?;
         let mut w = self.writer.lock();
         w.write_all(&event.lsn.to_le_bytes())?;
         w.write_all(&(json.len() as u32).to_le_bytes())?;
