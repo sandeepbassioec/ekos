@@ -461,6 +461,18 @@ impl TableEngine {
         Ok(self.cdc_log.read_from(from_lsn)?)
     }
 
+    /// Return summary statistics (event count, byte size, min/max LSN) for the
+    /// CDC log without parsing JSON bodies.
+    pub fn cdc_log_stats(&self) -> EngineResult<crate::cdc_log::CdcLogStats> {
+        Ok(self.cdc_log.stats()?)
+    }
+
+    /// Rewrite the CDC log keeping only events with `lsn >= retain_lsn`.
+    /// Returns the number of events removed.
+    pub fn compact_cdc_log(&self, retain_lsn: u64) -> EngineResult<usize> {
+        Ok(self.cdc_log.compact(retain_lsn)?)
+    }
+
     /// Subscribe to change events for this table.
     ///
     /// Each call returns an independent [`tokio::sync::broadcast::Receiver`].

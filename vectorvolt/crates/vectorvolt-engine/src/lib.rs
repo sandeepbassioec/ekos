@@ -52,7 +52,7 @@ mod window;
 
 pub use aggregate::HistogramBucket;
 pub use cdc::{ChangeEvent, ChangeKind};
-pub use cdc_log::CdcLog;
+pub use cdc_log::{CdcLog, CdcLogStats};
 pub use compact::CompactResult;
 pub use cond::UpsertResult;
 pub use engine::TableEngine;
