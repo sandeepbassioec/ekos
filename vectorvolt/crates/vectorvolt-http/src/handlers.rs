@@ -8,20 +8,22 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::multi_txn::MultiTxnOp;
 use crate::server::AppState;
 use crate::types::{
     AggResp, BatchDeleteResp, BatchGetResp, BatchInsertBody, BatchInsertResp, BatchPksBody,
     BucketResp, CasBody, CasResp, CdcCompactQuery, CdcCompactResp, CdcLogQuery, CdcLogResp,
     CdcStatsResp, ConditionalInsertResp, CountResp, CreateTableBody, CreateViewBody, DistinctResp,
     ErrorResp, GroupByAggQuery, GroupByQuery, GroupEntryResp, GroupResp, HistogramQuery,
-    HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody, OkResp, PageResp,
-    PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery, RegisterWebhookBody,
-    RegisterWebhookResp, RowResp, RowsResp, ScanPageQuery, ScanProjectQuery, ScanProjectResp,
-    ScanQuery, ScanSortedQuery, ScanWhereQuery, SchemaResp, SecondaryQuery, SnapshotInfoResp,
-    SnapshotResp, SubscribeQuery, TablesResp, TtlNowQuery, UpdateFieldBody, UpdateWhereQuery,
-    UpdatedResp, ValueCountEntry, ValueCountsResp, ViewEntryResp, ViewInfoResp, ViewStateResp,
-    ViewsListResp, WebhookEntryResp, WebhooksListResp, WindowAggQuery, WindowCountQuery,
-    WindowRankQuery, WindowResp, WindowRowResp,
+    HistogramResp, IncrDecrWhereQuery, InsertBody, InsertTtlBody, MultiTxnBeginResp,
+    MultiTxnCommitResp, MultiTxnInfoResp, MultiTxnOpBody, MultiTxnRollbackResp, MultiTxnStagedResp,
+    OkResp, PageResp, PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery,
+    RegisterWebhookBody, RegisterWebhookResp, RowResp, RowsResp, ScanPageQuery, ScanProjectQuery,
+    ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery, SchemaResp, SecondaryQuery,
+    SnapshotInfoResp, SnapshotResp, SubscribeQuery, TablesResp, TtlNowQuery, UpdateFieldBody,
+    UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp, ViewEntryResp, ViewInfoResp,
+    ViewStateResp, ViewsListResp, WebhookEntryResp, WebhooksListResp, WindowAggQuery,
+    WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -1587,4 +1589,112 @@ pub async fn delete_webhook_handler(
             Json(OkResp { ok: true }).into_response()
         }
     }
+}
+
+// ── Layer 71: Multi-Table Transactions ───────────────────────────────────────
+
+/// `POST /multi_txn` — begin a new multi-table transaction.
+pub async fn multi_txn_begin_handler(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let txn_id = st.multi_txns.begin();
+    Json(MultiTxnBeginResp { txn_id }).into_response()
+}
+
+/// `GET /multi_txn/{id}` — inspect pending op count.
+pub async fn multi_txn_info_handler(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match st.multi_txns.op_count(id) {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResp {
+                error: format!("multi-txn {id} not found"),
+            }),
+        )
+            .into_response(),
+        Some(pending_ops) => Json(MultiTxnInfoResp {
+            txn_id: id,
+            pending_ops,
+        })
+        .into_response(),
+    }
+}
+
+/// `POST /multi_txn/{id}/ops` — stage one insert or delete operation.
+pub async fn multi_txn_stage_handler(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+    Json(body): Json<MultiTxnOpBody>,
+) -> impl IntoResponse {
+    let values = match body.op.as_str() {
+        "insert" => {
+            let Some(vals) = body.values else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResp {
+                        error: "insert op requires 'values'".into(),
+                    }),
+                )
+                    .into_response();
+            };
+            Some(vals)
+        }
+        "delete" => None,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResp {
+                    error: format!("unknown op '{other}'; expected 'insert' or 'delete'"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    match st.multi_txns.stage(
+        id,
+        MultiTxnOp {
+            table: body.table,
+            pk: body.pk,
+            values,
+        },
+    ) {
+        Err(msg) => (StatusCode::NOT_FOUND, Json(ErrorResp { error: msg })).into_response(),
+        Ok(()) => {
+            let staged = st.multi_txns.op_count(id).unwrap_or(0);
+            Json(MultiTxnStagedResp { staged }).into_response()
+        }
+    }
+}
+
+/// `POST /multi_txn/{id}/commit` — apply all staged ops and close the txn.
+pub async fn multi_txn_commit_handler(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match st.multi_txns.commit(id, &st.registry) {
+        Err(e) => {
+            let status = if e.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                Json(ErrorResp {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Ok(committed) => Json(MultiTxnCommitResp { committed }).into_response(),
+    }
+}
+
+/// `POST /multi_txn/{id}/rollback` — discard all staged ops and close the txn.
+pub async fn multi_txn_rollback_handler(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let rolled_back = st.multi_txns.rollback(id);
+    Json(MultiTxnRollbackResp { rolled_back }).into_response()
 }

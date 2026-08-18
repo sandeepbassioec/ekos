@@ -13,6 +13,7 @@ use vectorvolt_engine::{TableRegistry, ViewRegistry};
 
 use crate::handlers;
 use crate::metrics::Metrics;
+use crate::multi_txn::MultiTxnRegistry;
 use crate::obs;
 use crate::webhook::WebhookRegistry;
 
@@ -22,6 +23,7 @@ pub struct AppState {
     pub views: Arc<ViewRegistry>,
     pub metrics: Arc<Metrics>,
     pub webhooks: Arc<WebhookRegistry>,
+    pub multi_txns: Arc<MultiTxnRegistry>,
     /// When `Some`, every non-observability request must carry
     /// `Authorization: Bearer <token>`.
     pub api_token: Option<String>,
@@ -64,7 +66,15 @@ impl HttpServer {
         let metrics = Metrics::new();
         let views = Arc::new(ViewRegistry::new());
         let webhooks = Arc::new(WebhookRegistry::new());
-        let app = build_router(registry, views, webhooks, metrics, config.api_token);
+        let multi_txns = Arc::new(MultiTxnRegistry::new());
+        let app = build_router(
+            registry,
+            views,
+            webhooks,
+            multi_txns,
+            metrics,
+            config.api_token,
+        );
         let listener = TcpListener::bind(config.addr).await?;
         Ok(Self { listener, app })
     }
@@ -112,6 +122,7 @@ fn build_router(
     registry: Arc<TableRegistry>,
     views: Arc<ViewRegistry>,
     webhooks: Arc<WebhookRegistry>,
+    multi_txns: Arc<MultiTxnRegistry>,
     metrics: Arc<Metrics>,
     api_token: Option<String>,
 ) -> Router {
@@ -119,6 +130,7 @@ fn build_router(
         registry,
         views,
         webhooks,
+        multi_txns,
         metrics,
         api_token,
     });
@@ -262,6 +274,21 @@ fn build_router(
         .route(
             "/tables/{table}/webhooks/{id}",
             delete(handlers::delete_webhook_handler),
+        )
+        // Layer 71: Multi-Table Transactions
+        .route("/multi_txn", post(handlers::multi_txn_begin_handler))
+        .route("/multi_txn/{id}", get(handlers::multi_txn_info_handler))
+        .route(
+            "/multi_txn/{id}/ops",
+            post(handlers::multi_txn_stage_handler),
+        )
+        .route(
+            "/multi_txn/{id}/commit",
+            post(handlers::multi_txn_commit_handler),
+        )
+        .route(
+            "/multi_txn/{id}/rollback",
+            post(handlers::multi_txn_rollback_handler),
         )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),

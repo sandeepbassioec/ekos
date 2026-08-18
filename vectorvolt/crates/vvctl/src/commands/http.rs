@@ -41,8 +41,8 @@ pub struct HttpArgs {
     #[arg(long, default_value = "http://localhost:3030")]
     pub addr: String,
 
-    /// Table name to operate on.
-    #[arg(long, short = 't')]
+    /// Table name to operate on (not required for multi-txn commands).
+    #[arg(long, short = 't', default_value = "")]
     pub table: String,
 
     /// Bearer token for authenticated gateways (matches --api-token on the server).
@@ -387,6 +387,44 @@ pub enum HttpCommand {
         /// Webhook sink ID to remove.
         #[arg(long)]
         id: u64,
+    },
+
+    // ── Layer 71: Multi-Table Transactions ────────────────────────────────────
+    /// Begin a new multi-table transaction (--table not required).
+    MultiTxnBegin,
+    /// Show pending op count for a multi-table transaction.
+    MultiTxnInfo {
+        /// Transaction ID returned by multi-txn-begin.
+        #[arg(long)]
+        txn_id: u64,
+    },
+    /// Stage one insert or delete operation into a multi-table transaction.
+    MultiTxnStage {
+        /// Transaction ID.
+        #[arg(long)]
+        txn_id: u64,
+        /// Target table name.
+        #[arg(long)]
+        tbl: String,
+        /// Operation: "insert" or "delete".
+        #[arg(long)]
+        op: String,
+        /// Primary key.
+        #[arg(long)]
+        pk: u64,
+        /// Comma-separated column values (required for insert).
+        #[arg(long)]
+        values: Option<String>,
+    },
+    /// Commit a multi-table transaction (apply all staged ops).
+    MultiTxnCommit {
+        #[arg(long)]
+        txn_id: u64,
+    },
+    /// Rollback a multi-table transaction (discard all staged ops).
+    MultiTxnRollback {
+        #[arg(long)]
+        txn_id: u64,
     },
 }
 
@@ -935,6 +973,51 @@ pub fn run(args: HttpArgs) -> Result<()> {
                 req = req.header(AUTHORIZATION, auth);
             }
             let resp = req.send().context("HTTP DELETE /webhooks/{id} failed")?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::MultiTxnBegin => {
+            let url = format!("{}/multi_txn", args.addr);
+            let resp = post_json(&client, &url, serde_json::Value::Null, tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::MultiTxnInfo { txn_id } => {
+            let url = format!("{}/multi_txn/{txn_id}", args.addr);
+            let resp = get_req(&client, &url, &[], tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::MultiTxnStage {
+            txn_id,
+            tbl,
+            op,
+            pk,
+            values,
+        } => {
+            let url = format!("{}/multi_txn/{txn_id}/ops", args.addr);
+            let vals: Option<Vec<u64>> = if let Some(s) = values {
+                Some(parse_u64_list(&s)?)
+            } else {
+                None
+            };
+            let mut body = serde_json::json!({ "table": tbl, "op": op, "pk": pk });
+            if let Some(v) = vals {
+                body["values"] = serde_json::json!(v);
+            }
+            let resp = post_json(&client, &url, body, tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::MultiTxnCommit { txn_id } => {
+            let url = format!("{}/multi_txn/{txn_id}/commit", args.addr);
+            let resp = post_json(&client, &url, serde_json::Value::Null, tok)?;
+            print_response(resp)?;
+        }
+
+        HttpCommand::MultiTxnRollback { txn_id } => {
+            let url = format!("{}/multi_txn/{txn_id}/rollback", args.addr);
+            let resp = post_json(&client, &url, serde_json::Value::Null, tok)?;
             print_response(resp)?;
         }
 
