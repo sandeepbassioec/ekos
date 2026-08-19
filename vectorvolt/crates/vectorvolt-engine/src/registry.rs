@@ -254,4 +254,14 @@ impl TableRegistry {
     pub fn has_default(&self) -> bool {
         self.tables.read().contains_key("default")
     }
+
+    /// True if a table with the given name is currently registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tables.read().contains_key(name)
+    }
+
+    /// Number of tables currently registered.
+    pub fn table_count(&self) -> usize {
+        self.tables.read().len()
+    }
 }
