@@ -22,6 +22,13 @@ thiserror = { workspace = true }
 # `sched_setaffinity` / `sched_getaffinity` / `sched_getcpu`.
 libc = "0.2"
 
+[dev-dependencies.criterion]
+workspace = true
+
+[[bench]]
+name    = "simd_bench"
+harness = false
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

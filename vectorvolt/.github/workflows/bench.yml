@@ -1,0 +1,78 @@
+# Layer 79 — Criterion performance regression gate (VV-TST-008).
+#
+# This workflow runs the HAL SIMD Criterion benchmarks and fails if any
+# measurement regresses more than 20 % versus the stored baseline.
+#
+# DISABLED: auto-triggers are commented out pending GitHub billing fix.
+# Re-enable by uncommenting the `on:` block below.
+#
+# Manual run:
+#   gh workflow run bench.yml
+
+name: bench
+
+on:
+  # push:
+  #   branches: [main]
+  # pull_request:
+  #   branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-cpu=native"
+
+jobs:
+  simd-bench:
+    name: SIMD Criterion gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-bench-
+
+      - name: Restore benchmark baseline
+        uses: actions/cache@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.base_ref || 'main' }}
+          restore-keys: criterion-baseline-
+
+      - name: Run SIMD perf-gate tests
+        working-directory: vectorvolt
+        run: cargo test -p vectorvolt-hal --test perf_gate
+
+      - name: Run Criterion SIMD benchmarks (save baseline on main)
+        working-directory: vectorvolt
+        if: github.ref == 'refs/heads/main'
+        run: cargo bench -p vectorvolt-hal -- --save-baseline main
+
+      - name: Run Criterion SIMD benchmarks (compare against main on PR)
+        working-directory: vectorvolt
+        if: github.event_name == 'pull_request'
+        run: |
+          cargo bench -p vectorvolt-hal -- --baseline main 2>&1 | tee bench_output.txt
+          # Fail if any benchmark regressed >20 %
+          if grep -q "Performance has regressed\|regressed by" bench_output.txt; then
+            echo "::error::A Criterion benchmark regressed >20%. See bench_output.txt."
+            exit 1
+          fi
+
+      - name: Save baseline artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-baseline
+          path: target/criterion/
+          retention-days: 90
