@@ -68,20 +68,6 @@ fn validate_name(name: &str) -> EngineResult<()> {
     Ok(())
 }
 
-fn write_schema(dir: &std::path::Path, schema: &[String]) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join(SCHEMA_FILE), schema.join("\n"))
-}
-
-fn read_schema(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
-    let raw = std::fs::read_to_string(dir.join(SCHEMA_FILE))?;
-    Ok(raw
-        .lines()
-        .map(str::to_owned)
-        .filter(|s| !s.is_empty())
-        .collect())
-}
-
 fn write_typed_schema(dir: &std::path::Path, schema: &TableSchema) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join(SCHEMA_FILE), schema.to_text())
@@ -142,8 +128,8 @@ impl TableRegistry {
                 if validate_name(&name).is_err() {
                     continue;
                 }
-                let schema = read_schema(&path)?;
-                let engine = Arc::new(TableEngine::open_with(schema, &path, options)?);
+                let typed = read_typed_schema(&path)?;
+                let engine = Arc::new(TableEngine::open_typed(typed, &path, options)?);
                 map.insert(name, engine);
             }
         }
@@ -186,8 +172,9 @@ impl TableRegistry {
         // Write schema.txt before opening the engine: if the engine open fails,
         // the schema file stays on disk and will be picked up by `open()` on the
         // next restart — which is fine, the engine will just start empty.
-        write_schema(&dir, &schema)?;
-        let engine = Arc::new(TableEngine::open_with(schema, &dir, self.options)?);
+        let typed = TableSchema::from_names(&schema);
+        write_typed_schema(&dir, &typed)?;
+        let engine = Arc::new(TableEngine::open_typed(typed, &dir, self.options)?);
         tables.insert(name.into(), Arc::clone(&engine));
         Ok(engine)
     }
@@ -211,8 +198,7 @@ impl TableRegistry {
 
         let dir = self.base_dir.join(name);
         write_typed_schema(&dir, &schema)?;
-        let col_names = schema.names();
-        let engine = Arc::new(TableEngine::open_with(col_names, &dir, self.options)?);
+        let engine = Arc::new(TableEngine::open_typed(schema, &dir, self.options)?);
         tables.insert(name.into(), Arc::clone(&engine));
         Ok(engine)
     }

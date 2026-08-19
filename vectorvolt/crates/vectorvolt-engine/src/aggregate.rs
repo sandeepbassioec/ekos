@@ -34,7 +34,7 @@ impl TableEngine {
     // ── helpers ───────────────────────────────────────────────────────────────
 
     pub(crate) fn check_col(&self, col_idx: usize) -> EngineResult<()> {
-        let col_count = self.schema.len();
+        let col_count = self.schema.col_count();
         if col_idx >= col_count {
             return Err(EngineError::ColOutOfRange { col_idx, col_count });
         }

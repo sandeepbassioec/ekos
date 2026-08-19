@@ -211,7 +211,7 @@ pub async fn describe_table(
         Ok(eng) => {
             st.metrics.record_ok();
             Json(SchemaResp {
-                columns: eng.schema.clone(),
+                columns: eng.schema.names(),
             })
             .into_response()
         }

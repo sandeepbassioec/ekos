@@ -198,5 +198,5 @@ fn stats_are_accurate() {
 #[test]
 fn schema_exposed_on_engine() {
     let (engine, _dir) = make_engine(100);
-    assert_eq!(engine.schema, vec!["id", "age"]);
+    assert_eq!(engine.schema.names(), vec!["id", "age"]);
 }
