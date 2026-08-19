@@ -1,17 +1,19 @@
 name: SDK Tests
 
-# Run on every PR and push to main/develop that touches the SDKs or the engine.
+# Temporarily disabled — re-enable once GitHub Actions billing is restored.
+# on:
+#   push:
+#     branches: [main, develop]
+#     paths:
+#       - "vectorvolt/**"
+#       - "sdk/**"
+#   pull_request:
+#     branches: [main]
+#     paths:
+#       - "vectorvolt/**"
+#       - "sdk/**"
 on:
-  push:
-    branches: [main, develop]
-    paths:
-      - "vectorvolt/**"
-      - "sdk/**"
-  pull_request:
-    branches: [main]
-    paths:
-      - "vectorvolt/**"
-      - "sdk/**"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
