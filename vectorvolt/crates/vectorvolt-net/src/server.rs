@@ -1228,7 +1228,7 @@ fn serve_request(
         }
 
         Request::DescribeTable => Response::Schema {
-            columns: engine.schema.clone(),
+            columns: engine.schema.names(),
         },
 
         Request::IncrementMulti { pk, pairs } => match engine.get(pk) {

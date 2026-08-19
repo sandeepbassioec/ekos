@@ -168,7 +168,7 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
             Ok(QueryResponse::Ok)
         }
 
-        Query::Describe => Ok(QueryResponse::Schema(engine.schema.clone())),
+        Query::Describe => Ok(QueryResponse::Schema(engine.schema.names())),
 
         Query::Stats => Ok(QueryResponse::Stats(engine.stats())),
 

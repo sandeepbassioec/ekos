@@ -41,7 +41,7 @@ impl TableEngine {
         hi: u64,
         projection: &[usize],
     ) -> EngineResult<Vec<EngineRow>> {
-        let col_count = self.schema.len();
+        let col_count = self.schema.col_count();
 
         if filter_col >= col_count {
             return Err(EngineError::ColOutOfRange {

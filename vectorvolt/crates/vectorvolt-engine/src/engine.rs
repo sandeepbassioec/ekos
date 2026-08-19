@@ -30,6 +30,7 @@ use crate::cdc::ChangeEvent;
 use crate::cdc_log::CdcLog;
 use crate::index_catalog;
 use crate::mvcc::MvccStore;
+use crate::schema::TableSchema;
 use crate::{CompactResult, EngineError, EngineResult, EngineRow, EngineStats, TxnId};
 
 /// Per-table engine: owns the write path (TxnManager) and read path (PartitionReader map).
@@ -38,7 +39,7 @@ pub struct TableEngine {
     /// Flushed partition files keyed by (file_id, partition_id).
     pub(crate) partitions: RwLock<HashMap<(u16, u16), PartitionReader>>,
     partition_dir: PathBuf,
-    pub schema: Vec<String>,
+    pub schema: TableSchema,
     /// How `compact` chooses what to merge.
     compaction_strategy: CompactionStrategy,
     /// Storage options for compaction output.
@@ -269,6 +270,22 @@ impl TableEngine {
         Self::open_with(schema, data_dir, EngineOptions::new(flush_threshold))
     }
 
+    /// Open with a fully-typed [`TableSchema`].
+    ///
+    /// Use this when the caller already has a `TableSchema` (e.g. deserialized
+    /// from `schema.txt` by [`TableRegistry`]).  Compared to [`open_with`],
+    /// this preserves column types so `insert` can enforce them.
+    pub fn open_typed(
+        typed_schema: TableSchema,
+        data_dir: impl Into<PathBuf>,
+        options: EngineOptions,
+    ) -> EngineResult<Self> {
+        let names = typed_schema.names();
+        let mut engine = Self::open_with(names, data_dir, options)?;
+        engine.schema = typed_schema;
+        Ok(engine)
+    }
+
     /// [`open`](Self::open) with explicit options.
     pub fn open_with(
         schema: Vec<String>,
@@ -312,6 +329,8 @@ impl TableEngine {
         }
 
         // Start the partition counter past any existing files to avoid overwrites.
+        let typed_schema = TableSchema::from_names(&schema);
+
         let txn = TxnManager::with_starting_partition(
             wal,
             schema.clone(),
@@ -434,7 +453,7 @@ impl TableEngine {
             txn,
             partitions: RwLock::new(partitions),
             partition_dir,
-            schema,
+            schema: typed_schema,
             compaction_strategy: options.compaction_strategy,
             write_options: options.write_options,
             manifest_recovery,
@@ -453,7 +472,7 @@ impl TableEngine {
         // Done after full construction so build_secondary_index can call
         // flush_if_needed, get, and scan normally.
         for col in index_catalog::load(&engine.catalog_path) {
-            if col < engine.schema.len() {
+            if col < engine.schema.col_count() {
                 engine.build_secondary_index(col)?;
             }
         }
@@ -530,7 +549,14 @@ impl TableEngine {
     ///
     /// All live secondary indexes are updated atomically after the write
     /// succeeds, at no extra cost when no indexes are built.
+    /// Return the table's [`TableSchema`].
+    pub fn typed_schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
     pub fn insert(&self, pk: u64, values: Vec<u64>) -> EngineResult<WalTip> {
+        self.schema.validate_row(&values)?;
+
         // Clone for CDC â€” always needed for log persistence; also used for
         // broadcasting to live SSE subscribers when any are active.
         let cdc_vals = Some(values.clone());
@@ -726,7 +752,7 @@ impl TableEngine {
     /// Uses per-column zone statistics to skip partitions that cannot contain
     /// a match (O(1) prune per partition).  Pending rows are flushed first.
     pub fn scan(&self, col_idx: usize, lo: u64, hi: u64) -> EngineResult<Vec<EngineRow>> {
-        let col_count = self.schema.len();
+        let col_count = self.schema.col_count();
         if col_idx >= col_count {
             return Err(EngineError::ColOutOfRange { col_idx, col_count });
         }
@@ -1025,7 +1051,7 @@ impl TableEngine {
             rows_buffered: self.txn.row_count_buffered(),
             rows_flushed: self.txn.total_rows_flushed(),
             partition_count: self.partitions.read().len(),
-            schema: self.schema.clone(),
+            schema: self.schema.names(),
             auto_compact_threshold: self.auto_compact_threshold,
         }
     }
