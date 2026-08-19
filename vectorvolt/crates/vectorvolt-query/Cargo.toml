@@ -1,10 +1,13 @@
 [package]
 name = "vectorvolt-query"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 vectorvolt-engine = { workspace = true }
+vectorvolt-hal = { workspace = true }
+vectorvolt-index = { workspace = true }
+vectorvolt-storage = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

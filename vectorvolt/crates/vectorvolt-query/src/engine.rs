@@ -100,6 +100,147 @@ impl QueryEngine {
         self.catalog.fk_filter.contains(fk_value)
     }
 
+    // ── SIMD analytics ───────────────────────────────────────────────────────
+
+    /// Count rows where column `col_idx` falls in `[lo, hi]`.
+    ///
+    /// Uses ZoneMap pruning + `count_matching` (SIMD count_range under the hood).
+    /// No offset Vec is allocated, saving a heap round-trip vs `range_scan`.
+    pub fn count_scan(&self, col_idx: usize, lo: u64, hi: u64) -> QueryResult<u64> {
+        if lo > hi {
+            return Ok(0);
+        }
+        let mut total: u64 = 0;
+        for (&(file_id, partition_id), reader) in &self.catalog.partitions {
+            if let Ok((zone_min, zone_max)) = reader.zone_min_max(col_idx)
+                && (zone_min > hi || zone_max < lo)
+            {
+                continue;
+            }
+            total += reader.count_matching(col_idx, lo, hi)? as u64;
+            let _ = (file_id, partition_id);
+        }
+        Ok(total)
+    }
+
+    /// Sum of column `sum_col` for all rows where column `filter_col` is in `[lo, hi]`.
+    ///
+    /// Filters partitions with ZoneMap, then gathers `sum_col` values at matched
+    /// offsets and applies `simd::sum`.
+    pub fn sum_scan(
+        &self,
+        filter_col: usize,
+        lo: u64,
+        hi: u64,
+        sum_col: usize,
+    ) -> QueryResult<u64> {
+        let mut total = 0u64;
+        for (&(file_id, partition_id), reader) in &self.catalog.partitions {
+            if let Ok((zone_min, zone_max)) = reader.zone_min_max(filter_col)
+                && (zone_min > hi || zone_max < lo)
+            {
+                continue;
+            }
+            let offsets = reader.filter_offsets(filter_col, lo, hi)?;
+            if offsets.is_empty() {
+                let _ = (file_id, partition_id);
+                continue;
+            }
+            let gathered: Vec<u64> = offsets
+                .iter()
+                .map(|&o| reader.read_value(sum_col, o as usize))
+                .collect::<Result<_, _>>()?;
+            total = total.wrapping_add(vectorvolt_hal::simd::sum(&gathered));
+            let _ = (file_id, partition_id);
+        }
+        Ok(total)
+    }
+
+    /// Minimum value of column `col_idx` among rows where `col_idx` is in `[lo, hi]`.
+    ///
+    /// Returns `None` if no rows match.
+    pub fn min_scan(&self, col_idx: usize, lo: u64, hi: u64) -> QueryResult<Option<u64>> {
+        let mut global_min: Option<u64> = None;
+        for (&(file_id, partition_id), reader) in &self.catalog.partitions {
+            if let Ok((zone_min, zone_max)) = reader.zone_min_max(col_idx)
+                && (zone_min > hi || zone_max < lo)
+            {
+                continue;
+            }
+            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
+            if offsets.is_empty() {
+                let _ = (file_id, partition_id);
+                continue;
+            }
+            let gathered: Vec<u64> = offsets
+                .iter()
+                .map(|&o| reader.read_value(col_idx, o as usize))
+                .collect::<Result<_, _>>()?;
+            if let Some((part_min, _)) = vectorvolt_hal::simd::min_max(&gathered) {
+                global_min = Some(match global_min {
+                    None => part_min,
+                    Some(cur) => cur.min(part_min),
+                });
+            }
+            let _ = (file_id, partition_id);
+        }
+        Ok(global_min)
+    }
+
+    /// Maximum value of column `col_idx` among rows where `col_idx` is in `[lo, hi]`.
+    ///
+    /// Returns `None` if no rows match.
+    pub fn max_scan(&self, col_idx: usize, lo: u64, hi: u64) -> QueryResult<Option<u64>> {
+        let mut global_max: Option<u64> = None;
+        for (&(file_id, partition_id), reader) in &self.catalog.partitions {
+            if let Ok((zone_min, zone_max)) = reader.zone_min_max(col_idx)
+                && (zone_min > hi || zone_max < lo)
+            {
+                continue;
+            }
+            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
+            if offsets.is_empty() {
+                let _ = (file_id, partition_id);
+                continue;
+            }
+            let gathered: Vec<u64> = offsets
+                .iter()
+                .map(|&o| reader.read_value(col_idx, o as usize))
+                .collect::<Result<_, _>>()?;
+            if let Some((_, part_max)) = vectorvolt_hal::simd::min_max(&gathered) {
+                global_max = Some(match global_max {
+                    None => part_max,
+                    Some(cur) => cur.max(part_max),
+                });
+            }
+            let _ = (file_id, partition_id);
+        }
+        Ok(global_max)
+    }
+
+    /// Batch PK lookup using `CuckooMap::get_batch`.
+    ///
+    /// Returns one `Option<QueryRow>` per input PK in the same order.
+    pub fn pk_lookup_batch(&self, pks: &[u64]) -> QueryResult<Vec<Option<QueryRow>>> {
+        let descs = self.catalog.pk_index.get_batch(pks);
+        descs
+            .into_iter()
+            .zip(pks.iter())
+            .map(|(desc_opt, &pk)| match desc_opt {
+                None => Ok(None),
+                Some(desc) => self.fetch_row(pk, desc).map(Some),
+            })
+            .collect()
+    }
+
+    /// Batch FK existence check using `CuckooFilter::contains_batch`.
+    ///
+    /// Returns one `bool` per input value in the same order.
+    #[inline]
+    pub fn fk_exists_batch(&self, fk_values: &[u64]) -> Vec<bool> {
+        self.catalog.fk_filter.contains_batch(fk_values)
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn fetch_row(&self, pk: u64, desc: RowDescriptor) -> QueryResult<QueryRow> {
