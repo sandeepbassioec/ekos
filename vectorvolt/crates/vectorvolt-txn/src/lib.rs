@@ -33,6 +33,7 @@ pub mod error;
 pub mod manager;
 pub mod ops;
 pub mod ring_buffer;
+pub mod shard_writer;
 
 pub use error::{TxnError, TxnResult};
 pub use manager::{FlushResult, PENDING_FILE_ID, TxnManager, WalTip};

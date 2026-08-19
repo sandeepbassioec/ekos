@@ -18,11 +18,12 @@
 //! 4. Rebuild RowDescriptors in CuckooMap → real (file_id, partition_id).
 //! 5. Update ZoneMap with PK min/max for the new partition.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
 
 use vectorvolt_index::{CuckooFilter, CuckooMap, RowDescriptor, SecondaryIndex, ZoneMap};
 use vectorvolt_storage::{ColumnValues, MicroPartition, write_partition};
@@ -33,7 +34,8 @@ use vectorvolt_storage::{
 pub use vectorvolt_wal::WalTip;
 use vectorvolt_wal::{SyncCommitter, SyncStats, WalWriter};
 
-use crate::{TxnError, TxnResult, ops::Mutation, ring_buffer::RingBuffer};
+use crate::shard_writer::ShardWriter;
+use crate::{TxnError, TxnResult, ops::Mutation};
 
 // Sentinel file_id for rows still in the write buffer.
 /// `file_id` marking a descriptor that points into the write buffer rather than
@@ -53,16 +55,16 @@ pub struct FlushResult {
 /// WAL-backed transaction manager for a single table.
 pub struct TxnManager {
     wal: SyncCommitter,
-    pub pk_index: RwLock<CuckooMap>,
+    pub pk_index: Arc<RwLock<CuckooMap>>,
     pub secondary_index: RwLock<SecondaryIndex>,
     pub zone_map: RwLock<ZoneMap>,
     pub fk_filter: RwLock<CuckooFilter>,
-    /// Write buffer — a pre-allocated LMAX-style ring buffer.
+    /// Per-shard writer thread (VV-TXN-009).
     ///
-    /// Wrapped in `Mutex` until per-shard writer threads land (VV-TXN-009),
-    /// at which point the external lock will be removed and the ring buffer will
-    /// run in a true single-producer configuration.
-    write_buf: Mutex<RingBuffer>,
+    /// Owns the ring buffer outright — no mutex wraps the push or drain path.
+    /// All write-side operations are serialised through a single OS thread,
+    /// making insert a true SPSC (single-producer, single-consumer) operation.
+    writer: ShardWriter,
     flush_dir: PathBuf,
     pub schema: Vec<String>,
     next_file_id: AtomicU16,
@@ -96,8 +98,11 @@ pub struct TxnManager {
     /// I/O. A row must always be findable — buffered, in flight, or in a partition
     /// — and this is the middle state. Reads consult it after the buffer.
     ///
-    /// Innermost lock: never held while acquiring the buffer or index locks.
-    in_flight: Mutex<HashMap<u64, Vec<u64>>>,
+    /// Shared with the writer thread so it can populate `in_flight` atomically
+    /// inside its Drain handler before sending the reply. That ordering means any
+    /// subsequent RowFor (which arrives after the reply) always sees the row in
+    /// `in_flight`, closing the TOCTOU window the old Mutex path had.
+    in_flight: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
 }
 
 impl TxnManager {
@@ -121,13 +126,21 @@ impl TxnManager {
         start_partition_id: u16,
     ) -> Self {
         let schema_width = schema.len();
+        let pk_index = Arc::new(RwLock::new(CuckooMap::with_capacity(64)));
+        let in_flight = Arc::new(Mutex::new(HashMap::new()));
+        let writer = ShardWriter::new(
+            flush_threshold,
+            schema_width,
+            Arc::clone(&pk_index),
+            Arc::clone(&in_flight),
+        );
         TxnManager {
             wal: SyncCommitter::new(wal),
-            pk_index: RwLock::new(CuckooMap::with_capacity(64)),
+            pk_index,
             secondary_index: RwLock::new(SecondaryIndex::new()),
             zone_map: RwLock::new(ZoneMap::new()),
             fk_filter: RwLock::new(CuckooFilter::with_capacity(64)),
-            write_buf: Mutex::new(RingBuffer::new(flush_threshold, schema_width)),
+            writer,
             flush_dir: flush_dir.into(),
             schema,
             next_file_id: AtomicU16::new(0),
@@ -138,7 +151,7 @@ impl TxnManager {
             sync_on_commit: false,
             manifest: Mutex::new(None),
             pending_tombstones: Mutex::new(HashMap::new()),
-            in_flight: Mutex::new(HashMap::new()),
+            in_flight,
         }
     }
 
@@ -210,35 +223,14 @@ impl TxnManager {
         // 3. CuckooFilter.
         self.fk_filter.write().insert(pk)?;
 
-        // 4-5. Buffer offset, index entry, and push — under ONE acquisition of the
-        //      buffer lock.
+        // 4-5. Delegate buffer offset, index entry, and push to the writer thread.
         //
-        // This used to read `write_buf.len()`, RELEASE the lock, record that
-        // offset in the index, and re-acquire the lock to push. Two concurrent
-        // inserts could both observe length 5, both record offset 5, and then push
-        // into slots 5 and 6 — leaving one row's index entry pointing at the other
-        // row's data. A `get` for that key then found the wrong pk in the slot and
-        // reported the row missing.
-        //
-        // Silent, load-dependent, and a data-correctness bug rather than a
-        // performance one. Found by a concurrency test that failed roughly one run
-        // in three under full-workspace load; single-crate runs never reproduced it.
-        //
-        // The index insert happens BEFORE the push, still under the lock: if it
-        // fails, nothing has been buffered, so there is no row without an index
-        // entry. `full` is captured inside the scope and acted on after the lock is
-        // dropped, because `flush` takes the same lock.
-        let full = {
-            let buf = self.write_buf.lock();
-            let buf_offset = buf.len() as u32;
-            self.pk_index
-                .write()
-                .insert(pk, RowDescriptor::new(PENDING_FILE_ID, 0, buf_offset))?;
-            // RingBuffer::push returns Err(()) only when the ring is physically
-            // full (head-tail == capacity). Normal operation auto-flushes at
-            // flush_threshold, so Err here signals a full ring — treat as full.
-            buf.push(pk, values).unwrap_or(true)
-        };
+        // The writer thread is the single producer for the ring buffer. It computes
+        // the offset, writes the pk_index entry (BEFORE the push), and then pushes
+        // the row — all as one atomic sequence with no other thread racing on these
+        // three operations. This eliminates the ABBA-style concurrency bug the old
+        // Mutex path had when two threads interleaved their read-offset / push steps.
+        let full = self.writer.insert(pk, values)?;
 
         // 6. Auto-flush if the buffer filled.
         if full {
@@ -533,21 +525,14 @@ impl TxnManager {
         // published. Bounded by the flush threshold and cheap next to the file
         // write it overlaps with.
         //
-        // Lock ORDER: `insert` takes buffer then index, so nothing here may take
-        // the index lock while holding the buffer lock in the other order.
-        // `in_flight` is innermost and never held across another acquisition.
-        let rows = {
-            let buf_guard = self.write_buf.lock();
-            let rows = buf_guard.drain();
-            if rows.is_empty() {
-                return Ok(None);
-            }
-            let mut inf = self.in_flight.lock();
-            for (pk, values) in &rows {
-                inf.insert(*pk, values.clone());
-            }
-            rows
-        };
+        // The writer thread drains the ring buffer and populates `in_flight`
+        // atomically before sending the reply — so by the time `drain()` returns
+        // here, any concurrent reader with a PENDING descriptor will already find
+        // the row in `in_flight`. No additional lock is needed.
+        let rows = self.writer.drain()?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
 
         // Persist tombstone counts alongside the flush — a natural batching point,
         // and it keeps the manifest close to reality without an fsync per delete.
@@ -703,16 +688,8 @@ impl TxnManager {
         // CuckooFilter.
         self.fk_filter.write().insert(pk)?;
 
-        // Write buffer + pk_index under ONE lock acquisition (same ordering as
-        // `insert` to avoid ABBA deadlocks).
-        let full = {
-            let buf = self.write_buf.lock();
-            let buf_offset = buf.len() as u32;
-            self.pk_index
-                .write()
-                .insert(pk, RowDescriptor::new(PENDING_FILE_ID, 0, buf_offset))?;
-            buf.push(pk, values).unwrap_or(true)
-        };
+        // Delegate to the writer thread — same atomicity invariant as `insert()`.
+        let full = self.writer.insert(pk, values)?;
 
         if full {
             self.flush()?;
@@ -753,7 +730,7 @@ impl TxnManager {
     /// Lets a reader resolve a PENDING descriptor without forcing a flush. See
     /// `WriteBuffer::row_for` for why the pk is re-checked.
     pub fn buffered_row(&self, pk: u64, offset: usize) -> Option<Vec<u64>> {
-        self.write_buf.lock().row_for(pk, offset)
+        self.writer.row_for(pk, offset)
     }
 
     /// Check the write buffer first, then the in-flight set.
@@ -764,14 +741,14 @@ impl TxnManager {
     /// places so a reader with a PENDING descriptor never falsely reports the
     /// row absent.
     pub fn buffered_or_inflight_row(&self, pk: u64, offset: usize) -> Option<Vec<u64>> {
-        if let Some(vals) = self.write_buf.lock().row_for(pk, offset) {
+        if let Some(vals) = self.writer.row_for(pk, offset) {
             return Some(vals);
         }
         self.in_flight.lock().get(&pk).cloned()
     }
 
     pub fn row_count_buffered(&self) -> usize {
-        self.write_buf.lock().len()
+        self.writer.len()
     }
 
     pub fn total_rows_flushed(&self) -> u64 {
