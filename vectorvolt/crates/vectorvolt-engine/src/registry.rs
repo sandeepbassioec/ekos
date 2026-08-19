@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::schema::TableSchema;
 use crate::{EngineOptions, EngineResult, TableEngine};
 
 /// Filename written inside every table's directory to record its schema.
@@ -79,6 +80,16 @@ fn read_schema(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
         .map(str::to_owned)
         .filter(|s| !s.is_empty())
         .collect())
+}
+
+fn write_typed_schema(dir: &std::path::Path, schema: &TableSchema) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(SCHEMA_FILE), schema.to_text())
+}
+
+fn read_typed_schema(dir: &std::path::Path) -> EngineResult<TableSchema> {
+    let raw = std::fs::read_to_string(dir.join(SCHEMA_FILE))?;
+    TableSchema::from_text(&raw)
 }
 
 // ── TableRegistry ─────────────────────────────────────────────────────────────
@@ -179,6 +190,42 @@ impl TableRegistry {
         let engine = Arc::new(TableEngine::open_with(schema, &dir, self.options)?);
         tables.insert(name.into(), Arc::clone(&engine));
         Ok(engine)
+    }
+
+    /// Create a table with a typed [`TableSchema`], persist it, and open it.
+    ///
+    /// Writes `<base_dir>/<name>/schema.txt` in the typed `"name:type"` format.
+    /// Returns `Err(TableAlreadyExists)` if the name is already registered.
+    pub fn create_table_typed(
+        &self,
+        name: &str,
+        schema: TableSchema,
+    ) -> EngineResult<Arc<TableEngine>> {
+        use crate::EngineError;
+        validate_name(name)?;
+
+        let mut tables = self.tables.write();
+        if tables.contains_key(name) {
+            return Err(EngineError::TableAlreadyExists(name.into()));
+        }
+
+        let dir = self.base_dir.join(name);
+        write_typed_schema(&dir, &schema)?;
+        let col_names = schema.names();
+        let engine = Arc::new(TableEngine::open_with(col_names, &dir, self.options)?);
+        tables.insert(name.into(), Arc::clone(&engine));
+        Ok(engine)
+    }
+
+    /// Read the persisted [`TableSchema`] for a table without opening its engine.
+    pub fn read_schema(&self, name: &str) -> EngineResult<TableSchema> {
+        use crate::EngineError;
+        validate_name(name)?;
+        let dir = self.base_dir.join(name);
+        if !dir.join(SCHEMA_FILE).exists() {
+            return Err(EngineError::TableNotFound(name.into()));
+        }
+        read_typed_schema(&dir)
     }
 
     /// Return a reference to an existing table, or `Err(TableNotFound)`.

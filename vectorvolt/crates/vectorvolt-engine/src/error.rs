@@ -33,6 +33,12 @@ pub enum EngineError {
 
     #[error("no table selected — send UseTable first")]
     NoTableSelected,
+    #[error("column {col_idx} has type {col_type} but value {value} is not valid for that type")]
+    SchemaMismatch {
+        col_idx: usize,
+        col_type: &'static str,
+        value: u64,
+    },
 
     #[error("transaction {0} not found (already committed, rolled back, or never started)")]
     TxnNotFound(u64),
