@@ -16,10 +16,11 @@
 //! error upstream.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tokio::sync::{Notify, oneshot};
-use tokio::time::{Duration, interval};
+use tokio::time::Duration;
 use tracing::{debug, error, warn};
 
 use crate::error::{WalError, WalResult};
@@ -52,15 +53,30 @@ pub struct BatcherConfig {
     pub max_batch_bytes: usize,
     /// Bounded channel depth. When full, `submit()` returns Backpressure.
     pub channel_capacity: usize,
+    /// Adaptive window: minimum flush interval in nanoseconds (0 = disabled).
+    pub adaptive_window_min_ns: u64,
+    /// Adaptive window: maximum flush interval in nanoseconds (0 = disabled).
+    pub adaptive_window_max_ns: u64,
 }
 
 impl Default for BatcherConfig {
     fn default() -> Self {
         BatcherConfig {
             flush_interval: Duration::from_micros(500),
-            max_batch_bytes: 4 * 1024 * 1024, // 4 MiB
+            max_batch_bytes: 4 * 1024 * 1024,
             channel_capacity: 8192,
+            adaptive_window_min_ns: 0,
+            adaptive_window_max_ns: 0,
         }
+    }
+}
+
+impl BatcherConfig {
+    /// Enable adaptive batch-window tuning for this batcher.
+    pub fn with_adaptive_window(mut self, min_ns: u64, max_ns: u64) -> Self {
+        self.adaptive_window_min_ns = min_ns;
+        self.adaptive_window_max_ns = max_ns;
+        self
     }
 }
 
@@ -69,6 +85,9 @@ pub struct GroupCommitBatcher {
     tx: crossbeam_channel::Sender<Submission>,
     shutdown: Arc<Notify>,
     metrics: BatcherMetrics,
+    /// Current flush window in nanoseconds.  Readable from any thread.
+    /// Updated after each flush when adaptive tuning is enabled.
+    current_window_ns: Arc<AtomicU64>,
 }
 
 impl GroupCommitBatcher {
@@ -85,6 +104,8 @@ impl GroupCommitBatcher {
                 flush_interval,
                 max_batch_bytes,
                 channel_capacity,
+                adaptive_window_min_ns: 0,
+                adaptive_window_max_ns: 0,
             },
         )
     }
@@ -95,24 +116,36 @@ impl GroupCommitBatcher {
         let shutdown = Arc::new(Notify::new());
         let metrics = BatcherMetrics::new();
 
+        let initial_ns = cfg.flush_interval.as_nanos() as u64;
+        let current_window_ns = Arc::new(AtomicU64::new(initial_ns));
+
         let shutdown_bg = shutdown.clone();
         let metrics_bg = metrics.clone();
+        let window_ns_bg = Arc::clone(&current_window_ns);
         let max_bytes = cfg.max_batch_bytes;
+        let adaptive_min = cfg.adaptive_window_min_ns;
+        let adaptive_max = cfg.adaptive_window_max_ns;
+        let adaptive = adaptive_min > 0 && adaptive_max > 0;
 
         tokio::spawn(async move {
-            let mut ticker = interval(cfg.flush_interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
             loop {
+                let window = window_ns_bg.load(Ordering::Relaxed);
                 tokio::select! {
-                    _ = ticker.tick() => {},
+                    _ = tokio::time::sleep(Duration::from_nanos(window)) => {},
                     _ = shutdown_bg.notified() => {
-                        // Graceful drain: flush whatever is queued.
                         Self::drain_and_flush(&rx, &writer, max_bytes, &metrics_bg);
                         break;
                     }
                 }
                 Self::drain_and_flush(&rx, &writer, max_bytes, &metrics_bg);
+
+                if adaptive {
+                    let ema_us = metrics_bg.avg_latency_us();
+                    // Target: 1.2× the EMA latency, converted to nanoseconds.
+                    let target_ns = (ema_us * 1_200.0) as u64;
+                    let new_ns = target_ns.clamp(adaptive_min, adaptive_max);
+                    window_ns_bg.store(new_ns, Ordering::Relaxed);
+                }
             }
         });
 
@@ -120,6 +153,7 @@ impl GroupCommitBatcher {
             tx,
             shutdown,
             metrics,
+            current_window_ns,
         }
     }
 
@@ -209,6 +243,14 @@ impl GroupCommitBatcher {
     /// Live metrics handle — readable from any thread, zero lock contention.
     pub fn metrics(&self) -> &BatcherMetrics {
         &self.metrics
+    }
+
+    /// Current flush window in nanoseconds.
+    ///
+    /// Equals `flush_interval.as_nanos()` when adaptive tuning is disabled.
+    /// Updated after every flush when adaptive tuning is active.
+    pub fn current_window_ns(&self) -> u64 {
+        self.current_window_ns.load(Ordering::Relaxed)
     }
 }
 
