@@ -31,6 +31,9 @@ pub enum EngineError {
     #[error("invalid table name: {0}")]
     InvalidTableName(String),
 
+    #[error("invalid engine config: {0}")]
+    InvalidConfig(String),
+
     #[error("no table selected — send UseTable first")]
     NoTableSelected,
     #[error("column {col_idx} has type {col_type} but value {value} is not valid for that type")]
