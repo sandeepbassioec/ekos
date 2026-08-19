@@ -6,4 +6,5 @@ pub mod keygen;
 pub mod serve;
 pub mod store;
 pub mod table;
+pub mod tune;
 pub mod wal;

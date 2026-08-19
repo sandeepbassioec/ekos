@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use store::OutputFormat;
-use vvctl::commands::{bench, connect, hal, http, keygen, serve, store, table, wal};
+use vvctl::commands::{bench, connect, hal, http, keygen, serve, store, table, tune, wal};
 use vvctl::ui;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -70,6 +70,9 @@ enum Commands {
 
     /// Generate a cryptographically random 32-byte hex secret (for use with --secret).
     Keygen(keygen::KeygenArgs),
+
+    /// Detect hardware and derive recommended engine configuration (VV-CFG-006).
+    Tune(tune::TuneArgs),
 
     /// Print version and build info.
     Version,
@@ -188,6 +191,8 @@ fn main() -> Result<()> {
         Commands::Http(args) => http::run(args)?,
 
         Commands::Keygen(args) => keygen::run(args)?,
+
+        Commands::Tune(args) => tune::run(args)?,
 
         Commands::Version => print_version(),
     }
