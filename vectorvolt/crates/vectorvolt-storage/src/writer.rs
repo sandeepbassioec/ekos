@@ -19,18 +19,20 @@ use std::io::Write;
 use crate::{
     StorageError, StorageResult,
     column::ColumnValues,
-    format::{COL_META_SIZE, COMPRESSION_LZ4, COMPRESSION_NONE, HEADER_FIXED_SIZE, MAGIC, VERSION},
+    format::{
+        COL_META_SIZE, COMPRESSION_LZ4, COMPRESSION_NONE, COMPRESSION_ZSTD, HEADER_FIXED_SIZE,
+        MAGIC, VERSION,
+    },
     partition::MicroPartition,
 };
 
-/// How a partition's column payloads are stored (VV-STO-012).
+/// How a partition's column payloads are stored (VV-STO-012, VV-STO-013).
 ///
 /// Compression is **off by default and must be asked for**. See
-/// [`COMPRESSION_LZ4`] for why: LZ4 covers the whole column payload, so reading
-/// one value costs a full-column decompress, turning `read_value` from O(1) into
-/// O(column). That is the right trade for cold, scan-only data and the wrong one
-/// for everything else, and it is not a decision this crate should make silently
-/// on a caller's behalf.
+/// [`COMPRESSION_LZ4`] for why: compression covers the whole column payload, so
+/// reading one value costs a full-column decompress, turning `read_value` from
+/// O(1) into O(column). That is the right trade for cold, scan-only data and
+/// the wrong one for everything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compression {
     /// Store payloads verbatim. Keeps O(1) point reads.
@@ -38,6 +40,14 @@ pub enum Compression {
     None,
     /// LZ4-compress each column payload. For cold/archive tiers only.
     Lz4,
+    /// Zstd-compress each column payload. Better ratio than LZ4 at similar
+    /// decode throughput. For cold/archival tiers only.
+    Zstd {
+        /// Zstd compression level (1–22). 3 is the Zstd default; higher
+        /// levels compress more but encode more slowly. Decode speed is
+        /// nearly level-independent.
+        level: i32,
+    },
 }
 
 impl Compression {
@@ -45,6 +55,7 @@ impl Compression {
         match self {
             Compression::None => COMPRESSION_NONE,
             Compression::Lz4 => COMPRESSION_LZ4,
+            Compression::Zstd { .. } => COMPRESSION_ZSTD,
         }
     }
 }
@@ -64,6 +75,21 @@ impl WriteOptions {
     /// point-queried — see [`Compression`].
     pub fn with_lz4(mut self) -> Self {
         self.compression = Compression::Lz4;
+        self
+    }
+
+    /// Enable Zstd at the default compression level (3).
+    ///
+    /// Use [`with_zstd_level`](Self::with_zstd_level) to override. Only for
+    /// cold/archival partitions — see [`Compression`].
+    pub fn with_zstd(mut self) -> Self {
+        self.compression = Compression::Zstd { level: 3 };
+        self
+    }
+
+    /// Enable Zstd at a specific compression level (1–22).
+    pub fn with_zstd_level(mut self, level: i32) -> Self {
+        self.compression = Compression::Zstd { level };
         self
     }
 }
@@ -165,6 +191,15 @@ pub fn write_partition_with<W: Write>(
                 // precisely when nothing else helps, and LZ4 on random bytes adds
                 // framing overhead. Storing the larger of the two would make
                 // "enable compression" able to grow a file, so fall back.
+                if packed.len() < payload.len() {
+                    packed
+                } else {
+                    payload
+                }
+            }
+            Compression::Zstd { level } => {
+                let packed = zstd::bulk::compress(&payload, level)
+                    .map_err(|e| StorageError::InvalidData(format!("Zstd compress: {e}")))?;
                 if packed.len() < payload.len() {
                     packed
                 } else {

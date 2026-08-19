@@ -1,4 +1,4 @@
-//! LZ4 compression and the scan decode path (VV-STO-012/013/014).
+//! LZ4 + Zstd compression and the scan decode path (VV-STO-012/013/014).
 
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -384,6 +384,392 @@ fn report_compression_and_scan() {
             lz4_len,
             best,
             pt
+        );
+        assert_eq!(buf, values, "{name}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zstd tests (VV-STO-013)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Zstd round-trips losslessly for every encoding shape.
+#[test]
+fn zstd_round_trips_every_encoding() {
+    for (name, values) in shapes(2000) {
+        let mut p = MicroPartition::new(10, 12);
+        p.push_column("v", ColumnValues::auto_encode(values.clone()))
+            .unwrap();
+        let f = write_with(&p, Some(WriteOptions::new().with_zstd()));
+        let r = PartitionReader::open(f.path()).unwrap();
+
+        let mut buf = Vec::new();
+        r.decode_column_into(0, &mut buf).unwrap();
+        assert_eq!(buf, values, "{name}: decode_column_into under Zstd");
+        assert_eq!(
+            r.read_column(0).unwrap().to_raw_vec(),
+            values,
+            "{name}: read_column under Zstd"
+        );
+        for i in [0usize, 1, values.len() / 2, values.len() - 1] {
+            assert_eq!(
+                r.read_value(0, i).unwrap(),
+                values[i],
+                "{name}: read_value({i})"
+            );
+        }
+        assert_eq!(
+            r.zone_min_max(0).unwrap(),
+            (
+                values.iter().copied().min().unwrap(),
+                values.iter().copied().max().unwrap()
+            ),
+            "{name}: zone survives Zstd"
+        );
+    }
+}
+
+/// Enabling Zstd must never make a file bigger.
+#[test]
+fn zstd_never_inflates_a_file() {
+    for (name, values) in shapes(4096) {
+        let mut p = MicroPartition::new(11, 13);
+        p.push_column("v", ColumnValues::auto_encode(values.clone()))
+            .unwrap();
+
+        let plain = write_with(&p, None);
+        let packed = write_with(&p, Some(WriteOptions::new().with_zstd()));
+        let plain_len = std::fs::metadata(plain.path()).unwrap().len();
+        let packed_len = std::fs::metadata(packed.path()).unwrap().len();
+
+        assert!(
+            packed_len <= plain_len,
+            "{name}: Zstd grew the file, {plain_len} -> {packed_len}"
+        );
+        let r = PartitionReader::open(packed.path()).unwrap();
+        let mut buf = Vec::new();
+        r.decode_column_into(0, &mut buf).unwrap();
+        assert_eq!(buf, values, "{name}: fallback column decoded wrong");
+    }
+}
+
+/// `is_point_read_optimal` reports the truth for Zstd partitions.
+#[test]
+fn zstd_point_read_optimality_reflects_what_was_stored() {
+    // Compressible → actually compressed → not point-optimal.
+    let mut p = MicroPartition::new(12, 14);
+    p.push_column(
+        "v",
+        ColumnValues::Raw((0..4096u64).map(|i| i % 4).collect()),
+    )
+    .unwrap();
+    let f = write_with(&p, Some(WriteOptions::new().with_zstd()));
+    let r = PartitionReader::open(f.path()).unwrap();
+    assert!(
+        r.is_column_compressed(0),
+        "compressible column should compress"
+    );
+    assert!(!r.is_point_read_optimal());
+
+    // Incompressible + Zstd requested → stored verbatim → still point-optimal.
+    let mut p2 = MicroPartition::new(12, 15);
+    p2.push_column("v", ColumnValues::Raw(incompressible(4096)))
+        .unwrap();
+    let f2 = write_with(&p2, Some(WriteOptions::new().with_zstd()));
+    let r2 = PartitionReader::open(f2.path()).unwrap();
+    assert!(
+        !r2.is_column_compressed(0),
+        "incompressible column must fall back to verbatim"
+    );
+    assert!(r2.is_point_read_optimal());
+}
+
+/// Mixed-compressibility partition keeps column offsets under Zstd.
+#[test]
+fn zstd_mixed_compressibility_keeps_offsets() {
+    let n = 2000usize;
+    let cols = shapes(n);
+    let mut p = MicroPartition::new(13, 16);
+    for (name, vals) in &cols {
+        p.push_column(name.to_string(), ColumnValues::auto_encode(vals.clone()))
+            .unwrap();
+    }
+    let f = write_with(&p, Some(WriteOptions::new().with_zstd()));
+    let r = PartitionReader::open(f.path()).unwrap();
+
+    let compressed: Vec<bool> = (0..cols.len()).map(|c| r.is_column_compressed(c)).collect();
+    assert!(
+        compressed.iter().any(|&x| x) && compressed.iter().any(|&x| !x),
+        "expected a mix of compressed and verbatim columns, got {compressed:?}"
+    );
+
+    let mut buf = Vec::new();
+    for (c, (name, vals)) in cols.iter().enumerate() {
+        r.decode_column_into(c, &mut buf).unwrap();
+        assert_eq!(&buf, vals, "column {c} ({name})");
+    }
+}
+
+/// Filter and materialization work on Zstd-compressed columns.
+#[test]
+fn zstd_filter_and_materialize_under_compression() {
+    let values: Vec<u64> = (0..4000u64).map(|i| 1_000_000 + (i * 13) % 900).collect();
+    let mut p = MicroPartition::new(14, 17);
+    p.push_column("v", ColumnValues::auto_encode(values.clone()))
+        .unwrap();
+    let f = write_with(&p, Some(WriteOptions::new().with_zstd()));
+    let r = PartitionReader::open(f.path()).unwrap();
+    assert!(r.is_column_compressed(0), "test needs a compressed column");
+
+    let (lo, hi) = (1_000_000, 1_000_050);
+    let got = r.filter_offsets(0, lo, hi).unwrap();
+    let want: Vec<u32> = values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v >= lo && **v <= hi)
+        .map(|(i, _)| i as u32)
+        .collect();
+    assert_eq!(got, want, "filter under Zstd");
+
+    let rows = r.materialize_rows(&got).unwrap();
+    assert_eq!(rows.len(), want.len());
+    for (row, &off) in rows.iter().zip(&want) {
+        assert_eq!(row[0], values[off as usize], "materialized row {off}");
+    }
+}
+
+/// `decode_column_into` and `read_column` agree under Zstd.
+#[test]
+fn zstd_scan_path_agrees_with_read_column() {
+    for (name, values) in shapes(1500) {
+        let mut p = MicroPartition::new(15, 18);
+        p.push_column("v", ColumnValues::auto_encode(values.clone()))
+            .unwrap();
+        let f = write_with(&p, Some(WriteOptions::new().with_zstd()));
+        let r = PartitionReader::open(f.path()).unwrap();
+
+        let mut fast = Vec::new();
+        r.decode_column_into(0, &mut fast).unwrap();
+        let slow = r.read_column(0).unwrap().to_raw_vec();
+        assert_eq!(fast, slow, "{name}: paths disagree under Zstd");
+        assert_eq!(fast, values, "{name}: wrong values under Zstd");
+    }
+}
+
+/// Scan buffer reuse works the same under Zstd as without compression.
+#[test]
+fn zstd_decode_buffer_is_reused_not_appended() {
+    let a: Vec<u64> = (0..500).collect();
+    let b: Vec<u64> = (1000..1300).collect();
+
+    let mut pa = MicroPartition::new(16, 19);
+    pa.push_column("a", ColumnValues::auto_encode(a.clone()))
+        .unwrap();
+    let fa = write_with(&pa, Some(WriteOptions::new().with_zstd()));
+    let ra = PartitionReader::open(fa.path()).unwrap();
+
+    let mut pb = MicroPartition::new(16, 20);
+    pb.push_column("b", ColumnValues::auto_encode(b.clone()))
+        .unwrap();
+    let fb = write_with(&pb, Some(WriteOptions::new().with_zstd()));
+    let rb = PartitionReader::open(fb.path()).unwrap();
+
+    let mut buf = Vec::new();
+    ra.decode_column_into(0, &mut buf).unwrap();
+    assert_eq!(buf, a);
+    rb.decode_column_into(0, &mut buf).unwrap();
+    assert_eq!(buf, b, "second decode appended instead of replacing");
+    assert_eq!(buf.len(), b.len());
+}
+
+/// A corrupt `uncompressed_len` must not become a huge allocation under Zstd.
+#[test]
+fn zstd_corrupt_uncompressed_length_is_capped() {
+    let values: Vec<u64> = (0..1000u64).map(|i| i % 8).collect();
+    let mut p = MicroPartition::new(17, 21);
+    p.push_column("v", ColumnValues::auto_encode(values))
+        .unwrap();
+    let mut buf: Vec<u8> = Vec::new();
+    write_partition_with(&mut buf, &p, WriteOptions::new().with_zstd()).unwrap();
+
+    let pos = 32 + 3 + 8 + 8 + 8;
+    for bad in [u64::MAX, 1u64 << 60, 1u64 << 40] {
+        let mut corrupt = buf.clone();
+        corrupt[pos..pos + 8].copy_from_slice(&bad.to_le_bytes());
+        let len = corrupt.len();
+        let crc = crc32fast::hash(&corrupt[..len - 4]);
+        corrupt[len - 4..].copy_from_slice(&crc.to_le_bytes());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bad.vvsst");
+        std::fs::write(&path, &corrupt).unwrap();
+        let r = PartitionReader::open(&path).unwrap();
+        assert!(
+            r.read_value(0, 0).is_err(),
+            "uncompressed_len {bad}: should error under Zstd, not allocate"
+        );
+    }
+}
+
+/// Zstd achieves a better ratio than LZ4 on highly-repetitive data.
+///
+/// Zstd uses a larger window and a longer-range matching algorithm. On data that
+/// compresses well (runs of repeated values) Zstd's ratio should be noticeably
+/// better. We only assert a directional improvement — not a specific ratio — to
+/// avoid making the test fragile to crate version changes.
+#[test]
+fn zstd_achieves_better_ratio_than_lz4_on_repetitive_data() {
+    let values: Vec<u64> = vec![42u64; 65536];
+    let mut p = MicroPartition::new(18, 22);
+    p.push_column("v", ColumnValues::auto_encode(values))
+        .unwrap();
+
+    let lz4_f = write_with(&p, Some(WriteOptions::new().with_lz4()));
+    let zstd_f = write_with(&p, Some(WriteOptions::new().with_zstd()));
+    let lz4_len = std::fs::metadata(lz4_f.path()).unwrap().len();
+    let zstd_len = std::fs::metadata(zstd_f.path()).unwrap().len();
+    assert!(
+        zstd_len <= lz4_len,
+        "Zstd ({zstd_len} B) should be at most as large as LZ4 ({lz4_len} B) on all-identical data"
+    );
+}
+
+/// Two separate partition files — one LZ4, one Zstd — are each readable.
+#[test]
+fn zstd_and_lz4_files_both_readable_independently() {
+    let values: Vec<u64> = (0..2000u64).map(|i| i % 100).collect();
+
+    let mut p_lz4 = MicroPartition::new(19, 23);
+    p_lz4
+        .push_column("v", ColumnValues::auto_encode(values.clone()))
+        .unwrap();
+    let f_lz4 = write_with(&p_lz4, Some(WriteOptions::new().with_lz4()));
+
+    let mut p_zstd = MicroPartition::new(19, 24);
+    p_zstd
+        .push_column("v", ColumnValues::auto_encode(values.clone()))
+        .unwrap();
+    let f_zstd = write_with(&p_zstd, Some(WriteOptions::new().with_zstd()));
+
+    for (label, path) in [("lz4", f_lz4.path()), ("zstd", f_zstd.path())] {
+        let r = PartitionReader::open(path).unwrap();
+        let mut buf = Vec::new();
+        r.decode_column_into(0, &mut buf).unwrap();
+        assert_eq!(buf, values, "{label} partition decoded wrong");
+    }
+}
+
+/// Zone statistics are preserved through Zstd compression.
+#[test]
+fn zstd_zone_min_max_survives_compression() {
+    for (name, values) in shapes(1000) {
+        let mut p = MicroPartition::new(20, 25);
+        p.push_column("v", ColumnValues::auto_encode(values.clone()))
+            .unwrap();
+        let f = write_with(&p, Some(WriteOptions::new().with_zstd()));
+        let r = PartitionReader::open(f.path()).unwrap();
+        let (got_min, got_max) = r.zone_min_max(0).unwrap();
+        let want_min = values.iter().copied().min().unwrap();
+        let want_max = values.iter().copied().max().unwrap();
+        assert_eq!(got_min, want_min, "{name}: zone_min");
+        assert_eq!(got_max, want_max, "{name}: zone_max");
+    }
+}
+
+/// The compression byte stored in the file is `COMPRESSION_ZSTD` (= 2).
+#[test]
+fn zstd_compression_byte_is_two() {
+    let values: Vec<u64> = (0..1024u64).map(|i| i % 8).collect();
+    let mut p = MicroPartition::new(21, 26);
+    p.push_column("v", ColumnValues::auto_encode(values))
+        .unwrap();
+    let mut buf: Vec<u8> = Vec::new();
+    write_partition_with(&mut buf, &p, WriteOptions::new().with_zstd()).unwrap();
+
+    // Header: 32 bytes. Schema: name_len[2] + "v"[1] = 3 bytes.
+    // Column metadata starts at 32 + 3 = 35.
+    // Within ColMeta: encoding[1] bit_width[1] compression[1] ...
+    // So compression is at buf[35 + 2] = buf[37].
+    let compression_byte = buf[37];
+    assert_eq!(
+        compression_byte, 2,
+        "expected COMPRESSION_ZSTD (2), got {compression_byte}"
+    );
+}
+
+/// Higher Zstd levels compress at least as well as lower on compressible data.
+#[test]
+fn zstd_higher_level_compresses_at_least_as_well() {
+    let values: Vec<u64> = (0..8192u64).map(|i| i % 64).collect();
+    let mut p_l1 = MicroPartition::new(22, 27);
+    p_l1.push_column("v", ColumnValues::auto_encode(values.clone()))
+        .unwrap();
+    let mut p_l9 = MicroPartition::new(22, 28);
+    p_l9.push_column("v", ColumnValues::auto_encode(values))
+        .unwrap();
+
+    let f_l1 = write_with(&p_l1, Some(WriteOptions::new().with_zstd_level(1)));
+    let f_l9 = write_with(&p_l9, Some(WriteOptions::new().with_zstd_level(9)));
+    let l1_len = std::fs::metadata(f_l1.path()).unwrap().len();
+    let l9_len = std::fs::metadata(f_l9.path()).unwrap().len();
+    assert!(
+        l9_len <= l1_len,
+        "level-9 ({l9_len} B) should be <= level-1 ({l1_len} B)"
+    );
+}
+
+/// Large partition (100 k rows) round-trips under Zstd.
+#[test]
+fn zstd_large_partition_round_trips_100k_rows() {
+    let n = 100_000usize;
+    let values: Vec<u64> = (0..n as u64).map(|i| (i * 31) % 1_000_003).collect();
+    let mut p = MicroPartition::new(23, 29);
+    p.push_column("v", ColumnValues::auto_encode(values.clone()))
+        .unwrap();
+    let f = write_with(&p, Some(WriteOptions::new().with_zstd()));
+    let r = PartitionReader::open(f.path()).unwrap();
+    let mut buf = Vec::new();
+    r.decode_column_into(0, &mut buf).unwrap();
+    assert_eq!(buf, values);
+}
+
+/// Reports Zstd compression ratios alongside LZ4 for comparison.
+#[test]
+fn zstd_report_compression_ratios() {
+    use std::time::Instant;
+    let n = 65536usize;
+    println!(
+        "\n  {:<18} {:>9} {:>9} {:>9} {:>9}  {:>10}",
+        "shape", "raw B", "enc B", "lz4 B", "zstd B", "scan ns/row"
+    );
+    for (name, values) in shapes(n) {
+        let mut p = MicroPartition::new(24, 30);
+        p.push_column("v", ColumnValues::auto_encode(values.clone()))
+            .unwrap();
+        let plain = write_with(&p, None);
+        let lz4_f = write_with(&p, Some(WriteOptions::new().with_lz4()));
+        let zstd_f = write_with(&p, Some(WriteOptions::new().with_zstd()));
+        let enc_len = std::fs::metadata(plain.path()).unwrap().len();
+        let lz4_len = std::fs::metadata(lz4_f.path()).unwrap().len();
+        let zstd_len = std::fs::metadata(zstd_f.path()).unwrap().len();
+
+        let r = PartitionReader::open(plain.path()).unwrap();
+        let mut buf = Vec::new();
+        r.decode_column_into(0, &mut buf).unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            r.decode_column_into(0, &mut buf).unwrap();
+            best = best.min(t.elapsed().as_nanos() as f64 / n as f64);
+        }
+        println!(
+            "  {:<18} {:>9} {:>9} {:>9} {:>9}  {:>10.2}",
+            name,
+            n * 8,
+            enc_len,
+            lz4_len,
+            zstd_len,
+            best
         );
         assert_eq!(buf, values, "{name}");
     }
