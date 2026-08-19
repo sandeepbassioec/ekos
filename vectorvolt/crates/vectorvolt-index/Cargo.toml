@@ -9,9 +9,10 @@ repository.workspace = true
 homepage.workspace   = true
 
 [dependencies]
-thiserror  = { workspace = true }
-bytes      = { workspace = true }
-roaring    = { workspace = true }
+thiserror        = { workspace = true }
+bytes            = { workspace = true }
+roaring          = { workspace = true }
+vectorvolt-hal   = { workspace = true }
 
 [dev-dependencies]
 tempfile   = { workspace = true }

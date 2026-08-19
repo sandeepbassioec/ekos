@@ -318,6 +318,68 @@ pub unsafe fn find_first_eq(values: &[u64], needle: u64) -> Option<usize> {
     }
 }
 
+/// AVX2 [`crate::simd::scalar::zone_overlap_indices`].
+///
+/// Overlap condition per zone: `mins[i] <= hi && maxes[i] >= lo`.
+///
+/// # Safety
+/// Requires runtime AVX2 support. See the module-level safety contract.
+#[target_feature(enable = "avx2")]
+pub unsafe fn zone_overlap_indices(
+    mins: &[u64],
+    maxes: &[u64],
+    lo: u64,
+    hi: u64,
+    out: &mut Vec<u32>,
+) {
+    debug_assert_eq!(mins.len(), maxes.len());
+    // SAFETY: see module-level safety contract. Indices bounded by
+    // `chunks * LANES <= mins.len()`; loads are unaligned-safe.
+    unsafe {
+        let flip = _mm256_set1_epi64x(FLIP);
+        // Broadcast flipped query bounds so comparisons are unsigned-correct.
+        let lo_v = _mm256_xor_si256(_mm256_set1_epi64x(lo as i64), flip);
+        let hi_v = _mm256_xor_si256(_mm256_set1_epi64x(hi as i64), flip);
+
+        let n = mins.len();
+        let chunks = n / LANES;
+        let min_ptr = mins.as_ptr();
+        let max_ptr = maxes.as_ptr();
+
+        for c in 0..chunks {
+            let base = c * LANES;
+            let raw_min = _mm256_loadu_si256(min_ptr.add(base) as *const __m256i);
+            let raw_max = _mm256_loadu_si256(max_ptr.add(base) as *const __m256i);
+
+            // Apply unsigned-to-signed range shift.
+            let min_s = _mm256_xor_si256(raw_min, flip);
+            let max_s = _mm256_xor_si256(raw_max, flip);
+
+            // Prune lane if min > hi (unsigned) or lo > max (unsigned).
+            let min_above_hi = _mm256_cmpgt_epi64(min_s, hi_v);
+            let lo_above_max = _mm256_cmpgt_epi64(lo_v, max_s);
+            let prune = _mm256_or_si256(min_above_hi, lo_above_max);
+
+            let prune_bits = _mm256_movemask_pd(_mm256_castsi256_pd(prune)) as u32;
+            let mut good = !prune_bits & 0x0F;
+
+            while good != 0 {
+                let lane = good.trailing_zeros() as usize;
+                out.push((base + lane) as u32);
+                good &= good - 1;
+            }
+        }
+
+        for i in (chunks * LANES)..n {
+            let min = *min_ptr.add(i);
+            let max = *max_ptr.add(i);
+            if min <= hi && max >= lo {
+                out.push(i as u32);
+            }
+        }
+    }
+}
+
 /// Hardware CRC-32C via the `crc32` instruction (SSE4.2).
 ///
 /// ~20× faster than the bitwise scalar version. Produces identical output to

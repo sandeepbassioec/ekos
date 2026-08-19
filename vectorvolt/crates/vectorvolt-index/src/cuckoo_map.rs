@@ -205,6 +205,14 @@ impl CuckooMap {
         None
     }
 
+    /// Look up every key in `keys`, returning `Some(RowDescriptor)` for each hit.
+    ///
+    /// Equivalent to calling [`get`](Self::get) for each key, but as a batch
+    /// API for scan paths that resolve many PKs at once.
+    pub fn get_batch(&self, keys: &[u64]) -> Vec<Option<RowDescriptor>> {
+        keys.iter().map(|&k| self.get(k)).collect()
+    }
+
     /// Insert or update `key → value`.
     ///
     /// Grows and retries on a failed displacement chain, so insertion is **total**

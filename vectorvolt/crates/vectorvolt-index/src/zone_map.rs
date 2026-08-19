@@ -41,6 +41,7 @@
 //! conservatively scanned.
 
 use std::collections::HashMap;
+use vectorvolt_hal::simd;
 
 /// Min/max statistics for one micro-partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +145,96 @@ impl ZoneMap {
 impl Default for ZoneMap {
     fn default() -> Self {
         ZoneMap::new()
+    }
+}
+
+// ── ZoneVec ───────────────────────────────────────────────────────────────────
+
+/// SoA (Structure-of-Arrays) zone store for SIMD-accelerated range pruning.
+///
+/// `ZoneMap` uses a `HashMap<u16, ZoneEntry>` — good for random access but
+/// unsuitable for the tight vector loop that is the hot path of a range scan.
+/// `ZoneVec` keeps three parallel arrays (`pids`, `mins`, `maxes`) so the min
+/// and max values sit in cache-friendly linear memory. The HAL's
+/// `simd::zone_overlap_indices` kernel then processes 4 zones per instruction
+/// on AVX2 hardware.
+///
+/// ## Building one
+///
+/// Push zones directly with [`ZoneVec::push`], or convert an existing
+/// [`ZoneMap`] with [`ZoneVec::from_zone_map`]. Iteration order is not
+/// guaranteed.
+///
+/// ## Querying
+///
+/// [`ZoneVec::overlapping_pids`] returns the ids of every partition whose zone
+/// overlaps the query range. The same caveats as [`ZoneMap::overlapping_partitions`]
+/// apply: unregistered partitions are absent, so subtract from the real partition
+/// list rather than using this as a scan list directly.
+pub struct ZoneVec {
+    pids: Vec<u32>,
+    mins: Vec<u64>,
+    maxes: Vec<u64>,
+}
+
+impl ZoneVec {
+    pub fn new() -> Self {
+        ZoneVec {
+            pids: Vec::new(),
+            mins: Vec::new(),
+            maxes: Vec::new(),
+        }
+    }
+
+    /// Number of zones stored.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.pids.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.pids.is_empty()
+    }
+
+    /// Append a zone for `pid` with bounds `[min, max]`.
+    pub fn push(&mut self, pid: u32, min: u64, max: u64) {
+        self.pids.push(pid);
+        self.mins.push(min);
+        self.maxes.push(max);
+    }
+
+    /// Build a `ZoneVec` from an existing [`ZoneMap`].
+    pub fn from_zone_map(zm: &ZoneMap) -> Self {
+        let mut v = ZoneVec::with_capacity(zm.len());
+        for (&pid, &e) in &zm.entries {
+            v.push(pid as u32, e.min, e.max);
+        }
+        v
+    }
+
+    fn with_capacity(n: usize) -> Self {
+        ZoneVec {
+            pids: Vec::with_capacity(n),
+            mins: Vec::with_capacity(n),
+            maxes: Vec::with_capacity(n),
+        }
+    }
+
+    /// Return the partition IDs whose zone overlaps `[lo, hi]`.
+    ///
+    /// Uses the HAL SIMD kernel for the inner loop — AVX2 on capable hardware,
+    /// portable scalar otherwise.
+    pub fn overlapping_pids(&self, lo: u64, hi: u64) -> Vec<u32> {
+        let mut indices: Vec<u32> = Vec::new();
+        simd::zone_overlap_indices(&self.mins, &self.maxes, lo, hi, &mut indices);
+        indices.iter().map(|&i| self.pids[i as usize]).collect()
+    }
+}
+
+impl Default for ZoneVec {
+    fn default() -> Self {
+        ZoneVec::new()
     }
 }
 
