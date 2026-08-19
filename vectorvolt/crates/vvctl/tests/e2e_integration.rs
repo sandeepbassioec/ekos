@@ -40,6 +40,7 @@ impl E2EHarness {
             key_id: "default".into(),
             cert: None,
             key: None,
+            config: None,
             multi: false,
             http_addr: None,
             http_token: None,

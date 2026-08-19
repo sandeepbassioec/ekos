@@ -75,6 +75,14 @@ pub struct ServeArgs {
     #[arg(long)]
     pub multi: bool,
 
+    /// Load engine tunables from a TOML config file (VV-ENG-017).
+    ///
+    /// When provided, `flush_threshold`, `durability`, `max_partitions`, and
+    /// `[[columns]]` are read from the file. CLI flags that overlap with config
+    /// values are ignored; the config file takes precedence.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
     /// Also start an HTTP/REST gateway on this address (e.g. `127.0.0.1:7879`).
     ///
     /// The gateway exposes a JSON API that mirrors the wire-protocol opcodes,
@@ -107,12 +115,20 @@ pub struct BoundServer {
 type ServerBuilder = Box<dyn FnOnce(ServerConfig) -> Result<Server>>;
 
 pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
+    // ── Config file (VV-ENG-017) ──────────────────────────────────────────────
+    let (cfg_opts, _cfg_schema) = if let Some(ref path) = args.config {
+        vectorvolt_engine::load_config(path)
+            .with_context(|| format!("load config {}", path.display()))?
+    } else {
+        (EngineOptions::new(FLUSH_THRESHOLD), None)
+    };
+
     // ── Schema / table setup ──────────────────────────────────────────────────
     let (server_builder, schema, engine, registry) = if args.multi {
         // Multi-table mode: open catalog root.
         std::fs::create_dir_all(&args.dir)
             .with_context(|| format!("create catalog root {}", args.dir.display()))?;
-        let opts = EngineOptions::new(FLUSH_THRESHOLD);
+        let opts = cfg_opts;
         let reg = Arc::new(
             TableRegistry::open(&args.dir, opts)
                 .with_context(|| format!("open catalog at {}", args.dir.display()))?,
@@ -159,7 +175,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
             args.columns.clone()
         };
         let eng = Arc::new(
-            TableEngine::open(schema.clone(), &args.dir, FLUSH_THRESHOLD)
+            TableEngine::open(schema.clone(), &args.dir, cfg_opts.flush_threshold)
                 .with_context(|| "open engine")?,
         );
         let eng2 = Arc::clone(&eng);

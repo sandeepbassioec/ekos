@@ -38,6 +38,7 @@ fn start_plain(dir: &TempDir) -> (SocketAddr, impl FnOnce()) {
         cert: None,
         key: None,
         multi: false,
+        config: None,
         http_addr: None,
         http_token: None,
     };
@@ -69,6 +70,7 @@ fn start_authed(dir: &TempDir, secret_hex: &str) -> (SocketAddr, impl FnOnce()) 
         cert: None,
         key: None,
         multi: false,
+        config: None,
         http_addr: None,
         http_token: None,
     };
@@ -127,6 +129,7 @@ fn bind_creates_schema_file_for_new_table() {
         cert: None,
         key: None,
         multi: false,
+        config: None,
         http_addr: None,
         http_token: None,
     };
@@ -153,6 +156,7 @@ fn bind_reads_existing_schema_from_disk() {
         cert: None,
         key: None,
         multi: false,
+        config: None,
         http_addr: None,
         http_token: None,
     };
@@ -176,6 +180,7 @@ fn bind_fails_when_no_table_and_no_columns() {
         cert: None,
         key: None,
         multi: false,
+        config: None,
         http_addr: None,
         http_token: None,
     };
@@ -198,6 +203,7 @@ fn bind_fails_with_cert_but_no_key() {
         cert: Some(std::path::PathBuf::from("nonexistent.pem")),
         key: None,
         multi: false,
+        config: None,
         http_addr: None,
         http_token: None,
     };
