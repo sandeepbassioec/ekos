@@ -45,6 +45,9 @@ pub enum EngineError {
 
     #[error("transaction {0} not found (already committed, rolled back, or never started)")]
     TxnNotFound(u64),
+
+    #[error("invalid YAML schema: {0}")]
+    InvalidYamlSchema(String),
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;

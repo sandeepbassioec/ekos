@@ -51,6 +51,8 @@ mod stats;
 mod ttl;
 mod update_where;
 pub mod views;
+pub mod yaml_schema;
+
 mod window;
 
 pub use aggregate::HistogramBucket;

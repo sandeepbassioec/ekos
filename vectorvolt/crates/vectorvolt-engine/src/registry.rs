@@ -301,6 +301,18 @@ impl TableRegistry {
         self.catalog_wal.is_some()
     }
 
+    /// Create a table from a YAML schema file.
+    ///
+    /// The YAML must match the format expected by [`crate::yaml_schema::load_yaml_schema`].
+    /// The table name is taken from the YAML `table` field, ignoring any name passed by
+    /// the caller. Returns `Err(TableAlreadyExists)` if the table is already registered.
+    pub fn create_from_yaml_file(&self, path: &std::path::Path) -> EngineResult<Arc<TableEngine>> {
+        use crate::yaml_schema::{load_yaml_schema, yaml_def_to_schema};
+        let def = load_yaml_schema(path)?;
+        let schema = yaml_def_to_schema(&def)?;
+        self.create_table_typed(&def.table, schema)
+    }
+
     fn log_ddl(&self, mutation: Mutation) {
         if let Some(wal) = &self.catalog_wal {
             let payload = mutation.encode();
