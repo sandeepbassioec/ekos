@@ -682,6 +682,44 @@ impl PartitionReader {
         Ok(out)
     }
 
+    /// Count rows where column `col_idx` falls in `[lo, hi]`, without allocating a match Vec.
+    ///
+    /// Equivalent to `filter_offsets(col_idx, lo, hi)?.len()` but uses
+    /// `simd::count_range` which avoids writing the matching indices. Prefer this
+    /// over `filter_offsets` when you only need the count (e.g. index cardinality
+    /// estimates, selectivity probes).
+    pub fn count_matching(&self, col_idx: usize, lo: u64, hi: u64) -> StorageResult<usize> {
+        if lo > hi {
+            return Ok(0);
+        }
+        let mut scratch = Vec::new();
+        self.decode_column_into(col_idx, &mut scratch)?;
+        Ok(vectorvolt_hal::simd::count_range(&scratch, lo, hi))
+    }
+
+    /// SIMD wrapping-sum of every value in column `col_idx`.
+    ///
+    /// Useful for aggregate queries (`SUM(col)`). The sum wraps on overflow, matching
+    /// the semantics of `simd::sum`.
+    pub fn column_sum(&self, col_idx: usize) -> StorageResult<u64> {
+        let mut scratch = Vec::new();
+        self.decode_column_into(col_idx, &mut scratch)?;
+        Ok(vectorvolt_hal::simd::sum(&scratch))
+    }
+
+    /// SIMD `(min, max)` of every value in column `col_idx`, or `None` if the
+    /// partition is empty.
+    ///
+    /// This decodes the full column and runs `simd::min_max` on the result.
+    /// For the stored per-column zone statistics use [`zone_min_max`](Self::zone_min_max),
+    /// which is cheaper (no decode). This method is correct even for columns that
+    /// were written before zone stats existed.
+    pub fn column_min_max(&self, col_idx: usize) -> StorageResult<Option<(u64, u64)>> {
+        let mut scratch = Vec::new();
+        self.decode_column_into(col_idx, &mut scratch)?;
+        Ok(vectorvolt_hal::simd::min_max(&scratch))
+    }
+
     /// Every column's value for one row, via the [`read_value`](Self::read_value) path.
     pub fn read_row(&self, row_offset: usize) -> StorageResult<Vec<u64>> {
         let n = self.col_count as usize;
