@@ -420,6 +420,11 @@ pub async fn query_handler(
                         .collect(),
                 }),
                 vectorvolt_query::QueryResponse::Purged(n) => Json(QueryResp::Purged { purged: n }),
+                // DDL responses are only reachable via execute_ddl, not through the HTTP DML handler.
+                vectorvolt_query::QueryResponse::TableCreated { .. }
+                | vectorvolt_query::QueryResponse::TableDropped { .. } => {
+                    unreachable!("DDL responses not reachable through HTTP DML handler")
+                }
             };
             json.into_response()
         }

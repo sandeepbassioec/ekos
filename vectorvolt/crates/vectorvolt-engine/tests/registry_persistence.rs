@@ -27,7 +27,7 @@ fn create_table_writes_schema_file() {
     assert!(schema_path.exists(), "schema.txt not written");
     let content = std::fs::read_to_string(&schema_path).unwrap();
     let cols: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(cols, vec!["id", "age"]);
+    assert_eq!(cols, vec!["id:u64", "age:u64"]);
 }
 
 // ── open() restores tables ────────────────────────────────────────────────────

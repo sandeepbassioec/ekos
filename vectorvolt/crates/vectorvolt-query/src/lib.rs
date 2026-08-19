@@ -31,5 +31,5 @@ mod parser;
 
 pub use engine::QueryEngine;
 pub use error::{QueryError, QueryResult};
-pub use executor::{QueryResponse, execute, run};
+pub use executor::{QueryResponse, execute, execute_ddl, run, run_ddl};
 pub use parser::{Query, parse};
