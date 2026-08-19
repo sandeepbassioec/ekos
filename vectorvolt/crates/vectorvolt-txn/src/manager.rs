@@ -285,6 +285,51 @@ impl TxnManager {
         Ok(tip)
     }
 
+    // ── UPSERT ─────────────────────────────────────────────────────────────────
+
+    /// Insert or overwrite a row.  WAL-logged as a single `Mutation::Upsert`.
+    ///
+    /// If `pk` already exists in the index, the old index entry is removed
+    /// before the new row is pushed (equivalent to delete + insert, but with a
+    /// single WAL record).  If `pk` is absent, behaves identically to `insert`.
+    pub fn upsert(&self, pk: u64, values: Vec<u64>) -> TxnResult<WalTip> {
+        if values.len() != self.schema.len() {
+            return Err(TxnError::SchemaMismatch {
+                expected: self.schema.len(),
+                got: values.len(),
+            });
+        }
+
+        // WAL first — a single Upsert record covers both the remove and the push.
+        let mutation = Mutation::Upsert {
+            pk,
+            values: values.clone(),
+        };
+        let tip = self.commit(mutation.encode())?;
+
+        // Remove stale index entry if the pk already exists.
+        if self.pk_index.read().get(pk).is_some() {
+            self.pk_index.write().remove(pk);
+        }
+
+        // Secondary index + filter.
+        {
+            let mut sec = self.secondary_index.write();
+            for (col_idx, &val) in values.iter().enumerate().skip(1) {
+                sec.insert(col_value_hash(col_idx, val), pk as u32);
+            }
+        }
+        self.fk_filter.write().insert(pk)?;
+
+        // Push to the writer thread; auto-flush on threshold.
+        let full = self.writer.insert(pk, values)?;
+        if full {
+            self.flush()?;
+        }
+
+        Ok(tip)
+    }
+
     // ── FLUSH ──────────────────────────────────────────────────────────────────
 
     /// Flush the write buffer to a `.vvsst` partition file.

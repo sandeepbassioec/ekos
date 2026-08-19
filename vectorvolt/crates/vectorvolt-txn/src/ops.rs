@@ -14,6 +14,7 @@ use crate::error::{TxnError, TxnResult};
 
 pub const OP_INSERT: u8 = 0x00;
 pub const OP_DELETE: u8 = 0x01;
+pub const OP_UPSERT: u8 = 0x02;
 pub const OP_DDL_CREATE: u8 = 0x10;
 pub const OP_DDL_DROP: u8 = 0x11;
 
@@ -21,6 +22,7 @@ pub const OP_DDL_DROP: u8 = 0x11;
 pub enum Mutation {
     Insert { pk: u64, values: Vec<u64> },
     Delete { pk: u64 },
+    Upsert { pk: u64, values: Vec<u64> },
     DdlCreate { table_name: String },
     DdlDrop { table_name: String },
 }
@@ -28,7 +30,9 @@ pub enum Mutation {
 impl Mutation {
     pub fn pk(&self) -> u64 {
         match self {
-            Mutation::Insert { pk, .. } | Mutation::Delete { pk } => *pk,
+            Mutation::Insert { pk, .. } | Mutation::Delete { pk } | Mutation::Upsert { pk, .. } => {
+                *pk
+            }
             Mutation::DdlCreate { .. } | Mutation::DdlDrop { .. } => 0,
         }
     }
@@ -47,6 +51,14 @@ impl Mutation {
             Mutation::Delete { pk } => {
                 buf.write_u8(OP_DELETE).unwrap();
                 buf.write_u64::<LittleEndian>(*pk).unwrap();
+            }
+            Mutation::Upsert { pk, values } => {
+                buf.write_u8(OP_UPSERT).unwrap();
+                buf.write_u64::<LittleEndian>(*pk).unwrap();
+                buf.write_u32::<LittleEndian>(values.len() as u32).unwrap();
+                for &v in values {
+                    buf.write_u64::<LittleEndian>(v).unwrap();
+                }
             }
             Mutation::DdlCreate { table_name } | Mutation::DdlDrop { table_name } => {
                 let op = if matches!(self, Mutation::DdlCreate { .. }) {
@@ -92,6 +104,23 @@ impl Mutation {
                     .read_u64::<LittleEndian>()
                     .map_err(|_| TxnError::CorruptPayload("truncated pk".into()))?;
                 Ok(Mutation::Delete { pk })
+            }
+            OP_UPSERT => {
+                let pk = cur
+                    .read_u64::<LittleEndian>()
+                    .map_err(|_| TxnError::CorruptPayload("truncated pk".into()))?;
+                let count = cur
+                    .read_u32::<LittleEndian>()
+                    .map_err(|_| TxnError::CorruptPayload("truncated value_count".into()))?
+                    as usize;
+                let mut values = Vec::with_capacity(count);
+                for i in 0..count {
+                    let v = cur.read_u64::<LittleEndian>().map_err(|_| {
+                        TxnError::CorruptPayload(format!("truncated upsert value at index {i}"))
+                    })?;
+                    values.push(v);
+                }
+                Ok(Mutation::Upsert { pk, values })
             }
             OP_DDL_CREATE | OP_DDL_DROP => {
                 let name_len = cur

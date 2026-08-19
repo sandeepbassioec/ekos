@@ -375,6 +375,10 @@ impl TableEngine {
                     Ok(Mutation::Delete { pk }) => {
                         txn.pk_index.write().remove(pk);
                     }
+                    Ok(Mutation::Upsert { pk, values }) => {
+                        txn.pk_index.write().remove(pk);
+                        let _ = txn.replay_insert(pk, values);
+                    }
                     Ok(Mutation::DdlCreate { .. }) | Ok(Mutation::DdlDrop { .. }) => {}
                     Err(_) => {}
                 }
