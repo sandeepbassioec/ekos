@@ -227,6 +227,15 @@ impl CuckooFilter {
         self.buckets[i1].contains(fp) || self.buckets[i2].contains(fp)
     }
 
+    /// Check membership for every key in `keys`.
+    ///
+    /// Equivalent to calling [`contains`](Self::contains) for each key, but as
+    /// a batch API that is cache-friendlier for large key sets and
+    /// vectorization-ready for a future fingerprint-batch HAL kernel.
+    pub fn contains_batch(&self, keys: &[u64]) -> Vec<bool> {
+        keys.iter().map(|&k| self.contains(k)).collect()
+    }
+
     /// Remove `key` from the filter. Returns `true` if found and removed.
     pub fn remove(&mut self, key: u64) -> bool {
         if self.overflow.remove(&key) {

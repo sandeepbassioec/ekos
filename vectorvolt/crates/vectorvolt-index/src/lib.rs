@@ -26,7 +26,7 @@ pub use cuckoo_filter::CuckooFilter;
 pub use cuckoo_map::CuckooMap;
 pub use row_descriptor::RowDescriptor;
 pub use secondary_index::SecondaryIndex;
-pub use zone_map::{ZoneEntry, ZoneMap};
+pub use zone_map::{ZoneEntry, ZoneMap, ZoneVec};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 

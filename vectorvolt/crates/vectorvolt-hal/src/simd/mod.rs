@@ -297,6 +297,22 @@ pub fn find_first_eq(values: &[u64], needle: u64) -> Option<usize> {
     scalar::find_first_eq(values, needle)
 }
 
+/// Append the index of every zone whose `[mins[i], maxes[i]]` overlaps `[lo, hi]`.
+///
+/// Both slices must be the same length. This is the SIMD inner loop behind
+/// `ZoneVec::overlapping_pids` — the caller maps the returned indices back to
+/// partition IDs.
+#[inline]
+pub fn zone_overlap_indices(mins: &[u64], maxes: &[u64], lo: u64, hi: u64, out: &mut Vec<u32>) {
+    #[cfg(target_arch = "x86_64")]
+    if tier() == SimdTier::Avx2 {
+        // SAFETY: `tier()` confirmed AVX2 support via cpuid.
+        unsafe { avx2::zone_overlap_indices(mins, maxes, lo, hi, out) };
+        return;
+    }
+    scalar::zone_overlap_indices(mins, maxes, lo, hi, out);
+}
+
 /// Total set bits across `words`.
 ///
 /// No vector variant: `POPCNT` is already one instruction per word, and SIMD

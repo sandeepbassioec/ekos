@@ -54,6 +54,21 @@ pub fn find_first_eq(values: &[u64], needle: u64) -> Option<usize> {
     values.iter().position(|&v| v == needle)
 }
 
+/// Append the index of every zone pair where `mins[i] <= hi && maxes[i] >= lo`.
+///
+/// This is the inner loop of ZoneMap range pruning: given parallel arrays of
+/// per-partition min and max statistics, find which partitions overlap the
+/// query range `[lo, hi]`.
+#[inline]
+pub fn zone_overlap_indices(mins: &[u64], maxes: &[u64], lo: u64, hi: u64, out: &mut Vec<u32>) {
+    debug_assert_eq!(mins.len(), maxes.len());
+    for (i, (&min, &max)) in mins.iter().zip(maxes.iter()).enumerate() {
+        if min <= hi && max >= lo {
+            out.push(i as u32);
+        }
+    }
+}
+
 /// Total set bits across `words`.
 ///
 /// Already one `POPCNT` instruction per word on any modern CPU — the SIMD
