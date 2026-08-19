@@ -48,6 +48,9 @@ pub enum EngineError {
 
     #[error("invalid YAML schema: {0}")]
     InvalidYamlSchema(String),
+
+    #[error("alter table failed: {0}")]
+    AlterTableError(String),
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;

@@ -379,7 +379,9 @@ impl TableEngine {
                         txn.pk_index.write().remove(pk);
                         let _ = txn.replay_insert(pk, values);
                     }
-                    Ok(Mutation::DdlCreate { .. }) | Ok(Mutation::DdlDrop { .. }) => {}
+                    Ok(Mutation::DdlCreate { .. })
+                    | Ok(Mutation::DdlDrop { .. })
+                    | Ok(Mutation::DdlAlter { .. }) => {}
                     Err(_) => {}
                 }
             }
