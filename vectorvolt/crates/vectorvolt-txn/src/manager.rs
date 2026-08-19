@@ -33,7 +33,7 @@ use vectorvolt_storage::{
 pub use vectorvolt_wal::WalTip;
 use vectorvolt_wal::{SyncCommitter, SyncStats, WalWriter};
 
-use crate::{TxnError, TxnResult, buffer::WriteBuffer, ops::Mutation};
+use crate::{TxnError, TxnResult, ops::Mutation, ring_buffer::RingBuffer};
 
 // Sentinel file_id for rows still in the write buffer.
 /// `file_id` marking a descriptor that points into the write buffer rather than
@@ -57,7 +57,12 @@ pub struct TxnManager {
     pub secondary_index: RwLock<SecondaryIndex>,
     pub zone_map: RwLock<ZoneMap>,
     pub fk_filter: RwLock<CuckooFilter>,
-    write_buf: Mutex<WriteBuffer>,
+    /// Write buffer — a pre-allocated LMAX-style ring buffer.
+    ///
+    /// Wrapped in `Mutex` until per-shard writer threads land (VV-TXN-009),
+    /// at which point the external lock will be removed and the ring buffer will
+    /// run in a true single-producer configuration.
+    write_buf: Mutex<RingBuffer>,
     flush_dir: PathBuf,
     pub schema: Vec<String>,
     next_file_id: AtomicU16,
@@ -122,7 +127,7 @@ impl TxnManager {
             secondary_index: RwLock::new(SecondaryIndex::new()),
             zone_map: RwLock::new(ZoneMap::new()),
             fk_filter: RwLock::new(CuckooFilter::with_capacity(64)),
-            write_buf: Mutex::new(WriteBuffer::new(flush_threshold, schema_width)),
+            write_buf: Mutex::new(RingBuffer::new(flush_threshold, schema_width)),
             flush_dir: flush_dir.into(),
             schema,
             next_file_id: AtomicU16::new(0),
@@ -224,12 +229,15 @@ impl TxnManager {
         // entry. `full` is captured inside the scope and acted on after the lock is
         // dropped, because `flush` takes the same lock.
         let full = {
-            let mut buf = self.write_buf.lock();
+            let buf = self.write_buf.lock();
             let buf_offset = buf.len() as u32;
             self.pk_index
                 .write()
                 .insert(pk, RowDescriptor::new(PENDING_FILE_ID, 0, buf_offset))?;
-            buf.push(pk, values)
+            // RingBuffer::push returns Err(()) only when the ring is physically
+            // full (head-tail == capacity). Normal operation auto-flushes at
+            // flush_threshold, so Err here signals a full ring — treat as full.
+            buf.push(pk, values).unwrap_or(true)
         };
 
         // 6. Auto-flush if the buffer filled.
@@ -529,7 +537,7 @@ impl TxnManager {
         // the index lock while holding the buffer lock in the other order.
         // `in_flight` is innermost and never held across another acquisition.
         let rows = {
-            let mut buf_guard = self.write_buf.lock();
+            let buf_guard = self.write_buf.lock();
             let rows = buf_guard.drain();
             if rows.is_empty() {
                 return Ok(None);
@@ -698,12 +706,12 @@ impl TxnManager {
         // Write buffer + pk_index under ONE lock acquisition (same ordering as
         // `insert` to avoid ABBA deadlocks).
         let full = {
-            let mut buf = self.write_buf.lock();
+            let buf = self.write_buf.lock();
             let buf_offset = buf.len() as u32;
             self.pk_index
                 .write()
                 .insert(pk, RowDescriptor::new(PENDING_FILE_ID, 0, buf_offset))?;
-            buf.push(pk, values)
+            buf.push(pk, values).unwrap_or(true)
         };
 
         if full {
@@ -745,10 +753,7 @@ impl TxnManager {
     /// Lets a reader resolve a PENDING descriptor without forcing a flush. See
     /// `WriteBuffer::row_for` for why the pk is re-checked.
     pub fn buffered_row(&self, pk: u64, offset: usize) -> Option<Vec<u64>> {
-        self.write_buf
-            .lock()
-            .row_for(pk, offset)
-            .map(|v| v.to_vec())
+        self.write_buf.lock().row_for(pk, offset)
     }
 
     /// Check the write buffer first, then the in-flight set.
@@ -759,12 +764,7 @@ impl TxnManager {
     /// places so a reader with a PENDING descriptor never falsely reports the
     /// row absent.
     pub fn buffered_or_inflight_row(&self, pk: u64, offset: usize) -> Option<Vec<u64>> {
-        if let Some(vals) = self
-            .write_buf
-            .lock()
-            .row_for(pk, offset)
-            .map(|v| v.to_vec())
-        {
+        if let Some(vals) = self.write_buf.lock().row_for(pk, offset) {
             return Some(vals);
         }
         self.in_flight.lock().get(&pk).cloned()

@@ -32,6 +32,7 @@ pub mod buffer;
 pub mod error;
 pub mod manager;
 pub mod ops;
+pub mod ring_buffer;
 
 pub use error::{TxnError, TxnResult};
 pub use manager::{FlushResult, PENDING_FILE_ID, TxnManager, WalTip};
