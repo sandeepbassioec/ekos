@@ -299,10 +299,7 @@ impl ColumnValues {
     /// blocked frame.
     pub fn zone_min_max(&self) -> (u64, u64) {
         fn min_max(vs: &[u64]) -> (u64, u64) {
-            match (vs.iter().copied().min(), vs.iter().copied().max()) {
-                (Some(a), Some(b)) => (a, b),
-                _ => (0, 0),
-            }
+            vectorvolt_hal::simd::min_max(vs).unwrap_or((0, 0))
         }
         match self {
             ColumnValues::Raw(v) => min_max(v),
