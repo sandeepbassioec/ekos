@@ -1,7 +1,7 @@
 //! Parse a token stream into a [`Query`] AST.
 
 use crate::error::{QueryError, QueryResult};
-use crate::lexer::{tokenize, Keyword, Token};
+use crate::lexer::{Keyword, Token, tokenize};
 
 /// The AST for one query statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -263,6 +263,19 @@ pub enum Query {
 
     /// `PURGE EXPIRED NOW <n>`
     PurgeExpired { now: u64 },
+
+    // ── Layer 82: DDL ─────────────────────────────────────────────────────────
+    /// `CREATE TABLE <name> COL <col_name> <type> [COL <col_name> <type> ...]`
+    ///
+    /// At least one `COL` clause is required. Unknown type tokens default to
+    /// `u64`. Example: `CREATE TABLE orders COL pk u64 COL price decimal`.
+    CreateTable {
+        name: String,
+        columns: Vec<(String, String)>,
+    },
+
+    /// `DROP TABLE <name>`
+    DropTable { name: String },
 }
 
 /// Parse a query string into a [`Query`].
@@ -438,7 +451,7 @@ impl Parser {
                     Ok(Query::ScanWithTtl { now })
                 } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
                     self.next(); // consume WHERE
-                                 // parse 1..N  col=<n> lo=<lo> hi=<hi>  triplets separated by optional AND
+                    // parse 1..N  col=<n> lo=<lo> hi=<hi>  triplets separated by optional AND
                     let mut predicates = Vec::new();
                     loop {
                         self.expect_keyword(Keyword::Col)?;
@@ -588,7 +601,7 @@ impl Parser {
                     Some(t) => {
                         return Err(QueryError::Syntax(format!(
                             "expected COUNT/SUM/MIN/MAX after GROUP, got {t:?}"
-                        )))
+                        )));
                     }
                     None => return Err(QueryError::UnexpectedEof),
                 };
@@ -652,7 +665,7 @@ impl Parser {
                     Some(t) => {
                         return Err(QueryError::Syntax(format!(
                             "expected RUNNING_SUM/RUNNING_COUNT/RANK/DENSE_RANK after WINDOW, got {t:?}"
-                        )))
+                        )));
                     }
                     None => return Err(QueryError::UnexpectedEof),
                 };
@@ -669,11 +682,7 @@ impl Parser {
                             agg_col,
                         })
                     }
-                    Keyword::RunningCount => Ok(Query::WindowRunningCount {
-                        filter_col,
-                        lo,
-                        hi,
-                    }),
+                    Keyword::RunningCount => Ok(Query::WindowRunningCount { filter_col, lo, hi }),
                     Keyword::Rank => {
                         self.expect_keyword(Keyword::SortCol)?;
                         self.expect_eq()?;
@@ -765,7 +774,7 @@ impl Parser {
                     Some(t) => {
                         return Err(QueryError::Syntax(format!(
                             "expected GET/DELETE/INSERT after BATCH, got {t:?}"
-                        )))
+                        )));
                     }
                     None => return Err(QueryError::UnexpectedEof),
                 };
@@ -819,9 +828,81 @@ impl Parser {
                 Ok(Query::PurgeExpired { now })
             }
 
+            // ── Layer 82: DDL ─────────────────────────────────────────────────
+            Keyword::Create => {
+                self.expect_keyword(Keyword::Table)?;
+                let name = self.expect_ident()?;
+                let mut columns = Vec::new();
+                while matches!(self.peek(), Some(Token::Keyword(Keyword::Col))) {
+                    self.next(); // consume COL
+                    let col_name = self.expect_ident()?;
+                    let type_str = self.parse_col_type();
+                    columns.push((col_name, type_str));
+                }
+                if columns.is_empty() {
+                    return Err(QueryError::Syntax(
+                        "CREATE TABLE requires at least one COL clause".into(),
+                    ));
+                }
+                Ok(Query::CreateTable { name, columns })
+            }
+
+            Keyword::Drop => {
+                self.expect_keyword(Keyword::Table)?;
+                let name = self.expect_ident()?;
+                Ok(Query::DropTable { name })
+            }
+
             other => Err(QueryError::Syntax(format!(
                 "{other:?} is not a statement keyword"
             ))),
+        }
+    }
+
+    fn expect_ident(&mut self) -> QueryResult<String> {
+        match self.next() {
+            Some(Token::Ident(s)) => Ok(s),
+            Some(t) => Err(QueryError::Syntax(format!(
+                "expected identifier, got {t:?}"
+            ))),
+            None => Err(QueryError::UnexpectedEof),
+        }
+    }
+
+    fn parse_col_type(&mut self) -> String {
+        match self.peek() {
+            Some(Token::Keyword(Keyword::U64Kw)) => {
+                self.next();
+                "u64".into()
+            }
+            Some(Token::Keyword(Keyword::I64Kw)) => {
+                self.next();
+                "i64".into()
+            }
+            Some(Token::Keyword(Keyword::F64Kw)) => {
+                self.next();
+                "f64".into()
+            }
+            Some(Token::Keyword(Keyword::BoolKw)) => {
+                self.next();
+                "bool".into()
+            }
+            Some(Token::Keyword(Keyword::TimestampKw)) => {
+                self.next();
+                "timestamp".into()
+            }
+            Some(Token::Keyword(Keyword::DecimalKw)) => {
+                self.next();
+                "decimal".into()
+            }
+            Some(Token::Ident(_)) => {
+                if let Some(Token::Ident(s)) = self.next() {
+                    s
+                } else {
+                    "u64".into()
+                }
+            }
+            _ => "u64".into(),
         }
     }
 

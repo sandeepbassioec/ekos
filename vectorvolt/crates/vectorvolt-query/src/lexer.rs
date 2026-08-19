@@ -87,6 +87,17 @@ pub enum Keyword {
     Purge,
     Expired,
     Now,
+    // Layer 82 additions — DDL
+    Create,
+    Table,
+    Drop,
+    // Column type tokens (used after COL <name> <type>)
+    U64Kw,
+    I64Kw,
+    F64Kw,
+    BoolKw,
+    TimestampKw,
+    DecimalKw,
 }
 
 impl Keyword {
@@ -157,6 +168,15 @@ impl Keyword {
             "PURGE" => Some(Self::Purge),
             "EXPIRED" => Some(Self::Expired),
             "NOW" => Some(Self::Now),
+            "CREATE" => Some(Self::Create),
+            "TABLE" => Some(Self::Table),
+            "DROP" => Some(Self::Drop),
+            "U64" => Some(Self::U64Kw),
+            "I64" => Some(Self::I64Kw),
+            "F64" => Some(Self::F64Kw),
+            "BOOL" => Some(Self::BoolKw),
+            "TIMESTAMP" => Some(Self::TimestampKw),
+            "DECIMAL" => Some(Self::DecimalKw),
             _ => None,
         }
     }

@@ -101,6 +101,13 @@ pub enum QueryResponse {
 
     /// Number of rows purged by PURGE EXPIRED.
     Purged(usize),
+
+    // ── Layer 82: DDL ─────────────────────────────────────────────────────────
+    /// CREATE TABLE succeeded; `name` is the table that was created.
+    TableCreated { name: String },
+
+    /// DROP TABLE succeeded; `name` is the table that was dropped.
+    TableDropped { name: String },
 }
 
 /// Execute `query` against `engine`.
@@ -453,6 +460,11 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
             let n = engine.purge_expired(now)?;
             Ok(QueryResponse::Purged(n))
         }
+
+        // DDL queries require a registry; reject them here.
+        Query::CreateTable { .. } | Query::DropTable { .. } => Err(
+            crate::error::QueryError::Syntax("DDL queries must use execute_ddl()".into()),
+        ),
     }
 }
 
@@ -460,4 +472,50 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
 pub fn run(engine: &TableEngine, input: &str) -> QueryResult<QueryResponse> {
     let query = crate::parser::parse(input)?;
     execute(engine, query)
+}
+
+// ── Layer 82: DDL ─────────────────────────────────────────────────────────────
+
+/// Execute a DDL [`Query`] (CREATE TABLE / DROP TABLE) against `registry`.
+///
+/// DML queries belong to [`execute`] which operates on a single `TableEngine`.
+/// DDL queries operate on the registry and must use this function instead.
+pub fn execute_ddl(
+    registry: &vectorvolt_engine::TableRegistry,
+    query: Query,
+) -> QueryResult<QueryResponse> {
+    use crate::error::QueryError;
+    use vectorvolt_engine::schema::{ColumnDef, TableSchema};
+
+    match query {
+        Query::CreateTable { name, columns } => {
+            let col_defs: Vec<ColumnDef> = columns
+                .into_iter()
+                .map(|(col_name, type_str)| ColumnDef::from_line(&format!("{col_name}:{type_str}")))
+                .collect();
+            let schema = TableSchema::new(col_defs).map_err(QueryError::Engine)?;
+            registry
+                .create_table_typed(&name, schema)
+                .map_err(QueryError::Engine)?;
+            Ok(QueryResponse::TableCreated { name })
+        }
+
+        Query::DropTable { name } => {
+            registry.drop_table(&name).map_err(QueryError::Engine)?;
+            Ok(QueryResponse::TableDropped { name })
+        }
+
+        other => Err(QueryError::Syntax(format!(
+            "{other:?} is not a DDL query; use execute() for DML"
+        ))),
+    }
+}
+
+/// Parse and execute a DDL query string against `registry`.
+pub fn run_ddl(
+    registry: &vectorvolt_engine::TableRegistry,
+    input: &str,
+) -> QueryResult<QueryResponse> {
+    let query = crate::parser::parse(input)?;
+    execute_ddl(registry, query)
 }
