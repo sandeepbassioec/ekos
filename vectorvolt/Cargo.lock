@@ -2180,6 +2180,7 @@ dependencies = [
  "roaring",
  "tempfile",
  "thiserror",
+ "vectorvolt-hal",
 ]
 
 [[package]]
@@ -2206,6 +2207,9 @@ dependencies = [
  "tempfile",
  "thiserror",
  "vectorvolt-engine",
+ "vectorvolt-hal",
+ "vectorvolt-index",
+ "vectorvolt-storage",
 ]
 
 [[package]]

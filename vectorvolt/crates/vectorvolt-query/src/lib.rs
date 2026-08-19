@@ -20,11 +20,16 @@
 //! | `HISTOGRAM col=<n> lo=<lo> hi=<hi> buckets=<b>` | `HISTOGRAM col=1 lo=0 hi=100 buckets=5` |
 //! | `PERCENTILE col=<n> lo=<lo> hi=<hi> p=<0-100>` | `PERCENTILE col=1 lo=0 hi=100 p=95` |
 
+pub mod catalog;
+pub mod engine;
+pub mod row;
+
 mod error;
 mod executor;
 mod lexer;
 mod parser;
 
+pub use engine::QueryEngine;
 pub use error::{QueryError, QueryResult};
-pub use executor::{execute, run, QueryResponse};
-pub use parser::{parse, Query};
+pub use executor::{QueryResponse, execute, run};
+pub use parser::{Query, parse};
