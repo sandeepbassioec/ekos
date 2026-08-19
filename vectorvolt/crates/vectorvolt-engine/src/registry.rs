@@ -33,6 +33,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use vectorvolt_txn::ops::Mutation;
+use vectorvolt_wal::{WalConfig, WalWriter};
 
 use crate::schema::TableSchema;
 use crate::{EngineOptions, EngineResult, TableEngine};
@@ -85,6 +87,9 @@ pub struct TableRegistry {
     base_dir: PathBuf,
     options: EngineOptions,
     tables: RwLock<HashMap<String, Arc<TableEngine>>>,
+    /// Optional catalog WAL — when set, every CREATE / DROP TABLE is appended
+    /// as a `DdlCreate` / `DdlDrop` mutation for audit / replay.
+    catalog_wal: Option<WalWriter>,
 }
 
 impl TableRegistry {
@@ -96,6 +101,7 @@ impl TableRegistry {
             base_dir: base_dir.into(),
             options,
             tables: RwLock::new(HashMap::new()),
+            catalog_wal: None,
         }
     }
 
@@ -138,6 +144,7 @@ impl TableRegistry {
             base_dir,
             options,
             tables: RwLock::new(map),
+            catalog_wal: None,
         })
     }
 
@@ -152,6 +159,7 @@ impl TableRegistry {
             base_dir: PathBuf::new(),
             options: EngineOptions::default(),
             tables: RwLock::new(map),
+            catalog_wal: None,
         }
     }
 
@@ -176,6 +184,10 @@ impl TableRegistry {
         write_typed_schema(&dir, &typed)?;
         let engine = Arc::new(TableEngine::open_typed(typed, &dir, self.options)?);
         tables.insert(name.into(), Arc::clone(&engine));
+        drop(tables);
+        self.log_ddl(Mutation::DdlCreate {
+            table_name: name.into(),
+        });
         Ok(engine)
     }
 
@@ -200,6 +212,10 @@ impl TableRegistry {
         write_typed_schema(&dir, &schema)?;
         let engine = Arc::new(TableEngine::open_typed(schema, &dir, self.options)?);
         tables.insert(name.into(), Arc::clone(&engine));
+        drop(tables);
+        self.log_ddl(Mutation::DdlCreate {
+            table_name: name.into(),
+        });
         Ok(engine)
     }
 
@@ -240,6 +256,9 @@ impl TableRegistry {
         // Best-effort: remove schema.txt so the table is not re-opened on restart.
         let schema_path = self.base_dir.join(name).join(SCHEMA_FILE);
         let _ = std::fs::remove_file(schema_path);
+        self.log_ddl(Mutation::DdlDrop {
+            table_name: name.into(),
+        });
         Ok(())
     }
 
@@ -253,5 +272,52 @@ impl TableRegistry {
     /// True if `"default"` is registered (backward-compat check).
     pub fn has_default(&self) -> bool {
         self.tables.read().contains_key("default")
+    }
+
+    /// True if a table with the given name is currently registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tables.read().contains_key(name)
+    }
+
+    /// Number of tables currently registered.
+    pub fn table_count(&self) -> usize {
+        self.tables.read().len()
+    }
+
+    /// Attach a catalog WAL so that CREATE / DROP TABLE events are durably
+    /// logged.  `wal_dir` is the directory where the catalog WAL segments
+    /// are stored (typically `<base_dir>/_catalog_wal`).
+    ///
+    /// Returns an error if the WAL directory cannot be opened.
+    pub fn enable_catalog_wal(&mut self, wal_dir: impl Into<PathBuf>) -> EngineResult<()> {
+        let cfg = WalConfig::default().with_dir(wal_dir).with_fsync(false);
+        let writer = WalWriter::open(cfg)?;
+        self.catalog_wal = Some(writer);
+        Ok(())
+    }
+
+    /// Whether a catalog WAL is currently attached.
+    pub fn has_catalog_wal(&self) -> bool {
+        self.catalog_wal.is_some()
+    }
+
+    /// Create a table from a YAML schema file.
+    ///
+    /// The YAML must match the format expected by [`crate::yaml_schema::load_yaml_schema`].
+    /// The table name is taken from the YAML `table` field, ignoring any name passed by
+    /// the caller. Returns `Err(TableAlreadyExists)` if the table is already registered.
+    pub fn create_from_yaml_file(&self, path: &std::path::Path) -> EngineResult<Arc<TableEngine>> {
+        use crate::yaml_schema::{load_yaml_schema, yaml_def_to_schema};
+        let def = load_yaml_schema(path)?;
+        let schema = yaml_def_to_schema(&def)?;
+        self.create_table_typed(&def.table, schema)
+    }
+
+    fn log_ddl(&self, mutation: Mutation) {
+        if let Some(wal) = &self.catalog_wal {
+            let payload = mutation.encode();
+            let _ = wal.append(payload);
+            let _ = wal.flush();
+        }
     }
 }
