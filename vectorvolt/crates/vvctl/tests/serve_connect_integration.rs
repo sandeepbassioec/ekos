@@ -1,10 +1,10 @@
-/// End-to-end integration tests for `vvctl serve` + `vvctl connect`.
+﻿/// End-to-end integration tests for `vvctl serve` + `vvctl connect`.
 ///
 /// Each test binds a real server on an ephemeral port, drives it through
 /// `connect::run` or the `Client` API, then shuts it down cleanly.
 ///
-/// Schema: pk(u64), age(u64), score(u64) — 3 columns total.
-/// `Client::insert(pk, values)` — `values` contains ALL columns including pk
+/// Schema: pk(u64), age(u64), score(u64) â€” 3 columns total.
+/// `Client::insert(pk, values)` â€” `values` contains ALL columns including pk
 /// at index 0, matching how `vectorvolt-engine` stores rows.
 use std::net::SocketAddr;
 use std::thread;
@@ -13,7 +13,7 @@ use anyhow::Result;
 use tempfile::TempDir;
 use vectorvolt_net::Client;
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn ephemeral() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
@@ -41,6 +41,10 @@ fn start_plain(dir: &TempDir) -> (SocketAddr, impl FnOnce()) {
         config: None,
         http_addr: None,
         http_token: None,
+        flush_threshold: None,
+        durability: None,
+        max_partitions: None,
+        catalog: false,
     };
 
     let bound = bind(&args).expect("bind");
@@ -73,6 +77,10 @@ fn start_authed(dir: &TempDir, secret_hex: &str) -> (SocketAddr, impl FnOnce()) 
         config: None,
         http_addr: None,
         http_token: None,
+        flush_threshold: None,
+        durability: None,
+        max_partitions: None,
+        catalog: false,
     };
 
     let bound = bind(&args).expect("bind");
@@ -112,7 +120,7 @@ fn row(pk: u64, age: u64, score: u64) -> Vec<u64> {
     vec![pk, age, score]
 }
 
-// ── serve: bind() unit-level ──────────────────────────────────────────────────
+// â”€â”€ serve: bind() unit-level â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn bind_creates_schema_file_for_new_table() {
@@ -132,6 +140,10 @@ fn bind_creates_schema_file_for_new_table() {
         config: None,
         http_addr: None,
         http_token: None,
+        flush_threshold: None,
+        durability: None,
+        max_partitions: None,
+        catalog: false,
     };
     let bound = bind(&args).unwrap();
     bound.server.shutdown_handle().shutdown();
@@ -148,7 +160,7 @@ fn bind_reads_existing_schema_from_disk() {
 
     let args = ServeArgs {
         dir: dir.path().to_path_buf(),
-        columns: vec![], // ignored — schema already on disk
+        columns: vec![], // ignored â€” schema already on disk
         addr: ephemeral(),
         max_connections: 4,
         secret: None,
@@ -159,6 +171,10 @@ fn bind_reads_existing_schema_from_disk() {
         config: None,
         http_addr: None,
         http_token: None,
+        flush_threshold: None,
+        durability: None,
+        max_partitions: None,
+        catalog: false,
     };
     let bound = bind(&args).unwrap();
     bound.server.shutdown_handle().shutdown();
@@ -183,6 +199,10 @@ fn bind_fails_when_no_table_and_no_columns() {
         config: None,
         http_addr: None,
         http_token: None,
+        flush_threshold: None,
+        durability: None,
+        max_partitions: None,
+        catalog: false,
     };
     assert!(bind(&args).is_err());
 }
@@ -206,11 +226,15 @@ fn bind_fails_with_cert_but_no_key() {
         config: None,
         http_addr: None,
         http_token: None,
+        flush_threshold: None,
+        durability: None,
+        max_partitions: None,
+        catalog: false,
     };
     assert!(bind(&args).is_err());
 }
 
-// ── connect: ping ─────────────────────────────────────────────────────────────
+// â”€â”€ connect: ping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn connect_ping_round_trips() {
@@ -231,7 +255,7 @@ fn connect_to_closed_port_returns_error() {
     assert!(result.is_err(), "expected connection error");
 }
 
-// ── connect: CRUD ─────────────────────────────────────────────────────────────
+// â”€â”€ connect: CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn connect_insert_then_get_round_trips() {
@@ -297,7 +321,7 @@ fn connect_delete_missing_row_returns_ok() {
     assert!(result.is_ok(), "delete-missing: {result:?}");
 }
 
-// ── connect: scan ─────────────────────────────────────────────────────────────
+// â”€â”€ connect: scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn connect_scan_returns_inserted_rows() {
@@ -348,7 +372,7 @@ fn connect_scan_empty_range_returns_ok() {
     assert!(result.is_ok(), "empty-scan: {result:?}");
 }
 
-// ── connect: stats / flush / compact ─────────────────────────────────────────
+// â”€â”€ connect: stats / flush / compact â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn connect_stats_returns_ok() {
@@ -392,7 +416,7 @@ fn connect_compact_returns_ok() {
     assert!(result.is_ok(), "compact: {result:?}");
 }
 
-// ── connect: auth paths ───────────────────────────────────────────────────────
+// â”€â”€ connect: auth paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const SECRET_HEX: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
 
@@ -457,7 +481,7 @@ fn connect_unauthenticated_to_authed_server_ping_ok_insert_fails() {
     assert!(ins.is_err(), "unauthenticated insert must fail: {ins:?}");
 }
 
-// ── full lifecycle via connect::run ──────────────────────────────────────────
+// â”€â”€ full lifecycle via connect::run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn full_crud_lifecycle_via_connect_run() {
@@ -494,14 +518,14 @@ fn full_crud_lifecycle_via_connect_run() {
     )
     .unwrap();
     plain(addr, ConnectCommand::Delete { pk: 100 }).unwrap();
-    plain(addr, ConnectCommand::Get { pk: 100 }).unwrap(); // missing now — still Ok
+    plain(addr, ConnectCommand::Get { pk: 100 }).unwrap(); // missing now â€” still Ok
     plain(addr, ConnectCommand::Flush).unwrap();
     plain(addr, ConnectCommand::Stats).unwrap();
     plain(addr, ConnectCommand::Compact).unwrap();
     shutdown();
 }
 
-// ── direct Client API: verify underlying round-trips ─────────────────────────
+// â”€â”€ direct Client API: verify underlying round-trips â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn client_insert_and_get_match() {
@@ -565,10 +589,10 @@ fn client_stats_reflect_inserted_rows() {
     let (rows, _parts, _bytes) = c.stats().unwrap();
     shutdown();
 
-    assert!(rows >= 3, "stats must report ≥3 rows; got {rows}");
+    assert!(rows >= 3, "stats must report â‰¥3 rows; got {rows}");
 }
 
-// ── connect: secondary-lookup ─────────────────────────────────────────────────
+// â”€â”€ connect: secondary-lookup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn connect_secondary_lookup_returns_matching_rows() {
@@ -631,7 +655,7 @@ fn connect_secondary_lookup_no_match_returns_ok() {
     );
 }
 
-// ── connect: fk-exists ────────────────────────────────────────────────────────
+// â”€â”€ connect: fk-exists â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn connect_fk_exists_true_for_inserted_pk() {
@@ -675,7 +699,7 @@ fn connect_fk_exists_false_for_unknown_pk() {
     assert!(result.is_ok(), "fk-exists for unknown pk: {result:?}");
 }
 
-// ── direct Client API: secondary_scan + fk_exists ────────────────────────────
+// â”€â”€ direct Client API: secondary_scan + fk_exists â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn client_secondary_scan_finds_inserted_value() {

@@ -22,13 +22,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use vectorvolt_engine::{EngineOptions, TableEngine, TableRegistry};
+use vectorvolt_engine::{
+    CliOverrides, ShardCatalog, SystemProfile, TableEngine, TableRegistry, load_config_full,
+};
 use vectorvolt_http::{HttpServer, HttpServerConfig};
 use vectorvolt_net::tls::ServerTlsConfig;
 use vectorvolt_net::{AuthConfig, Scope, Secret, Server, ServerConfig};
 
 const SCHEMA_FILE: &str = "schema.txt";
-const FLUSH_THRESHOLD: usize = 1_048_576;
 
 #[derive(Args)]
 pub struct ServeArgs {
@@ -75,13 +76,31 @@ pub struct ServeArgs {
     #[arg(long)]
     pub multi: bool,
 
-    /// Load engine tunables from a TOML config file (VV-ENG-017).
+    /// Load engine tunables from a TOML or YAML config file (VV-ENG-017).
     ///
-    /// When provided, `flush_threshold`, `durability`, `max_partitions`, and
-    /// `[[columns]]` are read from the file. CLI flags that overlap with config
-    /// values are ignored; the config file takes precedence.
+    /// Precedence (highest wins): CLI flags > VECTORVOLT_* env vars > config file > host profile.
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Override flush threshold (rows buffered before WAL flush). Wins over config + env.
+    #[arg(long)]
+    pub flush_threshold: Option<usize>,
+
+    /// Override durability mode ("fsync" | "write_only" | "buffered"). Wins over config + env.
+    #[arg(long)]
+    pub durability: Option<String>,
+
+    /// Override max partitions per table. Wins over config + env.
+    #[arg(long)]
+    pub max_partitions: Option<usize>,
+
+    /// Open a ShardCatalog (TxnManager-backed) alongside the wire server.
+    ///
+    /// Implies multi-table mode. The catalog is stored at `<dir>/catalog/` and
+    /// exposed via `BoundServer.catalog` for direct TxnManager access. The wire
+    /// server is bound via `TableRegistry` until S4 adds native catalog binding.
+    #[arg(long)]
+    pub catalog: bool,
 
     /// Also start an HTTP/REST gateway on this address (e.g. `127.0.0.1:7879`).
     ///
@@ -110,18 +129,39 @@ pub struct BoundServer {
     pub engine: Option<Arc<TableEngine>>,
     /// Multi-table mode: the opened registry (None in single-table mode).
     pub registry: Option<Arc<TableRegistry>>,
+    /// `--catalog` mode: ShardCatalog at `<dir>/catalog/` (None otherwise). L105.
+    pub catalog: Option<Arc<ShardCatalog>>,
+    /// Resolved EngineOptions (flush_threshold, durability) after full precedence chain.
+    pub engine_opts_flush_threshold: usize,
 }
 
 type ServerBuilder = Box<dyn FnOnce(ServerConfig) -> Result<Server>>;
 
+/// Build [`CliOverrides`] from the parsed [`ServeArgs`].
+pub fn cli_overrides_from_args(args: &ServeArgs) -> CliOverrides {
+    let mut o = CliOverrides::new();
+    if let Some(v) = args.flush_threshold {
+        o = o.with_flush_threshold(v);
+    }
+    if let Some(ref v) = args.durability {
+        o = o.with_durability(v.as_str());
+    }
+    if let Some(v) = args.max_partitions {
+        o = o.with_max_partitions(v);
+    }
+    o
+}
+
 pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
-    // ── Config file (VV-ENG-017) ──────────────────────────────────────────────
-    let (cfg_opts, _cfg_schema) = if let Some(ref path) = args.config {
-        vectorvolt_engine::load_config(path)
-            .with_context(|| format!("load config {}", path.display()))?
-    } else {
-        (EngineOptions::new(FLUSH_THRESHOLD), None)
-    };
+    // ── Config — full 4-layer precedence chain (L104: VV-ENG-017) ────────────
+    let cli_overrides = cli_overrides_from_args(args);
+    let (cfg_opts, _cfg_schema) = load_config_full(
+        args.config.as_deref(),
+        &SystemProfile::probe(),
+        &cli_overrides,
+    )
+    .with_context(|| "load engine config")?;
+    let resolved_flush_threshold = cfg_opts.flush_threshold;
 
     // ── Schema / table setup ──────────────────────────────────────────────────
     let (server_builder, schema, engine, registry) = if args.multi {
@@ -221,6 +261,18 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
 
     let server = server_builder(config)?;
 
+    // ── ShardCatalog (L105: VV-CTL-001) ─────────────────────────────────────
+    // Opened at <dir>/catalog/ when --catalog is set.  Stored in BoundServer
+    // for direct TxnManager access; S4 will add native catalog wire binding.
+    let catalog = if args.catalog {
+        let catalog_dir = args.dir.join("catalog");
+        std::fs::create_dir_all(&catalog_dir)
+            .with_context(|| format!("create catalog dir {}", catalog_dir.display()))?;
+        Some(Arc::new(ShardCatalog::new(&catalog_dir)))
+    } else {
+        None
+    };
+
     Ok(BoundServer {
         server,
         auth,
@@ -228,6 +280,8 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         tls_enabled,
         engine,
         registry,
+        catalog,
+        engine_opts_flush_threshold: resolved_flush_threshold,
     })
 }
 
@@ -239,6 +293,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
         tls_enabled,
         engine,
         registry,
+        catalog,
+        engine_opts_flush_threshold,
     } = bind(&args)?;
 
     let local = server.local_addr()?;
@@ -262,6 +318,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eprintln!("  table     : {}", args.dir.display());
         eprintln!("  schema    : {}", schema.join(", "));
     }
+    if let Some(ref cat) = catalog {
+        eprintln!("  catalog   : {} table(s) ready", cat.table_count());
+    }
     eprintln!(
         "  auth      : {}",
         if auth.is_enabled() {
@@ -275,7 +334,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         if tls_enabled { "enabled" } else { "plaintext" }
     );
     eprintln!("  max conns : {}", args.max_connections);
-    eprintln!("  flush thr : {} rows", FLUSH_THRESHOLD);
+    eprintln!("  flush thr : {} rows", engine_opts_flush_threshold);
 
     // ── HTTP gateway (optional) ───────────────────────────────────────────────
     let http_token = args.http_token.clone();
