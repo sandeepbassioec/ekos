@@ -334,6 +334,53 @@ impl TxnManager {
         Ok(tip)
     }
 
+    // ── UPSERT BATCH ──────────────────────────────────────────────────────────
+
+    /// Insert-or-overwrite multiple rows as a single WAL record.
+    ///
+    /// All rows are validated before the WAL commit. For each row, if the PK
+    /// already exists in the index the old entry is removed before the new row
+    /// is pushed (same semantics as `upsert`). New PKs are inserted as normal.
+    ///
+    /// Returns `Err(SchemaMismatch)` for the first row whose value count does
+    /// not match the schema. On error, no rows from the batch are modified.
+    pub fn upsert_batch(&self, rows: Vec<(u64, Vec<u64>)>) -> TxnResult<WalTip> {
+        for (_, values) in &rows {
+            if values.len() != self.schema.len() {
+                return Err(TxnError::SchemaMismatch {
+                    expected: self.schema.len(),
+                    got: values.len(),
+                });
+            }
+        }
+
+        let tip = self.commit(Mutation::UpsertBatch { rows: rows.clone() }.encode())?;
+
+        let mut any_full = false;
+        for (pk, values) in rows {
+            // Remove old index entry if present (upsert semantics).
+            self.pk_index.write().remove(pk);
+
+            {
+                let mut sec = self.secondary_index.write();
+                for (col_idx, &val) in values.iter().enumerate().skip(1) {
+                    sec.insert(col_value_hash(col_idx, val), pk as u32);
+                }
+            }
+            self.fk_filter.write().insert(pk)?;
+            let full = self.writer.insert(pk, values)?;
+            if full {
+                any_full = true;
+            }
+        }
+
+        if any_full {
+            self.flush()?;
+        }
+
+        Ok(tip)
+    }
+
     // ── DELETE BATCH ──────────────────────────────────────────────────────────
 
     /// Delete multiple rows as a single WAL record.

@@ -390,6 +390,12 @@ impl TableEngine {
                             idx.remove(pk);
                         }
                     }
+                    Ok(Mutation::UpsertBatch { rows }) => {
+                        for (pk, values) in rows {
+                            txn.pk_index.write().remove(pk);
+                            let _ = txn.replay_insert(pk, values);
+                        }
+                    }
                     Ok(Mutation::DdlCreate { .. })
                     | Ok(Mutation::DdlDrop { .. })
                     | Ok(Mutation::DdlAlter { .. }) => {}
