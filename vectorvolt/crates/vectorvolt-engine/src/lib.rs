@@ -61,7 +61,7 @@ pub use cdc::{ChangeEvent, ChangeKind};
 pub use cdc_log::{CdcLog, CdcLogStats};
 pub use compact::CompactResult;
 pub use cond::UpsertResult;
-pub use config::load_config;
+pub use config::{load_config, load_config_auto, load_config_with_profile};
 pub use engine::TableEngine;
 pub use engine::{Durability, EngineOptions, FlushResult, WalTip};
 pub use error::{EngineError, EngineResult};
