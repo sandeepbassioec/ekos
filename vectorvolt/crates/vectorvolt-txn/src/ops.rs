@@ -9,7 +9,8 @@
 //! DdlDrop:   op=0x11 | name_len u32 | name bytes (UTF-8)
 //! DdlAlter:  op=0x12 | name_len u32 | name bytes | add_count u32 | [col_len u32 | col bytes]* | drop_count u32 | [col_len u32 | col bytes]*
 //! InsertBatch: op=0x03 | row_count u32 | [(pk u64 | value_count u32 | values [u64; value_count])*]
-//! DeleteBatch: op=0x04 | pk_count u32 | [pk u64]*
+//! DeleteBatch:  op=0x04 | pk_count u32 | [pk u64]*
+//! UpsertBatch: op=0x05 | row_count u32 | [(pk u64 | value_count u32 | values [u64; value_count])*]
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read};
@@ -24,6 +25,7 @@ pub const OP_DDL_DROP: u8 = 0x11;
 pub const OP_DDL_ALTER: u8 = 0x12;
 pub const OP_INSERT_BATCH: u8 = 0x03;
 pub const OP_DELETE_BATCH: u8 = 0x04;
+pub const OP_UPSERT_BATCH: u8 = 0x05;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mutation {
@@ -43,6 +45,9 @@ pub enum Mutation {
     },
     DeleteBatch {
         pks: Vec<u64>,
+    },
+    UpsertBatch {
+        rows: Vec<(u64, Vec<u64>)>,
     },
     DdlCreate {
         table_name: String,
@@ -65,6 +70,7 @@ impl Mutation {
             }
             Mutation::InsertBatch { rows } => rows.first().map(|(pk, _)| *pk).unwrap_or(0),
             Mutation::DeleteBatch { pks } => pks.first().copied().unwrap_or(0),
+            Mutation::UpsertBatch { rows } => rows.first().map(|(pk, _)| *pk).unwrap_or(0),
             Mutation::DdlCreate { .. } | Mutation::DdlDrop { .. } | Mutation::DdlAlter { .. } => 0,
         }
     }
@@ -108,6 +114,17 @@ impl Mutation {
                 buf.write_u32::<LittleEndian>(pks.len() as u32).unwrap();
                 for &pk in pks {
                     buf.write_u64::<LittleEndian>(pk).unwrap();
+                }
+            }
+            Mutation::UpsertBatch { rows } => {
+                buf.write_u8(OP_UPSERT_BATCH).unwrap();
+                buf.write_u32::<LittleEndian>(rows.len() as u32).unwrap();
+                for (pk, values) in rows {
+                    buf.write_u64::<LittleEndian>(*pk).unwrap();
+                    buf.write_u32::<LittleEndian>(values.len() as u32).unwrap();
+                    for &v in values {
+                        buf.write_u64::<LittleEndian>(v).unwrap();
+                    }
                 }
             }
             Mutation::DdlCreate { table_name } | Mutation::DdlDrop { table_name } => {
@@ -222,6 +239,33 @@ impl Mutation {
                     rows.push((pk, values));
                 }
                 Ok(Mutation::InsertBatch { rows })
+            }
+            OP_UPSERT_BATCH => {
+                let row_count = cur.read_u32::<LittleEndian>().map_err(|_| {
+                    TxnError::CorruptPayload("truncated upsert_batch row_count".into())
+                })? as usize;
+                let mut rows = Vec::with_capacity(row_count.min(65536));
+                for i in 0..row_count {
+                    let pk = cur.read_u64::<LittleEndian>().map_err(|_| {
+                        TxnError::CorruptPayload(format!("truncated upsert_batch pk at row {i}"))
+                    })?;
+                    let count = cur.read_u32::<LittleEndian>().map_err(|_| {
+                        TxnError::CorruptPayload(format!(
+                            "truncated upsert_batch value_count at row {i}"
+                        ))
+                    })? as usize;
+                    let mut values = Vec::with_capacity(count.min(65536));
+                    for j in 0..count {
+                        let v = cur.read_u64::<LittleEndian>().map_err(|_| {
+                            TxnError::CorruptPayload(format!(
+                                "truncated upsert_batch value at row {i} col {j}"
+                            ))
+                        })?;
+                        values.push(v);
+                    }
+                    rows.push((pk, values));
+                }
+                Ok(Mutation::UpsertBatch { rows })
             }
             OP_DELETE_BATCH => {
                 let pk_count = cur.read_u32::<LittleEndian>().map_err(|_| {
