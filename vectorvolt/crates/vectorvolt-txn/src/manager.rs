@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 
 use vectorvolt_index::{CuckooFilter, CuckooMap, RowDescriptor, SecondaryIndex, ZoneMap};
-use vectorvolt_storage::{ColumnValues, MicroPartition, write_partition};
+use vectorvolt_storage::{ColumnValues, MicroPartition, PartitionReader, write_partition};
 use vectorvolt_storage::{
     CompactionOptions, CompactionOutcome, CompactionStrategy, Liveness, Manifest, ManifestEdit,
     ManifestRecovery, PartitionMeta, RowLocation, WriteOptions,
@@ -287,6 +287,62 @@ impl TxnManager {
         }
 
         Ok(tip)
+    }
+
+    // ── READ ──────────────────────────────────────────────────────────────────
+
+    /// Fetch a single row by primary key.
+    ///
+    /// Returns `Ok(None)` if the key does not exist (not in `pk_index`).
+    ///
+    /// Two storage tiers are checked:
+    /// 1. **Pending** (`file_id == PENDING_FILE_ID`): row is still in the
+    ///    write buffer or the `in_flight` map (rows transferred to the writer
+    ///    thread but not yet flushed).  `in_flight` is checked first because
+    ///    the writer thread populates it atomically before returning from
+    ///    `Drain`, so a row_offset that no longer points into the ring belongs
+    ///    there.
+    /// 2. **Flushed**: row lives in a `.vvsst` partition file.  The file is
+    ///    opened via `PartitionReader`, which validates the magic and CRC
+    ///    before any column is read.
+    pub fn get(&self, pk: u64) -> TxnResult<Option<Vec<u64>>> {
+        let desc = match self.pk_index.read().get(pk) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let row_offset = desc.row_offset() as usize;
+
+        if desc.file_id() == PENDING_FILE_ID {
+            // Try in_flight map first (row handed to writer thread but not yet
+            // flushed to disk).
+            if let Some(values) = self.in_flight.lock().get(&pk).cloned() {
+                return Ok(Some(values));
+            }
+            // Fall back to the ring buffer (row still buffered locally).
+            let values = self
+                .writer
+                .row_for(pk, row_offset)
+                .ok_or(TxnError::PkNotFound(pk))?;
+            return Ok(Some(values));
+        }
+
+        // Flushed path: open the .vvsst file and read the row.
+        let file_id = desc.file_id();
+        let partition_id = desc.partition_id();
+        let filename = format!("{file_id:05}_{partition_id:05}.vvsst");
+        let path = self.flush_dir.join(&filename);
+        let reader = PartitionReader::open(&path)?;
+        let values = reader.read_row(row_offset)?;
+        Ok(Some(values))
+    }
+
+    /// Return all primary keys currently present in the index.
+    ///
+    /// The list is a snapshot — concurrent inserts or deletes may not be
+    /// reflected. PKs are returned in unspecified order.
+    pub fn scan_all_pks(&self) -> Vec<u64> {
+        self.pk_index.read().iter().map(|(pk, _)| pk).collect()
     }
 
     // ── DELETE ─────────────────────────────────────────────────────────────────
