@@ -36,7 +36,7 @@ use parking_lot::RwLock;
 use vectorvolt_txn::ops::Mutation;
 use vectorvolt_wal::{WalConfig, WalWriter};
 
-use crate::schema::TableSchema;
+use crate::schema::{ColumnDef, TableSchema};
 use crate::{EngineOptions, EngineResult, TableEngine};
 
 /// Filename written inside every table's directory to record its schema.
@@ -311,6 +311,58 @@ impl TableRegistry {
         let def = load_yaml_schema(path)?;
         let schema = yaml_def_to_schema(&def)?;
         self.create_table_typed(&def.table, schema)
+    }
+
+    /// Alter a table's schema by adding and/or dropping columns.
+    ///
+    /// - `add`: new columns appended to the schema (in order). Errors if a name
+    ///   already exists.
+    /// - `drop_cols`: column names to remove. Silently ignores unknown names.
+    ///   Errors if the result would have zero columns.
+    ///
+    /// The on-disk `schema.txt` is rewritten atomically (write-then-rename), the
+    /// in-memory engine is replaced, and a `DdlAlter` record is appended to the
+    /// catalog WAL if one is attached.
+    ///
+    /// Returns `Err(TableNotFound)` if the table is not registered.
+    pub fn alter_table(
+        &self,
+        name: &str,
+        add: &[ColumnDef],
+        drop_cols: &[&str],
+    ) -> EngineResult<Arc<TableEngine>> {
+        use crate::EngineError;
+        validate_name(name)?;
+
+        let mut tables = self.tables.write();
+        if !tables.contains_key(name) {
+            return Err(EngineError::TableNotFound(name.into()));
+        }
+
+        let dir = self.base_dir.join(name);
+        let old_schema = read_typed_schema(&dir)?;
+
+        let new_schema = old_schema
+            .with_added(add)
+            .and_then(|s| s.with_dropped(drop_cols))?;
+
+        // Write new schema atomically: temp file then rename.
+        let tmp = dir.join("schema.txt.tmp");
+        std::fs::write(&tmp, new_schema.to_text())?;
+        std::fs::rename(&tmp, dir.join(SCHEMA_FILE))?;
+
+        let engine = Arc::new(TableEngine::open_typed(new_schema, &dir, self.options)?);
+        tables.insert(name.into(), Arc::clone(&engine));
+
+        let add_names: Vec<String> = add.iter().map(|c| c.name.clone()).collect();
+        let drop_names: Vec<String> = drop_cols.iter().map(|s| s.to_string()).collect();
+        drop(tables);
+        self.log_ddl(Mutation::DdlAlter {
+            table_name: name.into(),
+            add_columns: add_names,
+            drop_columns: drop_names,
+        });
+        Ok(engine)
     }
 
     fn log_ddl(&self, mutation: Mutation) {

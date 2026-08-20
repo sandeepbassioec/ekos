@@ -216,6 +216,42 @@ impl TableSchema {
             .join("\n")
     }
 
+    /// Return a new schema with `new_cols` appended.
+    ///
+    /// Errors if any added column name duplicates an existing one.
+    pub fn with_added(&self, new_cols: &[ColumnDef]) -> EngineResult<Self> {
+        let mut columns = self.columns.clone();
+        for col in new_cols {
+            if columns.iter().any(|c| c.name == col.name) {
+                return Err(crate::EngineError::InvalidTableName(format!(
+                    "column '{}' already exists",
+                    col.name
+                )));
+            }
+            columns.push(col.clone());
+        }
+        Self::new(columns)
+    }
+
+    /// Return a new schema with the named columns removed.
+    ///
+    /// Silently ignores names that don't match any column (idempotent).
+    /// Errors if the result would have zero columns.
+    pub fn with_dropped(&self, names: &[&str]) -> EngineResult<Self> {
+        let columns: Vec<ColumnDef> = self
+            .columns
+            .iter()
+            .filter(|c| !names.contains(&c.name.as_str()))
+            .cloned()
+            .collect();
+        if columns.is_empty() {
+            return Err(crate::EngineError::InvalidTableName(
+                "ALTER TABLE DROP would remove all columns".into(),
+            ));
+        }
+        Self::new(columns)
+    }
+
     /// Deserialize from the text stored in `schema.txt`.
     ///
     /// Handles both the new `"name:type"` format and the legacy `"name"` format.
