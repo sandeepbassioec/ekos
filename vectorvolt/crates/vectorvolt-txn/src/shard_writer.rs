@@ -132,9 +132,12 @@ impl ShardWriter {
                                 }
                             }
 
-                            // Compute offset BEFORE push — this is the value the
-                            // pk_index entry will carry.
-                            let offset = ring.len() as u32;
+                            // Compute offset BEFORE push — this is the absolute
+                            // head sequence number where the row will be stored.
+                            // Using ring.head() (not ring.len()) ensures the offset
+                            // stays correct after a drain, when len() resets to 0
+                            // but head() continues from where it left off.
+                            let offset = ring.head() as u32;
 
                             // Index entry first, row second.  If the index fails
                             // (e.g. capacity exhausted after many grows), nothing
