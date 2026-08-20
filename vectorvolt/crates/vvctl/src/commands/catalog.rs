@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use vectorvolt_engine::{ColumnDef, SchemaRegistry, ShardCatalog, TableSchema};
+use vectorvolt_engine::{ColumnDef, SchemaRegistry, ShardCatalog, TableSchema, validate_catalog};
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
 const DEFAULT_PARTITION_COUNT: usize = 4;
@@ -86,6 +86,22 @@ pub enum CatalogCommand {
         /// Number of write shards applied to every restored table.
         #[arg(long, default_value_t = DEFAULT_PARTITION_COUNT)]
         partitions: usize,
+    },
+
+    /// Validate catalog and registry integrity (VV-CTL-005).
+    ///
+    /// Checks each registered schema for correctness (column count, duplicate
+    /// names, primary-key convention) and detects structural mismatches:
+    ///
+    ///   ghost entries  — schema in registry but no catalog directory on disk
+    ///   orphan dirs    — catalog directory on disk but no registry entry
+    ///
+    /// Exits 0 when the catalog is healthy (no errors, no ghost/orphan entries).
+    /// With `--strict`, any warning also causes exit 1.
+    Validate {
+        /// Treat warnings (e.g. non-u64 primary key) as errors.
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -192,6 +208,49 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                 for name in catalog.list_tables() {
                     println!("  {name}");
                 }
+            }
+        }
+
+        CatalogCommand::Validate { strict } => {
+            let report = validate_catalog(&catalog_dir, &registry_dir)
+                .with_context(|| "validate catalog")?;
+
+            // Per-table results
+            for name in &report.valid_tables {
+                println!("  ok       {name}");
+            }
+            for issue in &report.issues {
+                let tag = if issue.is_error { "error  " } else { "warning" };
+                println!("  {tag}  {} — {}", issue.table, issue.message);
+            }
+
+            // Structural findings
+            for name in &report.orphan_dirs {
+                println!("  orphan   {name} (catalog dir without registry entry)");
+            }
+            for name in &report.ghost_entries {
+                println!("  ghost    {name} (registry entry without catalog dir)");
+            }
+
+            // Summary
+            let total = report.valid_tables.len()
+                + report.error_count()
+                + report.warning_count()
+                + report.orphan_dirs.len()
+                + report.ghost_entries.len();
+            println!(
+                "\n{} table(s) checked — {} ok, {} error(s), {} warning(s), {} orphan(s), {} ghost(s)",
+                total,
+                report.valid_tables.len(),
+                report.error_count(),
+                report.warning_count(),
+                report.orphan_dirs.len(),
+                report.ghost_entries.len(),
+            );
+
+            let unhealthy = !report.is_healthy() || (strict && !report.is_clean());
+            if unhealthy {
+                bail!("catalog validation failed");
             }
         }
     }
