@@ -334,6 +334,44 @@ impl TxnManager {
         Ok(tip)
     }
 
+    // ── DELETE BATCH ──────────────────────────────────────────────────────────
+
+    /// Delete multiple rows as a single WAL record.
+    ///
+    /// All PKs are encoded together into one `DeleteBatch` WAL frame and
+    /// committed in a single `commit()` call. Each PK is then removed from
+    /// the in-memory pk_index individually.
+    ///
+    /// Returns `Err(PkNotFound)` for the first PK that is not in the index.
+    /// On error, no rows from the batch are removed (all-or-nothing validation
+    /// happens before the WAL commit).
+    pub fn delete_batch(&self, pks: Vec<u64>) -> TxnResult<WalTip> {
+        // Validate all PKs exist and capture tombstone homes before mutating.
+        let mut homes = Vec::with_capacity(pks.len());
+        {
+            let idx = self.pk_index.read();
+            for &pk in &pks {
+                let desc = idx.get(pk).ok_or(TxnError::PkNotFound(pk))?;
+                homes.push((pk, (desc.file_id(), desc.partition_id())));
+            }
+        }
+
+        // Single WAL commit for the entire batch.
+        let tip = self.commit(Mutation::DeleteBatch { pks: pks.clone() }.encode())?;
+
+        // Remove each PK from the index and accumulate tombstones.
+        {
+            let mut idx = self.pk_index.write();
+            let mut tombstones = self.pending_tombstones.lock();
+            for (pk, home) in homes {
+                idx.remove(pk);
+                *tombstones.entry(home).or_insert(0) += 1;
+            }
+        }
+
+        Ok(tip)
+    }
+
     // ── UPSERT ─────────────────────────────────────────────────────────────────
 
     /// Insert or overwrite a row.  WAL-logged as a single `Mutation::Upsert`.

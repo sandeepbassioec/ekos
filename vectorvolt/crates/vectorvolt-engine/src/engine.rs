@@ -384,6 +384,12 @@ impl TableEngine {
                             let _ = txn.replay_insert(pk, values);
                         }
                     }
+                    Ok(Mutation::DeleteBatch { pks }) => {
+                        let mut idx = txn.pk_index.write();
+                        for pk in pks {
+                            idx.remove(pk);
+                        }
+                    }
                     Ok(Mutation::DdlCreate { .. })
                     | Ok(Mutation::DdlDrop { .. })
                     | Ok(Mutation::DdlAlter { .. }) => {}
