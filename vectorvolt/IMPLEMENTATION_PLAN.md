@@ -24,7 +24,7 @@ That three-command sequence tells you exactly where the project stands.
 |--------|-------|--------|
 | **S1** | HAL Foundations — SIMD, topology, NUMA, huge pages, wait strategies | ✅ COMPLETE |
 | **S2** | SIMD Wire-up + CLI UX — storage/query/index SIMD, Zstd, Criterion gate | ✅ COMPLETE |
-| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L101 next) |
+| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L105 next) |
 | **S4** | Network + MVCC — vectorvolt-net, TCP :50051, TLS, BEGIN/COMMIT/ABORT, Prometheus | ⬜ |
 | **S5** | Storage tiering L0–L4, snapshots/PITR, Kafka/Postgres sinks | ⬜ |
 | **S6** | Cluster — SWIM gossip, 4096 vnodes, Raft, <2s failover | ⬜ |
@@ -65,8 +65,8 @@ Every layer: feature branch → implementation → fmt+clippy+test → commit wi
 | L101 | VV-ENG-023 | Aggregate Root Partitioning — AggregateRoot + AggregateRouter | #179 | ✅ |
 | L102 | VV-ENG-006 | Multi-table catalog (ShardCatalog) | #180 | ✅ |
 | L103 | VV-ENG-007 | Schema registry — typed column persistence | #181 | ✅ |
-| **L104** | **VV-ENG-017** | **Config: env + CLI precedence** | **#182** | **⬜ NEXT** |
-| L105 | VV-CTL-001 | vvctl serve wired to TxnManager + catalog | #183 | ⬜ |
+| L104 | VV-ENG-017 | Config: env + CLI precedence | #182 | ✅ |
+| **L105** | **VV-CTL-001** | **vvctl serve wired to TxnManager + catalog** | **#183** | **⬜ NEXT** |
 
 ---
 
