@@ -62,8 +62,8 @@ Every layer: feature branch → implementation → fmt+clippy+test → commit wi
 | L98 | VV-ENG-010 | Fibonacci-hash partition routing | #176 | ✅ |
 | L99 | VV-CFG-001 | SystemProfile host capability snapshot | #177 | ✅ |
 | L100 | VV-CFG-037 | YAML-primary config + profile-aware defaults | #178 | ✅ |
-| **L101** | **VV-ENG-023** | **Aggregate Root Partitioning** | **#179** | **⬜ NEXT** |
-| L102 | VV-ENG-006 | Multi-table catalog (ShardCatalog) | #180 | ⬜ |
+| L101 | VV-ENG-023 | Aggregate Root Partitioning — AggregateRoot + AggregateRouter | #179 | ✅ |
+| **L102** | **VV-ENG-006** | **Multi-table catalog (ShardCatalog)** | **#180** | **⬜ NEXT** |
 | L103 | VV-ENG-007 | Schema registry — typed column persistence | #181 | ⬜ |
 | L104 | VV-ENG-017 | Config: env + CLI precedence | #182 | ⬜ |
 | L105 | VV-CTL-001 | vvctl serve wired to TxnManager + catalog | #183 | ⬜ |
