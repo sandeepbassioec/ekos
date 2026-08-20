@@ -345,6 +345,25 @@ impl TxnManager {
         self.pk_index.read().iter().map(|(pk, _)| pk).collect()
     }
 
+    /// Scan all live rows, returning `(pk, values)` pairs.
+    ///
+    /// Internally calls `get(pk)` for every key in `pk_index`.  The snapshot
+    /// is taken from the index at the start of the call; rows inserted or
+    /// deleted concurrently may or may not appear in the result.
+    ///
+    /// Returns `Err` on the first storage or I/O failure.  Rows whose `get`
+    /// returns `None` (race with a concurrent delete) are silently skipped.
+    pub fn scan(&self) -> TxnResult<Vec<(u64, Vec<u64>)>> {
+        let pks: Vec<u64> = self.pk_index.read().iter().map(|(pk, _)| pk).collect();
+        let mut rows = Vec::with_capacity(pks.len());
+        for pk in pks {
+            if let Some(values) = self.get(pk)? {
+                rows.push((pk, values));
+            }
+        }
+        Ok(rows)
+    }
+
     // ── DELETE ─────────────────────────────────────────────────────────────────
 
     /// All PKs whose column `col_idx` matches `value` via the SecondaryIndex.

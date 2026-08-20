@@ -131,6 +131,14 @@ impl RingBuffer {
         head - tail
     }
 
+    /// Absolute producer sequence number. Rows are stored at slot `head & mask`
+    /// BEFORE `head` is incremented; this is the correct value to save in a
+    /// `RowDescriptor` as the `row_offset` field for later `row_for` lookups.
+    #[inline]
+    pub fn head(&self) -> usize {
+        self.head.load(Ordering::Acquire)
+    }
+
     /// True when no rows are buffered.
     #[inline]
     pub fn is_empty(&self) -> bool {
