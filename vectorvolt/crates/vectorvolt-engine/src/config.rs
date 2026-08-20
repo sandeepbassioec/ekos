@@ -5,6 +5,20 @@
 //! When no config file is present, `load_config_with_profile()` fills in
 //! [`SystemProfile`]-derived recommendations as defaults.
 //!
+//! ## Precedence chain (lowest → highest)
+//!
+//! ```text
+//! SystemProfile defaults < config file < VECTORVOLT_* env vars < CLI overrides
+//! ```
+//!
+//! ## Environment variables
+//!
+//! | Variable | Config field |
+//! |---|---|
+//! | `VECTORVOLT_FLUSH_THRESHOLD` | `flush_threshold` (integer) |
+//! | `VECTORVOLT_DURABILITY` | `durability` (`fsync` / `write_only` / `buffered`) |
+//! | `VECTORVOLT_MAX_PARTITIONS` | `max_partitions` (integer) |
+//!
 //! ## Example `engine.yaml` (preferred)
 //!
 //! ```yaml
@@ -194,6 +208,130 @@ pub fn load_config_with_profile(
     if cfg.max_partitions.is_none() {
         cfg.max_partitions = Some(profile.recommended_partition_count);
     }
+    split_config(cfg)
+}
+
+/// Optional CLI-level overrides applied after env vars.
+///
+/// `None` for any field means "not overridden at this layer".
+#[derive(Debug, Default, Clone)]
+pub struct CliOverrides {
+    pub flush_threshold: Option<usize>,
+    pub durability: Option<String>,
+    pub max_partitions: Option<usize>,
+}
+
+impl CliOverrides {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_flush_threshold(mut self, v: usize) -> Self {
+        self.flush_threshold = Some(v);
+        self
+    }
+
+    pub fn with_durability(mut self, v: impl Into<String>) -> Self {
+        self.durability = Some(v.into());
+        self
+    }
+
+    pub fn with_max_partitions(mut self, v: usize) -> Self {
+        self.max_partitions = Some(v);
+        self
+    }
+}
+
+/// Apply `VECTORVOLT_*` environment variables over a mutable [`EngineConfig`].
+///
+/// Each env var only overrides the corresponding field when the variable is set
+/// and non-empty. Parse errors return [`EngineError::InvalidConfig`].
+pub fn apply_env_overrides(cfg: &mut EngineConfig) -> EngineResult<()> {
+    apply_env_overrides_with(cfg, |key| std::env::var(key).ok())
+}
+
+/// Like [`apply_env_overrides`] but uses a custom lookup instead of the real env.
+///
+/// Useful for deterministic testing without process-level env var mutation.
+pub fn apply_env_overrides_with(
+    cfg: &mut EngineConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> EngineResult<()> {
+    if let Some(val) = lookup("VECTORVOLT_FLUSH_THRESHOLD") {
+        let val = val.trim().to_owned();
+        if !val.is_empty() {
+            cfg.flush_threshold = Some(val.parse::<usize>().map_err(|_| {
+                EngineError::InvalidConfig(format!(
+                    "VECTORVOLT_FLUSH_THRESHOLD={val:?} is not a valid integer"
+                ))
+            })?);
+        }
+    }
+    if let Some(val) = lookup("VECTORVOLT_DURABILITY") {
+        let val = val.trim().to_owned();
+        if !val.is_empty() {
+            cfg.durability = Some(val);
+        }
+    }
+    if let Some(val) = lookup("VECTORVOLT_MAX_PARTITIONS") {
+        let val = val.trim().to_owned();
+        if !val.is_empty() {
+            cfg.max_partitions = Some(val.parse::<usize>().map_err(|_| {
+                EngineError::InvalidConfig(format!(
+                    "VECTORVOLT_MAX_PARTITIONS={val:?} is not a valid integer"
+                ))
+            })?);
+        }
+    }
+    Ok(())
+}
+
+/// Apply [`CliOverrides`] over a mutable [`EngineConfig`].
+///
+/// CLI values win over everything because they are the highest-priority layer.
+pub fn apply_cli_overrides(cfg: &mut EngineConfig, cli: &CliOverrides) {
+    if let Some(v) = cli.flush_threshold {
+        cfg.flush_threshold = Some(v);
+    }
+    if let Some(ref v) = cli.durability {
+        cfg.durability = Some(v.clone());
+    }
+    if let Some(v) = cli.max_partitions {
+        cfg.max_partitions = Some(v);
+    }
+}
+
+/// Full precedence chain: profile < file < env < CLI.
+///
+/// - `path`: optional config file (YAML or TOML, auto-detected).
+/// - `profile`: [`SystemProfile`] used as baseline when file is absent / fields unset.
+/// - `cli`: explicit CLI overrides applied last.
+pub fn load_config_full(
+    path: Option<&Path>,
+    profile: &SystemProfile,
+    cli: &CliOverrides,
+) -> EngineResult<(EngineOptions, Option<TableSchema>)> {
+    // Layer 1: file or empty config
+    let mut cfg = match path {
+        Some(p) if p.exists() => EngineConfig::load_auto(p)?,
+        _ => EngineConfig {
+            flush_threshold: None,
+            durability: None,
+            max_partitions: None,
+            columns: vec![],
+        },
+    };
+    // Layer 2: profile recommendations for unset fields
+    if cfg.flush_threshold.is_none() {
+        cfg.flush_threshold = Some(profile.recommended_flush_threshold);
+    }
+    if cfg.max_partitions.is_none() {
+        cfg.max_partitions = Some(profile.recommended_partition_count);
+    }
+    // Layer 3: env vars
+    apply_env_overrides(&mut cfg)?;
+    // Layer 4: CLI flags
+    apply_cli_overrides(&mut cfg, cli);
     split_config(cfg)
 }
 
