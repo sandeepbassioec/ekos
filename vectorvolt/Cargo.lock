@@ -2232,6 +2232,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "vectorvolt-hal",
  "vectorvolt-index",
  "vectorvolt-storage",
  "vectorvolt-txn",

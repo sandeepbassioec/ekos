@@ -53,6 +53,7 @@ mod update_where;
 pub mod views;
 pub mod yaml_schema;
 
+pub mod system_profile;
 mod window;
 
 pub use aggregate::HistogramBucket;
@@ -71,5 +72,6 @@ pub use row::EngineRow;
 pub use schema::{ColumnDef, ColumnType, TableSchema};
 pub use snapshot::SnapshotMeta;
 pub use stats::EngineStats;
+pub use system_profile::SystemProfile;
 pub use views::{ViewDefinition, ViewEntry, ViewKind, ViewRegistry};
 pub use window::WindowRow;

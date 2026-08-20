@@ -8,6 +8,7 @@ license.workspace   = true
 repository.workspace = true
 
 [dependencies]
+vectorvolt-hal     = { workspace = true }
 vectorvolt-wal     = { workspace = true }
 vectorvolt-txn     = { workspace = true }
 vectorvolt-storage = { workspace = true }
