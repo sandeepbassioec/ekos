@@ -1,7 +1,7 @@
-//! Integration tests for L105: vvctl serve wired to TxnManager + ShardCatalog (VV-CTL-001).
+﻿//! Integration tests for L105: vvctl serve wired to TxnManager + ShardCatalog (VV-CTL-001).
 //!
 //! Tests use `bind()` with port 0 (OS-assigned) so they never conflict.
-//! The `run()` path (blocking event loop) is not tested here — CI covers that via smoke tests.
+//! The `run()` path (blocking event loop) is not tested here â€” CI covers that via smoke tests.
 
 use std::net::SocketAddr;
 
@@ -9,7 +9,7 @@ use tempfile::TempDir;
 use vectorvolt_engine::{ColumnDef, TableSchema};
 use vvctl::commands::serve::{ServeArgs, bind, cli_overrides_from_args};
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn any_port() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
@@ -39,6 +39,7 @@ fn single_table_args(dir: &TempDir) -> ServeArgs {
         durability: None,
         max_partitions: None,
         catalog: false,
+        restore_catalog: false,
         http_addr: None,
         http_token: None,
     }
@@ -51,7 +52,7 @@ fn multi_args(dir: &TempDir) -> ServeArgs {
     }
 }
 
-// ── cli_overrides_from_args tests ─────────────────────────────────────────────
+// â”€â”€ cli_overrides_from_args tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn cli_overrides_none_when_args_empty() {
@@ -103,7 +104,7 @@ fn cli_overrides_all_fields_populated() {
     assert_eq!(o.max_partitions, Some(16));
 }
 
-// ── bind() engine-opts tests ──────────────────────────────────────────────────
+// â”€â”€ bind() engine-opts tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn bind_flush_threshold_from_cli_wins() {
@@ -119,7 +120,7 @@ fn bind_default_flush_threshold_from_profile() {
     let dir = TempDir::new().unwrap();
     let args = single_table_args(&dir);
     let bound = bind(&args).unwrap();
-    // SystemProfile fills in a profile-derived default — just verify > 0.
+    // SystemProfile fills in a profile-derived default â€” just verify > 0.
     assert!(bound.engine_opts_flush_threshold > 0);
 }
 
@@ -132,7 +133,7 @@ fn bind_invalid_durability_errors() {
     assert!(result.is_err(), "invalid durability should be an error");
 }
 
-// ── bind() catalog-mode tests ─────────────────────────────────────────────────
+// â”€â”€ bind() catalog-mode tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn bind_catalog_flag_creates_catalog_in_bound_server() {
