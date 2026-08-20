@@ -1,4 +1,4 @@
-/// Layer 49 — End-to-end integration tests exercising the full stack:
+/// Layer 49 â€” End-to-end integration tests exercising the full stack:
 /// TCP server (vectorvolt-net), HTTP gateway (vectorvolt-http), and
 /// the DSL query bridge, all started in the same process.
 ///
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use vectorvolt_net::Client as TcpClient;
 
-// ── harness ───────────────────────────────────────────────────────────────────
+// â”€â”€ harness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 struct E2EHarness {
     tcp_addr: SocketAddr,
@@ -44,6 +44,10 @@ impl E2EHarness {
             multi: false,
             http_addr: None,
             http_token: None,
+            flush_threshold: None,
+            durability: None,
+            max_partitions: None,
+            catalog: false,
         };
         let bound = bind(&tcp_args).expect("bind tcp");
         let tcp_addr = bound.server.local_addr().unwrap();
@@ -95,7 +99,7 @@ impl E2EHarness {
     }
 }
 
-// ── TCP tests ─────────────────────────────────────────────────────────────────
+// â”€â”€ TCP tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[tokio::test]
 async fn tcp_insert_and_get_round_trip() {
@@ -137,10 +141,10 @@ async fn tcp_stats_reflect_inserted_rows() {
     }
     c.flush().unwrap();
     let (rows, _parts, _bytes) = c.stats().unwrap();
-    assert!(rows >= 3, "stats must report ≥3 rows; got {rows}");
+    assert!(rows >= 3, "stats must report â‰¥3 rows; got {rows}");
 }
 
-// ── HTTP tests ────────────────────────────────────────────────────────────────
+// â”€â”€ HTTP tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[tokio::test]
 async fn http_health_returns_200() {
@@ -261,7 +265,7 @@ async fn http_sum_range_is_correct() {
         .json()
         .await
         .unwrap();
-    // AggResp { value: Some(60) } — sum of col[0] for pks 10, 20, 30
+    // AggResp { value: Some(60) } â€” sum of col[0] for pks 10, 20, 30
     assert_eq!(resp["value"], json!(60u64));
 }
 
@@ -393,7 +397,7 @@ async fn http_delete_range_removes_rows() {
     assert_eq!(resp["count"], json!(0u64));
 }
 
-// ── DSL bridge via HTTP ───────────────────────────────────────────────────────
+// â”€â”€ DSL bridge via HTTP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[tokio::test]
 async fn http_dsl_get_returns_inserted_row() {
