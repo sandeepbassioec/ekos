@@ -24,6 +24,7 @@
 //! ```
 
 mod aggregate;
+pub mod aggregate_root;
 mod batch;
 pub mod cdc;
 pub mod cdc_log;
@@ -57,6 +58,7 @@ pub mod system_profile;
 mod window;
 
 pub use aggregate::HistogramBucket;
+pub use aggregate_root::{AggregateRoot, AggregateRouter};
 pub use cdc::{ChangeEvent, ChangeKind};
 pub use cdc_log::{CdcLog, CdcLogStats};
 pub use compact::CompactResult;
