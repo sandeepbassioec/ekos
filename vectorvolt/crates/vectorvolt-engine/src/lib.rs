@@ -26,6 +26,7 @@
 mod aggregate;
 pub mod aggregate_root;
 mod batch;
+pub mod catalog_export;
 pub mod catalog_validate;
 pub mod cdc;
 pub mod cdc_log;
@@ -62,6 +63,9 @@ mod window;
 
 pub use aggregate::HistogramBucket;
 pub use aggregate_root::{AggregateRoot, AggregateRouter};
+pub use catalog_export::{
+    CatalogExport, ExportedTable, ImportReport, export_catalog, import_catalog,
+};
 pub use catalog_validate::{CatalogValidationReport, TableIssue, validate_catalog};
 pub use cdc::{ChangeEvent, ChangeKind};
 pub use cdc_log::{CdcLog, CdcLogStats};

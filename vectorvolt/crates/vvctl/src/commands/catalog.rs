@@ -19,7 +19,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use vectorvolt_engine::{ColumnDef, SchemaRegistry, ShardCatalog, TableSchema, validate_catalog};
+use vectorvolt_engine::{
+    CatalogExport, ColumnDef, SchemaRegistry, ShardCatalog, TableSchema, export_catalog,
+    import_catalog, validate_catalog,
+};
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
 const DEFAULT_PARTITION_COUNT: usize = 4;
@@ -86,6 +89,35 @@ pub enum CatalogCommand {
         /// Number of write shards applied to every restored table.
         #[arg(long, default_value_t = DEFAULT_PARTITION_COUNT)]
         partitions: usize,
+    },
+
+    /// Export all schemas to a JSON file (or stdout) for portability.
+    ///
+    /// The export can be transferred to another environment and imported
+    /// with `vvctl catalog import`.
+    Export {
+        /// Write JSON to this file. Omit to print to stdout.
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
+    },
+
+    /// Import schemas from a JSON export file.
+    ///
+    /// Creates each table in the catalog and persists its schema in the
+    /// registry.  Tables that already exist are skipped (with `--skip-existing`)
+    /// or cause an error (default).
+    Import {
+        /// Path to a JSON export file produced by `vvctl catalog export`.
+        file: std::path::PathBuf,
+        /// Rows buffered before a WAL flush (applied to every imported table).
+        #[arg(long, default_value_t = DEFAULT_FLUSH_THRESHOLD)]
+        flush_threshold: usize,
+        /// Number of write shards applied to every imported table.
+        #[arg(long, default_value_t = DEFAULT_PARTITION_COUNT)]
+        partitions: usize,
+        /// Silently skip tables that already exist instead of returning an error.
+        #[arg(long)]
+        skip_existing: bool,
     },
 
     /// Validate catalog and registry integrity (VV-CTL-005).
@@ -209,6 +241,56 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                     println!("  {name}");
                 }
             }
+        }
+
+        CatalogCommand::Export { output } => {
+            let export = export_catalog(&registry_dir).with_context(|| "export catalog schemas")?;
+            let json = export
+                .to_json()
+                .with_context(|| "serialise catalog to JSON")?;
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, &json)
+                        .with_context(|| format!("write export to {}", path.display()))?;
+                    println!(
+                        "exported {} table(s) to {}",
+                        export.tables.len(),
+                        path.display()
+                    );
+                }
+                None => println!("{json}"),
+            }
+        }
+
+        CatalogCommand::Import {
+            file,
+            flush_threshold,
+            partitions,
+            skip_existing,
+        } => {
+            let json = std::fs::read_to_string(&file)
+                .with_context(|| format!("read import file {}", file.display()))?;
+            let export = CatalogExport::from_json(&json).with_context(|| "parse import JSON")?;
+            let report = import_catalog(
+                &catalog_dir,
+                &registry_dir,
+                &export,
+                flush_threshold,
+                partitions,
+                skip_existing,
+            )
+            .with_context(|| "import catalog schemas")?;
+            for name in &report.imported {
+                println!("  imported: {name}");
+            }
+            for name in &report.skipped {
+                println!("  skipped : {name} (already exists)");
+            }
+            println!(
+                "\nimported {} table(s), skipped {}",
+                report.imported.len(),
+                report.skipped.len()
+            );
         }
 
         CatalogCommand::Validate { strict } => {
