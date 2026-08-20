@@ -24,7 +24,7 @@ That three-command sequence tells you exactly where the project stands.
 |--------|-------|--------|
 | **S1** | HAL Foundations — SIMD, topology, NUMA, huge pages, wait strategies | ✅ COMPLETE |
 | **S2** | SIMD Wire-up + CLI UX — storage/query/index SIMD, Zstd, Criterion gate | ✅ COMPLETE |
-| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L108 next) |
+| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L109 next) |
 | **S4** | Network + MVCC — vectorvolt-net, TCP :50051, TLS, BEGIN/COMMIT/ABORT, Prometheus | ⬜ |
 | **S5** | Storage tiering L0–L4, snapshots/PITR, Kafka/Postgres sinks | ⬜ |
 | **S6** | Cluster — SWIM gossip, 4096 vnodes, Raft, <2s failover | ⬜ |
@@ -69,7 +69,8 @@ Every layer: feature branch → implementation → fmt+clippy+test → commit wi
 | L105 | VV-CTL-001 | vvctl serve wired to TxnManager + catalog | #183 | ✅ |
 | L106 | VV-CTL-002 | vvctl catalog subcommand — in-process ShardCatalog management | #184 | ✅ |
 | L107 | VV-CTL-003 | SchemaRegistry integration into ShardCatalog create/drop | #185 | ✅ |
-| **L108** | **VV-CTL-004** | **vvctl catalog restore — explicit restore-all subcommand + serve --restore-catalog flag** | **#186** | **⬜ NEXT** |
+| L108 | VV-CTL-004 | vvctl catalog restore + serve --restore-catalog flag | #186 | ✅ |
+| **L109** | **VV-CTL-005** | **vvctl catalog validate — schema validation and cross-table integrity checks** | **#187** | **⬜ NEXT** |
 
 ---
 
