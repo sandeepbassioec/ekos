@@ -22,6 +22,9 @@ pub enum TxnError {
 
     #[error("pk {0} not found")]
     PkNotFound(u64),
+
+    #[error("writer thread shut down unexpectedly")]
+    WriterShutdown,
 }
 
 pub type TxnResult<T> = Result<T, TxnError>;

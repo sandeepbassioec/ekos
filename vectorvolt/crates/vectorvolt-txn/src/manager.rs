@@ -240,6 +240,55 @@ impl TxnManager {
         Ok(tip)
     }
 
+    // ── INSERT BATCH ──────────────────────────────────────────────────────────
+
+    /// Insert multiple rows as a single WAL record.
+    ///
+    /// All rows are encoded together into one `InsertBatch` WAL frame and
+    /// committed in a single `commit()` call. Each row is then applied to the
+    /// in-memory indexes and write buffer individually.
+    ///
+    /// Returns the WAL tip after the batch frame. Errors if any row's value
+    /// count does not match the schema, or if WAL commit fails; in either case
+    /// no rows from this batch are guaranteed to be visible.
+    pub fn insert_batch(&self, rows: Vec<(u64, Vec<u64>)>) -> TxnResult<WalTip> {
+        for (i, (_, values)) in rows.iter().enumerate() {
+            if values.len() != self.schema.len() {
+                return Err(TxnError::SchemaMismatch {
+                    expected: self.schema.len(),
+                    got: values.len(),
+                });
+            }
+            let _ = i;
+        }
+
+        // Single WAL commit for the entire batch.
+        let mutation = Mutation::InsertBatch { rows: rows.clone() };
+        let tip = self.commit(mutation.encode())?;
+
+        // Apply each row to in-memory structures.
+        let mut any_full = false;
+        for (pk, values) in rows {
+            {
+                let mut sec = self.secondary_index.write();
+                for (col_idx, &val) in values.iter().enumerate().skip(1) {
+                    sec.insert(col_value_hash(col_idx, val), pk as u32);
+                }
+            }
+            self.fk_filter.write().insert(pk)?;
+            let full = self.writer.insert(pk, values)?;
+            if full {
+                any_full = true;
+            }
+        }
+
+        if any_full {
+            self.flush()?;
+        }
+
+        Ok(tip)
+    }
+
     // ── DELETE ─────────────────────────────────────────────────────────────────
 
     /// All PKs whose column `col_idx` matches `value` via the SecondaryIndex.
