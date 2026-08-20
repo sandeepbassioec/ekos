@@ -9,6 +9,7 @@
 //! vvctl catalog list-tables                                   # list all tables in the catalog
 //! vvctl catalog drop-table <name>                             # remove table from catalog
 //! vvctl catalog describe-table <name>                         # show column names
+//! vvctl catalog restore                                       # reload all persisted tables
 //! ```
 //!
 //! Tables are created inside `<dir>/catalog/<name>/` and their typed schemas
@@ -71,6 +72,20 @@ pub enum CatalogCommand {
     DescribeTable {
         /// Table name.
         name: String,
+    },
+
+    /// Reload all tables persisted in the schema registry into the catalog.
+    ///
+    /// Equivalent to the automatic restore that `vvctl serve --restore-catalog`
+    /// performs at startup.  Useful for one-shot CLI operations that need all
+    /// historic tables available before continuing.
+    Restore {
+        /// Rows buffered before a WAL flush (applied to every restored table).
+        #[arg(long, default_value_t = DEFAULT_FLUSH_THRESHOLD)]
+        flush_threshold: usize,
+        /// Number of write shards applied to every restored table.
+        #[arg(long, default_value_t = DEFAULT_PARTITION_COUNT)]
+        partitions: usize,
     },
 }
 
@@ -159,6 +174,23 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                 if let Some(col) = schema.get(i) {
                     let tag = if i == 0 { " (pk)" } else { "" };
                     println!("  [{i}] {}:{}{tag}", col.name, col.col_type.as_str());
+                }
+            }
+        }
+
+        CatalogCommand::Restore {
+            flush_threshold,
+            partitions,
+        } => {
+            let count = catalog
+                .restore_all(flush_threshold, partitions)
+                .with_context(|| "restore catalog from registry")?;
+            if count == 0 {
+                println!("nothing to restore");
+            } else {
+                println!("restored {count} table(s):");
+                for name in catalog.list_tables() {
+                    println!("  {name}");
                 }
             }
         }

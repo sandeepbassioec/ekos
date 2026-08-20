@@ -102,6 +102,14 @@ pub struct ServeArgs {
     #[arg(long)]
     pub catalog: bool,
 
+    /// On startup, reload all tables persisted in the schema registry.
+    ///
+    /// Requires `--catalog`. Calls `ShardCatalog::restore_all()` immediately
+    /// after the catalog is opened so tables from prior sessions are available
+    /// without an explicit `vvctl catalog restore` call.
+    #[arg(long, requires = "catalog")]
+    pub restore_catalog: bool,
+
     /// Also start an HTTP/REST gateway on this address (e.g. `127.0.0.1:7879`).
     ///
     /// The gateway exposes a JSON API that mirrors the wire-protocol opcodes,
@@ -162,6 +170,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
     )
     .with_context(|| "load engine config")?;
     let resolved_flush_threshold = cfg_opts.flush_threshold;
+    let resolved_max_partitions = args.max_partitions.unwrap_or(4);
 
     // ── Schema / table setup ──────────────────────────────────────────────────
     let (server_builder, schema, engine, registry) = if args.multi {
@@ -261,14 +270,21 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
 
     let server = server_builder(config)?;
 
-    // ── ShardCatalog (L105: VV-CTL-001) ─────────────────────────────────────
-    // Opened at <dir>/catalog/ when --catalog is set.  Stored in BoundServer
-    // for direct TxnManager access; S4 will add native catalog wire binding.
+    // ── ShardCatalog (L105/L108: VV-CTL-001/004) ────────────────────────────
+    // Opened at <dir>/catalog/ when --catalog is set.  Uses with_registry so
+    // schema is auto-persisted.  --restore-catalog reloads prior-session tables.
     let catalog = if args.catalog {
         let catalog_dir = args.dir.join("catalog");
+        let registry_dir = args.dir.join("registry");
         std::fs::create_dir_all(&catalog_dir)
             .with_context(|| format!("create catalog dir {}", catalog_dir.display()))?;
-        Some(Arc::new(ShardCatalog::new(&catalog_dir)))
+        let cat = ShardCatalog::with_registry(&catalog_dir, &registry_dir)
+            .with_context(|| "open catalog with registry")?;
+        if args.restore_catalog {
+            cat.restore_all(resolved_flush_threshold, resolved_max_partitions)
+                .with_context(|| "restore catalog from registry")?;
+        }
+        Some(Arc::new(cat))
     } else {
         None
     };

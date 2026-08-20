@@ -45,6 +45,7 @@ fn start_plain(dir: &TempDir) -> (SocketAddr, impl FnOnce()) {
         durability: None,
         max_partitions: None,
         catalog: false,
+        restore_catalog: false,
     };
 
     let bound = bind(&args).expect("bind");
@@ -81,6 +82,7 @@ fn start_authed(dir: &TempDir, secret_hex: &str) -> (SocketAddr, impl FnOnce()) 
         durability: None,
         max_partitions: None,
         catalog: false,
+        restore_catalog: false,
     };
 
     let bound = bind(&args).expect("bind");
@@ -144,6 +146,7 @@ fn bind_creates_schema_file_for_new_table() {
         durability: None,
         max_partitions: None,
         catalog: false,
+        restore_catalog: false,
     };
     let bound = bind(&args).unwrap();
     bound.server.shutdown_handle().shutdown();
@@ -175,6 +178,7 @@ fn bind_reads_existing_schema_from_disk() {
         durability: None,
         max_partitions: None,
         catalog: false,
+        restore_catalog: false,
     };
     let bound = bind(&args).unwrap();
     bound.server.shutdown_handle().shutdown();
@@ -203,6 +207,7 @@ fn bind_fails_when_no_table_and_no_columns() {
         durability: None,
         max_partitions: None,
         catalog: false,
+        restore_catalog: false,
     };
     assert!(bind(&args).is_err());
 }
@@ -230,6 +235,7 @@ fn bind_fails_with_cert_but_no_key() {
         durability: None,
         max_partitions: None,
         catalog: false,
+        restore_catalog: false,
     };
     assert!(bind(&args).is_err());
 }
