@@ -79,11 +79,9 @@ pub fn run(args: CatalogArgs) -> Result<()> {
     let registry_dir = args.dir.join("registry");
     std::fs::create_dir_all(&catalog_dir)
         .with_context(|| format!("create catalog dir {}", catalog_dir.display()))?;
-    std::fs::create_dir_all(&registry_dir)
-        .with_context(|| format!("create registry dir {}", registry_dir.display()))?;
 
-    let catalog = ShardCatalog::new(&catalog_dir);
-    let registry = SchemaRegistry::new(&registry_dir);
+    let catalog = ShardCatalog::with_registry(&catalog_dir, &registry_dir)
+        .with_context(|| "open catalog with registry")?;
 
     match args.command {
         CatalogCommand::CreateTable {
@@ -110,9 +108,6 @@ pub fn run(args: CatalogArgs) -> Result<()> {
             catalog
                 .create_table(&name, schema.clone(), flush_threshold, partitions)
                 .with_context(|| format!("create table '{name}'"))?;
-            registry
-                .save(&name, &schema)
-                .with_context(|| format!("persist schema for '{name}'"))?;
             println!("created: {name}");
             let col_strs: Vec<String> = (0..schema.col_count())
                 .filter_map(|i| schema.get(i))
@@ -124,41 +119,40 @@ pub fn run(args: CatalogArgs) -> Result<()> {
         }
 
         CatalogCommand::ListTables => {
-            let from_registry = registry
-                .list_tables()
-                .with_context(|| "list registry tables")?;
-            if from_registry.is_empty() {
+            // Restore from registry so list reflects tables from prior sessions.
+            catalog
+                .restore_all(DEFAULT_FLUSH_THRESHOLD, DEFAULT_PARTITION_COUNT)
+                .with_context(|| "restore catalog from registry")?;
+            let names = catalog.list_tables();
+            if names.is_empty() {
                 println!("(no tables)");
             } else {
-                for name in &from_registry {
+                for name in &names {
                     println!("{name}");
                 }
-                println!("\n{} table(s)", from_registry.len());
+                println!("\n{} table(s)", names.len());
             }
         }
 
         CatalogCommand::DropTable { name } => {
-            let in_catalog = catalog.contains(&name);
-            let in_registry = registry.exists(&name);
-            if !in_catalog && !in_registry {
+            // Restore to pick up tables persisted in prior sessions.
+            catalog
+                .restore_all(DEFAULT_FLUSH_THRESHOLD, DEFAULT_PARTITION_COUNT)
+                .with_context(|| "restore catalog from registry")?;
+            if !catalog.contains(&name) {
                 bail!("table '{name}' not found in catalog or registry");
             }
-            if in_catalog {
-                catalog
-                    .drop_table(&name)
-                    .with_context(|| format!("drop '{name}' from catalog"))?;
-            }
-            if in_registry {
-                registry
-                    .remove(&name)
-                    .with_context(|| format!("remove '{name}' from registry"))?;
-            }
+            catalog
+                .drop_table(&name)
+                .with_context(|| format!("drop '{name}'"))?;
             println!("dropped: {name}");
         }
 
         CatalogCommand::DescribeTable { name } => {
-            let schema = registry
-                .load(&name)
+            let schema = catalog
+                .get(&name)
+                .map(|e| e.schema.clone())
+                .or_else(|_| SchemaRegistry::new(&registry_dir).load(&name))
                 .with_context(|| format!("load schema for '{name}'"))?;
             println!("table: {name}");
             for i in 0..schema.col_count() {
