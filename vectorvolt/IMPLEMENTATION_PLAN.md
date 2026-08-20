@@ -74,6 +74,86 @@ Every layer: feature branch → implementation → fmt+clippy+test → commit wi
 
 ---
 
+## 🚩 Flagged Milestone — Master Config Schema (VV-CFG-010)
+
+> **Do after S3 control-plane layers complete. Do NOT implement yet — shape is dictated by runtime APIs that must exist first.**
+
+The current `engine.yaml` covers only `flush_threshold`, `durability`, `max_partitions`, and `columns`.
+This milestone expands it into a full multi-section configuration authority consumed by `vvctl serve`,
+`vvctl catalog`, and eventually `vectorvolt-server`.
+
+### Target schema shape
+
+```yaml
+hal:
+  cpu_cores: [0, 1, 2, 3]      # core affinity pinning (vectorvolt-hal API)
+  numa_node: 0                  # NUMA binding
+  huge_pages: 2mb               # 2mb | 1gb | disabled
+
+threads:
+  writer_count: 4               # per-shard writer thread count
+  ring_buffer_size: 65536       # LMAX Disruptor ring buffer capacity
+  writer_priority: normal       # normal | realtime
+
+observability:
+  prometheus_addr: "0.0.0.0:9100"
+  trace_level: info             # error | warn | info | debug
+  jaeger_endpoint: ~            # null = disabled
+
+storage:
+  compaction_strategy: leveled  # leveled | tiered | none
+  l0_flush_threshold: 4         # SSTable L0 file count trigger
+  block_size: 65536             # SSTable block size in bytes
+
+network:
+  bind_addr: "0.0.0.0:50051"
+  tls_cert: ~
+  tls_key: ~
+  max_connections: 256
+  keepalive_secs: 30
+
+tables:
+  orders:
+    flush_threshold: 524288     # per-table override
+    durability: fsync
+    partitions: 8
+    entity: Order               # logical entity name
+    aggregate_root: true
+    members: [order_lines]      # member tables for AggregateRouter
+    columns:
+      - name: pk
+        type: u64
+      - name: status
+        type: u64
+
+query:
+  default_projection: []        # empty = all columns
+  max_scan_rows: 0              # 0 = unlimited
+  index_hint: auto              # auto | cuckoo | none
+```
+
+### Config sections and their runtime dependencies
+
+| Section | Depends on | Status |
+|---------|-----------|--------|
+| `hal` | `vectorvolt-hal` affinity API | ✅ HAL implemented (S1) — section ready to wire |
+| `threads` | `vectorvolt-txn` ring buffer + shard writers | ✅ TxnManager implemented (S3) |
+| `observability` | `tracing`, Prometheus metrics | ⬜ S4 target |
+| `storage` | `vectorvolt-storage` compaction | ⬜ S5 target |
+| `network` | `vectorvolt-net` | ⬜ S4 target |
+| `tables` | `ShardCatalog` + `AggregateRouter` | ✅ Both implemented (S3) — **ready now** |
+| `query` | `vectorvolt-query` DSL executor | ✅ Partially implemented |
+
+### Implementation approach
+
+1. Expand `EngineConfig` into a versioned top-level struct with optional sections.
+2. Each section is its own `#[derive(Deserialize)]` struct with full defaults.
+3. `load_config_full` applies per-section env var overrides (e.g. `VECTORVOLT_HAL_CPU_CORES`).
+4. Per-table blocks in `tables:` override the global `flush_threshold` / `durability` / `partitions`.
+5. `vvctl tune --apply` writes a fully-populated template from `SystemProfile` introspection.
+
+---
+
 ## Architecture — Locked Decisions
 
 | Decision | Detail |
