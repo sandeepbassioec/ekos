@@ -34,6 +34,7 @@ use vectorvolt_storage::{
 pub use vectorvolt_wal::WalTip;
 use vectorvolt_wal::{SyncCommitter, SyncStats, WalWriter};
 
+use crate::routing::select_partition;
 use crate::shard_writer::ShardWriter;
 use crate::{TxnError, TxnResult, ops::Mutation};
 
@@ -103,6 +104,14 @@ pub struct TxnManager {
     /// subsequent RowFor (which arrives after the reply) always sees the row in
     /// `in_flight`, closing the TOCTOU window the old Mutex path had.
     in_flight: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    /// Number of logical partitions rows are routed across on flush.
+    ///
+    /// `select_partition(pk, partition_count)` determines which partition file
+    /// a row lands in. `1` (the default) preserves the original single-file
+    /// flush behaviour. Higher values distribute rows across `partition_count`
+    /// separate `.vvsst` files per flush cycle, each with a unique `partition_id`
+    /// in the RowDescriptor.
+    partition_count: usize,
 }
 
 impl TxnManager {
@@ -152,7 +161,17 @@ impl TxnManager {
             manifest: Mutex::new(None),
             pending_tombstones: Mutex::new(HashMap::new()),
             in_flight,
+            partition_count: 1,
         }
+    }
+
+    /// Set the number of logical partitions rows are distributed across on flush.
+    ///
+    /// Must be called before the first `flush()`.  `n` must be >= 1; passing 0
+    /// is treated as 1 to avoid a panic in `select_partition`.
+    pub fn with_partition_count(mut self, n: usize) -> Self {
+        self.partition_count = n.max(1);
+        self
     }
 
     /// Flush the WAL out of its `BufWriter` after every mutation.
@@ -793,77 +812,91 @@ impl TxnManager {
         self.persist_tombstones()?;
 
         let file_id = self.next_file_id.load(Ordering::Relaxed);
-        let partition_id = self.next_partition_id.fetch_add(1, Ordering::Relaxed);
-        let row_count = rows.len();
 
-        // Build MicroPartition.
-        let mut mp = MicroPartition::new(file_id, partition_id);
-        for (col_idx, name) in self.schema.iter().enumerate() {
-            let col_vals: Vec<u64> = rows.iter().map(|(_, vals)| vals[col_idx]).collect();
-            let encoded = if col_idx == 0 {
-                ColumnValues::Raw(col_vals)
-            } else {
-                ColumnValues::auto_encode(col_vals)
-            };
-            mp.push_column(name.clone(), encoded)?;
+        // Group rows by their logical partition (PK-hash routing).
+        // With partition_count=1 this is a no-op — all rows land in group 0.
+        let pc = self.partition_count;
+        let mut groups: Vec<Vec<(u64, Vec<u64>)>> = vec![Vec::new(); pc];
+        for row in &rows {
+            groups[select_partition(row.0, pc)].push(row.clone());
         }
 
-        // Write .vvsst file — via a temp path, renamed into place atomically.
-        //
-        // The directory is created here rather than assumed. Previously a manager
-        // pointed at a non-existent flush_dir failed at flush time with a bare
-        // NotFound, and once enable_manifest started calling create_dir_all,
-        // whether flush worked at all depended on whether a manifest was enabled —
-        // an unrelated setting silently changing a core operation.
-        //
-        // The temp-then-rename pattern closes the race with `sync_partitions`.
-        // That function opens every `.vvsst` file it finds in the directory.
-        // `File::create` makes the file visible to `read_dir` IMMEDIATELY — before
-        // `write_partition` has written even the magic bytes. A concurrent
-        // `sync_partitions` call (triggered by another thread's completed flush)
-        // would therefore open the half-empty file and return `InvalidMagic`.
-        // Writing to `{filename}.tmp` first and renaming atomically into the final
-        // name means a `.vvsst` file only appears in the directory once it is
-        // fully written.  `sync_partitions` skips `.tmp` files (wrong extension).
+        // Allocate a contiguous block of partition IDs for this flush —
+        // one per non-empty group.  We over-allocate by `pc` in the worst case
+        // (some groups may be empty) but that is harmless: unallocated IDs simply
+        // have no file on disk.
+        let base_partition_id = self
+            .next_partition_id
+            .fetch_add(pc as u16, Ordering::Relaxed);
+
         std::fs::create_dir_all(&self.flush_dir)?;
-        let filename = format!("{file_id:05}_{partition_id:05}.vvsst");
-        let tmp_filename = format!("{file_id:05}_{partition_id:05}.vvsst.tmp");
-        let path = self.flush_dir.join(&filename);
-        let tmp_path = self.flush_dir.join(&tmp_filename);
-        {
-            let mut file = std::fs::File::create(&tmp_path)?;
-            write_partition(&mut file, &mp)?;
-        } // file closed before rename — kernel buffer visible to other opens
-        std::fs::rename(&tmp_path, &path)?;
 
-        // WAL checkpoint record.
-        let ckpt = format!(
-            "flush file_id={file_id} partition_id={partition_id} rows={row_count} path={filename}"
-        );
-        let tip = self.commit(ckpt.into_bytes())?;
+        // Write one .vvsst file per non-empty group, collect (partition_id, rows)
+        // for the index rebuild that follows.
+        type PartitionGroup = (u16, Vec<(u64, Vec<u64>)>);
+        let mut written: Vec<PartitionGroup> = Vec::with_capacity(pc);
+        let mut total_written = 0usize;
+        let mut last_tip = None;
 
-        // Rebuild RowDescriptors: pending → real coordinates.
-        let base = self
+        for (group_idx, group_rows) in groups.into_iter().enumerate() {
+            if group_rows.is_empty() {
+                continue;
+            }
+            let pid = base_partition_id + group_idx as u16;
+            let group_count = group_rows.len();
+
+            let mut mp = MicroPartition::new(file_id, pid);
+            for (col_idx, name) in self.schema.iter().enumerate() {
+                let col_vals: Vec<u64> = group_rows.iter().map(|(_, vals)| vals[col_idx]).collect();
+                let encoded = if col_idx == 0 {
+                    ColumnValues::Raw(col_vals)
+                } else {
+                    ColumnValues::auto_encode(col_vals)
+                };
+                mp.push_column(name.clone(), encoded)?;
+            }
+
+            // Atomic temp-then-rename write (see original comment above).
+            let filename = format!("{file_id:05}_{pid:05}.vvsst");
+            let tmp_filename = format!("{file_id:05}_{pid:05}.vvsst.tmp");
+            let path = self.flush_dir.join(&filename);
+            let tmp_path = self.flush_dir.join(&tmp_filename);
+            {
+                let mut file = std::fs::File::create(&tmp_path)?;
+                write_partition(&mut file, &mp)?;
+            }
+            std::fs::rename(&tmp_path, &path)?;
+
+            let ckpt = format!(
+                "flush file_id={file_id} partition_id={pid} rows={group_count} path={filename}"
+            );
+            last_tip = Some(self.commit(ckpt.into_bytes())?);
+
+            total_written += group_count;
+            written.push((pid, group_rows));
+        }
+
+        let tip = last_tip.unwrap_or_else(|| {
+            // All groups were empty after grouping — shouldn't happen since we
+            // checked rows.is_empty() above, but be defensive.
+            unreachable!("flush: rows non-empty but all groups empty")
+        });
+
+        // Rebuild RowDescriptors: pending → real (file_id, partition_id, offset).
+        let _base = self
             .total_rows_flushed
-            .fetch_add(row_count as u64, Ordering::Relaxed);
+            .fetch_add(total_written as u64, Ordering::Relaxed);
         {
             let mut idx = self.pk_index.write();
-            for (off, (pk, _)) in rows.iter().enumerate() {
-                // Propagated, not discarded. `CuckooMap::insert` can fail after
-                // exhausting its grow retries, and `let _ =` here meant the key
-                // silently left the index while its row sat in a partition on
-                // disk — the row is durable and permanently unreachable, which is
-                // indistinguishable from data loss to anyone reading.
-                //
-                // A flush that cannot index what it wrote has not succeeded, so it
-                // reports that rather than returning Ok.
-                idx.insert(*pk, RowDescriptor::new(file_id, partition_id, off as u32))?;
+            for (pid, group_rows) in &written {
+                for (off, (pk, _)) in group_rows.iter().enumerate() {
+                    idx.insert(*pk, RowDescriptor::new(file_id, *pid, off as u32))?;
+                }
             }
         }
 
         // Every drained row now has a real descriptor, so the in-flight copies can
-        // go. Done after the index rewrite, never before: dropping them earlier
-        // would reopen the window this exists to close.
+        // go. Done after the index rewrite, never before.
         {
             let mut inf = self.in_flight.lock();
             for (pk, _) in &rows {
@@ -871,41 +904,45 @@ impl TxnManager {
             }
         }
 
-        // ZoneMap: record PK min/max for this partition.
-        let pk_min = rows.iter().map(|(pk, _)| *pk).min().unwrap_or(0);
-        let pk_max = rows.iter().map(|(pk, _)| *pk).max().unwrap_or(0);
-        self.zone_map.write().set(partition_id, pk_min, pk_max);
+        // ZoneMap + Manifest: one entry per written partition group.
+        let mut first_pid = base_partition_id;
+        let mut first_path = self.flush_dir.join("none");
 
-        // Manifest: record the partition so compaction planning, retention, and
-        // verification can see it. Written AFTER the .vvsst file is on disk and
-        // after the WAL checkpoint, so the manifest can never name a partition
-        // that does not exist. The reverse — a file with no manifest entry — is
-        // survivable: it leaks disk until a scan for orphans finds it, whereas a
-        // manifest entry pointing at nothing breaks every read that follows it.
-        if let Some(m) = self.manifest.lock().as_mut() {
-            let size_bytes = std::fs::metadata(&path).map(|md| md.len()).unwrap_or(0);
-            m.apply(ManifestEdit::Add(Box::new(PartitionMeta {
-                file_id,
-                partition_id,
-                path: path.clone(),
-                level: 0,
-                size_bytes,
-                row_count: row_count as u32,
-                created_at_millis: now_millis(),
-                min_key: pk_min,
-                max_key: pk_max,
-                tombstones: 0,
-                worm_locked: false,
-            })))?;
+        for (g_idx, (pid, group_rows)) in written.iter().enumerate() {
+            let pk_min = group_rows.iter().map(|(pk, _)| *pk).min().unwrap_or(0);
+            let pk_max = group_rows.iter().map(|(pk, _)| *pk).max().unwrap_or(0);
+            self.zone_map.write().set(*pid, pk_min, pk_max);
+
+            let gpath = self.flush_dir.join(format!("{file_id:05}_{pid:05}.vvsst"));
+
+            if g_idx == 0 {
+                first_pid = *pid;
+                first_path = gpath.clone();
+            }
+
+            if let Some(m) = self.manifest.lock().as_mut() {
+                let size_bytes = std::fs::metadata(&gpath).map(|md| md.len()).unwrap_or(0);
+                m.apply(ManifestEdit::Add(Box::new(PartitionMeta {
+                    file_id,
+                    partition_id: *pid,
+                    path: gpath,
+                    level: 0,
+                    size_bytes,
+                    row_count: group_rows.len() as u32,
+                    created_at_millis: now_millis(),
+                    min_key: pk_min,
+                    max_key: pk_max,
+                    tombstones: 0,
+                    worm_locked: false,
+                })))?;
+            }
         }
-
-        let _ = base; // used by fetch_add above
 
         Ok(Some(FlushResult {
             file_id,
-            partition_id,
-            row_count,
-            path,
+            partition_id: first_pid,
+            row_count: total_written,
+            path: first_path,
             wal_tip: tip,
         }))
     }
