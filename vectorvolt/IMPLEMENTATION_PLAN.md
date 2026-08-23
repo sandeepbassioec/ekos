@@ -24,7 +24,7 @@ That three-command sequence tells you exactly where the project stands.
 |--------|-------|--------|
 | **S1** | HAL Foundations — SIMD, topology, NUMA, huge pages, wait strategies | ✅ COMPLETE |
 | **S2** | SIMD Wire-up + CLI UX — storage/query/index SIMD, Zstd, Criterion gate | ✅ COMPLETE |
-| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L113 next) |
+| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L114 next) |
 | **S4** | Network + MVCC — vectorvolt-net, TCP :50051, TLS, BEGIN/COMMIT/ABORT, Prometheus | ⬜ |
 | **S5** | Storage tiering L0–L4, snapshots/PITR, Kafka/Postgres sinks | ⬜ |
 | **S6** | Cluster — SWIM gossip, 4096 vnodes, Raft, <2s failover | ⬜ |
@@ -74,7 +74,8 @@ Every layer: feature branch → implementation → fmt+clippy+test → commit wi
 | L110 | VV-CTL-006 | vvctl catalog export/import — schema portability (JSON round-trip) | #188 | ✅ |
 | L111 | VV-CTL-007 | vvctl catalog diff — compare two catalog exports or live vs file | #189 | ✅ |
 | L112 | VV-CTL-008 | vvctl catalog snapshot — point-in-time catalog backup + restore | #190 | ✅ |
-| **L113** | **VV-CTL-009** | **vvctl catalog check-health — aggregate validate + diff + snapshot freshness** | **#191** | **⬜ NEXT** |
+| L113 | VV-CTL-009 | vvctl catalog check-health — aggregate validate + diff + snapshot freshness | #191 | ✅ |
+| **L114** | **VV-CTL-010** | **vvctl catalog gc — remove orphan dirs, ghost schema entries, stale snapshots** | **#192** | **⬜ NEXT** |
 
 ---
 
