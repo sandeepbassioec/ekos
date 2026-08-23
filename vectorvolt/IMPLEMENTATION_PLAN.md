@@ -24,7 +24,7 @@ That three-command sequence tells you exactly where the project stands.
 |--------|-------|--------|
 | **S1** | HAL Foundations — SIMD, topology, NUMA, huge pages, wait strategies | ✅ COMPLETE |
 | **S2** | SIMD Wire-up + CLI UX — storage/query/index SIMD, Zstd, Criterion gate | ✅ COMPLETE |
-| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L117 next) |
+| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L118 next) |
 | **S4** | Network + MVCC — vectorvolt-net, TCP :50051, TLS, BEGIN/COMMIT/ABORT, Prometheus | ⬜ |
 | **S5** | Storage tiering L0–L4, snapshots/PITR, Kafka/Postgres sinks | ⬜ |
 | **S6** | Cluster — SWIM gossip, 4096 vnodes, Raft, <2s failover | ⬜ |
@@ -78,7 +78,8 @@ Every layer: feature branch → implementation → fmt+clippy+test → commit wi
 | L114 | VV-CTL-010 | vvctl catalog gc — remove orphan dirs, ghost schema entries, stale snapshots | #192 | ✅ |
 | L115 | VV-CTL-011 | vvctl catalog watch — poll catalog for changes and stream diffs | #193 | ✅ |
 | L116 | VV-CTL-012 | vvctl catalog stats — per-table disk usage and schema summary | #194 | ✅ |
-| **L117** | **VV-CTL-013** | **vvctl catalog rename — rename a table in catalog + registry** | **#195** | **⬜ NEXT** |
+| L117 | VV-CTL-013 | vvctl catalog rename-table — rename a table in catalog + registry | #195 | ✅ |
+| **L118** | **VV-CTL-014** | **vvctl catalog clone — copy a table schema to a new name** | **#196** | **⬜ NEXT** |
 
 ---
 

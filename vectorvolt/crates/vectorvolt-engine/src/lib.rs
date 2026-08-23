@@ -30,6 +30,7 @@ pub mod catalog_diff;
 pub mod catalog_export;
 pub mod catalog_gc;
 pub mod catalog_health;
+pub mod catalog_rename;
 pub mod catalog_snapshot;
 pub mod catalog_stats;
 pub mod catalog_validate;
@@ -75,6 +76,7 @@ pub use catalog_export::{
 };
 pub use catalog_gc::{GcReport, run_catalog_gc};
 pub use catalog_health::{HealthReport, SnapshotFreshness, check_health};
+pub use catalog_rename::rename_table;
 pub use catalog_snapshot::{
     CatalogSnapshot, CatalogSnapshotMeta, SnapshotInfo, list_snapshots, restore_snapshot,
     save_snapshot,

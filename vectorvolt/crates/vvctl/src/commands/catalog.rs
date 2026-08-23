@@ -22,8 +22,8 @@ use clap::{Args, Subcommand};
 use vectorvolt_engine::{
     CatalogExport, CatalogStatsReport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry,
     ShardCatalog, SnapshotFreshness, TableSchema, WatchControl, WatchEvent, catalog_stats,
-    check_health, diff_catalogs, export_catalog, import_catalog, list_snapshots, restore_snapshot,
-    run_catalog_gc, save_snapshot, validate_catalog, watch_catalog,
+    check_health, diff_catalogs, export_catalog, import_catalog, list_snapshots, rename_table,
+    restore_snapshot, run_catalog_gc, save_snapshot, validate_catalog, watch_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -187,6 +187,23 @@ pub enum CatalogCommand {
         /// Silently skip tables that already exist instead of returning an error.
         #[arg(long)]
         skip_existing: bool,
+    },
+
+    /// Rename a table in the catalog directory and schema registry (VV-CTL-013).
+    ///
+    /// Renames the catalog subdirectory on disk and moves the schema file in
+    /// the registry to the new name.  The operation is atomic at the registry
+    /// level: the old name is removed only after the new schema file is written.
+    ///
+    /// Fails if the target name already exists unless `--overwrite` is given.
+    RenameTable {
+        /// Current table name.
+        from: String,
+        /// New table name.
+        to: String,
+        /// Replace the target if it already exists.
+        #[arg(long)]
+        overwrite: bool,
     },
 
     /// Show per-table disk usage and schema summary (VV-CTL-012).
@@ -619,6 +636,16 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                 report.imported.len(),
                 report.skipped.len()
             );
+        }
+
+        CatalogCommand::RenameTable {
+            from,
+            to,
+            overwrite,
+        } => {
+            rename_table(&catalog_dir, &registry_dir, &from, &to, overwrite)
+                .with_context(|| format!("rename table '{from}' -> '{to}'"))?;
+            println!("renamed: {from} -> {to}");
         }
 
         CatalogCommand::Stats { verbose } => {
