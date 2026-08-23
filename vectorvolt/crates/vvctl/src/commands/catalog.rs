@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use vectorvolt_engine::{
-    CatalogExport, ColumnDef, SchemaRegistry, ShardCatalog, TableSchema, export_catalog,
-    import_catalog, validate_catalog,
+    CatalogExport, ColumnChangeKind, ColumnDef, SchemaRegistry, ShardCatalog, TableSchema,
+    diff_catalogs, export_catalog, import_catalog, validate_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -89,6 +89,25 @@ pub enum CatalogCommand {
         /// Number of write shards applied to every restored table.
         #[arg(long, default_value_t = DEFAULT_PARTITION_COUNT)]
         partitions: usize,
+    },
+
+    /// Compare two catalog export files (or the live catalog against a file).
+    ///
+    /// Prints a human-readable diff: added tables (+), removed tables (-), and
+    /// column-level changes within shared tables.
+    ///
+    /// One of `--left` or `--live` must be provided.
+    /// `--right` is always required.
+    Diff {
+        /// Left-hand export JSON file. Mutually exclusive with `--live`.
+        #[arg(long, conflicts_with = "live")]
+        left: Option<std::path::PathBuf>,
+        /// Use the current live catalog as the left side.
+        #[arg(long, conflicts_with = "left")]
+        live: bool,
+        /// Right-hand export JSON file.
+        #[arg(long)]
+        right: std::path::PathBuf,
     },
 
     /// Export all schemas to a JSON file (or stdout) for portability.
@@ -241,6 +260,69 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                     println!("  {name}");
                 }
             }
+        }
+
+        CatalogCommand::Diff { left, live, right } => {
+            let left_export = if live {
+                export_catalog(&registry_dir)
+                    .with_context(|| "export live catalog as diff left side")?
+            } else {
+                let path = left.context("--left or --live is required")?;
+                let json = std::fs::read_to_string(&path)
+                    .with_context(|| format!("read left file {}", path.display()))?;
+                CatalogExport::from_json(&json).with_context(|| "parse left JSON")?
+            };
+
+            let right_json = std::fs::read_to_string(&right)
+                .with_context(|| format!("read right file {}", right.display()))?;
+            let right_export =
+                CatalogExport::from_json(&right_json).with_context(|| "parse right JSON")?;
+
+            let diff = diff_catalogs(&left_export, &right_export);
+
+            if diff.is_empty() {
+                println!("catalogs are identical");
+                return Ok(());
+            }
+
+            for t in &diff.added {
+                println!("+ {}", t.name);
+                for col in &t.columns {
+                    println!("    + {col}");
+                }
+            }
+            for t in &diff.removed {
+                println!("- {}", t.name);
+                for col in &t.columns {
+                    println!("    - {col}");
+                }
+            }
+            for td in &diff.changed {
+                println!("~ {}", td.name);
+                for ch in &td.changes {
+                    match &ch.kind {
+                        ColumnChangeKind::Added { name, col_type } => {
+                            println!("    + [{i}] {name}:{col_type}", i = ch.index);
+                        }
+                        ColumnChangeKind::Removed { name, col_type } => {
+                            println!("    - [{i}] {name}:{col_type}", i = ch.index);
+                        }
+                        ColumnChangeKind::TypeChanged { name, from, to } => {
+                            println!("    ~ [{i}] {name}: {from} -> {to}", i = ch.index);
+                        }
+                        ColumnChangeKind::Renamed { from, to, col_type } => {
+                            println!("    ~ [{i}] {from} -> {to} ({col_type})", i = ch.index);
+                        }
+                    }
+                }
+            }
+
+            println!(
+                "\n{} added, {} removed, {} changed",
+                diff.added.len(),
+                diff.removed.len(),
+                diff.changed.len()
+            );
         }
 
         CatalogCommand::Export { output } => {
