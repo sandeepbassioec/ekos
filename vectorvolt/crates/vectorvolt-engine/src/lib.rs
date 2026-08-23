@@ -28,6 +28,7 @@ pub mod aggregate_root;
 mod batch;
 pub mod catalog_diff;
 pub mod catalog_export;
+pub mod catalog_snapshot;
 pub mod catalog_validate;
 pub mod cdc;
 pub mod cdc_log;
@@ -67,6 +68,10 @@ pub use aggregate_root::{AggregateRoot, AggregateRouter};
 pub use catalog_diff::{CatalogDiff, ColumnChange, ColumnChangeKind, TableDiff, diff_catalogs};
 pub use catalog_export::{
     CatalogExport, ExportedTable, ImportReport, export_catalog, import_catalog,
+};
+pub use catalog_snapshot::{
+    CatalogSnapshot, CatalogSnapshotMeta, SnapshotInfo, list_snapshots, restore_snapshot,
+    save_snapshot,
 };
 pub use catalog_validate::{CatalogValidationReport, TableIssue, validate_catalog};
 pub use cdc::{ChangeEvent, ChangeKind};

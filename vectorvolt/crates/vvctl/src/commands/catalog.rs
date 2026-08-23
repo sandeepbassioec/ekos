@@ -21,7 +21,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use vectorvolt_engine::{
     CatalogExport, ColumnChangeKind, ColumnDef, SchemaRegistry, ShardCatalog, TableSchema,
-    diff_catalogs, export_catalog, import_catalog, validate_catalog,
+    diff_catalogs, export_catalog, import_catalog, list_snapshots, restore_snapshot, save_snapshot,
+    validate_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -89,6 +90,37 @@ pub enum CatalogCommand {
         /// Number of write shards applied to every restored table.
         #[arg(long, default_value_t = DEFAULT_PARTITION_COUNT)]
         partitions: usize,
+    },
+
+    /// Create a point-in-time snapshot of the catalog schema registry.
+    ///
+    /// Writes a `catalog-<unix_secs>.snapshot.json` file into `<dir>/snapshots/`.
+    /// The snapshot can later be restored with `snapshot-restore`.
+    SnapshotCreate {
+        /// Directory to write the snapshot file into. Defaults to `<catalog-dir>/snapshots/`.
+        #[arg(long)]
+        output_dir: Option<std::path::PathBuf>,
+    },
+
+    /// List all available snapshots in the snapshots directory.
+    SnapshotList,
+
+    /// Restore a catalog snapshot file into the catalog.
+    ///
+    /// Equivalent to importing the export embedded in the snapshot.
+    /// Use `--skip-existing` to silently skip tables already present.
+    SnapshotRestore {
+        /// Path to a `.snapshot.json` file.
+        file: std::path::PathBuf,
+        /// Rows buffered before a WAL flush (applied to every restored table).
+        #[arg(long, default_value_t = DEFAULT_FLUSH_THRESHOLD)]
+        flush_threshold: usize,
+        /// Number of write shards applied to every restored table.
+        #[arg(long, default_value_t = DEFAULT_PARTITION_COUNT)]
+        partitions: usize,
+        /// Silently skip tables that already exist instead of returning an error.
+        #[arg(long)]
+        skip_existing: bool,
     },
 
     /// Compare two catalog export files (or the live catalog against a file).
@@ -260,6 +292,58 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                     println!("  {name}");
                 }
             }
+        }
+
+        CatalogCommand::SnapshotCreate { output_dir } => {
+            let snapshots_dir = output_dir.unwrap_or_else(|| args.dir.join("snapshots"));
+            let path = save_snapshot(&registry_dir, &snapshots_dir)
+                .with_context(|| "create catalog snapshot")?;
+            println!("snapshot: {}", path.display());
+        }
+
+        CatalogCommand::SnapshotList => {
+            let snapshots_dir = args.dir.join("snapshots");
+            let list = list_snapshots(&snapshots_dir).with_context(|| "list catalog snapshots")?;
+            if list.is_empty() {
+                println!("(no snapshots)");
+            } else {
+                for info in &list {
+                    println!(
+                        "  {} — {} table(s)",
+                        info.path.file_name().unwrap_or_default().to_string_lossy(),
+                        info.table_count
+                    );
+                }
+                println!("\n{} snapshot(s)", list.len());
+            }
+        }
+
+        CatalogCommand::SnapshotRestore {
+            file,
+            flush_threshold,
+            partitions,
+            skip_existing,
+        } => {
+            let report = restore_snapshot(
+                &file,
+                &catalog_dir,
+                &registry_dir,
+                flush_threshold,
+                partitions,
+                skip_existing,
+            )
+            .with_context(|| format!("restore snapshot {}", file.display()))?;
+            for name in &report.imported {
+                println!("  imported: {name}");
+            }
+            for name in &report.skipped {
+                println!("  skipped : {name} (already exists)");
+            }
+            println!(
+                "\nrestored {} table(s), skipped {}",
+                report.imported.len(),
+                report.skipped.len()
+            );
         }
 
         CatalogCommand::Diff { left, live, right } => {
