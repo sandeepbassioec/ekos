@@ -20,10 +20,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use vectorvolt_engine::{
-    CatalogExport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry, ShardCatalog,
-    SnapshotFreshness, TableSchema, WatchControl, WatchEvent, check_health, diff_catalogs,
-    export_catalog, import_catalog, list_snapshots, restore_snapshot, run_catalog_gc,
-    save_snapshot, validate_catalog, watch_catalog,
+    CatalogExport, CatalogStatsReport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry,
+    ShardCatalog, SnapshotFreshness, TableSchema, WatchControl, WatchEvent, catalog_stats,
+    check_health, diff_catalogs, export_catalog, import_catalog, list_snapshots, restore_snapshot,
+    run_catalog_gc, save_snapshot, validate_catalog, watch_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -187,6 +187,19 @@ pub enum CatalogCommand {
         /// Silently skip tables that already exist instead of returning an error.
         #[arg(long)]
         skip_existing: bool,
+    },
+
+    /// Show per-table disk usage and schema summary (VV-CTL-012).
+    ///
+    /// Reads schemas from the registry and walks each table's catalog
+    /// directory to compute disk usage — no running server needed.
+    ///
+    /// Output: one line per table with column count, file count, and
+    /// disk size; a totals line at the bottom.
+    Stats {
+        /// Show individual column names and types for each table.
+        #[arg(long, short)]
+        verbose: bool,
     },
 
     /// Poll the catalog for schema changes and stream diffs to stdout.
@@ -608,6 +621,35 @@ pub fn run(args: CatalogArgs) -> Result<()> {
             );
         }
 
+        CatalogCommand::Stats { verbose } => {
+            let report: CatalogStatsReport =
+                catalog_stats(&catalog_dir, &registry_dir).with_context(|| "catalog stats")?;
+
+            if report.tables.is_empty() {
+                println!("(no tables)");
+            } else {
+                for t in &report.tables {
+                    println!(
+                        "  {:<32}  {:>2} col(s)  {:>4} file(s)  {:>10}",
+                        t.name,
+                        t.column_count,
+                        t.file_count,
+                        fmt_bytes(t.disk_bytes),
+                    );
+                    if verbose {
+                        for col in &t.columns {
+                            println!("    {col}");
+                        }
+                    }
+                }
+                println!(
+                    "\n{} table(s) — {} total",
+                    report.tables.len(),
+                    fmt_bytes(report.total_disk_bytes()),
+                );
+            }
+        }
+
         CatalogCommand::Watch {
             interval,
             count,
@@ -744,4 +786,19 @@ pub fn run(args: CatalogArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    const KB: u64 = 1_024;
+    const MB: u64 = 1_024 * KB;
+    const GB: u64 = 1_024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
