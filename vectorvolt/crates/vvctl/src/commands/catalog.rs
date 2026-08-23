@@ -20,9 +20,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use vectorvolt_engine::{
-    CatalogExport, ColumnChangeKind, ColumnDef, SchemaRegistry, ShardCatalog, TableSchema,
-    diff_catalogs, export_catalog, import_catalog, list_snapshots, restore_snapshot, save_snapshot,
-    validate_catalog,
+    CatalogExport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry, ShardCatalog,
+    SnapshotFreshness, TableSchema, check_health, diff_catalogs, export_catalog, import_catalog,
+    list_snapshots, restore_snapshot, run_catalog_gc, save_snapshot, validate_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -90,6 +90,23 @@ pub enum CatalogCommand {
         /// Number of write shards applied to every restored table.
         #[arg(long, default_value_t = DEFAULT_PARTITION_COUNT)]
         partitions: usize,
+    },
+
+    /// Aggregate health check: validate + snapshot freshness + optional baseline diff.
+    ///
+    /// Combines `catalog validate`, snapshot-age inspection, and an optional
+    /// diff against a baseline export file.  Exits 0 only when all checks pass.
+    /// Suitable for CI pipelines.
+    CheckHealth {
+        /// Fail if the newest snapshot is older than this many seconds.
+        #[arg(long)]
+        max_snapshot_age: Option<u64>,
+        /// Path to a baseline export JSON file. Fails if the live catalog diverges.
+        #[arg(long)]
+        baseline: Option<std::path::PathBuf>,
+        /// Treat schema warnings (e.g. non-u64 primary key) as errors.
+        #[arg(long)]
+        strict: bool,
     },
 
     /// Create a point-in-time snapshot of the catalog schema registry.
@@ -169,6 +186,25 @@ pub enum CatalogCommand {
         /// Silently skip tables that already exist instead of returning an error.
         #[arg(long)]
         skip_existing: bool,
+    },
+
+    /// Remove stale state: orphan dirs, ghost schema entries, and old snapshots.
+    ///
+    /// Three classes of stale state are cleaned up:
+    ///
+    ///   orphan dirs      — catalog subdirectories with no registry entry
+    ///   ghost entries    — registry schema files with no catalog directory
+    ///   stale snapshots  — snapshot files older than `--max-snapshot-age`
+    ///
+    /// Use `--dry-run` to preview what would be removed without touching disk.
+    /// Exits 0 even when nothing is removed (a clean catalog is fine).
+    Gc {
+        /// Remove snapshots older than this many seconds.
+        #[arg(long)]
+        max_snapshot_age: Option<u64>,
+        /// Preview removals without touching the filesystem.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Validate catalog and registry integrity (VV-CTL-005).
@@ -292,6 +328,99 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                     println!("  {name}");
                 }
             }
+        }
+
+        CatalogCommand::CheckHealth {
+            max_snapshot_age,
+            baseline,
+            strict,
+        } => {
+            let snapshots_dir = args.dir.join("snapshots");
+
+            let baseline_export = baseline
+                .map(|p| {
+                    let json = std::fs::read_to_string(&p)
+                        .with_context(|| format!("read baseline {}", p.display()))?;
+                    CatalogExport::from_json(&json).with_context(|| "parse baseline JSON")
+                })
+                .transpose()?;
+
+            let report = check_health(
+                &catalog_dir,
+                &registry_dir,
+                &snapshots_dir,
+                max_snapshot_age,
+                baseline_export.as_ref(),
+            )
+            .with_context(|| "catalog health check")?;
+
+            // ── Validation ─────────────────────────────────────────────
+            if report.validation.valid_tables.is_empty()
+                && report.validation.issues.is_empty()
+                && report.validation.orphan_dirs.is_empty()
+                && report.validation.ghost_entries.is_empty()
+            {
+                println!("  validation : ok (empty catalog)");
+            } else {
+                for name in &report.validation.valid_tables {
+                    println!("  validation : ok  {name}");
+                }
+                for issue in &report.validation.issues {
+                    let tag = if issue.is_error { "error  " } else { "warning" };
+                    println!("  validation : {tag}  {} — {}", issue.table, issue.message);
+                }
+                for name in &report.validation.orphan_dirs {
+                    println!("  validation : orphan  {name}");
+                }
+                for name in &report.validation.ghost_entries {
+                    println!("  validation : ghost  {name}");
+                }
+            }
+
+            // ── Snapshot freshness ──────────────────────────────────────
+            match &report.freshness {
+                SnapshotFreshness::Unchecked => {
+                    println!(
+                        "  snapshots  : {} snapshot(s) (freshness not checked)",
+                        report.snapshot_count
+                    );
+                }
+                SnapshotFreshness::Fresh { age_secs } => {
+                    println!("  snapshots  : ok  newest is {age_secs}s old");
+                }
+                SnapshotFreshness::Stale {
+                    age_secs,
+                    max_age_secs,
+                } => {
+                    println!(
+                        "  snapshots  : STALE  newest is {age_secs}s old (max {max_age_secs}s)"
+                    );
+                }
+                SnapshotFreshness::Missing => {
+                    println!("  snapshots  : MISSING  no snapshots found");
+                }
+            }
+
+            // ── Baseline drift ──────────────────────────────────────────
+            if let Some(ref drift) = report.baseline_drift {
+                if drift.is_empty() {
+                    println!("  baseline   : ok  no drift");
+                } else {
+                    println!(
+                        "  baseline   : DRIFT  {} added, {} removed, {} changed",
+                        drift.added.len(),
+                        drift.removed.len(),
+                        drift.changed.len()
+                    );
+                }
+            }
+
+            // ── Overall verdict ─────────────────────────────────────────
+            let unhealthy = !report.is_healthy() || (strict && !report.is_clean());
+            if unhealthy {
+                bail!("catalog health check FAILED");
+            }
+            println!("\nhealth check PASSED");
         }
 
         CatalogCommand::SnapshotCreate { output_dir } => {
@@ -457,6 +586,51 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                 report.imported.len(),
                 report.skipped.len()
             );
+        }
+
+        CatalogCommand::Gc {
+            max_snapshot_age,
+            dry_run,
+        } => {
+            let snapshots_dir = args.dir.join("snapshots");
+            let report: GcReport = run_catalog_gc(
+                &catalog_dir,
+                &registry_dir,
+                &snapshots_dir,
+                max_snapshot_age,
+                dry_run,
+            )
+            .with_context(|| "catalog gc")?;
+
+            let prefix = if dry_run {
+                "[dry-run] would remove"
+            } else {
+                "removed"
+            };
+            for p in &report.orphan_dirs_removed {
+                println!("  {prefix} orphan   {}", p.display());
+            }
+            for name in &report.ghost_entries_removed {
+                println!("  {prefix} ghost    {name}");
+            }
+            for p in &report.stale_snapshots_removed {
+                println!(
+                    "  {prefix} snapshot {}",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+
+            if report.is_clean() {
+                println!("catalog gc: nothing to remove");
+            } else {
+                println!(
+                    "\n{}: {} orphan(s), {} ghost(s), {} stale snapshot(s)",
+                    if dry_run { "would remove" } else { "removed" },
+                    report.orphan_dirs_removed.len(),
+                    report.ghost_entries_removed.len(),
+                    report.stale_snapshots_removed.len(),
+                );
+            }
         }
 
         CatalogCommand::Validate { strict } => {
