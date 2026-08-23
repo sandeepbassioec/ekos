@@ -28,6 +28,8 @@ pub mod aggregate_root;
 mod batch;
 pub mod catalog_diff;
 pub mod catalog_export;
+pub mod catalog_gc;
+pub mod catalog_health;
 pub mod catalog_snapshot;
 pub mod catalog_validate;
 pub mod cdc;
@@ -69,6 +71,8 @@ pub use catalog_diff::{CatalogDiff, ColumnChange, ColumnChangeKind, TableDiff, d
 pub use catalog_export::{
     CatalogExport, ExportedTable, ImportReport, export_catalog, import_catalog,
 };
+pub use catalog_gc::{GcReport, run_catalog_gc};
+pub use catalog_health::{HealthReport, SnapshotFreshness, check_health};
 pub use catalog_snapshot::{
     CatalogSnapshot, CatalogSnapshotMeta, SnapshotInfo, list_snapshots, restore_snapshot,
     save_snapshot,
