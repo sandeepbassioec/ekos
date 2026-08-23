@@ -21,8 +21,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use vectorvolt_engine::{
     CatalogExport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry, ShardCatalog,
-    SnapshotFreshness, TableSchema, check_health, diff_catalogs, export_catalog, import_catalog,
-    list_snapshots, restore_snapshot, run_catalog_gc, save_snapshot, validate_catalog,
+    SnapshotFreshness, TableSchema, WatchControl, WatchEvent, check_health, diff_catalogs,
+    export_catalog, import_catalog, list_snapshots, restore_snapshot, run_catalog_gc,
+    save_snapshot, validate_catalog, watch_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -186,6 +187,25 @@ pub enum CatalogCommand {
         /// Silently skip tables that already exist instead of returning an error.
         #[arg(long)]
         skip_existing: bool,
+    },
+
+    /// Poll the catalog for schema changes and stream diffs to stdout.
+    ///
+    /// Takes an initial snapshot then re-exports the catalog every `--interval`
+    /// seconds.  When the schema set changes, a compact diff is printed showing
+    /// added tables (+), removed tables (-), and column-level changes (~).
+    ///
+    /// The command runs until interrupted (Ctrl-C) or `--count` polls are done.
+    Watch {
+        /// Poll interval in seconds (default: 5).
+        #[arg(long, short, default_value_t = 5)]
+        interval: u64,
+        /// Exit after this many polls (0 = run forever). Default: 0.
+        #[arg(long, short, default_value_t = 0)]
+        count: usize,
+        /// Print a line even when nothing changed.
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Remove stale state: orphan dirs, ghost schema entries, and old snapshots.
@@ -586,6 +606,52 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                 report.imported.len(),
                 report.skipped.len()
             );
+        }
+
+        CatalogCommand::Watch {
+            interval,
+            count,
+            verbose,
+        } => {
+            use std::time::Duration;
+            let max = if count == 0 { None } else { Some(count) };
+            let dur = Duration::from_secs(interval);
+
+            watch_catalog(&registry_dir, dur, max, |event| match event {
+                WatchEvent::Initial { export } => {
+                    println!("[watch] initial snapshot: {} table(s)", export.tables.len());
+                    for t in &export.tables {
+                        println!("  {}", t.name);
+                    }
+                    WatchControl::Continue
+                }
+                WatchEvent::Unchanged => {
+                    if verbose {
+                        println!("[watch] no change");
+                    }
+                    WatchControl::Continue
+                }
+                WatchEvent::Changed { diff, current } => {
+                    println!(
+                        "[watch] changed: {} table(s) now — {} added, {} removed, {} changed",
+                        current.tables.len(),
+                        diff.added.len(),
+                        diff.removed.len(),
+                        diff.changed.len(),
+                    );
+                    for t in &diff.added {
+                        println!("  + {}", t.name);
+                    }
+                    for t in &diff.removed {
+                        println!("  - {}", t.name);
+                    }
+                    for td in &diff.changed {
+                        println!("  ~ {}", td.name);
+                    }
+                    WatchControl::Continue
+                }
+            })
+            .with_context(|| "catalog watch")?;
         }
 
         CatalogCommand::Gc {

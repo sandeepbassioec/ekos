@@ -32,6 +32,7 @@ pub mod catalog_gc;
 pub mod catalog_health;
 pub mod catalog_snapshot;
 pub mod catalog_validate;
+pub mod catalog_watch;
 pub mod cdc;
 pub mod cdc_log;
 mod compact;
@@ -78,6 +79,7 @@ pub use catalog_snapshot::{
     save_snapshot,
 };
 pub use catalog_validate::{CatalogValidationReport, TableIssue, validate_catalog};
+pub use catalog_watch::{WatchControl, WatchEvent, watch_catalog};
 pub use cdc::{ChangeEvent, ChangeKind};
 pub use cdc_log::{CdcLog, CdcLogStats};
 pub use compact::CompactResult;
