@@ -16,15 +16,17 @@
 //! are persisted to `<dir>/registry/` via [`SchemaRegistry`] (VV-ENG-007, L103).
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use vectorvolt_engine::{
     CatalogExport, CatalogStatsReport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry,
     ShardCatalog, SnapshotFreshness, TableSchema, WatchControl, WatchEvent, catalog_stats,
-    check_health, clear_tags, clone_table, diff_catalogs, export_catalog, get_tags, import_catalog,
-    list_snapshots, remove_tag, rename_table, restore_snapshot, run_catalog_gc, save_snapshot,
-    set_tag, validate_catalog, watch_catalog,
+    check_health, clear_tags, clone_table, diff_catalogs, export_catalog, get_lock_info, get_tags,
+    import_catalog, list_snapshots, lock_table, remove_tag, rename_table,
+    restore_snapshot, run_catalog_gc, save_snapshot, set_tag, unlock_table, validate_catalog,
+    watch_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -278,6 +280,39 @@ pub enum CatalogCommand {
         /// Preview removals without touching the filesystem.
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Place an advisory write-lock on a table (VV-CTL-016).
+    ///
+    /// Writes a `<table>.lock` file into the registry directory.  The engine
+    /// never checks this lock during normal writes — it is a coordination
+    /// mechanism for operators running maintenance (schema changes, bulk loads,
+    /// backup windows).  Use `unlock-table` to release.
+    ///
+    /// Fails if the table is already locked unless `--force` is given.
+    LockTable {
+        /// Table name.
+        table: String,
+        /// Human-readable reason stored in the lock file.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Overwrite an existing lock without error.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Release an advisory write-lock on a table (VV-CTL-016).
+    ///
+    /// No-op if the table is not currently locked.
+    UnlockTable {
+        /// Table name.
+        table: String,
+    },
+
+    /// Print the lock status of a table (VV-CTL-016).
+    LockStatus {
+        /// Table name.
+        table: String,
     },
 
     /// Attach or update a metadata tag on a table (VV-CTL-015).
@@ -850,6 +885,43 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                     report.ghost_entries_removed.len(),
                     report.stale_snapshots_removed.len(),
                 );
+            }
+        }
+
+        CatalogCommand::LockTable {
+            table,
+            reason,
+            force,
+        } => {
+            lock_table(&registry_dir, &table, reason.as_deref(), force)
+                .with_context(|| format!("lock table '{table}'"))?;
+            println!("locked: {table}");
+        }
+
+        CatalogCommand::UnlockTable { table } => {
+            unlock_table(&registry_dir, &table)
+                .with_context(|| format!("unlock table '{table}'"))?;
+            println!("unlocked: {table}");
+        }
+
+        CatalogCommand::LockStatus { table } => {
+            match get_lock_info(&registry_dir, &table)
+                .with_context(|| format!("lock status for table '{table}'"))?
+            {
+                None => println!("unlocked: {table}"),
+                Some(info) => {
+                    let age = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(info.locked_at);
+                    let reason_str = info
+                        .reason
+                        .as_deref()
+                        .map(|r| format!(" — {r}"))
+                        .unwrap_or_default();
+                    println!("locked: {table}  ({age}s ago{reason_str})");
+                }
             }
         }
 
