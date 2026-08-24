@@ -24,7 +24,7 @@ That three-command sequence tells you exactly where the project stands.
 |--------|-------|--------|
 | **S1** | HAL Foundations — SIMD, topology, NUMA, huge pages, wait strategies | ✅ COMPLETE |
 | **S2** | SIMD Wire-up + CLI UX — storage/query/index SIMD, Zstd, Criterion gate | ✅ COMPLETE |
-| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L119 next) |
+| **S3** | Type System + Config + Txn read/write path + Partition routing | 🔄 IN PROGRESS (L120 next) |
 | **S4** | Network + MVCC — vectorvolt-net, TCP :50051, TLS, BEGIN/COMMIT/ABORT, Prometheus | ⬜ |
 | **S5** | Storage tiering L0–L4, snapshots/PITR, Kafka/Postgres sinks | ⬜ |
 | **S6** | Cluster — SWIM gossip, 4096 vnodes, Raft, <2s failover | ⬜ |
@@ -80,7 +80,8 @@ Every layer: feature branch → implementation → fmt+clippy+test → commit wi
 | L116 | VV-CTL-012 | vvctl catalog stats — per-table disk usage and schema summary | #194 | ✅ |
 | L117 | VV-CTL-013 | vvctl catalog rename-table — rename a table in catalog + registry | #195 | ✅ |
 | L118 | VV-CTL-014 | vvctl catalog clone — copy a table schema to a new name | #196 | ✅ |
-| **L119** | **VV-CTL-015** | **vvctl catalog tag — attach key-value metadata tags to a table** | **#197** | **⬜ NEXT** |
+| L119 | VV-CTL-015 | vvctl catalog tag — attach key-value metadata tags to a table | #197 | ✅ |
+| **L120** | **VV-CTL-016** | **vvctl catalog lock/unlock — advisory write-lock on a table** | **#198** | **⬜ NEXT** |
 
 ---
 
