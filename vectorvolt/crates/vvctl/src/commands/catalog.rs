@@ -22,8 +22,8 @@ use clap::{Args, Subcommand};
 use vectorvolt_engine::{
     CatalogExport, CatalogStatsReport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry,
     ShardCatalog, SnapshotFreshness, TableSchema, WatchControl, WatchEvent, catalog_stats,
-    check_health, diff_catalogs, export_catalog, import_catalog, list_snapshots, rename_table,
-    restore_snapshot, run_catalog_gc, save_snapshot, validate_catalog, watch_catalog,
+    check_health, clone_table, diff_catalogs, export_catalog, import_catalog, list_snapshots,
+    rename_table, restore_snapshot, run_catalog_gc, save_snapshot, validate_catalog, watch_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -187,6 +187,28 @@ pub enum CatalogCommand {
         /// Silently skip tables that already exist instead of returning an error.
         #[arg(long)]
         skip_existing: bool,
+    },
+
+    /// Clone a table schema to a new name (VV-CTL-014).
+    ///
+    /// Copies the source table's schema to `dest` and creates a fresh catalog
+    /// directory for the new name.  Only the schema is copied — no data is
+    /// transferred.  Useful for scaffolding tables with an identical layout
+    /// (e.g. staging mirrors, partitioned shards).
+    CloneTable {
+        /// Name of the existing source table.
+        source: String,
+        /// Name for the new cloned table.
+        dest: String,
+        /// Rows buffered before a WAL flush for the clone.
+        #[arg(long, default_value_t = DEFAULT_FLUSH_THRESHOLD)]
+        flush_threshold: usize,
+        /// Number of write shards for the clone.
+        #[arg(long, default_value_t = DEFAULT_PARTITION_COUNT)]
+        partitions: usize,
+        /// Replace the destination if it already exists.
+        #[arg(long)]
+        overwrite: bool,
     },
 
     /// Rename a table in the catalog directory and schema registry (VV-CTL-013).
@@ -636,6 +658,26 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                 report.imported.len(),
                 report.skipped.len()
             );
+        }
+
+        CatalogCommand::CloneTable {
+            source,
+            dest,
+            flush_threshold,
+            partitions,
+            overwrite,
+        } => {
+            clone_table(
+                &catalog_dir,
+                &registry_dir,
+                &source,
+                &dest,
+                flush_threshold,
+                partitions,
+                overwrite,
+            )
+            .with_context(|| format!("clone table '{source}' -> '{dest}'"))?;
+            println!("cloned: {source} -> {dest}");
         }
 
         CatalogCommand::RenameTable {
