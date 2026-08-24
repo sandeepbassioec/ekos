@@ -34,6 +34,7 @@ pub mod catalog_health;
 pub mod catalog_rename;
 pub mod catalog_snapshot;
 pub mod catalog_stats;
+pub mod catalog_tag;
 pub mod catalog_validate;
 pub mod catalog_watch;
 pub mod cdc;
@@ -84,6 +85,7 @@ pub use catalog_snapshot::{
     save_snapshot,
 };
 pub use catalog_stats::{CatalogStatsReport, TableStats, catalog_stats};
+pub use catalog_tag::{clear_tags, get_tags, remove_tag, set_tag};
 pub use catalog_validate::{CatalogValidationReport, TableIssue, validate_catalog};
 pub use catalog_watch::{WatchControl, WatchEvent, watch_catalog};
 pub use cdc::{ChangeEvent, ChangeKind};

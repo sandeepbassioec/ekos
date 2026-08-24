@@ -22,8 +22,9 @@ use clap::{Args, Subcommand};
 use vectorvolt_engine::{
     CatalogExport, CatalogStatsReport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry,
     ShardCatalog, SnapshotFreshness, TableSchema, WatchControl, WatchEvent, catalog_stats,
-    check_health, clone_table, diff_catalogs, export_catalog, import_catalog, list_snapshots,
-    rename_table, restore_snapshot, run_catalog_gc, save_snapshot, validate_catalog, watch_catalog,
+    check_health, clear_tags, clone_table, diff_catalogs, export_catalog, get_tags, import_catalog,
+    list_snapshots, remove_tag, rename_table, restore_snapshot, run_catalog_gc, save_snapshot,
+    set_tag, validate_catalog, watch_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -277,6 +278,48 @@ pub enum CatalogCommand {
         /// Preview removals without touching the filesystem.
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Attach or update a metadata tag on a table (VV-CTL-015).
+    ///
+    /// Tags are key/value string pairs stored alongside the schema in the
+    /// registry. They are purely advisory (environment, owner, team, cost
+    /// centre, etc.) and do not affect query execution.
+    TagSet {
+        /// Table name.
+        table: String,
+        /// Tag key (e.g. `env`, `owner`).
+        key: String,
+        /// Tag value.
+        value: String,
+    },
+
+    /// Get one or all metadata tags for a table (VV-CTL-015).
+    ///
+    /// Without `--key`, prints every tag as `key=value`.
+    /// With `--key <k>`, prints only the value for that key (exits 1 if absent).
+    TagGet {
+        /// Table name.
+        table: String,
+        /// Print only this tag's value.
+        #[arg(long)]
+        key: Option<String>,
+    },
+
+    /// Remove a metadata tag from a table (VV-CTL-015).
+    ///
+    /// Exits 0 whether or not the key was present.
+    TagRemove {
+        /// Table name.
+        table: String,
+        /// Tag key to remove.
+        key: String,
+    },
+
+    /// Remove ALL metadata tags from a table (VV-CTL-015).
+    TagClear {
+        /// Table name.
+        table: String,
     },
 
     /// Validate catalog and registry integrity (VV-CTL-005).
@@ -808,6 +851,52 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                     report.stale_snapshots_removed.len(),
                 );
             }
+        }
+
+        CatalogCommand::TagSet { table, key, value } => {
+            set_tag(&registry_dir, &table, &key, &value)
+                .with_context(|| format!("set tag '{key}' on table '{table}'"))?;
+            println!("tag set: {table}  {key}={value}");
+        }
+
+        CatalogCommand::TagGet { table, key } => {
+            let tags = get_tags(&registry_dir, &table)
+                .with_context(|| format!("get tags for table '{table}'"))?;
+            match key {
+                Some(k) => {
+                    let v = tags
+                        .get(&k)
+                        .with_context(|| format!("tag '{k}' not found on table '{table}'"))?;
+                    println!("{v}");
+                }
+                None => {
+                    if tags.is_empty() {
+                        println!("(no tags)");
+                    } else {
+                        let mut pairs: Vec<_> = tags.iter().collect();
+                        pairs.sort_by_key(|(k, _)| k.as_str());
+                        for (k, v) in pairs {
+                            println!("{k}={v}");
+                        }
+                    }
+                }
+            }
+        }
+
+        CatalogCommand::TagRemove { table, key } => {
+            let existed = remove_tag(&registry_dir, &table, &key)
+                .with_context(|| format!("remove tag '{key}' from table '{table}'"))?;
+            if existed {
+                println!("tag removed: {table}  {key}");
+            } else {
+                println!("tag not found: {table}  {key}");
+            }
+        }
+
+        CatalogCommand::TagClear { table } => {
+            clear_tags(&registry_dir, &table)
+                .with_context(|| format!("clear tags for table '{table}'"))?;
+            println!("tags cleared: {table}");
         }
 
         CatalogCommand::Validate { strict } => {
