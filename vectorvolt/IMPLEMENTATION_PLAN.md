@@ -72,17 +72,17 @@ Every layer: feature branch → implementation → fmt+clippy+test → commit wi
 | L108 | VV-CTL-004 | vvctl catalog restore + serve --restore-catalog flag | #186 | ✅ |
 | L109 | VV-CTL-005 | vvctl catalog validate — schema validation and cross-table integrity checks | #187 | ✅ |
 | L110 | VV-CTL-006 | vvctl catalog export/import — schema portability (JSON round-trip) | #188 | ✅ |
-| L111 | VV-CTL-007 | vvctl catalog diff — compare two catalog exports or live vs file | #189 | ✅ |
-| L112 | VV-CTL-008 | vvctl catalog snapshot — point-in-time catalog backup + restore | #190 | ✅ |
-| L113 | VV-CTL-009 | vvctl catalog check-health — aggregate validate + diff + snapshot freshness | #191 | ✅ |
-| L114 | VV-CTL-010 | vvctl catalog gc — remove orphan dirs, ghost schema entries, stale snapshots | #192 | ✅ |
-| L115 | VV-CTL-011 | vvctl catalog watch — poll catalog for changes and stream diffs | #193 | ✅ |
-| L116 | VV-CTL-012 | vvctl catalog stats — per-table disk usage and schema summary | #194 | ✅ |
-| L117 | VV-CTL-013 | vvctl catalog rename-table — rename a table in catalog + registry | #195 | ✅ |
-| L118 | VV-CTL-014 | vvctl catalog clone — copy a table schema to a new name | #196 | ✅ |
-| L119 | VV-CTL-015 | vvctl catalog tag — attach key-value metadata tags to a table | #197 | ✅ |
-| L120 | VV-CTL-016 | vvctl catalog lock/unlock — advisory write-lock on a table | #198 | ✅ |
-| **L121** | **VV-CTL-017** | **vvctl catalog alias — create a named alias for a table** | **#199** | **⬜ NEXT** |
+| L111 | VV-CTL-007 | vvctl catalog diff — compare two catalog exports or live vs file | #209 | ✅ |
+| L112 | VV-CTL-008 | vvctl catalog snapshot — point-in-time catalog backup + restore | #210 | ✅ |
+| L113 | VV-CTL-009 | vvctl catalog check-health — aggregate validate + diff + snapshot freshness | #211 | ✅ |
+| L114 | VV-CTL-010 | vvctl catalog gc — remove orphan dirs, ghost schema entries, stale snapshots | #212 | ✅ |
+| L115 | VV-CTL-011 | vvctl catalog watch — poll catalog for changes and stream diffs | #213 | ✅ |
+| L116 | VV-CTL-012 | vvctl catalog stats — per-table disk usage and schema summary | #214 | ✅ |
+| L117 | VV-CTL-013 | vvctl catalog rename-table — rename a table in catalog + registry | #215 | ✅ |
+| L118 | VV-CTL-014 | vvctl catalog clone — copy a table schema to a new name | #216 | ✅ |
+| L119 | VV-CTL-015 | vvctl catalog tag — attach key-value metadata tags to a table | #217 | ✅ |
+| L120 | VV-CTL-016 | vvctl catalog lock/unlock — advisory write-lock on a table | #218 | ✅ |
+| **L121** | **VV-CTL-017** | **vvctl catalog alias — create a named alias for a table** | **#219** | **⬜ NEXT** |
 
 ---
 
