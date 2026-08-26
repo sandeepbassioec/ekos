@@ -23,10 +23,10 @@ use clap::{Args, Subcommand};
 use vectorvolt_engine::{
     CatalogExport, CatalogStatsReport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry,
     ShardCatalog, SnapshotFreshness, TableSchema, WatchControl, WatchEvent, catalog_stats,
-    check_health, clear_tags, clone_table, diff_catalogs, export_catalog, get_lock_info, get_tags,
-    import_catalog, list_snapshots, lock_table, remove_tag, rename_table,
-    restore_snapshot, run_catalog_gc, save_snapshot, set_tag, unlock_table, validate_catalog,
-    watch_catalog,
+    check_health, clear_tags, clone_table, create_alias, diff_catalogs, export_catalog,
+    get_lock_info, get_tags, import_catalog, list_aliases, list_snapshots, lock_table,
+    remove_alias, remove_tag, rename_table, resolve_alias, restore_snapshot, run_catalog_gc,
+    save_snapshot, set_tag, unlock_table, validate_catalog, watch_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -281,6 +281,44 @@ pub enum CatalogCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Create a named alias pointing to an existing table (VV-CTL-017).
+    ///
+    /// An alias is a lightweight pointer stored in the registry directory.
+    /// It lets you give a stable public name to a table that may be renamed,
+    /// or refer to environment-specific tables by a canonical name.
+    ///
+    /// The alias is NOT automatically followed by the engine — use
+    /// `alias-resolve` to look up the target before querying.
+    AliasCreate {
+        /// Alias name to create.
+        alias: String,
+        /// Existing table name the alias points to.
+        target: String,
+        /// Replace an existing alias without error.
+        #[arg(long)]
+        overwrite: bool,
+    },
+
+    /// Remove a named alias (VV-CTL-017).
+    ///
+    /// No-op if the alias does not exist.
+    AliasRemove {
+        /// Alias name to remove.
+        alias: String,
+    },
+
+    /// Resolve an alias to its target table name (VV-CTL-017).
+    ///
+    /// Prints the target table name if `name` is an alias, or reports that
+    /// `name` is not an alias (exits 1 so scripts can branch on it).
+    AliasResolve {
+        /// Alias name to resolve.
+        name: String,
+    },
+
+    /// List all aliases in the registry (VV-CTL-017).
+    AliasList,
 
     /// Place an advisory write-lock on a table (VV-CTL-016).
     ///
@@ -885,6 +923,47 @@ pub fn run(args: CatalogArgs) -> Result<()> {
                     report.ghost_entries_removed.len(),
                     report.stale_snapshots_removed.len(),
                 );
+            }
+        }
+
+        CatalogCommand::AliasCreate {
+            alias,
+            target,
+            overwrite,
+        } => {
+            create_alias(&registry_dir, &alias, &target, overwrite)
+                .with_context(|| format!("create alias '{alias}' -> '{target}'"))?;
+            println!("alias created: {alias} -> {target}");
+        }
+
+        CatalogCommand::AliasRemove { alias } => {
+            let existed = remove_alias(&registry_dir, &alias)
+                .with_context(|| format!("remove alias '{alias}'"))?;
+            if existed {
+                println!("alias removed: {alias}");
+            } else {
+                println!("alias not found: {alias}");
+            }
+        }
+
+        CatalogCommand::AliasResolve { name } => {
+            match resolve_alias(&registry_dir, &name)
+                .with_context(|| format!("resolve alias '{name}'"))?
+            {
+                Some(target) => println!("{target}"),
+                None => bail!("'{name}' is not an alias"),
+            }
+        }
+
+        CatalogCommand::AliasList => {
+            let pairs = list_aliases(&registry_dir).with_context(|| "list aliases")?;
+            if pairs.is_empty() {
+                println!("(no aliases)");
+            } else {
+                for (alias, target) in &pairs {
+                    println!("  {alias} -> {target}");
+                }
+                println!("\n{} alias(es)", pairs.len());
             }
         }
 

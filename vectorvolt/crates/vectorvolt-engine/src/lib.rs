@@ -26,6 +26,7 @@
 mod aggregate;
 pub mod aggregate_root;
 mod batch;
+pub mod catalog_alias;
 pub mod catalog_clone;
 pub mod catalog_diff;
 pub mod catalog_export;
@@ -73,6 +74,7 @@ mod window;
 
 pub use aggregate::HistogramBucket;
 pub use aggregate_root::{AggregateRoot, AggregateRouter};
+pub use catalog_alias::{create_alias, list_aliases, remove_alias, resolve_alias};
 pub use catalog_clone::clone_table;
 pub use catalog_diff::{CatalogDiff, ColumnChange, ColumnChangeKind, TableDiff, diff_catalogs};
 pub use catalog_export::{
