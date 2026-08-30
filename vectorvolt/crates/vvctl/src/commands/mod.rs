@@ -1,5 +1,6 @@
 pub mod bench;
 pub mod catalog;
+pub mod config;
 pub mod connect;
 pub mod hal;
 pub mod http;

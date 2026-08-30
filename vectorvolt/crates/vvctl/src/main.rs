@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use store::OutputFormat;
-use vvctl::commands::{bench, catalog, connect, hal, http, keygen, serve, store, table, tune, wal};
+use vvctl::commands::{
+    bench, catalog, config, connect, hal, http, keygen, serve, store, table, tune, wal,
+};
 use vvctl::ui;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -47,6 +49,10 @@ enum Commands {
     /// In-process ShardCatalog management — create, list, drop, and describe tables
     /// without needing a running server (VV-CTL-002).
     Catalog(catalog::CatalogArgs),
+
+    /// Master configuration management — init, show, and validate vectorvolt.yaml (VV-CFG-012).
+    #[command(subcommand)]
+    Config(config::ConfigCommand),
 
     /// Send a single command to a running VectorVolt server.
     Connect(connect::ConnectArgs),
@@ -167,6 +173,8 @@ fn main() -> Result<()> {
         Commands::Serve(args) => serve::run(args)?,
 
         Commands::Catalog(args) => catalog::run(args)?,
+
+        Commands::Config(cmd) => config::run(cmd)?,
 
         Commands::Connect(args) => connect::run(args)?,
 
