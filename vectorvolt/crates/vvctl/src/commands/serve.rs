@@ -23,7 +23,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use vectorvolt_engine::{
-    CliOverrides, ShardCatalog, SystemProfile, TableEngine, TableRegistry, load_config_full,
+    CliOverrides, ShardCatalog, SystemProfile, TableEngine, TableRegistry, VvConfig,
+    load_config_full,
 };
 use vectorvolt_http::{HttpServer, HttpServerConfig};
 use vectorvolt_net::tls::ServerTlsConfig;
@@ -81,6 +82,17 @@ pub struct ServeArgs {
     /// Precedence (highest wins): CLI flags > VECTORVOLT_* env vars > config file > host profile.
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Load the master multi-section VectorVolt config (VV-CFG-011).
+    ///
+    /// Accepts a `vectorvolt.yaml` file written with `vvctl catalog config-set`.
+    /// Sections applied (CLI flags override):
+    /// - `network.bind_addr` → default listen address
+    /// - `network.max_connections` → default max connections
+    /// - `threads.writer_count` → default partition count
+    /// - `storage.l0_flush_threshold` → default flush threshold
+    #[arg(long)]
+    pub master_config: Option<PathBuf>,
 
     /// Override flush threshold (rows buffered before WAL flush). Wins over config + env.
     #[arg(long)]
@@ -141,6 +153,8 @@ pub struct BoundServer {
     pub catalog: Option<Arc<ShardCatalog>>,
     /// Resolved EngineOptions (flush_threshold, durability) after full precedence chain.
     pub engine_opts_flush_threshold: usize,
+    /// Master VvConfig loaded from `--master-config` (None when flag not used). L123.
+    pub master_config: Option<VvConfig>,
 }
 
 type ServerBuilder = Box<dyn FnOnce(ServerConfig) -> Result<Server>>;
@@ -161,6 +175,25 @@ pub fn cli_overrides_from_args(args: &ServeArgs) -> CliOverrides {
 }
 
 pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
+    // ── Master config (VV-CFG-011, L123) — lowest precedence layer ───────────
+    let master_config: Option<VvConfig> = if let Some(ref p) = args.master_config {
+        let cfg = VvConfig::from_file(p)
+            .with_context(|| format!("load master config '{}'", p.display()))?;
+        Some(cfg)
+    } else {
+        None
+    };
+
+    // Defaults sourced from master config (CLI flags override below).
+    let mc_flush_threshold: Option<usize> = master_config
+        .as_ref()
+        .and_then(|mc| mc.storage.l0_flush_threshold)
+        .map(|v| v as usize);
+    let mc_max_partitions: Option<usize> = master_config
+        .as_ref()
+        .and_then(|mc| mc.threads.writer_count)
+        .map(|v| v as usize);
+
     // ── Config — full 4-layer precedence chain (L104: VV-ENG-017) ────────────
     let cli_overrides = cli_overrides_from_args(args);
     let (cfg_opts, _cfg_schema) = load_config_full(
@@ -169,8 +202,16 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         &cli_overrides,
     )
     .with_context(|| "load engine config")?;
-    let resolved_flush_threshold = cfg_opts.flush_threshold;
-    let resolved_max_partitions = args.max_partitions.unwrap_or(4);
+    // CLI flush_threshold > per-table config > master config > SystemProfile default
+    let resolved_flush_threshold = if args.flush_threshold.is_some() {
+        cfg_opts.flush_threshold
+    } else {
+        mc_flush_threshold.unwrap_or(cfg_opts.flush_threshold)
+    };
+    // CLI max_partitions > master config threads.writer_count > default 4
+    let resolved_max_partitions = args
+        .max_partitions
+        .unwrap_or_else(|| mc_max_partitions.unwrap_or(4));
 
     // ── Schema / table setup ──────────────────────────────────────────────────
     let (server_builder, schema, engine, registry) = if args.multi {
@@ -298,6 +339,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         registry,
         catalog,
         engine_opts_flush_threshold: resolved_flush_threshold,
+        master_config,
     })
 }
 
@@ -311,6 +353,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         registry,
         catalog,
         engine_opts_flush_threshold,
+        master_config,
     } = bind(&args)?;
 
     let local = server.local_addr()?;
@@ -351,6 +394,30 @@ pub fn run(args: ServeArgs) -> Result<()> {
     );
     eprintln!("  max conns : {}", args.max_connections);
     eprintln!("  flush thr : {} rows", engine_opts_flush_threshold);
+    if let Some(ref mc) = master_config {
+        let sections: Vec<&str> = [
+            mc.hal != Default::default(),
+            mc.threads != Default::default(),
+            mc.storage != Default::default(),
+            mc.observability != Default::default(),
+            mc.network != Default::default(),
+            mc.query != Default::default(),
+            !mc.tables.is_empty(),
+        ]
+        .iter()
+        .zip([
+            "hal",
+            "threads",
+            "storage",
+            "observability",
+            "network",
+            "query",
+            "tables",
+        ])
+        .filter_map(|(active, name)| if *active { Some(name) } else { None })
+        .collect();
+        eprintln!("  master cfg: active sections: [{}]", sections.join(", "));
+    }
 
     // ── HTTP gateway (optional) ───────────────────────────────────────────────
     let http_token = args.http_token.clone();
