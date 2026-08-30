@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use tempfile::TempDir;
-use vvctl::commands::table::{TableCommand, run};
+use vvctl::commands::table::{OutputFormat, TableCommand, run};
 
 fn make_dir() -> TempDir {
     TempDir::new().unwrap()
@@ -136,12 +136,7 @@ fn truncate_removes_vvsst_files() {
         let vvsst_count = std::fs::read_dir(&data_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    == Some("vvsst")
-            })
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("vvsst"))
             .count();
         assert_eq!(vvsst_count, 0);
     }
@@ -168,6 +163,7 @@ fn truncate_then_create_succeeds() {
     // But we can still run Schema successfully
     run(TableCommand::Schema {
         dir: table_dir(&dir),
+        output: OutputFormat::Table,
     })
     .unwrap();
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use tempfile::TempDir;
 use vectorvolt_engine::{ColumnType, TypedValue};
-use vvctl::commands::table::{TableCommand, run};
+use vvctl::commands::table::{OutputFormat, TableCommand, run};
 
 fn make_dir() -> TempDir {
     TempDir::new().unwrap()
@@ -117,6 +117,7 @@ fn get_displays_bool_as_true_false() {
     run(TableCommand::Get {
         dir: table_dir(&dir),
         pk: 1,
+        output: OutputFormat::Table,
     })
     .unwrap();
 }
@@ -138,6 +139,7 @@ fn get_displays_i64_negative() {
     run(TableCommand::Get {
         dir: table_dir(&dir),
         pk: 10,
+        output: OutputFormat::Table,
     })
     .unwrap();
 }
@@ -167,6 +169,7 @@ fn scan_succeeds_with_typed_columns() {
         col: 0,
         lo: 0,
         hi: u64::MAX,
+        output: OutputFormat::Table,
     })
     .unwrap();
 }
