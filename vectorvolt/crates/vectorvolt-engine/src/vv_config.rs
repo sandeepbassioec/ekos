@@ -545,6 +545,100 @@ impl VvConfig {
         );
         entries
     }
+
+    /// Return a new config that applies all non-default fields from `overlay`
+    /// on top of `self`.
+    ///
+    /// `Option` fields: overlay value wins when `Some`; base value is kept when
+    /// overlay is `None`.  `Vec` fields: overlay replaces base when non-empty;
+    /// base is kept when overlay is empty.  The `tables` map is merged by key:
+    /// overlay entries win for matching keys; base-only keys are preserved.
+    pub fn merge_with(&self, overlay: &Self) -> Self {
+        macro_rules! opt {
+            ($base:expr, $over:expr) => {
+                if $over.is_some() {
+                    $over.clone()
+                } else {
+                    $base.clone()
+                }
+            };
+        }
+        macro_rules! vec_field {
+            ($base:expr, $over:expr) => {
+                if !$over.is_empty() {
+                    $over.clone()
+                } else {
+                    $base.clone()
+                }
+            };
+        }
+        let mut tables = self.tables.clone();
+        for (k, v) in &overlay.tables {
+            tables.insert(k.clone(), v.clone());
+        }
+        Self {
+            hal: HalConfig {
+                cpu_cores: vec_field!(self.hal.cpu_cores, overlay.hal.cpu_cores),
+                numa_node: opt!(self.hal.numa_node, overlay.hal.numa_node),
+                huge_pages: opt!(self.hal.huge_pages, overlay.hal.huge_pages),
+            },
+            threads: ThreadsConfig {
+                writer_count: opt!(self.threads.writer_count, overlay.threads.writer_count),
+                ring_buffer_size: opt!(
+                    self.threads.ring_buffer_size,
+                    overlay.threads.ring_buffer_size
+                ),
+                writer_priority: opt!(
+                    self.threads.writer_priority,
+                    overlay.threads.writer_priority
+                ),
+            },
+            storage: StorageConfig {
+                compaction_strategy: opt!(
+                    self.storage.compaction_strategy,
+                    overlay.storage.compaction_strategy
+                ),
+                l0_flush_threshold: opt!(
+                    self.storage.l0_flush_threshold,
+                    overlay.storage.l0_flush_threshold
+                ),
+                block_size: opt!(self.storage.block_size, overlay.storage.block_size),
+            },
+            observability: ObservabilityConfig {
+                prometheus_addr: opt!(
+                    self.observability.prometheus_addr,
+                    overlay.observability.prometheus_addr
+                ),
+                trace_level: opt!(
+                    self.observability.trace_level,
+                    overlay.observability.trace_level
+                ),
+                jaeger_endpoint: opt!(
+                    self.observability.jaeger_endpoint,
+                    overlay.observability.jaeger_endpoint
+                ),
+            },
+            network: NetworkConfig {
+                bind_addr: opt!(self.network.bind_addr, overlay.network.bind_addr),
+                tls_cert: opt!(self.network.tls_cert, overlay.network.tls_cert),
+                tls_key: opt!(self.network.tls_key, overlay.network.tls_key),
+                max_connections: opt!(
+                    self.network.max_connections,
+                    overlay.network.max_connections
+                ),
+                keepalive_secs: opt!(self.network.keepalive_secs, overlay.network.keepalive_secs),
+            },
+            query: QueryConfig {
+                default_projection: vec_field!(
+                    self.query.default_projection,
+                    overlay.query.default_projection
+                ),
+                max_scan_rows: opt!(self.query.max_scan_rows, overlay.query.max_scan_rows),
+                index_hint: opt!(self.query.index_hint, overlay.query.index_hint),
+            },
+            tables,
+        }
+    }
 }
 
 fn parse_u32(key: &str, value: &str) -> EngineResult<u32> {
