@@ -22,11 +22,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use vectorvolt_engine::{
     CatalogExport, CatalogStatsReport, ColumnChangeKind, ColumnDef, GcReport, SchemaRegistry,
-    ShardCatalog, SnapshotFreshness, TableSchema, WatchControl, WatchEvent, catalog_stats,
-    check_health, clear_tags, clone_table, create_alias, diff_catalogs, export_catalog,
-    get_lock_info, get_tags, import_catalog, list_aliases, list_snapshots, lock_table,
-    remove_alias, remove_tag, rename_table, resolve_alias, restore_snapshot, run_catalog_gc,
-    save_snapshot, set_tag, unlock_table, validate_catalog, watch_catalog,
+    ShardCatalog, SnapshotFreshness, TableSchema, VvConfig, WatchControl, WatchEvent,
+    catalog_stats, check_health, clear_tags, clone_table, create_alias, diff_catalogs,
+    export_catalog, get_lock_info, get_tags, import_catalog, list_aliases, list_snapshots,
+    lock_table, remove_alias, remove_tag, rename_table, resolve_alias, restore_snapshot,
+    run_catalog_gc, save_snapshot, set_tag, unlock_table, validate_catalog, watch_catalog,
 };
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 1_048_576;
@@ -409,6 +409,39 @@ pub enum CatalogCommand {
         /// Treat warnings (e.g. non-u64 primary key) as errors.
         #[arg(long)]
         strict: bool,
+    },
+
+    // ── Master config (VV-CFG-010) ────────────────────────────────────────────
+    /// Show the resolved master config as YAML (VV-CFG-010).
+    ///
+    /// Parses the given file and prints its contents to stdout.
+    ConfigShow {
+        /// Path to a `vectorvolt.yaml` master config file.
+        file: std::path::PathBuf,
+    },
+
+    /// Validate a master config file without starting the server (VV-CFG-010).
+    ///
+    /// Exits 0 if the file parses cleanly and has no constraint violations.
+    /// Exits 1 if there are any warnings (or parse errors).
+    ConfigValidate {
+        /// Path to a `vectorvolt.yaml` master config file.
+        file: std::path::PathBuf,
+    },
+
+    /// Set a single key in a master config file (VV-CFG-010).
+    ///
+    /// Uses dot-notation: `section.field`.  Creates the file if it does not
+    /// exist.  Writes the updated config back to the same file.
+    ///
+    /// Example: `vvctl catalog config-set threads.writer_count 8`
+    ConfigSet {
+        /// Path to a `vectorvolt.yaml` master config file (created if absent).
+        file: std::path::PathBuf,
+        /// Dot-notation key (e.g. `threads.writer_count`).
+        key: String,
+        /// New value (always provided as a string and coerced to the field type).
+        value: String,
     },
 }
 
@@ -1091,6 +1124,42 @@ pub fn run(args: CatalogArgs) -> Result<()> {
             if unhealthy {
                 bail!("catalog validation failed");
             }
+        }
+
+        CatalogCommand::ConfigShow { file } => {
+            let cfg = VvConfig::from_file(&file)
+                .with_context(|| format!("load config '{}'", file.display()))?;
+            let yaml = cfg.to_yaml().context("serialize config")?;
+            print!("{yaml}");
+        }
+
+        CatalogCommand::ConfigValidate { file } => {
+            let cfg = VvConfig::from_file(&file)
+                .with_context(|| format!("load config '{}'", file.display()))?;
+            let warns = cfg.validate();
+            if warns.is_empty() {
+                println!("config ok: {}", file.display());
+            } else {
+                for w in &warns {
+                    eprintln!("warning: {w}");
+                }
+                bail!("config has {} warning(s)", warns.len());
+            }
+        }
+
+        CatalogCommand::ConfigSet { file, key, value } => {
+            let mut cfg = if file.exists() {
+                VvConfig::from_file(&file)
+                    .with_context(|| format!("load config '{}'", file.display()))?
+            } else {
+                VvConfig::default()
+            };
+            cfg.set_key(&key, &value)
+                .with_context(|| format!("set key '{key}'"))?;
+            let yaml = cfg.to_yaml().context("serialize config")?;
+            std::fs::write(&file, &yaml)
+                .with_context(|| format!("write config '{}'", file.display()))?;
+            println!("set {key} = {value}  ({})", file.display());
         }
     }
 
