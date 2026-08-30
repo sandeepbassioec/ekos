@@ -48,6 +48,13 @@ pub enum ConfigCommand {
         /// Path to the config file.
         file: PathBuf,
     },
+
+    /// List all supported VECTORVOLT_* environment variables and their current values.
+    ///
+    /// Shows every env var that `vvctl` honours as a config override, the
+    /// dot-notation key it maps to, a one-line description, and whether it is
+    /// currently set in the process environment.
+    EnvList,
 }
 
 pub fn run(cmd: ConfigCommand) -> Result<()> {
@@ -55,6 +62,7 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
         ConfigCommand::Init { output, force } => cmd_init(&output, force),
         ConfigCommand::Show { file } => cmd_show(&file),
         ConfigCommand::Validate { file } => cmd_validate(&file),
+        ConfigCommand::EnvList => cmd_env_list(),
     }
 }
 
@@ -125,6 +133,19 @@ fn cmd_validate(file: &Path) -> Result<()> {
         }
         bail!("config has {} warning(s)", warns.len());
     }
+}
+
+fn cmd_env_list() -> Result<()> {
+    let table = VvConfig::env_var_table();
+    let env_col = table.iter().map(|(e, _, _)| e.len()).max().unwrap_or(0);
+    let key_col = table.iter().map(|(_, k, _)| k.len()).max().unwrap_or(0);
+    println!("{:<env_col$}  {:<key_col$}  VALUE", "ENV VAR", "CONFIG KEY");
+    println!("{}", "-".repeat(env_col + key_col + 10));
+    for (env_key, dot_key, _desc) in table {
+        let val = std::env::var(env_key).unwrap_or_else(|_| "(unset)".into());
+        println!("{:<env_col$}  {:<key_col$}  {val}", env_key, dot_key);
+    }
+    Ok(())
 }
 
 /// Build a [`VvConfig`] pre-populated from a [`SystemProfile`].

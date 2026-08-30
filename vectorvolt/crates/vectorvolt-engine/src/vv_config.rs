@@ -303,6 +303,129 @@ impl VvConfig {
         }
         Ok(())
     }
+
+    /// Return a table of all supported env-var overrides.
+    ///
+    /// Each entry is `(env_key, dot_key, description)`.  The env var maps
+    /// one-to-one to the dot-notation key accepted by [`VvConfig::set_key`].
+    pub fn env_var_table() -> &'static [(&'static str, &'static str, &'static str)] {
+        &[
+            (
+                "VECTORVOLT_HAL_NUMA_NODE",
+                "hal.numa_node",
+                "NUMA node binding (0-based)",
+            ),
+            (
+                "VECTORVOLT_HAL_HUGE_PAGES",
+                "hal.huge_pages",
+                "Huge page size: 2mb | 1gb | disabled",
+            ),
+            (
+                "VECTORVOLT_THREADS_WRITER_COUNT",
+                "threads.writer_count",
+                "Per-shard writer thread count",
+            ),
+            (
+                "VECTORVOLT_THREADS_RING_BUFFER_SIZE",
+                "threads.ring_buffer_size",
+                "LMAX Disruptor ring buffer capacity",
+            ),
+            (
+                "VECTORVOLT_THREADS_WRITER_PRIORITY",
+                "threads.writer_priority",
+                "Thread priority: normal | realtime",
+            ),
+            (
+                "VECTORVOLT_STORAGE_COMPACTION_STRATEGY",
+                "storage.compaction_strategy",
+                "Compaction: leveled | tiered | none",
+            ),
+            (
+                "VECTORVOLT_STORAGE_L0_FLUSH_THRESHOLD",
+                "storage.l0_flush_threshold",
+                "L0 file count that triggers compaction",
+            ),
+            (
+                "VECTORVOLT_STORAGE_BLOCK_SIZE",
+                "storage.block_size",
+                "SSTable block size in bytes",
+            ),
+            (
+                "VECTORVOLT_OBSERVABILITY_PROMETHEUS_ADDR",
+                "observability.prometheus_addr",
+                "Prometheus metrics endpoint host:port",
+            ),
+            (
+                "VECTORVOLT_OBSERVABILITY_TRACE_LEVEL",
+                "observability.trace_level",
+                "Log level: error | warn | info | debug",
+            ),
+            (
+                "VECTORVOLT_OBSERVABILITY_JAEGER_ENDPOINT",
+                "observability.jaeger_endpoint",
+                "Jaeger collector endpoint (empty = off)",
+            ),
+            (
+                "VECTORVOLT_NETWORK_BIND_ADDR",
+                "network.bind_addr",
+                "TCP bind address",
+            ),
+            (
+                "VECTORVOLT_NETWORK_TLS_CERT",
+                "network.tls_cert",
+                "TLS certificate file path",
+            ),
+            (
+                "VECTORVOLT_NETWORK_TLS_KEY",
+                "network.tls_key",
+                "TLS private key file path",
+            ),
+            (
+                "VECTORVOLT_NETWORK_MAX_CONNECTIONS",
+                "network.max_connections",
+                "Maximum simultaneous client connections",
+            ),
+            (
+                "VECTORVOLT_NETWORK_KEEPALIVE_SECS",
+                "network.keepalive_secs",
+                "TCP keepalive interval in seconds",
+            ),
+            (
+                "VECTORVOLT_QUERY_MAX_SCAN_ROWS",
+                "query.max_scan_rows",
+                "Maximum rows per scan (0 = unlimited)",
+            ),
+            (
+                "VECTORVOLT_QUERY_INDEX_HINT",
+                "query.index_hint",
+                "Index hint: auto | cuckoo | none",
+            ),
+        ]
+    }
+
+    /// Build a [`VvConfig`] from environment variables.
+    ///
+    /// Only variables listed in [`VvConfig::env_var_table`] are read.
+    /// Missing variables produce no field; malformed values produce an error.
+    pub fn from_env() -> EngineResult<Self> {
+        let mut cfg = Self::default();
+        cfg.merge_env()?;
+        Ok(cfg)
+    }
+
+    /// Apply environment-variable overrides on top of the existing config.
+    ///
+    /// Variables listed in [`VvConfig::env_var_table`] that are present in the
+    /// process environment are applied in order, overwriting any previously set
+    /// values.  Variables that are absent are skipped silently.
+    pub fn merge_env(&mut self) -> EngineResult<()> {
+        for (env_key, dot_key, _desc) in Self::env_var_table() {
+            if let Ok(val) = std::env::var(env_key) {
+                self.set_key(dot_key, &val)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn parse_u32(key: &str, value: &str) -> EngineResult<u32> {
