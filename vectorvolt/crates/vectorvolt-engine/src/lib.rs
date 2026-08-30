@@ -67,6 +67,7 @@ mod stats;
 mod ttl;
 mod update_where;
 pub mod views;
+pub mod vv_config;
 pub mod yaml_schema;
 
 pub mod system_profile;
@@ -114,4 +115,8 @@ pub use snapshot::SnapshotMeta;
 pub use stats::EngineStats;
 pub use system_profile::SystemProfile;
 pub use views::{ViewDefinition, ViewEntry, ViewKind, ViewRegistry};
+pub use vv_config::{
+    HalConfig, NetworkConfig, ObservabilityConfig, QueryConfig, StorageConfig, TableConfig,
+    ThreadsConfig, VvConfig,
+};
 pub use window::WindowRow;
