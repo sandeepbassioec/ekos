@@ -426,12 +426,205 @@ impl VvConfig {
         }
         Ok(())
     }
+
+    /// Compute a field-level diff between `self` (base) and `other`.
+    ///
+    /// Returns one [`ConfigDiffEntry`] per field that differs.  Fields present
+    /// only in `base` are `Removed`; fields present only in `other` are
+    /// `Added`; fields present in both with different values are `Changed`.
+    /// An empty result means the two configs are identical.
+    pub fn diff(&self, other: &Self) -> Vec<ConfigDiffEntry> {
+        let mut entries = Vec::new();
+        diff_opt_str(
+            &mut entries,
+            "hal.huge_pages",
+            self.hal.huge_pages.as_deref(),
+            other.hal.huge_pages.as_deref(),
+        );
+        diff_opt_u32(
+            &mut entries,
+            "hal.numa_node",
+            self.hal.numa_node,
+            other.hal.numa_node,
+        );
+        diff_opt_u32(
+            &mut entries,
+            "threads.writer_count",
+            self.threads.writer_count,
+            other.threads.writer_count,
+        );
+        diff_opt_u32(
+            &mut entries,
+            "threads.ring_buffer_size",
+            self.threads.ring_buffer_size,
+            other.threads.ring_buffer_size,
+        );
+        diff_opt_str(
+            &mut entries,
+            "threads.writer_priority",
+            self.threads.writer_priority.as_deref(),
+            other.threads.writer_priority.as_deref(),
+        );
+        diff_opt_str(
+            &mut entries,
+            "storage.compaction_strategy",
+            self.storage.compaction_strategy.as_deref(),
+            other.storage.compaction_strategy.as_deref(),
+        );
+        diff_opt_u32(
+            &mut entries,
+            "storage.l0_flush_threshold",
+            self.storage.l0_flush_threshold,
+            other.storage.l0_flush_threshold,
+        );
+        diff_opt_u32(
+            &mut entries,
+            "storage.block_size",
+            self.storage.block_size,
+            other.storage.block_size,
+        );
+        diff_opt_str(
+            &mut entries,
+            "observability.prometheus_addr",
+            self.observability.prometheus_addr.as_deref(),
+            other.observability.prometheus_addr.as_deref(),
+        );
+        diff_opt_str(
+            &mut entries,
+            "observability.trace_level",
+            self.observability.trace_level.as_deref(),
+            other.observability.trace_level.as_deref(),
+        );
+        diff_opt_str(
+            &mut entries,
+            "observability.jaeger_endpoint",
+            self.observability.jaeger_endpoint.as_deref(),
+            other.observability.jaeger_endpoint.as_deref(),
+        );
+        diff_opt_str(
+            &mut entries,
+            "network.bind_addr",
+            self.network.bind_addr.as_deref(),
+            other.network.bind_addr.as_deref(),
+        );
+        diff_opt_str(
+            &mut entries,
+            "network.tls_cert",
+            self.network.tls_cert.as_deref(),
+            other.network.tls_cert.as_deref(),
+        );
+        diff_opt_str(
+            &mut entries,
+            "network.tls_key",
+            self.network.tls_key.as_deref(),
+            other.network.tls_key.as_deref(),
+        );
+        diff_opt_u32(
+            &mut entries,
+            "network.max_connections",
+            self.network.max_connections,
+            other.network.max_connections,
+        );
+        diff_opt_u32(
+            &mut entries,
+            "network.keepalive_secs",
+            self.network.keepalive_secs,
+            other.network.keepalive_secs,
+        );
+        diff_opt_u64(
+            &mut entries,
+            "query.max_scan_rows",
+            self.query.max_scan_rows,
+            other.query.max_scan_rows,
+        );
+        diff_opt_str(
+            &mut entries,
+            "query.index_hint",
+            self.query.index_hint.as_deref(),
+            other.query.index_hint.as_deref(),
+        );
+        entries
+    }
 }
 
 fn parse_u32(key: &str, value: &str) -> EngineResult<u32> {
     value.parse::<u32>().map_err(|_| {
         EngineError::InvalidConfig(format!("key '{key}': expected u32, got '{value}'"))
     })
+}
+
+// ── Config diff ───────────────────────────────────────────────────────────────
+
+/// Kind of change for a single config field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigDiffKind {
+    /// Field present in base but absent in other.
+    Removed,
+    /// Field absent in base but present in other.
+    Added,
+    /// Field present in both but with different values.
+    Changed,
+}
+
+/// A single field-level difference between two [`VvConfig`] instances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDiffEntry {
+    /// Dot-notation key (e.g. `"threads.writer_count"`).
+    pub key: String,
+    /// Value in the base config, or `None` if the field was absent.
+    pub base: Option<String>,
+    /// Value in the other config, or `None` if the field was absent.
+    pub other: Option<String>,
+    /// What kind of change this is.
+    pub kind: ConfigDiffKind,
+}
+
+fn diff_opt_str(
+    out: &mut Vec<ConfigDiffEntry>,
+    key: &str,
+    base: Option<&str>,
+    other: Option<&str>,
+) {
+    match (base, other) {
+        (None, None) => {}
+        (Some(b), None) => out.push(ConfigDiffEntry {
+            key: key.into(),
+            base: Some(b.into()),
+            other: None,
+            kind: ConfigDiffKind::Removed,
+        }),
+        (None, Some(o)) => out.push(ConfigDiffEntry {
+            key: key.into(),
+            base: None,
+            other: Some(o.into()),
+            kind: ConfigDiffKind::Added,
+        }),
+        (Some(b), Some(o)) if b != o => out.push(ConfigDiffEntry {
+            key: key.into(),
+            base: Some(b.into()),
+            other: Some(o.into()),
+            kind: ConfigDiffKind::Changed,
+        }),
+        _ => {}
+    }
+}
+
+fn diff_opt_u32(out: &mut Vec<ConfigDiffEntry>, key: &str, base: Option<u32>, other: Option<u32>) {
+    diff_opt_str(
+        out,
+        key,
+        base.as_ref().map(u32::to_string).as_deref(),
+        other.as_ref().map(u32::to_string).as_deref(),
+    );
+}
+
+fn diff_opt_u64(out: &mut Vec<ConfigDiffEntry>, key: &str, base: Option<u64>, other: Option<u64>) {
+    diff_opt_str(
+        out,
+        key,
+        base.as_ref().map(u64::to_string).as_deref(),
+        other.as_ref().map(u64::to_string).as_deref(),
+    );
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

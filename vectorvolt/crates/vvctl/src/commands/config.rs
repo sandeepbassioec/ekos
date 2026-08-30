@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use vectorvolt_engine::{SystemProfile, VvConfig};
+use vectorvolt_engine::{ConfigDiffKind, SystemProfile, VvConfig};
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
@@ -49,6 +49,18 @@ pub enum ConfigCommand {
         file: PathBuf,
     },
 
+    /// Compare two vectorvolt.yaml config files field-by-field.
+    ///
+    /// Exits 0 if the files are identical; exits 1 if there are differences.
+    /// Prints a human-readable diff table showing Added (+), Removed (-), and
+    /// Changed (~) fields.
+    Diff {
+        /// Base config file.
+        base: PathBuf,
+        /// Other config file to compare against.
+        other: PathBuf,
+    },
+
     /// List all supported VECTORVOLT_* environment variables and their current values.
     ///
     /// Shows every env var that `vvctl` honours as a config override, the
@@ -62,6 +74,7 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
         ConfigCommand::Init { output, force } => cmd_init(&output, force),
         ConfigCommand::Show { file } => cmd_show(&file),
         ConfigCommand::Validate { file } => cmd_validate(&file),
+        ConfigCommand::Diff { base, other } => cmd_diff(&base, &other),
         ConfigCommand::EnvList => cmd_env_list(),
     }
 }
@@ -133,6 +146,30 @@ fn cmd_validate(file: &Path) -> Result<()> {
         }
         bail!("config has {} warning(s)", warns.len());
     }
+}
+
+fn cmd_diff(base_path: &Path, other_path: &Path) -> Result<()> {
+    let base = VvConfig::from_file(base_path)
+        .with_context(|| format!("load '{}'", base_path.display()))?;
+    let other = VvConfig::from_file(other_path)
+        .with_context(|| format!("load '{}'", other_path.display()))?;
+    let diffs = base.diff(&other);
+    if diffs.is_empty() {
+        println!("configs are identical");
+        return Ok(());
+    }
+    let key_width = diffs.iter().map(|d| d.key.len()).max().unwrap_or(0);
+    for d in &diffs {
+        let sigil = match d.kind {
+            ConfigDiffKind::Added => '+',
+            ConfigDiffKind::Removed => '-',
+            ConfigDiffKind::Changed => '~',
+        };
+        let base_val = d.base.as_deref().unwrap_or("(unset)");
+        let other_val = d.other.as_deref().unwrap_or("(unset)");
+        println!("{sigil} {:<key_width$}  {base_val} -> {other_val}", d.key);
+    }
+    bail!("{} difference(s) found", diffs.len());
 }
 
 fn cmd_env_list() -> Result<()> {

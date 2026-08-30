@@ -116,7 +116,7 @@ pub use stats::EngineStats;
 pub use system_profile::SystemProfile;
 pub use views::{ViewDefinition, ViewEntry, ViewKind, ViewRegistry};
 pub use vv_config::{
-    HalConfig, NetworkConfig, ObservabilityConfig, QueryConfig, StorageConfig, TableConfig,
-    ThreadsConfig, VvConfig,
+    ConfigDiffEntry, ConfigDiffKind, HalConfig, NetworkConfig, ObservabilityConfig, QueryConfig,
+    StorageConfig, TableConfig, ThreadsConfig, VvConfig,
 };
 pub use window::WindowRow;
