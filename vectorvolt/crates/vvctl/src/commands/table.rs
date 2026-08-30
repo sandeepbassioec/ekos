@@ -14,8 +14,18 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use vectorvolt_engine::{ColumnDef, ColumnType, TableEngine, TableSchema, TypedValue};
+
+use serde_json;
+
+/// Output format for read commands.
+#[derive(Clone, Debug, ValueEnum, Default)]
+pub enum OutputFormat {
+    #[default]
+    Table,
+    Json,
+}
 
 const SCHEMA_FILE: &str = "schema.txt";
 const FLUSH_THRESHOLD: usize = 1_048_576; // 1M rows — effectively manual-only from CLI
@@ -50,6 +60,9 @@ pub enum TableCommand {
         dir: PathBuf,
         /// Primary key value (u64).
         pk: u64,
+        /// Output format (table or json).
+        #[arg(long, value_enum, default_value = "table")]
+        output: OutputFormat,
     },
 
     /// Range scan on a column (inclusive on both ends).
@@ -65,6 +78,9 @@ pub enum TableCommand {
         /// Maximum value (inclusive).
         #[arg(long, default_value = "18446744073709551615")]
         hi: u64,
+        /// Output format (table or json).
+        #[arg(long, value_enum, default_value = "table")]
+        output: OutputFormat,
     },
 
     /// Delete a row by primary key.
@@ -79,6 +95,9 @@ pub enum TableCommand {
     Stats {
         /// Table directory.
         dir: PathBuf,
+        /// Output format (table or json).
+        #[arg(long, value_enum, default_value = "table")]
+        output: OutputFormat,
     },
 
     /// Force flush the write buffer to a new partition file.
@@ -99,6 +118,9 @@ pub enum TableCommand {
     Schema {
         /// Table directory.
         dir: PathBuf,
+        /// Output format (table or json).
+        #[arg(long, value_enum, default_value = "table")]
+        output: OutputFormat,
     },
 
     /// Add a new column to an existing table schema (DDL ALTER ADD COLUMN).
@@ -166,13 +188,19 @@ pub fn run(cmd: TableCommand) -> Result<()> {
     match cmd {
         TableCommand::Create { dir, columns } => cmd_create(dir, columns),
         TableCommand::Insert { dir, pk, values } => cmd_insert(dir, pk, values),
-        TableCommand::Get { dir, pk } => cmd_get(dir, pk),
-        TableCommand::Scan { dir, col, lo, hi } => cmd_scan(dir, col, lo, hi),
+        TableCommand::Get { dir, pk, output } => cmd_get(dir, pk, output),
+        TableCommand::Scan {
+            dir,
+            col,
+            lo,
+            hi,
+            output,
+        } => cmd_scan(dir, col, lo, hi, output),
         TableCommand::Delete { dir, pk } => cmd_delete(dir, pk),
-        TableCommand::Stats { dir } => cmd_stats(dir),
+        TableCommand::Stats { dir, output } => cmd_stats(dir, output),
         TableCommand::Flush { dir } => cmd_flush(dir),
         TableCommand::Compact { dir } => cmd_compact(dir),
-        TableCommand::Schema { dir } => cmd_schema(dir),
+        TableCommand::Schema { dir, output } => cmd_schema(dir, output),
         TableCommand::AlterAddCol { dir, column } => cmd_alter_add_col(dir, column),
         TableCommand::AlterDropCol { dir, column } => cmd_alter_drop_col(dir, column),
         TableCommand::TypedInsert { dir, pk, values } => cmd_typed_insert(dir, pk, values),
@@ -230,26 +258,50 @@ fn cmd_insert(dir: PathBuf, pk: u64, values: Vec<u64>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_get(dir: PathBuf, pk: u64) -> Result<()> {
+fn cmd_get(dir: PathBuf, pk: u64, output: OutputFormat) -> Result<()> {
     let schema = load_schema(&dir)?;
     let typed = load_typed_schema(&dir)?;
     let engine =
         TableEngine::open(schema.clone(), &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
 
     match engine.get(pk).with_context(|| "get")? {
-        None => println!("not found: pk={pk}"),
+        None => match output {
+            OutputFormat::Json => println!("null"),
+            OutputFormat::Table => println!("not found: pk={pk}"),
+        },
         Some(row) => {
-            for (i, (name, raw)) in schema.iter().zip(row.values.iter()).enumerate() {
-                let col_type = typed.get(i).map(|c| c.col_type).unwrap_or(ColumnType::U64);
-                let display = TypedValue::from_bits(col_type, *raw).display_str();
-                println!("{name}={display}");
+            let fields: Vec<(String, String)> = schema
+                .iter()
+                .zip(row.values.iter())
+                .enumerate()
+                .map(|(i, (name, raw))| {
+                    let col_type = typed.get(i).map(|c| c.col_type).unwrap_or(ColumnType::U64);
+                    (
+                        name.clone(),
+                        TypedValue::from_bits(col_type, *raw).display_str(),
+                    )
+                })
+                .collect();
+            match output {
+                OutputFormat::Json => {
+                    let obj: serde_json::Map<String, serde_json::Value> = fields
+                        .into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&obj)?);
+                }
+                OutputFormat::Table => {
+                    for (name, display) in &fields {
+                        println!("{name}={display}");
+                    }
+                }
             }
         }
     }
     Ok(())
 }
 
-fn cmd_scan(dir: PathBuf, col: usize, lo: u64, hi: u64) -> Result<()> {
+fn cmd_scan(dir: PathBuf, col: usize, lo: u64, hi: u64, output: OutputFormat) -> Result<()> {
     let schema = load_schema(&dir)?;
     let typed = load_typed_schema(&dir)?;
     let col_name = schema
@@ -260,34 +312,61 @@ fn cmd_scan(dir: PathBuf, col: usize, lo: u64, hi: u64) -> Result<()> {
         TableEngine::open(schema.clone(), &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
 
     let rows = engine.scan(col, lo, hi).with_context(|| "scan")?;
-    if rows.is_empty() {
-        println!("no rows matched {col_name} in [{lo}, {hi}]");
-        return Ok(());
-    }
 
-    // Header
-    println!("{}", schema.join("\t"));
-    println!(
-        "{}",
-        schema
-            .iter()
-            .map(|_| "────────")
-            .collect::<Vec<_>>()
-            .join("\t")
-    );
-    for row in &rows {
-        let line: Vec<String> = row
-            .values
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                let col_type = typed.get(i).map(|c| c.col_type).unwrap_or(ColumnType::U64);
-                TypedValue::from_bits(col_type, *raw).display_str()
-            })
-            .collect();
-        println!("{}", line.join("\t"));
+    match output {
+        OutputFormat::Json => {
+            let arr: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    let obj: serde_json::Map<String, serde_json::Value> = schema
+                        .iter()
+                        .zip(row.values.iter())
+                        .enumerate()
+                        .map(|(i, (name, raw))| {
+                            let col_type =
+                                typed.get(i).map(|c| c.col_type).unwrap_or(ColumnType::U64);
+                            (
+                                name.clone(),
+                                serde_json::Value::String(
+                                    TypedValue::from_bits(col_type, *raw).display_str(),
+                                ),
+                            )
+                        })
+                        .collect();
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&arr)?);
+        }
+        OutputFormat::Table => {
+            if rows.is_empty() {
+                println!("no rows matched {col_name} in [{lo}, {hi}]");
+                return Ok(());
+            }
+            println!("{}", schema.join("\t"));
+            println!(
+                "{}",
+                schema
+                    .iter()
+                    .map(|_| "────────")
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            );
+            for row in &rows {
+                let line: Vec<String> = row
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, raw)| {
+                        let col_type = typed.get(i).map(|c| c.col_type).unwrap_or(ColumnType::U64);
+                        TypedValue::from_bits(col_type, *raw).display_str()
+                    })
+                    .collect();
+                println!("{}", line.join("\t"));
+            }
+            println!("\n{} row(s) matched", rows.len());
+        }
     }
-    println!("\n{} row(s) matched", rows.len());
     Ok(())
 }
 
@@ -302,15 +381,28 @@ fn cmd_delete(dir: PathBuf, pk: u64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(dir: PathBuf) -> Result<()> {
+fn cmd_stats(dir: PathBuf, output: OutputFormat) -> Result<()> {
     let schema = load_schema(&dir)?;
     let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
 
     let s = engine.stats();
-    println!("schema:      {}", s.schema.join(", "));
-    println!("buffered:    {} row(s)", s.rows_buffered);
-    println!("flushed:     {} row(s)", s.rows_flushed);
-    println!("partitions:  {}", s.partition_count);
+    match output {
+        OutputFormat::Json => {
+            let obj = serde_json::json!({
+                "schema": s.schema,
+                "rows_buffered": s.rows_buffered,
+                "rows_flushed": s.rows_flushed,
+                "partition_count": s.partition_count,
+            });
+            println!("{}", serde_json::to_string_pretty(&obj)?);
+        }
+        OutputFormat::Table => {
+            println!("schema:      {}", s.schema.join(", "));
+            println!("buffered:    {} row(s)", s.rows_buffered);
+            println!("flushed:     {} row(s)", s.rows_flushed);
+            println!("partitions:  {}", s.partition_count);
+        }
+    }
     Ok(())
 }
 
@@ -385,12 +477,32 @@ fn cmd_typed_insert(dir: PathBuf, pk: String, values: Vec<String>) -> Result<()>
     Ok(())
 }
 
-fn cmd_schema(dir: PathBuf) -> Result<()> {
+fn cmd_schema(dir: PathBuf, output: OutputFormat) -> Result<()> {
     let schema = load_typed_schema(&dir)?;
-    println!("schema: {} column(s)", schema.col_count());
-    for (i, col) in schema.columns().iter().enumerate() {
-        let pk_tag = if i == 0 { " (PK)" } else { "" };
-        println!("  [{i}] {}:{}{pk_tag}", col.name, col.col_type.as_str());
+    match output {
+        OutputFormat::Json => {
+            let cols: Vec<serde_json::Value> = schema
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    serde_json::json!({
+                        "index": i,
+                        "name": col.name,
+                        "type": col.col_type.as_str(),
+                        "is_pk": i == 0,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&cols)?);
+        }
+        OutputFormat::Table => {
+            println!("schema: {} column(s)", schema.col_count());
+            for (i, col) in schema.columns().iter().enumerate() {
+                let pk_tag = if i == 0 { " (PK)" } else { "" };
+                println!("  [{i}] {}:{}{pk_tag}", col.name, col.col_type.as_str());
+            }
+        }
     }
     Ok(())
 }

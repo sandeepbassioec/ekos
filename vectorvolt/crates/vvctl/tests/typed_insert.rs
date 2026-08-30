@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use tempfile::TempDir;
-use vvctl::commands::table::{TableCommand, run};
+use vvctl::commands::table::{OutputFormat, TableCommand, run};
 
 fn make_dir() -> TempDir {
     TempDir::new().unwrap()
@@ -36,6 +36,7 @@ fn typed_insert_u64_only() {
     run(TableCommand::Get {
         dir: table_dir(&dir),
         pk: 1,
+        output: OutputFormat::Table,
     })
     .unwrap();
 }
@@ -53,6 +54,7 @@ fn typed_insert_bool_true() {
     run(TableCommand::Get {
         dir: table_dir(&dir),
         pk: 10,
+        output: OutputFormat::Table,
     })
     .unwrap();
 }
@@ -94,6 +96,7 @@ fn typed_insert_i64_negative() {
     run(TableCommand::Get {
         dir: table_dir(&dir),
         pk: 5,
+        output: OutputFormat::Table,
     })
     .unwrap();
 }
@@ -150,6 +153,7 @@ fn typed_insert_multi_column() {
     run(TableCommand::Get {
         dir: table_dir(&dir),
         pk: 100,
+        output: OutputFormat::Table,
     })
     .unwrap();
 }
@@ -213,6 +217,7 @@ fn typed_insert_roundtrip_decimal_then_scan() {
         col: 0,
         lo: 20,
         hi: 20,
+        output: OutputFormat::Table,
     })
     .unwrap();
 }

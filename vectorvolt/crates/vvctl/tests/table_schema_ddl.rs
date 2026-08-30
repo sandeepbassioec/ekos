@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use tempfile::TempDir;
 use vectorvolt_engine::{ColumnType, TableSchema};
-use vvctl::commands::table::{TableCommand, run};
+use vvctl::commands::table::{OutputFormat, TableCommand, run};
 
 fn make_dir() -> TempDir {
     TempDir::new().unwrap()
@@ -30,6 +30,7 @@ fn schema_prints_column_list() {
     create_table(&dir, &["pk:u64", "score:i64"]);
     run(TableCommand::Schema {
         dir: table_dir(&dir),
+        output: OutputFormat::Table,
     })
     .unwrap();
 }
@@ -39,6 +40,7 @@ fn schema_missing_table_errors() {
     let dir = make_dir();
     let result = run(TableCommand::Schema {
         dir: dir.path().join("nonexistent"),
+        output: OutputFormat::Table,
     });
     assert!(result.is_err());
 }
@@ -157,6 +159,7 @@ fn alter_drop_col_nonexistent_is_idempotent() {
     // The schema is unchanged — pk + score still present.
     run(TableCommand::Schema {
         dir: table_dir(&dir),
+        output: OutputFormat::Table,
     })
     .unwrap();
 }
