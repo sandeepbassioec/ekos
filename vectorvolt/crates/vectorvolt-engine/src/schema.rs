@@ -179,6 +179,11 @@ impl TableSchema {
         self.columns.get(idx)
     }
 
+    /// Return all column definitions in declaration order.
+    pub fn columns(&self) -> &[ColumnDef] {
+        &self.columns
+    }
+
     /// Find a column by name, returning `(index, &ColumnDef)` or `None`.
     pub fn find(&self, name: &str) -> Option<(usize, &ColumnDef)> {
         self.columns
