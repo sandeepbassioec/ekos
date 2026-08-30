@@ -55,6 +55,7 @@ fn serve_args(dir: &TempDir, catalog: bool, restore_catalog: bool) -> ServeArgs 
         catalog,
         restore_catalog,
         http_addr: None,
+        master_config: None,
         http_token: None,
     }
 }

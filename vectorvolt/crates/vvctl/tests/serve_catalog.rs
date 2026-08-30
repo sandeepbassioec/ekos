@@ -41,6 +41,7 @@ fn single_table_args(dir: &TempDir) -> ServeArgs {
         catalog: false,
         restore_catalog: false,
         http_addr: None,
+        master_config: None,
         http_token: None,
     }
 }
