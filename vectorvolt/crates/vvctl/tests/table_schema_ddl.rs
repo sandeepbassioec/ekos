@@ -145,14 +145,20 @@ fn alter_drop_col_pk_errors() {
 }
 
 #[test]
-fn alter_drop_col_nonexistent_errors() {
+fn alter_drop_col_nonexistent_is_idempotent() {
     let dir = make_dir();
-    create_table(&dir, &["pk:u64"]);
-    let result = run(TableCommand::AlterDropCol {
+    create_table(&dir, &["pk:u64", "score:u64"]);
+    // Dropping a non-existent column is silently ignored (idempotent).
+    run(TableCommand::AlterDropCol {
         dir: table_dir(&dir),
         column: "ghost".into(),
-    });
-    assert!(result.is_err());
+    })
+    .unwrap();
+    // The schema is unchanged — pk + score still present.
+    run(TableCommand::Schema {
+        dir: table_dir(&dir),
+    })
+    .unwrap();
 }
 
 // ── typed create ─────────────────────────────────────────────────────────────

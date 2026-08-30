@@ -33,17 +33,26 @@ fn from_bits_i64_negative() {
 
 #[test]
 fn from_bits_bool_true_false() {
-    assert_eq!(TypedValue::from_bits(ColumnType::Bool, 1), TypedValue::Bool(true));
-    assert_eq!(TypedValue::from_bits(ColumnType::Bool, 0), TypedValue::Bool(false));
-    assert_eq!(TypedValue::from_bits(ColumnType::Bool, 1).display_str(), "true");
+    assert_eq!(
+        TypedValue::from_bits(ColumnType::Bool, 1),
+        TypedValue::Bool(true)
+    );
+    assert_eq!(
+        TypedValue::from_bits(ColumnType::Bool, 0),
+        TypedValue::Bool(false)
+    );
+    assert_eq!(
+        TypedValue::from_bits(ColumnType::Bool, 1).display_str(),
+        "true"
+    );
 }
 
 #[test]
 fn from_bits_f64_roundtrip() {
-    let f = 3.14f64;
+    let f = 1.25f64;
     let v = TypedValue::from_bits(ColumnType::F64, f.to_bits());
     assert_eq!(v.to_bits(), f.to_bits());
-    assert!(v.display_str().starts_with("3.14"));
+    assert!(v.display_str().starts_with("1.25"));
 }
 
 #[test]
@@ -57,10 +66,22 @@ fn from_bits_decimal_display() {
 
 #[test]
 fn parse_bool_variants() {
-    assert_eq!(TypedValue::parse(ColumnType::Bool, "true").unwrap(), TypedValue::Bool(true));
-    assert_eq!(TypedValue::parse(ColumnType::Bool, "false").unwrap(), TypedValue::Bool(false));
-    assert_eq!(TypedValue::parse(ColumnType::Bool, "1").unwrap(), TypedValue::Bool(true));
-    assert_eq!(TypedValue::parse(ColumnType::Bool, "0").unwrap(), TypedValue::Bool(false));
+    assert_eq!(
+        TypedValue::parse(ColumnType::Bool, "true").unwrap(),
+        TypedValue::Bool(true)
+    );
+    assert_eq!(
+        TypedValue::parse(ColumnType::Bool, "false").unwrap(),
+        TypedValue::Bool(false)
+    );
+    assert_eq!(
+        TypedValue::parse(ColumnType::Bool, "1").unwrap(),
+        TypedValue::Bool(true)
+    );
+    assert_eq!(
+        TypedValue::parse(ColumnType::Bool, "0").unwrap(),
+        TypedValue::Bool(false)
+    );
     assert!(TypedValue::parse(ColumnType::Bool, "yes").is_err());
 }
 
