@@ -122,6 +122,27 @@ pub enum TableCommand {
         /// Name of the column to remove.
         column: String,
     },
+
+    /// Delete the entire table directory (DDL DROP TABLE).
+    ///
+    /// Permanently removes all data, WAL, and schema for the table.
+    /// Requires `--force` to prevent accidental deletion.
+    Drop {
+        /// Table directory to delete.
+        dir: PathBuf,
+        /// Confirm the destructive operation.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Delete all row data while preserving the table schema (DDL TRUNCATE TABLE).
+    ///
+    /// Removes all `.vvsst` partition files and WAL segments; the `schema.txt`
+    /// file is left intact so the table can be re-used immediately.
+    Truncate {
+        /// Table directory to truncate.
+        dir: PathBuf,
+    },
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -139,6 +160,8 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::Schema { dir } => cmd_schema(dir),
         TableCommand::AlterAddCol { dir, column } => cmd_alter_add_col(dir, column),
         TableCommand::AlterDropCol { dir, column } => cmd_alter_drop_col(dir, column),
+        TableCommand::Drop { dir, force } => cmd_drop(dir, force),
+        TableCommand::Truncate { dir } => cmd_truncate(dir),
     }
 }
 
@@ -332,6 +355,53 @@ fn cmd_alter_drop_col(dir: PathBuf, column: String) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     write_typed_schema(&dir, &updated)?;
     println!("dropped column '{column}'");
+    Ok(())
+}
+
+fn cmd_drop(dir: PathBuf, force: bool) -> Result<()> {
+    if !dir.exists() {
+        bail!("table directory '{}' does not exist", dir.display());
+    }
+    if !force {
+        bail!("refusing to drop '{}' without --force", dir.display());
+    }
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("remove table directory '{}'", dir.display()))?;
+    println!("dropped table at {}", dir.display());
+    Ok(())
+}
+
+fn cmd_truncate(dir: PathBuf) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!(
+            "no table found at '{}' — did you run `table create` first?",
+            dir.display()
+        );
+    }
+    let data_dir = dir.join("data");
+    if data_dir.exists() {
+        for entry in std::fs::read_dir(&data_dir)
+            .with_context(|| format!("read data dir '{}'", data_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("vvsst") {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("remove '{}'", path.display()))?;
+            }
+        }
+    }
+    let wal_dir = dir.join("wal");
+    if wal_dir.exists() {
+        for entry in std::fs::read_dir(&wal_dir)
+            .with_context(|| format!("read wal dir '{}'", wal_dir.display()))?
+        {
+            let entry = entry?;
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("remove WAL file '{}'", entry.path().display()))?;
+        }
+    }
+    println!("truncated table at {} (schema preserved)", dir.display());
     Ok(())
 }
 
