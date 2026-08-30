@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use vectorvolt_engine::TableEngine;
+use vectorvolt_engine::{ColumnDef, TableEngine, TableSchema};
 
 const SCHEMA_FILE: &str = "schema.txt";
 const FLUSH_THRESHOLD: usize = 1_048_576; // 1M rows — effectively manual-only from CLI
@@ -92,6 +92,36 @@ pub enum TableCommand {
         /// Table directory.
         dir: PathBuf,
     },
+
+    /// Print the typed column schema for an existing table.
+    ///
+    /// Shows each column's index, name, and type in declaration order.
+    Schema {
+        /// Table directory.
+        dir: PathBuf,
+    },
+
+    /// Add a new column to an existing table schema (DDL ALTER ADD COLUMN).
+    ///
+    /// The column spec uses `name:type` syntax, e.g. `active:bool`.
+    /// Supported types: u64, i64, f64, bool, timestamp, decimal.
+    /// The new column is appended; existing rows have an implicit value of 0.
+    AlterAddCol {
+        /// Table directory.
+        dir: PathBuf,
+        /// Column spec in `name:type` format (e.g. `status:i64`).
+        column: String,
+    },
+
+    /// Drop a column from an existing table schema (DDL ALTER DROP COLUMN).
+    ///
+    /// The primary-key column (index 0) cannot be dropped.
+    AlterDropCol {
+        /// Table directory.
+        dir: PathBuf,
+        /// Name of the column to remove.
+        column: String,
+    },
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -106,6 +136,9 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::Stats { dir } => cmd_stats(dir),
         TableCommand::Flush { dir } => cmd_flush(dir),
         TableCommand::Compact { dir } => cmd_compact(dir),
+        TableCommand::Schema { dir } => cmd_schema(dir),
+        TableCommand::AlterAddCol { dir, column } => cmd_alter_add_col(dir, column),
+        TableCommand::AlterDropCol { dir, column } => cmd_alter_drop_col(dir, column),
     }
 }
 
@@ -263,6 +296,45 @@ fn cmd_compact(dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn cmd_schema(dir: PathBuf) -> Result<()> {
+    let schema = load_typed_schema(&dir)?;
+    println!("schema: {} column(s)", schema.col_count());
+    for (i, col) in schema.columns().iter().enumerate() {
+        let pk_tag = if i == 0 { " (PK)" } else { "" };
+        println!("  [{i}] {}:{}{pk_tag}", col.name, col.col_type.as_str());
+    }
+    Ok(())
+}
+
+fn cmd_alter_add_col(dir: PathBuf, column: String) -> Result<()> {
+    let schema = load_typed_schema(&dir)?;
+    let new_def = ColumnDef::from_line(&column);
+    let updated = schema
+        .with_added(std::slice::from_ref(&new_def))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    write_typed_schema(&dir, &updated)?;
+    println!(
+        "added column '{}:{}' (index {})",
+        new_def.name,
+        new_def.col_type.as_str(),
+        updated.col_count() - 1
+    );
+    Ok(())
+}
+
+fn cmd_alter_drop_col(dir: PathBuf, column: String) -> Result<()> {
+    let schema = load_typed_schema(&dir)?;
+    if schema.get(0).is_some_and(|pk| pk.name == column) {
+        bail!("cannot drop the primary-key column '{column}'");
+    }
+    let updated = schema
+        .with_dropped(&[column.as_str()])
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    write_typed_schema(&dir, &updated)?;
+    println!("dropped column '{column}'");
+    Ok(())
+}
+
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 fn load_schema(dir: &Path) -> Result<Vec<String>> {
@@ -278,4 +350,20 @@ fn load_schema(dir: &Path) -> Result<Vec<String>> {
         .map(str::to_owned)
         .filter(|s| !s.is_empty())
         .collect())
+}
+
+fn load_typed_schema(dir: &Path) -> Result<TableSchema> {
+    let path = dir.join(SCHEMA_FILE);
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "read schema from {} — did you run `table create` first?",
+            path.display()
+        )
+    })?;
+    TableSchema::from_text(&text).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn write_typed_schema(dir: &Path, schema: &TableSchema) -> Result<()> {
+    let path = dir.join(SCHEMA_FILE);
+    std::fs::write(&path, schema.to_text()).with_context(|| "write schema.txt")
 }
