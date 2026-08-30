@@ -123,6 +123,21 @@ pub enum TableCommand {
         column: String,
     },
 
+    /// Insert a row using typed string values (one per non-PK column in schema order).
+    ///
+    /// Values are parsed according to each column's declared type.
+    /// The PK column is always first; subsequent values match schema order.
+    /// Examples: `true`/`false` for bool, `3.14` for f64, `-5` for i64, `1.500000` for decimal.
+    TypedInsert {
+        /// Table directory.
+        dir: PathBuf,
+        /// Primary key value (string, parsed as the PK column's type).
+        pk: String,
+        /// Non-PK column values in schema order (typed string representations).
+        #[arg(num_args = 0..)]
+        values: Vec<String>,
+    },
+
     /// Delete the entire table directory (DDL DROP TABLE).
     ///
     /// Permanently removes all data, WAL, and schema for the table.
@@ -160,6 +175,7 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::Schema { dir } => cmd_schema(dir),
         TableCommand::AlterAddCol { dir, column } => cmd_alter_add_col(dir, column),
         TableCommand::AlterDropCol { dir, column } => cmd_alter_drop_col(dir, column),
+        TableCommand::TypedInsert { dir, pk, values } => cmd_typed_insert(dir, pk, values),
         TableCommand::Drop { dir, force } => cmd_drop(dir, force),
         TableCommand::Truncate { dir } => cmd_truncate(dir),
     }
@@ -328,6 +344,44 @@ fn cmd_compact(dir: PathBuf) -> Result<()> {
             println!("output:    {}", r.path.display());
         }
     }
+    Ok(())
+}
+
+fn cmd_typed_insert(dir: PathBuf, pk: String, values: Vec<String>) -> Result<()> {
+    let typed = load_typed_schema(&dir)?;
+    let cols = typed.columns();
+
+    if cols.is_empty() {
+        bail!("schema has no columns");
+    }
+    let pk_type = cols[0].col_type;
+    let pk_bits = TypedValue::parse(pk_type, &pk)
+        .map_err(|e| anyhow::anyhow!("pk: {e}"))?
+        .to_bits();
+
+    if values.len() != cols.len() - 1 {
+        bail!(
+            "schema has {} non-PK column(s) but {} value(s) provided",
+            cols.len() - 1,
+            values.len()
+        );
+    }
+
+    let mut row = vec![pk_bits];
+    for (i, (val_str, col)) in values.iter().zip(&cols[1..]).enumerate() {
+        let bits = TypedValue::parse(col.col_type, val_str)
+            .map_err(|e| anyhow::anyhow!("column '{}' (index {}): {e}", col.name, i + 1))?
+            .to_bits();
+        row.push(bits);
+    }
+
+    let schema_names = load_schema(&dir)?;
+    let engine =
+        TableEngine::open(schema_names, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    engine.insert(pk_bits, row).with_context(|| "insert")?;
+    engine.flush().with_context(|| "flush after insert")?;
+
+    println!("inserted pk={pk}");
     Ok(())
 }
 
