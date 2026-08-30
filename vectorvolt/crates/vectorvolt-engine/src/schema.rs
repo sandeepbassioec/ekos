@@ -270,3 +270,128 @@ impl TableSchema {
         Self::new(columns)
     }
 }
+
+// ── TypedValue ────────────────────────────────────────────────────────────────
+
+/// A runtime value produced by interpreting a raw `u64` bit-pattern through a
+/// [`ColumnType`] lens.
+///
+/// VectorVolt stores every column as `u64` on disk.  `TypedValue` is the
+/// presentation layer: it carries the decoded value so callers can display or
+/// compare it without knowing the storage representation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedValue {
+    /// Raw unsigned 64-bit integer.
+    U64(u64),
+    /// Signed 64-bit integer (two's-complement reinterpret).
+    I64(i64),
+    /// IEEE 754 double (bit-cast from `u64`).
+    F64(f64),
+    /// Boolean (`false` = 0, `true` = 1).
+    Bool(bool),
+    /// Unix timestamp in nanoseconds (displayed as raw `u64`).
+    Timestamp(u64),
+    /// Fixed-point decimal: `raw_bits as i64` / 1_000_000 (6 decimal places).
+    Decimal(i64),
+}
+
+impl TypedValue {
+    /// Decode a raw `u64` storage value according to the given [`ColumnType`].
+    pub fn from_bits(col_type: ColumnType, bits: u64) -> Self {
+        match col_type {
+            ColumnType::U64 => Self::U64(bits),
+            ColumnType::I64 => Self::I64(bits as i64),
+            ColumnType::F64 => Self::F64(f64::from_bits(bits)),
+            ColumnType::Bool => Self::Bool(bits != 0),
+            ColumnType::Timestamp => Self::Timestamp(bits),
+            ColumnType::Decimal => Self::Decimal(bits as i64),
+        }
+    }
+
+    /// Re-encode this value back to its raw `u64` storage representation.
+    pub fn to_bits(&self) -> u64 {
+        match self {
+            Self::U64(v) => *v,
+            Self::I64(v) => *v as u64,
+            Self::F64(v) => v.to_bits(),
+            Self::Bool(v) => *v as u64,
+            Self::Timestamp(v) => *v,
+            Self::Decimal(v) => *v as u64,
+        }
+    }
+
+    /// Human-readable string for CLI display.
+    ///
+    /// - `U64` / `Timestamp` → decimal integer
+    /// - `I64` → signed decimal (negative values show a minus sign)
+    /// - `F64` → up to 6 significant decimal digits
+    /// - `Bool` → `"true"` / `"false"`
+    /// - `Decimal` → `"N.NNNNNN"` (6 decimal places, signed)
+    pub fn display_str(&self) -> String {
+        match self {
+            Self::U64(v) => v.to_string(),
+            Self::I64(v) => v.to_string(),
+            Self::F64(v) => format!("{v:.6}"),
+            Self::Bool(v) => v.to_string(),
+            Self::Timestamp(v) => v.to_string(),
+            Self::Decimal(v) => {
+                let whole = v / 1_000_000;
+                let frac = (v % 1_000_000).abs();
+                format!("{whole}.{frac:06}")
+            }
+        }
+    }
+
+    /// Parse a human-readable string into a `TypedValue` of the given type.
+    ///
+    /// Accepts the same formats produced by [`TypedValue::display_str`] plus
+    /// common shorthands (`"1"` / `"0"` for booleans, plain integers for
+    /// decimals).
+    pub fn parse(col_type: ColumnType, s: &str) -> EngineResult<Self> {
+        let s = s.trim();
+        match col_type {
+            ColumnType::U64 => s
+                .parse::<u64>()
+                .map(Self::U64)
+                .map_err(|_| EngineError::InvalidConfig(format!("expected u64, got '{s}'"))),
+            ColumnType::I64 => s
+                .parse::<i64>()
+                .map(Self::I64)
+                .map_err(|_| EngineError::InvalidConfig(format!("expected i64, got '{s}'"))),
+            ColumnType::F64 => s
+                .parse::<f64>()
+                .map(Self::F64)
+                .map_err(|_| EngineError::InvalidConfig(format!("expected f64, got '{s}'"))),
+            ColumnType::Bool => match s {
+                "true" | "1" => Ok(Self::Bool(true)),
+                "false" | "0" => Ok(Self::Bool(false)),
+                _ => Err(EngineError::InvalidConfig(format!(
+                    "expected bool (true/false/1/0), got '{s}'"
+                ))),
+            },
+            ColumnType::Timestamp => s.parse::<u64>().map(Self::Timestamp).map_err(|_| {
+                EngineError::InvalidConfig(format!("expected timestamp (u64 ns), got '{s}'"))
+            }),
+            ColumnType::Decimal => {
+                if let Some(dot) = s.find('.') {
+                    let whole: i64 = s[..dot].parse().map_err(|_| {
+                        EngineError::InvalidConfig(format!("expected decimal, got '{s}'"))
+                    })?;
+                    let frac_str = &s[dot + 1..];
+                    let frac_str_padded = format!("{frac_str:0<6}");
+                    let frac: i64 = frac_str_padded[..6].parse().map_err(|_| {
+                        EngineError::InvalidConfig(format!("expected decimal, got '{s}'"))
+                    })?;
+                    let sign: i64 = if whole < 0 { -1 } else { 1 };
+                    Ok(Self::Decimal(whole * 1_000_000 + sign * frac))
+                } else {
+                    s.parse::<i64>()
+                        .map(|v| Self::Decimal(v * 1_000_000))
+                        .map_err(|_| {
+                            EngineError::InvalidConfig(format!("expected decimal, got '{s}'"))
+                        })
+                }
+            }
+        }
+    }
+}

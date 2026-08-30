@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use vectorvolt_engine::{ColumnDef, TableEngine, TableSchema};
+use vectorvolt_engine::{ColumnDef, ColumnType, TableEngine, TableSchema, TypedValue};
 
 const SCHEMA_FILE: &str = "schema.txt";
 const FLUSH_THRESHOLD: usize = 1_048_576; // 1M rows — effectively manual-only from CLI
@@ -216,14 +216,17 @@ fn cmd_insert(dir: PathBuf, pk: u64, values: Vec<u64>) -> Result<()> {
 
 fn cmd_get(dir: PathBuf, pk: u64) -> Result<()> {
     let schema = load_schema(&dir)?;
+    let typed = load_typed_schema(&dir)?;
     let engine =
         TableEngine::open(schema.clone(), &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
 
     match engine.get(pk).with_context(|| "get")? {
         None => println!("not found: pk={pk}"),
         Some(row) => {
-            for (name, val) in schema.iter().zip(row.values.iter()) {
-                println!("{name}={val}");
+            for (i, (name, raw)) in schema.iter().zip(row.values.iter()).enumerate() {
+                let col_type = typed.get(i).map(|c| c.col_type).unwrap_or(ColumnType::U64);
+                let display = TypedValue::from_bits(col_type, *raw).display_str();
+                println!("{name}={display}");
             }
         }
     }
@@ -232,6 +235,7 @@ fn cmd_get(dir: PathBuf, pk: u64) -> Result<()> {
 
 fn cmd_scan(dir: PathBuf, col: usize, lo: u64, hi: u64) -> Result<()> {
     let schema = load_schema(&dir)?;
+    let typed = load_typed_schema(&dir)?;
     let col_name = schema
         .get(col)
         .cloned()
@@ -256,7 +260,15 @@ fn cmd_scan(dir: PathBuf, col: usize, lo: u64, hi: u64) -> Result<()> {
             .join("\t")
     );
     for row in &rows {
-        let line: Vec<String> = row.values.iter().map(|v| v.to_string()).collect();
+        let line: Vec<String> = row
+            .values
+            .iter()
+            .enumerate()
+            .map(|(i, raw)| {
+                let col_type = typed.get(i).map(|c| c.col_type).unwrap_or(ColumnType::U64);
+                TypedValue::from_bits(col_type, *raw).display_str()
+            })
+            .collect();
         println!("{}", line.join("\t"));
     }
     println!("\n{} row(s) matched", rows.len());
