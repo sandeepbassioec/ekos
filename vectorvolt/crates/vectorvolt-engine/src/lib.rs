@@ -108,7 +108,7 @@ pub use mvcc::TxnId;
 pub use pagination::PageResult;
 pub use registry::{SCHEMA_FILE, TableRegistry};
 pub use row::EngineRow;
-pub use schema::{ColumnDef, ColumnType, TableSchema};
+pub use schema::{ColumnDef, ColumnType, TableSchema, TypedValue};
 pub use schema_registry::SchemaRegistry;
 pub use shard_catalog::{ShardCatalog, TableEntry};
 pub use snapshot::SnapshotMeta;
