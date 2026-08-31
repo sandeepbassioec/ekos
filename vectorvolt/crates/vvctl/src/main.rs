@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, catalog, config, connect, hal, http, keygen, profile, serve, store, table, tune, wal,
+    bench, catalog, completion, config, connect, hal, http, keygen, profile, serve, server_cmd,
+    store, support_bundle, table, topology, tune, wal,
 };
 use vvctl::ui;
 
@@ -86,6 +87,19 @@ enum Commands {
 
     /// Emit the host SystemProfile as JSON or a human-readable table (VV-CFG-001).
     Profile(profile::ProfileArgs),
+
+    /// Show detected CPU/NUMA topology.
+    Topology(topology::TopologyArgs),
+
+    /// Print shell completion scripts.
+    Completion(completion::CompletionArgs),
+
+    /// Server management commands (status, health).
+    #[command(subcommand)]
+    Server(server_cmd::ServerCommand),
+
+    /// Collect diagnostics into a support bundle file.
+    SupportBundle(support_bundle::SupportBundleArgs),
 
     /// Print version and build info.
     Version,
@@ -212,6 +226,14 @@ fn main() -> Result<()> {
         Commands::Tune(args) => tune::run(args)?,
 
         Commands::Profile(args) => profile::run(args)?,
+
+        Commands::Topology(args) => topology::run(args)?,
+
+        Commands::Completion(args) => completion::run(args)?,
+
+        Commands::Server(cmd) => server_cmd::run(cmd)?,
+
+        Commands::SupportBundle(args) => support_bundle::run(args)?,
 
         Commands::Version => print_version(),
     }

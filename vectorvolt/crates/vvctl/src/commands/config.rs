@@ -142,6 +142,15 @@ pub enum ConfigCommand {
         file: PathBuf,
     },
 
+    /// Reset a config file to defaults (overwrites with a fresh generated config).
+    ///
+    /// Equivalent to `config init --force` on an existing file.
+    Reset {
+        /// Path to the config file.
+        #[arg(long, short, default_value = "vectorvolt.yaml")]
+        file: PathBuf,
+    },
+
     /// Normalize a vectorvolt.yaml by loading and re-serializing it.
     ///
     /// Removes duplicate keys, normalises whitespace, and sorts map keys
@@ -179,6 +188,7 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
         ConfigCommand::ListKeys { file, output } => cmd_list_keys(&file, output),
         ConfigCommand::ValidateStrict { file } => cmd_validate_strict(&file),
         ConfigCommand::EnvExport { file } => cmd_env_export(&file),
+        ConfigCommand::Reset { file } => cmd_init(&file, true),
     }
 }
 

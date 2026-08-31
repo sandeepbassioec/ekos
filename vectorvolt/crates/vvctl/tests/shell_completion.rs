@@ -107,7 +107,7 @@ fn completion_bash_neverr() {
     let result = run(CompletionArgs {
         shell: CompletionShell::Bash,
     });
-    assert!(!result.is_err(), "bash completion should not error");
+    assert!(result.is_ok(), "bash completion should not error");
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn completion_zsh_neverr() {
     let result = run(CompletionArgs {
         shell: CompletionShell::Zsh,
     });
-    assert!(!result.is_err());
+    assert!(result.is_ok());
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn completion_fish_neverr() {
     let result = run(CompletionArgs {
         shell: CompletionShell::Fish,
     });
-    assert!(!result.is_err());
+    assert!(result.is_ok());
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn completion_powershell_neverr() {
     let result = run(CompletionArgs {
         shell: CompletionShell::Powershell,
     });
-    assert!(!result.is_err());
+    assert!(result.is_ok());
 }
 
 #[test]

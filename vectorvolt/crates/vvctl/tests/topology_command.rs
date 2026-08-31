@@ -59,7 +59,7 @@ fn topology_probe_succeeds() {
 #[test]
 fn topology_logical_ge_1() {
     let topo = vectorvolt_hal::CpuTopology::detect();
-    assert!(topo.logical.len() >= 1);
+    assert!(!topo.logical.is_empty());
 }
 
 #[test]
