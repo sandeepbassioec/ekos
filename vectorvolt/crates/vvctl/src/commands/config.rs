@@ -86,6 +86,22 @@ pub enum ConfigCommand {
         #[arg(long)]
         show_diff: bool,
     },
+
+    /// Set a single field in a vectorvolt.yaml config file by dot-notation key.
+    ///
+    /// Loads the file, sets the key, validates, and writes back in-place.
+    /// Use `--dry-run` to print the result without writing.
+    SetKey {
+        /// Path to the config file.
+        file: PathBuf,
+        /// Dot-notation key (e.g. `threads.writer_count`).
+        key: String,
+        /// New value (always a string; the engine parses to the target type).
+        value: String,
+        /// Print the result without writing the file.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn run(cmd: ConfigCommand) -> Result<()> {
@@ -101,6 +117,12 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
             output,
             show_diff,
         } => cmd_merge(&base, &overlay, output.as_deref(), show_diff),
+        ConfigCommand::SetKey {
+            file,
+            key,
+            value,
+            dry_run,
+        } => cmd_set_key(&file, &key, &value, dry_run),
     }
 }
 
@@ -255,6 +277,21 @@ fn cmd_merge(
                 println!("{sigil} {:<key_width$}  {base_val} -> {merged_val}", d.key);
             }
         }
+    }
+    Ok(())
+}
+
+fn cmd_set_key(file: &Path, key: &str, value: &str, dry_run: bool) -> Result<()> {
+    let mut cfg =
+        VvConfig::from_file(file).with_context(|| format!("load '{}'", file.display()))?;
+    cfg.set_key(key, value)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let yaml = cfg.to_yaml().context("serialize config")?;
+    if dry_run {
+        print!("{yaml}");
+    } else {
+        std::fs::write(file, &yaml).with_context(|| format!("write '{}'", file.display()))?;
+        println!("Updated: {} = {}", key, value);
     }
     Ok(())
 }
