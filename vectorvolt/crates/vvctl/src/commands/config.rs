@@ -102,6 +102,18 @@ pub enum ConfigCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Normalize a vectorvolt.yaml by loading and re-serializing it.
+    ///
+    /// Removes duplicate keys, normalises whitespace, and sorts map keys
+    /// to canonical order.  Writes back in-place unless `--dry-run`.
+    Normalize {
+        /// Path to the config file.
+        file: PathBuf,
+        /// Print the normalized result without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn run(cmd: ConfigCommand) -> Result<()> {
@@ -123,6 +135,7 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
             value,
             dry_run,
         } => cmd_set_key(&file, &key, &value, dry_run),
+        ConfigCommand::Normalize { file, dry_run } => cmd_normalize(&file, dry_run),
     }
 }
 
@@ -292,6 +305,18 @@ fn cmd_set_key(file: &Path, key: &str, value: &str, dry_run: bool) -> Result<()>
     } else {
         std::fs::write(file, &yaml).with_context(|| format!("write '{}'", file.display()))?;
         println!("Updated: {} = {}", key, value);
+    }
+    Ok(())
+}
+
+fn cmd_normalize(file: &Path, dry_run: bool) -> Result<()> {
+    let cfg = VvConfig::from_file(file).with_context(|| format!("load '{}'", file.display()))?;
+    let yaml = cfg.to_yaml().context("serialize")?;
+    if dry_run {
+        print!("{yaml}");
+    } else {
+        std::fs::write(file, &yaml).with_context(|| format!("write '{}'", file.display()))?;
+        println!("Normalized: {}", file.display());
     }
     Ok(())
 }
