@@ -187,6 +187,9 @@ pub enum TableCommand {
     Truncate {
         /// Table directory to truncate.
         dir: PathBuf,
+        /// Confirm the destructive operation.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Print the total row count (buffered + flushed) for a table.
@@ -435,7 +438,7 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::AlterDropCol { dir, column } => cmd_alter_drop_col(dir, column),
         TableCommand::TypedInsert { dir, pk, values } => cmd_typed_insert(dir, pk, values),
         TableCommand::Drop { dir, force } => cmd_drop(dir, force),
-        TableCommand::Truncate { dir } => cmd_truncate(dir),
+        TableCommand::Truncate { dir, force } => cmd_truncate(dir, force),
         TableCommand::Count { dir, output } => cmd_count(&dir, output),
         TableCommand::Head { dir, n, output } => cmd_head(&dir, n, output),
         TableCommand::Keys { dir, output } => cmd_keys(&dir, output),
@@ -801,7 +804,10 @@ fn cmd_drop(dir: PathBuf, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_truncate(dir: PathBuf) -> Result<()> {
+fn cmd_truncate(dir: PathBuf, force: bool) -> Result<()> {
+    if !force {
+        bail!("--force flag required for truncate");
+    }
     if !dir.join(SCHEMA_FILE).exists() {
         bail!(
             "no table found at '{}' — did you run `table create` first?",

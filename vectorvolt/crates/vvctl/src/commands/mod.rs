@@ -1,5 +1,6 @@
 pub mod bench;
 pub mod catalog;
+pub mod completion;
 pub mod config;
 pub mod connect;
 pub mod hal;
@@ -7,7 +8,10 @@ pub mod http;
 pub mod keygen;
 pub mod profile;
 pub mod serve;
+pub mod server_cmd;
 pub mod store;
+pub mod support_bundle;
 pub mod table;
+pub mod topology;
 pub mod tune;
 pub mod wal;

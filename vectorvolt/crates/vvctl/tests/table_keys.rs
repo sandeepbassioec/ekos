@@ -248,6 +248,7 @@ fn keys_after_truncate_is_empty() {
     .unwrap();
     run(TableCommand::Truncate {
         dir: table_dir(&dir),
+        force: true,
     })
     .unwrap();
     assert!(

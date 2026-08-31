@@ -113,6 +113,7 @@ fn truncate_preserves_schema() {
     create_and_insert(&dir);
     run(TableCommand::Truncate {
         dir: table_dir(&dir),
+        force: true,
     })
     .unwrap();
     assert!(table_dir(&dir).join("schema.txt").exists());
@@ -129,6 +130,7 @@ fn truncate_removes_vvsst_files() {
     .unwrap();
     run(TableCommand::Truncate {
         dir: table_dir(&dir),
+        force: true,
     })
     .unwrap();
     let data_dir = table_dir(&dir).join("data");
@@ -147,6 +149,7 @@ fn truncate_missing_table_errors() {
     let dir = make_dir();
     let result = run(TableCommand::Truncate {
         dir: dir.path().join("nonexistent"),
+        force: true,
     });
     assert!(result.is_err());
 }
@@ -157,6 +160,7 @@ fn truncate_then_create_succeeds() {
     create_and_insert(&dir);
     run(TableCommand::Truncate {
         dir: table_dir(&dir),
+        force: true,
     })
     .unwrap();
     // After truncate, schema.txt still exists so Create should fail (table exists)
@@ -178,6 +182,7 @@ fn truncate_empty_table_succeeds() {
     .unwrap();
     run(TableCommand::Truncate {
         dir: table_dir(&dir),
+        force: true,
     })
     .unwrap();
     assert!(table_dir(&dir).join("schema.txt").exists());
@@ -208,6 +213,7 @@ fn drop_removes_dir_truncate_does_not() {
     .unwrap();
     run(TableCommand::Truncate {
         dir: dir2.path().join("tbl"),
+        force: true,
     })
     .unwrap();
 
