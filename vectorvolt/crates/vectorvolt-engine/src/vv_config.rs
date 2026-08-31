@@ -304,6 +304,39 @@ impl VvConfig {
         Ok(())
     }
 
+    /// Get the current value of a single config key using dot-notation.
+    ///
+    /// Returns `None` when the key is valid but the field is currently unset.
+    /// Returns `Err` when the key is not recognised.
+    pub fn get_key(&self, key: &str) -> EngineResult<Option<String>> {
+        let val = match key {
+            "hal.numa_node" => self.hal.numa_node.map(|v| v.to_string()),
+            "hal.huge_pages" => self.hal.huge_pages.clone(),
+            "threads.writer_count" => self.threads.writer_count.map(|v| v.to_string()),
+            "threads.ring_buffer_size" => self.threads.ring_buffer_size.map(|v| v.to_string()),
+            "threads.writer_priority" => self.threads.writer_priority.clone(),
+            "storage.compaction_strategy" => self.storage.compaction_strategy.clone(),
+            "storage.l0_flush_threshold" => self.storage.l0_flush_threshold.map(|v| v.to_string()),
+            "storage.block_size" => self.storage.block_size.map(|v| v.to_string()),
+            "observability.prometheus_addr" => self.observability.prometheus_addr.clone(),
+            "observability.trace_level" => self.observability.trace_level.clone(),
+            "observability.jaeger_endpoint" => self.observability.jaeger_endpoint.clone(),
+            "network.bind_addr" => self.network.bind_addr.clone(),
+            "network.tls_cert" => self.network.tls_cert.clone(),
+            "network.tls_key" => self.network.tls_key.clone(),
+            "network.max_connections" => self.network.max_connections.map(|v| v.to_string()),
+            "network.keepalive_secs" => self.network.keepalive_secs.map(|v| v.to_string()),
+            "query.max_scan_rows" => self.query.max_scan_rows.map(|v| v.to_string()),
+            "query.index_hint" => self.query.index_hint.clone(),
+            other => {
+                return Err(EngineError::InvalidConfig(format!(
+                    "unknown config key '{other}'"
+                )));
+            }
+        };
+        Ok(val)
+    }
+
     /// Return a table of all supported env-var overrides.
     ///
     /// Each entry is `(env_key, dot_key, description)`.  The env var maps

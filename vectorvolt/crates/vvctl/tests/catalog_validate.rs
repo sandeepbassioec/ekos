@@ -1,4 +1,4 @@
-//! Integration tests for L109: `vvctl catalog validate` (VV-CTL-005).
+﻿//! Integration tests for L109: `vvctl catalog validate` (VV-CTL-005).
 
 use tempfile::TempDir;
 use vvctl::commands::catalog::{CatalogArgs, CatalogCommand, run};
@@ -30,7 +30,7 @@ fn validate_args(dir: &TempDir, strict: bool) -> CatalogArgs {
     args(dir, CatalogCommand::Validate { strict })
 }
 
-// ── empty catalog ─────────────────────────────────────────────────────────────
+// â”€â”€ empty catalog â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn validate_empty_catalog_succeeds() {
@@ -44,7 +44,7 @@ fn validate_empty_catalog_strict_succeeds() {
     run(validate_args(&dir, true)).unwrap();
 }
 
-// ── valid tables ──────────────────────────────────────────────────────────────
+// â”€â”€ valid tables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn validate_single_valid_table_passes() {
@@ -69,7 +69,7 @@ fn validate_strict_on_clean_catalog_passes() {
     run(validate_args(&dir, true)).unwrap();
 }
 
-// ── ghost entries ─────────────────────────────────────────────────────────────
+// â”€â”€ ghost entries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn validate_detects_ghost_entry() {
@@ -89,7 +89,7 @@ fn validate_detects_ghost_entry() {
     );
 }
 
-// ── orphan dirs ───────────────────────────────────────────────────────────────
+// â”€â”€ orphan dirs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn validate_detects_orphan_dir() {
@@ -104,7 +104,7 @@ fn validate_detects_orphan_dir() {
     );
 }
 
-// ── post-drop cleanliness ─────────────────────────────────────────────────────
+// â”€â”€ post-drop cleanliness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn validate_after_drop_leaves_no_orphans() {
@@ -112,7 +112,7 @@ fn validate_after_drop_leaves_no_orphans() {
     run(create_args(&dir, "tmp")).unwrap();
     run(args(&dir, CatalogCommand::DropTable { name: "tmp".into() })).unwrap();
     // After drop, catalog dir remains on disk but registry entry is gone.
-    // That means an orphan dir exists — validate should detect it.
+    // That means an orphan dir exists â€” validate should detect it.
     // This is expected behaviour: drop removes the registry entry, not the data.
     let result = run(validate_args(&dir, false));
     assert!(
@@ -121,7 +121,7 @@ fn validate_after_drop_leaves_no_orphans() {
     );
 }
 
-// ── engine-level validation logic ────────────────────────────────────────────
+// â”€â”€ engine-level validation logic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn engine_validate_healthy_report_for_valid_table() {
@@ -189,14 +189,14 @@ fn engine_validate_non_u64_pk_is_warning_not_error() {
     let reg_dir = dir.path().join("registry");
     std::fs::create_dir_all(cat_dir.join("metrics")).unwrap();
 
-    // First column is f64 — valid schema but violates pk convention.
+    // First column is f64 â€” valid schema but violates pk convention.
     let reg = SchemaRegistry::new(&reg_dir);
     let schema =
         TableSchema::new(vec![ColumnDef::from_line("ts:f64"), ColumnDef::u64("val")]).unwrap();
     reg.save("metrics", &schema).unwrap();
 
     let report = validate_catalog(&cat_dir, &reg_dir).unwrap();
-    // Warning: non-u64 pk. No errors, no orphan/ghost → is_healthy passes.
+    // Warning: non-u64 pk. No errors, no orphan/ghost â†’ is_healthy passes.
     assert!(report.is_healthy(), "non-u64 pk is a warning, not an error");
     assert!(!report.is_clean(), "non-u64 pk should produce a warning");
     assert_eq!(report.warning_count(), 1);

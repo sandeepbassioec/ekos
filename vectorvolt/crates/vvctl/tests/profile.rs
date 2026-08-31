@@ -1,8 +1,8 @@
-//! Integration tests for L133: vvctl profile (VV-CFG-001 CLI surface).
+﻿//! Integration tests for L133: vvctl profile (VV-CFG-001 CLI surface).
 
 use vvctl::commands::profile::{ProfileArgs, ProfileOutput, run};
 
-// ── JSON output (default) ─────────────────────────────────────────────────────
+// â”€â”€ JSON output (default) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn profile_json_succeeds() {
@@ -22,7 +22,7 @@ fn profile_json_recommendations_succeeds() {
     .unwrap();
 }
 
-// ── Table output ──────────────────────────────────────────────────────────────
+// â”€â”€ Table output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn profile_table_succeeds() {
@@ -42,7 +42,7 @@ fn profile_table_recommendations_succeeds() {
     .unwrap();
 }
 
-// ── Underlying SystemProfile invariants ──────────────────────────────────────
+// â”€â”€ Underlying SystemProfile invariants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn profile_logical_cores_at_least_one() {

@@ -1,4 +1,4 @@
-//! Integration tests for L119: `vvctl catalog tag-*` (VV-CTL-015).
+﻿//! Integration tests for L119: `vvctl catalog tag-*` (VV-CTL-015).
 
 use tempfile::TempDir;
 use vectorvolt_engine::{ColumnDef, SchemaRegistry, ShardCatalog, TableSchema, get_tags, set_tag};
@@ -39,7 +39,7 @@ fn make_table(dir: &TempDir, name: &str) {
     catalog.create_table(name, schema, 1024, 1).unwrap();
 }
 
-// ── CLI integration ───────────────────────────────────────────────────────────
+// â”€â”€ CLI integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn cli_tag_set_succeeds() {
@@ -152,7 +152,7 @@ fn cli_tag_clear_removes_all_tags() {
     assert!(tags.is_empty());
 }
 
-// ── engine API ────────────────────────────────────────────────────────────────
+// â”€â”€ engine API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn engine_set_tag_persists() {

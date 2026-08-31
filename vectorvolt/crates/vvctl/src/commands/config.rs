@@ -1,4 +1,4 @@
-﻿//! `vvctl config` — master VectorVolt configuration management (VV-CFG-012).
+//! `vvctl config` — master VectorVolt configuration management (VV-CFG-012).
 //!
 //! ## Subcommands
 //!
@@ -14,9 +14,19 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json;
+use serde_yaml;
+
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use vectorvolt_engine::{ConfigDiffKind, SystemProfile, VvConfig};
+
+#[derive(Clone, Debug, ValueEnum, Default)]
+pub enum ListKeysOutput {
+    #[default]
+    Table,
+    Json,
+}
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
@@ -103,6 +113,35 @@ pub enum ConfigCommand {
         dry_run: bool,
     },
 
+    /// Read a single dot-notation config key from a vectorvolt.yaml file.
+    GetKey {
+        /// Path to the config file.
+        file: PathBuf,
+        /// Dot-notation key (e.g. `threads.writer_count`).
+        key: String,
+    },
+
+    /// List all known dot-notation config keys and their current values.
+    ListKeys {
+        /// Path to the config file.
+        file: PathBuf,
+        /// Output format (table or json).
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: ListKeysOutput,
+    },
+
+    /// Validate config and report any unknown top-level sections.
+    ValidateStrict {
+        /// Path to the config file.
+        file: PathBuf,
+    },
+
+    /// Export config as shell export statements.
+    EnvExport {
+        /// Path to the config file.
+        file: PathBuf,
+    },
+
     /// Normalize a vectorvolt.yaml by loading and re-serializing it.
     ///
     /// Removes duplicate keys, normalises whitespace, and sorts map keys
@@ -136,6 +175,10 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
             dry_run,
         } => cmd_set_key(&file, &key, &value, dry_run),
         ConfigCommand::Normalize { file, dry_run } => cmd_normalize(&file, dry_run),
+        ConfigCommand::GetKey { file, key } => cmd_get_key(&file, &key),
+        ConfigCommand::ListKeys { file, output } => cmd_list_keys(&file, output),
+        ConfigCommand::ValidateStrict { file } => cmd_validate_strict(&file),
+        ConfigCommand::EnvExport { file } => cmd_env_export(&file),
     }
 }
 
@@ -317,6 +360,86 @@ fn cmd_normalize(file: &Path, dry_run: bool) -> Result<()> {
     } else {
         std::fs::write(file, &yaml).with_context(|| format!("write '{}'", file.display()))?;
         println!("Normalized: {}", file.display());
+    }
+    Ok(())
+}
+
+fn cmd_get_key(file: &Path, key: &str) -> Result<()> {
+    let cfg = VvConfig::from_file(file).with_context(|| format!("load '{}'", file.display()))?;
+    match cfg.get_key(key).map_err(|e| anyhow::anyhow!("{e}"))? {
+        Some(val) => println!("{val}"),
+        None => println!("key not found"),
+    }
+    Ok(())
+}
+
+fn cmd_list_keys(file: &Path, output: ListKeysOutput) -> Result<()> {
+    let cfg = VvConfig::from_file(file).with_context(|| format!("load '{}'", file.display()))?;
+    let table = VvConfig::env_var_table();
+    match output {
+        ListKeysOutput::Table => {
+            let key_col = table.iter().map(|(_, k, _)| k.len()).max().unwrap_or(0);
+            println!("{:<key_col$}  VALUE", "KEY");
+            println!("{}", "-".repeat(key_col + 10));
+            for (_env, dot_key, _desc) in table {
+                let val = cfg
+                    .get_key(dot_key)
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "(unset)".into());
+                println!("{:<key_col$}  {val}", dot_key);
+            }
+        }
+        ListKeysOutput::Json => {
+            let arr: Vec<serde_json::Value> = table
+                .iter()
+                .map(|(_env, dot_key, _desc)| {
+                    let val = cfg.get_key(dot_key).unwrap_or(None);
+                    serde_json::json!({"key": dot_key, "value": val})
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&arr)?);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_validate_strict(file: &Path) -> Result<()> {
+    let cfg = VvConfig::from_file(file).with_context(|| format!("load '{}'", file.display()))?;
+    let warns = cfg.validate();
+    let yaml_text = std::fs::read_to_string(file)?;
+    let raw: serde_yaml::Value =
+        serde_yaml::from_str(&yaml_text).with_context(|| "parse raw YAML")?;
+    let known = [
+        "hal",
+        "threads",
+        "storage",
+        "observability",
+        "network",
+        "query",
+        "tables",
+    ];
+    if let serde_yaml::Value::Mapping(map) = &raw {
+        for key in map.keys() {
+            if let serde_yaml::Value::String(k) = key
+                && !known.contains(&k.as_str())
+            {
+                eprintln!("warning: unknown section '{k}'");
+            }
+        }
+    }
+    for w in &warns {
+        eprintln!("warning: {w}");
+    }
+    println!("config ok (strict): {}", file.display());
+    Ok(())
+}
+
+fn cmd_env_export(file: &Path) -> Result<()> {
+    let cfg = VvConfig::from_file(file).with_context(|| format!("load '{}'", file.display()))?;
+    for (env_key, dot_key, _desc) in VvConfig::env_var_table() {
+        if let Ok(Some(val)) = cfg.get_key(dot_key) {
+            println!("export {env_key}={val}");
+        }
     }
     Ok(())
 }

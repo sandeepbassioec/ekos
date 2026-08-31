@@ -1,4 +1,4 @@
-//! Integration tests for L112: `vvctl catalog snapshot-*` (VV-CTL-008).
+﻿//! Integration tests for L112: `vvctl catalog snapshot-*` (VV-CTL-008).
 
 use std::path::PathBuf;
 
@@ -69,7 +69,7 @@ fn snapshot_restore_skip(dir: &TempDir, file: PathBuf) -> CatalogArgs {
     )
 }
 
-// ── snapshot-create ───────────────────────────────────────────────────────────
+// â”€â”€ snapshot-create â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn snapshot_create_empty_catalog_succeeds() {
@@ -141,7 +141,7 @@ fn snapshot_create_multiple_tables_all_captured() {
     assert_eq!(snap.export.tables.len(), 3);
 }
 
-// ── snapshot-list ─────────────────────────────────────────────────────────────
+// â”€â”€ snapshot-list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn snapshot_list_empty_dir_succeeds() {
@@ -160,7 +160,7 @@ fn snapshot_list_shows_created_snapshot() {
     assert_eq!(list[0].table_count, 1);
 }
 
-// ── snapshot-restore ──────────────────────────────────────────────────────────
+// â”€â”€ snapshot-restore â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn snapshot_restore_recreates_table_in_fresh_catalog() {

@@ -1,4 +1,4 @@
-//! Integration tests for L127: vvctl table schema + alter-add-col/alter-drop-col (VV-ENG-009).
+﻿//! Integration tests for L127: vvctl table schema + alter-add-col/alter-drop-col (VV-ENG-009).
 
 use std::path::PathBuf;
 
@@ -22,7 +22,7 @@ fn create_table(dir: &TempDir, columns: &[&str]) {
     .unwrap();
 }
 
-// ── vvctl table schema ────────────────────────────────────────────────────────
+// â”€â”€ vvctl table schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn schema_prints_column_list() {
@@ -56,7 +56,7 @@ fn schema_file_is_readable_as_table_schema() {
     assert_eq!(schema.get(1).unwrap().col_type, ColumnType::Bool);
 }
 
-// ── vvctl table alter-add-col ─────────────────────────────────────────────────
+// â”€â”€ vvctl table alter-add-col â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn alter_add_col_appends_column() {
@@ -116,7 +116,7 @@ fn alter_add_col_missing_table_errors() {
     assert!(result.is_err());
 }
 
-// ── vvctl table alter-drop-col ────────────────────────────────────────────────
+// â”€â”€ vvctl table alter-drop-col â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn alter_drop_col_removes_column() {
@@ -156,7 +156,7 @@ fn alter_drop_col_nonexistent_is_idempotent() {
         column: "ghost".into(),
     })
     .unwrap();
-    // The schema is unchanged — pk + score still present.
+    // The schema is unchanged â€” pk + score still present.
     run(TableCommand::Schema {
         dir: table_dir(&dir),
         output: OutputFormat::Table,
@@ -164,7 +164,7 @@ fn alter_drop_col_nonexistent_is_idempotent() {
     .unwrap();
 }
 
-// ── typed create ─────────────────────────────────────────────────────────────
+// â”€â”€ typed create â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn create_with_typed_columns_persists_types() {

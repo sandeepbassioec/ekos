@@ -1,4 +1,4 @@
-//! Integration tests for L126: vvctl config diff (VV-CFG-014).
+﻿//! Integration tests for L126: vvctl config diff (VV-CFG-014).
 
 use std::path::PathBuf;
 
@@ -16,7 +16,7 @@ fn write_yaml(dir: &TempDir, name: &str, yaml: &str) -> PathBuf {
     p
 }
 
-// ── engine API: VvConfig::diff ────────────────────────────────────────────────
+// â”€â”€ engine API: VvConfig::diff â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn diff_identical_configs_empty() {
@@ -89,7 +89,7 @@ fn diff_u64_field_max_scan_rows() {
     assert_eq!(diffs[0].kind, ConfigDiffKind::Changed);
 }
 
-// ── CLI: config diff ──────────────────────────────────────────────────────────
+// â”€â”€ CLI: config diff â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn diff_cmd_identical_files_succeeds() {
@@ -137,7 +137,7 @@ fn diff_cmd_empty_vs_populated() {
     let a = write_yaml(&dir, "a.yaml", "{}");
     let b = write_yaml(&dir, "b.yaml", "network:\n  bind_addr: 127.0.0.1:5995\n");
     let result = run(ConfigCommand::Diff { base: a, other: b });
-    assert!(result.is_err()); // difference found → exit 1
+    assert!(result.is_err()); // difference found â†’ exit 1
 }
 
 #[test]

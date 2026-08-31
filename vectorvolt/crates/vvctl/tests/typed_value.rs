@@ -1,4 +1,4 @@
-//! Integration tests for L129: TypedValue enum + typed display in vvctl table get/scan (VV-ENG-008).
+﻿//! Integration tests for L129: TypedValue enum + typed display in vvctl table get/scan (VV-ENG-008).
 
 use std::path::PathBuf;
 
@@ -14,7 +14,7 @@ fn table_dir(dir: &TempDir) -> PathBuf {
     dir.path().join("tbl")
 }
 
-// ── TypedValue::from_bits ─────────────────────────────────────────────────────
+// â”€â”€ TypedValue::from_bits â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn from_bits_u64_roundtrip() {
@@ -62,7 +62,7 @@ fn from_bits_decimal_display() {
     assert_eq!(v.display_str(), "1.500000");
 }
 
-// ── TypedValue::parse ─────────────────────────────────────────────────────────
+// â”€â”€ TypedValue::parse â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn parse_bool_variants() {
@@ -97,7 +97,7 @@ fn parse_decimal_with_fraction() {
     assert_eq!(v.to_bits(), 2_500_000i64 as u64);
 }
 
-// ── CLI: typed display in get ─────────────────────────────────────────────────
+// â”€â”€ CLI: typed display in get â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn get_displays_bool_as_true_false() {
@@ -144,7 +144,7 @@ fn get_displays_i64_negative() {
     .unwrap();
 }
 
-// ── CLI: typed display in scan ────────────────────────────────────────────────
+// â”€â”€ CLI: typed display in scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn scan_succeeds_with_typed_columns() {

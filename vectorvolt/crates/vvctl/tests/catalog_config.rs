@@ -1,4 +1,4 @@
-//! Integration tests for L122: `vvctl catalog config-*` (VV-CFG-010).
+﻿//! Integration tests for L122: `vvctl catalog config-*` (VV-CFG-010).
 
 use std::path::PathBuf;
 
@@ -27,7 +27,7 @@ fn write_config(dir: &TempDir, yaml: &str) -> PathBuf {
     p
 }
 
-// ── CLI integration ───────────────────────────────────────────────────────────
+// â”€â”€ CLI integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn cli_config_show_prints_yaml() {
@@ -126,7 +126,7 @@ fn cli_config_set_unknown_key_errors() {
     assert!(result.is_err());
 }
 
-// ── engine API ────────────────────────────────────────────────────────────────
+// â”€â”€ engine API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn engine_empty_yaml_default() {

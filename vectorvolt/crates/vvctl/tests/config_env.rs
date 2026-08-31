@@ -1,4 +1,4 @@
-//! Integration tests for L125: VvConfig env-var override layer (VV-CFG-013).
+﻿//! Integration tests for L125: VvConfig env-var override layer (VV-CFG-013).
 
 use std::env;
 use std::sync::Mutex;
@@ -8,7 +8,7 @@ use vvctl::commands::config::{ConfigCommand, run};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-// ── engine API: from_env / merge_env ─────────────────────────────────────────
+// â”€â”€ engine API: from_env / merge_env â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn from_env_default_when_no_vars() {
@@ -109,7 +109,7 @@ fn env_var_table_all_dot_keys_valid() {
     assert!(problems.is_empty(), "invalid dot keys: {problems:?}");
 }
 
-// ── CLI: config env-list ──────────────────────────────────────────────────────
+// â”€â”€ CLI: config env-list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn env_list_command_succeeds() {

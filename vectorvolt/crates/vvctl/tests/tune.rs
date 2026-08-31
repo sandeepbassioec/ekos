@@ -1,11 +1,11 @@
-//! Layer 85 — `vvctl tune` (VV-CFG-006).
+﻿//! Layer 85 â€” `vvctl tune` (VV-CFG-006).
 //!
 //! Tests the `DerivedConfig` probe + TOML emission path without requiring a
 //! live interactive terminal.
 
 use vvctl::commands::tune::{DerivedConfig, measure_fsync_ns};
 
-// ── probe basics ──────────────────────────────────────────────────────────────
+// â”€â”€ probe basics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn probe_succeeds() {
@@ -79,7 +79,7 @@ fn topo_summary_is_nonempty() {
     );
 }
 
-// ── fsync calibration ─────────────────────────────────────────────────────────
+// â”€â”€ fsync calibration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn fsync_calibration_produces_plausible_latency() {
@@ -91,7 +91,7 @@ fn fsync_calibration_produces_plausible_latency() {
     );
 }
 
-// ── TOML emission ─────────────────────────────────────────────────────────────
+// â”€â”€ TOML emission â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn toml_output_is_valid_toml() {
