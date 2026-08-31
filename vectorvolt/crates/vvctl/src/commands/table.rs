@@ -180,6 +180,16 @@ pub enum TableCommand {
         /// Table directory to truncate.
         dir: PathBuf,
     },
+
+    /// Print the total row count (buffered + flushed) for a table.
+    Count {
+        /// Table directory.
+        #[arg(short, long)]
+        dir: PathBuf,
+        /// Output format.
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -206,6 +216,7 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::TypedInsert { dir, pk, values } => cmd_typed_insert(dir, pk, values),
         TableCommand::Drop { dir, force } => cmd_drop(dir, force),
         TableCommand::Truncate { dir } => cmd_truncate(dir),
+        TableCommand::Count { dir, output } => cmd_count(&dir, output),
     }
 }
 
@@ -580,6 +591,26 @@ fn cmd_truncate(dir: PathBuf) -> Result<()> {
         }
     }
     println!("truncated table at {} (schema preserved)", dir.display());
+    Ok(())
+}
+
+fn cmd_count(dir: &Path, output: OutputFormat) -> Result<()> {
+    let schema = load_schema(dir)?;
+    let engine = TableEngine::open(schema, dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let s = engine.stats();
+    let buffered = s.rows_buffered as u64;
+    let flushed = s.rows_flushed;
+    let total = buffered + flushed;
+    match output {
+        OutputFormat::Json => {
+            println!("{{\"total\":{total},\"buffered\":{buffered},\"flushed\":{flushed}}}");
+        }
+        OutputFormat::Table => {
+            println!("total:    {total}");
+            println!("buffered: {buffered}");
+            println!("flushed:  {flushed}");
+        }
+    }
     Ok(())
 }
 

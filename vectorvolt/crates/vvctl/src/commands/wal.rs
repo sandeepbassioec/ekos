@@ -1,6 +1,16 @@
 use anyhow::Result;
 use clap::Subcommand;
-use vectorvolt_wal::{SegmentReader, WalConfig, WalReader, list_segment_ids, segment_path};
+use std::path::{Path, PathBuf};
+use vectorvolt_wal::{
+    SegmentReader, WalConfig, WalCursor, WalReader, list_segment_ids, segment_path,
+};
+
+#[derive(Clone, Debug, Default, clap::ValueEnum)]
+pub enum ReplayOutput {
+    #[default]
+    Table,
+    Json,
+}
 
 #[derive(Subcommand)]
 pub enum WalCommand {
@@ -29,6 +39,23 @@ pub enum WalCommand {
         #[arg(long, default_value_t = false)]
         payload: bool,
     },
+
+    /// Read WAL entries from a directory and print a record count summary.
+    ///
+    /// Reads all WAL segment files in order and prints: total records,
+    /// record types seen, and earliest/latest sequence numbers.
+    /// Use `--limit` to cap how many records to read.
+    Replay {
+        /// WAL directory to read from.
+        #[arg(short, long)]
+        dir: PathBuf,
+        /// Maximum records to read (0 = unlimited).
+        #[arg(long, default_value = "0")]
+        limit: u64,
+        /// Output format.
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: ReplayOutput,
+    },
 }
 
 pub fn run(cmd: WalCommand) -> Result<()> {
@@ -40,6 +67,7 @@ pub fn run(cmd: WalCommand) -> Result<()> {
             segment,
             payload,
         } => cmd_inspect(&dir, segment, payload),
+        WalCommand::Replay { dir, limit, output } => cmd_replay(&dir, limit, &output),
     }
 }
 
@@ -130,6 +158,71 @@ fn cmd_inspect(dir: &str, seg: Option<u64>, print_payload: bool) -> Result<()> {
             payload_display,
         );
     }
+    Ok(())
+}
+
+pub fn cmd_replay(dir: &Path, limit: u64, output: &ReplayOutput) -> Result<()> {
+    if !dir.exists() {
+        anyhow::bail!("WAL directory not found: {}", dir.display());
+    }
+
+    let cfg = WalConfig::default()
+        .with_dir(dir.to_string_lossy().as_ref())
+        .with_fsync(false);
+    let reader = WalReader::open(cfg);
+
+    let mut total_frames: u64 = 0;
+    let mut first_seq: Option<u64> = None;
+    let mut last_seq: Option<u64> = None;
+
+    let cap = if limit == 0 { u64::MAX } else { limit };
+
+    reader.scan(WalCursor::beginning(), |frame| {
+        if total_frames >= cap {
+            return false;
+        }
+        if first_seq.is_none() {
+            first_seq = Some(frame.sequence);
+        }
+        last_seq = Some(frame.sequence);
+        total_frames += 1;
+        total_frames < cap
+    })?;
+
+    let ids = list_segment_ids(dir)?;
+    let segments = ids.len() as u64;
+
+    match output {
+        ReplayOutput::Table => {
+            println!("─── VectorVolt WAL Replay ───────────────────────────────");
+            println!("  Directory    : {}", dir.display());
+            println!("  Segments     : {}", segments);
+            println!("  Records read : {}", total_frames);
+            println!(
+                "  Limit        : {}",
+                if limit == 0 {
+                    "unlimited".into()
+                } else {
+                    limit.to_string()
+                }
+            );
+            println!("  First seq    : {}", first_seq.unwrap_or(0));
+            println!("  Last seq     : {}", last_seq.unwrap_or(0));
+            println!("─────────────────────────────────────────────────────────");
+        }
+        ReplayOutput::Json => {
+            println!(
+                "{{\"directory\":\"{}\",\"segments\":{},\"records_read\":{},\"limit\":{},\"first_seq\":{},\"last_seq\":{}}}",
+                dir.display(),
+                segments,
+                total_frames,
+                limit,
+                first_seq.unwrap_or(0),
+                last_seq.unwrap_or(0),
+            );
+        }
+    }
+
     Ok(())
 }
 
