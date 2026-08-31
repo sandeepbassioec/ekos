@@ -2,6 +2,7 @@ pub mod bench;
 pub mod catalog;
 pub mod completion;
 pub mod config;
+pub mod config_audit;
 pub mod connect;
 pub mod hal;
 pub mod http;

@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, catalog, completion, config, connect, hal, http, keygen, profile, serve, server_cmd,
-    store, support_bundle, table, topology, tune, wal,
+    bench, catalog, completion, config, config_audit, connect, hal, http, keygen, profile, serve,
+    server_cmd, store, support_bundle, table, topology, tune, wal,
 };
 use vvctl::ui;
 
@@ -100,6 +100,13 @@ enum Commands {
 
     /// Collect diagnostics into a support bundle file.
     SupportBundle(support_bundle::SupportBundleArgs),
+
+    /// Audit a config file for deprecated keys (VV-CTL-184).
+    ConfigAudit {
+        /// Path to config file (default: vectorvolt.yaml).
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+    },
 
     /// Print version and build info.
     Version,
@@ -234,6 +241,8 @@ fn main() -> Result<()> {
         Commands::Server(cmd) => server_cmd::run(cmd)?,
 
         Commands::SupportBundle(args) => support_bundle::run(args)?,
+
+        Commands::ConfigAudit { path } => config_audit::run(path)?,
 
         Commands::Version => print_version(),
     }
