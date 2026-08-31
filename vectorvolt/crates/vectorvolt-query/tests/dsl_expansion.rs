@@ -3,7 +3,7 @@
 /// Schema: pk | val | score  (3 columns).
 use tempfile::TempDir;
 use vectorvolt_engine::{Durability, EngineOptions, TableEngine};
-use vectorvolt_query::{run, QueryResponse};
+use vectorvolt_query::{QueryResponse, run};
 
 fn open() -> (TableEngine, TempDir) {
     let dir = TempDir::new().unwrap();

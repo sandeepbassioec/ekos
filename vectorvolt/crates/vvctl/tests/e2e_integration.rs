@@ -1,4 +1,4 @@
-﻿/// Layer 49 Ã¢â‚¬â€ End-to-end integration tests exercising the full stack:
+/// Layer 49 Ã¢â‚¬â€ End-to-end integration tests exercising the full stack:
 /// TCP server (vectorvolt-net), HTTP gateway (vectorvolt-http), and
 /// the DSL query bridge, all started in the same process.
 ///
@@ -44,7 +44,7 @@ impl E2EHarness {
             multi: false,
             http_addr: None,
             master_config: None,
-        http_token: None,
+            http_token: None,
             flush_threshold: None,
             durability: None,
             max_partitions: None,
