@@ -1,4 +1,4 @@
-use vectorvolt_server::{Request, Response, handle};
+use vectorvolt_server::{handle, Request, Response};
 
 #[test]
 fn ping_returns_pong() {
