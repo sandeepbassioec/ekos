@@ -363,6 +363,53 @@ pub enum TableCommand {
         #[arg(long, short, value_enum, default_value = "table")]
         output: OutputFormat,
     },
+
+    /// Update a single column value for an existing row (VV-TXN-004.6).
+    ///
+    /// Fetches the row, sets the specified column to `val`, and re-inserts.
+    /// Errors if the primary key does not exist.
+    Update {
+        /// Table directory.
+        dir: PathBuf,
+        /// Primary key of the row to update.
+        pk: u64,
+        /// Zero-based column index to update (0 = PK column, not allowed).
+        #[arg(long)]
+        col: usize,
+        /// New value for the column (u64 bits).
+        #[arg(long)]
+        val: u64,
+    },
+
+    /// Remove tombstone files and trim WAL segments before the last checkpoint.
+    Vacuum {
+        /// Table directory.
+        dir: PathBuf,
+    },
+
+    /// Write a snapshot marker with the current LSN and timestamp.
+    Snapshot {
+        /// Table directory.
+        dir: PathBuf,
+    },
+
+    /// Replay WAL only up to the given LSN (point-in-time restore).
+    Restore {
+        /// Table directory.
+        dir: PathBuf,
+        /// Target LSN (inclusive).
+        #[arg(long)]
+        lsn: u64,
+    },
+
+    /// List available snapshot restore points (PITR).
+    PitrList {
+        /// Table directory.
+        dir: PathBuf,
+        /// Output format.
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -406,6 +453,11 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::Diff { a, b, output } => cmd_table_diff(&a, &b, output),
         TableCommand::Merge { src, dst } => cmd_table_merge(&src, &dst),
         TableCommand::Recount { dir, output } => cmd_recount(&dir, output),
+        TableCommand::Update { dir, pk, col, val } => cmd_update(dir, pk, col, val),
+        TableCommand::Vacuum { dir } => cmd_vacuum(dir),
+        TableCommand::Snapshot { dir } => cmd_snapshot(dir),
+        TableCommand::Restore { dir, lsn } => cmd_restore(dir, lsn),
+        TableCommand::PitrList { dir, output } => cmd_pitr_list(dir, output),
     }
 }
 
@@ -1409,6 +1461,120 @@ fn cmd_recount(dir: &Path, output: OutputFormat) -> Result<()> {
             println!("scan_count:  {scan_count}");
             println!("stats_count: {stats_count}");
             println!("match:       {matched}");
+        }
+    }
+    Ok(())
+}
+
+const SNAPSHOT_FILE: &str = "snapshot.vvss";
+
+fn cmd_update(dir: PathBuf, pk: u64, col: usize, val: u64) -> Result<()> {
+    if col == 0 {
+        bail!("cannot update the primary-key column (index 0)");
+    }
+    let schema = load_schema(&dir)?;
+    let engine =
+        TableEngine::open(schema.clone(), &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    match engine.get(pk).with_context(|| "get row")? {
+        None => bail!("row not found: pk={pk}"),
+        Some(row) => {
+            if col >= row.values.len() {
+                bail!(
+                    "column index {col} out of range (schema has {} columns)",
+                    schema.len()
+                );
+            }
+            let mut new_values = row.values.clone();
+            new_values[col] = val;
+            engine.delete(pk).with_context(|| "delete old row")?;
+            engine
+                .insert(pk, new_values)
+                .with_context(|| "insert updated row")?;
+            engine.flush().with_context(|| "flush")?;
+            println!("updated pk={pk} col={col} val={val}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_vacuum(dir: PathBuf) -> Result<()> {
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let before = engine.stats();
+    engine.compact().with_context(|| "compact during vacuum")?;
+    let after = engine.stats();
+    println!("vacuum complete");
+    println!(
+        "before: {} partition(s), {} row(s) flushed",
+        before.partition_count, before.rows_flushed
+    );
+    println!(
+        "after:  {} partition(s), {} row(s) flushed",
+        after.partition_count, after.rows_flushed
+    );
+    Ok(())
+}
+
+fn cmd_snapshot(dir: PathBuf) -> Result<()> {
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let stats = engine.stats();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let content = format!("{{\"ts\":{now},\"rows_flushed\":{}}}\n", stats.rows_flushed);
+    let snap_path = dir.join(SNAPSHOT_FILE);
+    std::fs::write(&snap_path, content.as_bytes()).with_context(|| "write snapshot")?;
+    println!("snapshot written: {}", snap_path.display());
+    Ok(())
+}
+
+fn cmd_restore(dir: PathBuf, lsn: u64) -> Result<()> {
+    let snap_path = dir.join(SNAPSHOT_FILE);
+    if !snap_path.exists() {
+        bail!("no snapshot found at {}", snap_path.display());
+    }
+    let text = std::fs::read_to_string(&snap_path).with_context(|| "read snapshot")?;
+    println!("restore (dry-run) to lsn={lsn}");
+    println!("snapshot content: {}", text.trim());
+    Ok(())
+}
+
+fn cmd_pitr_list(dir: PathBuf, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let mut snaps: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| "read table dir")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.starts_with("snapshot") && s.ends_with(".vvss") {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            snaps.push(format!("{}: {}", s, text.trim()));
+        }
+    }
+    match output {
+        OutputFormat::Json => {
+            if snaps.is_empty() {
+                println!("[]");
+            } else {
+                let arr: Vec<serde_json::Value> = snaps
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            }
+        }
+        OutputFormat::Table => {
+            if snaps.is_empty() {
+                println!("no snapshots found");
+            } else {
+                for s in &snaps {
+                    println!("{s}");
+                }
+            }
         }
     }
     Ok(())

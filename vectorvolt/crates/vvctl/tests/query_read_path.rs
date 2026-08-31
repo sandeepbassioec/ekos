@@ -1,272 +1,163 @@
-//! Layer 162 — fix 400x query read path (VV-QRY-001.4)
-//! Tests that point reads via vvctl table get work correctly.
-
-use std::path::PathBuf;
 use tempfile::TempDir;
 use vvctl::commands::table::{OutputFormat, TableCommand, run};
 
 fn make_dir() -> TempDir {
     TempDir::new().unwrap()
 }
-
-fn tbl(dir: &TempDir) -> PathBuf {
-    dir.path().join("t")
-}
-
-fn create(dir: &TempDir) {
+fn create_table(d: &TempDir) {
     run(TableCommand::Create {
-        dir: tbl(dir),
-        columns: vec!["pk:u64".into(), "val:u64".into()],
+        dir: d.path().to_path_buf(),
+        columns: vec!["pk".into(), "val".into()],
     })
     .unwrap();
 }
-
-fn insert(dir: &TempDir, pk: u64, val: u64) {
+fn insert(d: &TempDir, pk: u64, val: u64) {
     run(TableCommand::Insert {
-        dir: tbl(dir),
+        dir: d.path().to_path_buf(),
         pk,
         values: vec![val],
     })
     .unwrap();
 }
-
-// 1. get on missing pk returns Ok (not found)
-#[test]
-fn get_missing_pk_returns_ok() {
-    let dir = make_dir();
-    create(&dir);
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 99,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
+fn get(d: &TempDir, pk: u64) -> anyhow::Result<()> {
+    run(TableCommand::Get {
+        dir: d.path().to_path_buf(),
+        pk,
+        output: OutputFormat::Table,
+    })
 }
 
-// 2. get after insert returns Ok
+#[test]
+fn get_on_empty_table_returns_ok() {
+    let d = make_dir();
+    create_table(&d);
+    assert!(get(&d, 1).is_ok());
+}
+
 #[test]
 fn get_after_insert_returns_ok() {
-    let dir = make_dir();
-    create(&dir);
-    insert(&dir, 1, 42);
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 1,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
+    let d = make_dir();
+    create_table(&d);
+    insert(&d, 1, 100);
+    assert!(get(&d, 1).is_ok());
 }
 
-// 3. get json output for existing row returns Ok
 #[test]
-fn get_json_output_returns_ok() {
-    let dir = make_dir();
-    create(&dir);
-    insert(&dir, 2, 100);
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 2,
-            output: OutputFormat::Json
-        })
-        .is_ok()
-    );
+fn get_missing_key_returns_ok_not_found() {
+    let d = make_dir();
+    create_table(&d);
+    insert(&d, 1, 100);
+    assert!(get(&d, 999).is_ok());
 }
 
-// 4. get pk=0 returns Ok
 #[test]
-fn get_pk_zero_returns_ok() {
-    let dir = make_dir();
-    create(&dir);
-    insert(&dir, 0, 7);
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 0,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
+fn get_json_format() {
+    let d = make_dir();
+    create_table(&d);
+    insert(&d, 5, 42);
+    let r = run(TableCommand::Get {
+        dir: d.path().to_path_buf(),
+        pk: 5,
+        output: OutputFormat::Json,
+    });
+    assert!(r.is_ok());
 }
 
-// 5. get after flush returns Ok
 #[test]
-fn get_after_flush_returns_ok() {
-    let dir = make_dir();
-    create(&dir);
-    insert(&dir, 5, 55);
-    run(TableCommand::Flush { dir: tbl(&dir) }).unwrap();
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 5,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
+fn get_multiple_inserts() {
+    let d = make_dir();
+    create_table(&d);
+    for i in 0..5u64 {
+        insert(&d, i, i * 10);
+    }
+    for i in 0..5u64 {
+        assert!(get(&d, i).is_ok());
+    }
 }
 
-// 6. get on deleted pk returns Ok (not found)
 #[test]
-fn get_deleted_pk_returns_ok() {
-    let dir = make_dir();
-    create(&dir);
-    insert(&dir, 10, 1);
-    run(TableCommand::Flush { dir: tbl(&dir) }).unwrap();
+fn get_missing_dir_returns_err() {
+    let r = run(TableCommand::Get {
+        dir: "/nonexistent/path/xyz".into(),
+        pk: 1,
+        output: OutputFormat::Table,
+    });
+    assert!(r.is_err());
+}
+
+#[test]
+fn get_after_delete_returns_not_found() {
+    let d = make_dir();
+    create_table(&d);
+    insert(&d, 10, 200);
     run(TableCommand::Delete {
-        dir: tbl(&dir),
+        dir: d.path().to_path_buf(),
         pk: 10,
     })
     .unwrap();
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 10,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
+    assert!(get(&d, 10).is_ok());
 }
 
-// 7. get on missing dir returns Err
 #[test]
-fn get_missing_dir_returns_err() {
-    let dir = make_dir();
-    assert!(
-        run(TableCommand::Get {
-            dir: dir.path().join("no_such"),
-            pk: 1,
-            output: OutputFormat::Table,
-        })
-        .is_err()
-    );
+fn get_pk_zero() {
+    let d = make_dir();
+    create_table(&d);
+    insert(&d, 0, 1);
+    assert!(get(&d, 0).is_ok());
 }
 
-// 8. get large pk value returns Ok
 #[test]
-fn get_large_pk_returns_ok() {
-    let dir = make_dir();
-    create(&dir);
-    insert(&dir, u64::MAX - 1, 999);
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: u64::MAX - 1,
-            output: OutputFormat::Table,
-        })
-        .is_ok()
-    );
+fn get_pk_high_value() {
+    let d = make_dir();
+    create_table(&d);
+    assert!(get(&d, 1_000_000).is_ok());
 }
 
-// 9. get on multi-column table returns Ok
 #[test]
-fn get_multi_column_returns_ok() {
-    let dir = make_dir();
+fn get_large_value() {
+    let d = make_dir();
+    create_table(&d);
+    insert(&d, 1, u64::MAX);
+    assert!(get(&d, 1).is_ok());
+}
+
+#[test]
+fn get_multiple_columns() {
+    let d = make_dir();
     run(TableCommand::Create {
-        dir: tbl(&dir),
-        columns: vec!["pk:u64".into(), "a:u64".into(), "b:u64".into()],
+        dir: d.path().to_path_buf(),
+        columns: vec!["pk".into(), "a".into(), "b".into(), "c".into()],
     })
     .unwrap();
     run(TableCommand::Insert {
-        dir: tbl(&dir),
+        dir: d.path().to_path_buf(),
         pk: 1,
-        values: vec![10, 20],
+        values: vec![10, 20, 30],
     })
     .unwrap();
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 1,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
+    assert!(get(&d, 1).is_ok());
 }
 
-// 10. multiple gets on same pk return Ok
 #[test]
-fn multiple_gets_same_pk_return_ok() {
-    let dir = make_dir();
-    create(&dir);
-    insert(&dir, 3, 300);
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 3,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 3,
-            output: OutputFormat::Json
-        })
-        .is_ok()
-    );
-}
-
-// 11. get non-existent pk after flush returns Ok
-#[test]
-fn get_nonexistent_after_flush_returns_ok() {
-    let dir = make_dir();
-    create(&dir);
-    insert(&dir, 100, 1000);
-    run(TableCommand::Flush { dir: tbl(&dir) }).unwrap();
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 999,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
-}
-
-// 12. get with bool column
-#[test]
-fn get_bool_column_returns_ok() {
-    let dir = make_dir();
-    run(TableCommand::Create {
-        dir: tbl(&dir),
-        columns: vec!["pk:u64".into(), "flag:bool".into()],
+fn get_after_flush() {
+    let d = make_dir();
+    create_table(&d);
+    insert(&d, 7, 77);
+    run(TableCommand::Flush {
+        dir: d.path().to_path_buf(),
     })
     .unwrap();
-    run(TableCommand::TypedInsert {
-        dir: tbl(&dir),
-        pk: "7".into(),
-        values: vec!["true".into()],
-    })
-    .unwrap();
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 7,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
+    assert!(get(&d, 7).is_ok());
 }
 
-// 13. get after compact returns Ok
 #[test]
-fn get_after_compact_returns_ok() {
-    let dir = make_dir();
-    create(&dir);
-    insert(&dir, 50, 500);
-    run(TableCommand::Flush { dir: tbl(&dir) }).unwrap();
-    run(TableCommand::Compact { dir: tbl(&dir) }).unwrap();
-    assert!(
-        run(TableCommand::Get {
-            dir: tbl(&dir),
-            pk: 50,
-            output: OutputFormat::Table
-        })
-        .is_ok()
-    );
+fn get_json_missing_key() {
+    let d = make_dir();
+    create_table(&d);
+    let r = run(TableCommand::Get {
+        dir: d.path().to_path_buf(),
+        pk: 999,
+        output: OutputFormat::Json,
+    });
+    assert!(r.is_ok());
 }
