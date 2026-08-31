@@ -1,4 +1,4 @@
-//! `vvctl table` — table-oriented commands backed by [`vectorvolt_engine::TableEngine`].
+﻿//! `vvctl table` — table-oriented commands backed by [`vectorvolt_engine::TableEngine`].
 //!
 //! ## Schema persistence
 //!
@@ -203,6 +203,25 @@ pub enum TableCommand {
         #[arg(long, short, value_enum, default_value = "table")]
         output: OutputFormat,
     },
+
+    /// List all primary keys in a table.
+    Keys {
+        /// Table directory.
+        #[arg(short, long)]
+        dir: PathBuf,
+        /// Output format.
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Check whether a table directory exists and has a valid schema.
+    ///
+    /// Exits 0 if valid, exits 1 if missing or corrupt.
+    Exists {
+        /// Table directory.
+        #[arg(short, long)]
+        dir: PathBuf,
+    },
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -231,6 +250,8 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::Truncate { dir } => cmd_truncate(dir),
         TableCommand::Count { dir, output } => cmd_count(&dir, output),
         TableCommand::Head { dir, n, output } => cmd_head(&dir, n, output),
+        TableCommand::Keys { dir, output } => cmd_keys(&dir, output),
+        TableCommand::Exists { dir } => cmd_exists(&dir),
     }
 }
 
@@ -690,6 +711,44 @@ fn cmd_head(dir: &Path, n: usize, output: OutputFormat) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_keys(dir: &Path, output: OutputFormat) -> Result<()> {
+    let schema = load_schema(dir)?;
+    let typed = load_typed_schema(dir)?;
+    let engine = TableEngine::open(schema, dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(0, 0, u64::MAX).with_context(|| "scan")?;
+    let pk_type = typed.get(0).map(|c| c.col_type).unwrap_or(ColumnType::U64);
+    match output {
+        OutputFormat::Json => {
+            let arr: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    let pk_raw = row.values.first().copied().unwrap_or(0);
+                    serde_json::Value::String(TypedValue::from_bits(pk_type, pk_raw).display_str())
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&arr)?);
+        }
+        OutputFormat::Table => {
+            for row in &rows {
+                let pk_raw = row.values.first().copied().unwrap_or(0);
+                println!("{}", TypedValue::from_bits(pk_type, pk_raw).display_str());
+            }
+            println!("\n{} key(s)", rows.len());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_exists(dir: &Path) -> Result<()> {
+    let schema_path = dir.join("schema.txt");
+    if schema_path.exists() {
+        println!("exists: {}", dir.display());
+        Ok(())
+    } else {
+        anyhow::bail!("no table at '{}'", dir.display())
+    }
 }
 
 // ── Helper ────────────────────────────────────────────────────────────────────
