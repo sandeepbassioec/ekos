@@ -1,4 +1,4 @@
-use anyhow::Result;
+﻿use anyhow::Result;
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
 use vectorvolt_wal::{
@@ -56,6 +56,19 @@ pub enum WalCommand {
         #[arg(long, short, value_enum, default_value = "table")]
         output: ReplayOutput,
     },
+
+    /// Print aggregate statistics for a WAL directory.
+    ///
+    /// Reads all segments and reports: total frames, total bytes,
+    /// average frame size, first and last sequence numbers.
+    Stats {
+        /// WAL directory.
+        #[arg(short, long)]
+        dir: PathBuf,
+        /// Output format.
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: ReplayOutput,
+    },
 }
 
 pub fn run(cmd: WalCommand) -> Result<()> {
@@ -68,6 +81,7 @@ pub fn run(cmd: WalCommand) -> Result<()> {
             payload,
         } => cmd_inspect(&dir, segment, payload),
         WalCommand::Replay { dir, limit, output } => cmd_replay(&dir, limit, &output),
+        WalCommand::Stats { dir, output } => cmd_wal_stats(&dir, &output),
     }
 }
 
@@ -219,6 +233,51 @@ pub fn cmd_replay(dir: &Path, limit: u64, output: &ReplayOutput) -> Result<()> {
                 limit,
                 first_seq.unwrap_or(0),
                 last_seq.unwrap_or(0),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn cmd_wal_stats(dir: &Path, output: &ReplayOutput) -> Result<()> {
+    if !dir.exists() {
+        anyhow::bail!("WAL directory not found: {}", dir.display());
+    }
+
+    let cfg = WalConfig::default()
+        .with_dir(dir.to_string_lossy().as_ref())
+        .with_fsync(false);
+    let reader = WalReader::open(cfg);
+    let stats = reader.stats()?;
+
+    let avg_frame_bytes = stats
+        .total_bytes
+        .checked_div(stats.total_frames)
+        .unwrap_or(0);
+
+    match output {
+        ReplayOutput::Table => {
+            println!("─── VectorVolt WAL Stats ────────────────────────────────");
+            println!("  Directory    : {}", dir.display());
+            println!("  Segments     : {}", stats.segments);
+            println!("  Total frames : {}", stats.total_frames);
+            println!("  Total bytes  : {}", stats.total_bytes);
+            println!("  Avg frame    : {} bytes", avg_frame_bytes);
+            println!("  First seq    : {}", stats.first_sequence);
+            println!("  Last seq     : {}", stats.last_sequence);
+            println!("─────────────────────────────────────────────────────────");
+        }
+        ReplayOutput::Json => {
+            println!(
+                "{{\"directory\":\"{}\",\"segments\":{},\"total_frames\":{},\"total_bytes\":{},\"avg_frame_bytes\":{},\"first_seq\":{},\"last_seq\":{}}}",
+                dir.display(),
+                stats.segments,
+                stats.total_frames,
+                stats.total_bytes,
+                avg_frame_bytes,
+                stats.first_sequence,
+                stats.last_sequence,
             );
         }
     }
