@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, catalog, config, connect, hal, http, keygen, serve, store, table, tune, wal,
+    bench, catalog, config, connect, hal, http, keygen, profile, serve, store, table, tune, wal,
 };
 use vvctl::ui;
 
@@ -83,6 +83,9 @@ enum Commands {
 
     /// Detect hardware and derive recommended engine configuration (VV-CFG-006).
     Tune(tune::TuneArgs),
+
+    /// Emit the host SystemProfile as JSON or a human-readable table (VV-CFG-001).
+    Profile(profile::ProfileArgs),
 
     /// Print version and build info.
     Version,
@@ -207,6 +210,8 @@ fn main() -> Result<()> {
         Commands::Keygen(args) => keygen::run(args)?,
 
         Commands::Tune(args) => tune::run(args)?,
+
+        Commands::Profile(args) => profile::run(args)?,
 
         Commands::Version => print_version(),
     }

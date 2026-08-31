@@ -211,7 +211,9 @@ impl ShardCatalog {
             .remove(name)
             .map(|_| ())
             .ok_or_else(|| EngineError::TableNotFound(name.to_owned()))?;
-        if let Some(ref reg) = self.registry && reg.exists(name) {
+        if let Some(ref reg) = self.registry
+            && reg.exists(name)
+        {
             reg.remove(name)?;
         }
         Ok(())

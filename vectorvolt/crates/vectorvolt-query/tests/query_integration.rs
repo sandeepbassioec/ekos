@@ -4,7 +4,7 @@
 /// to verify that the full lexer → parser → executor pipeline works end-to-end.
 use tempfile::TempDir;
 use vectorvolt_engine::{Durability, EngineOptions, TableEngine};
-use vectorvolt_query::{run, QueryResponse};
+use vectorvolt_query::{QueryResponse, run};
 
 fn open() -> (TableEngine, TempDir) {
     let dir = TempDir::new().unwrap();

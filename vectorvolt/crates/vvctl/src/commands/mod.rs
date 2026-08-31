@@ -5,6 +5,7 @@ pub mod connect;
 pub mod hal;
 pub mod http;
 pub mod keygen;
+pub mod profile;
 pub mod serve;
 pub mod store;
 pub mod table;
