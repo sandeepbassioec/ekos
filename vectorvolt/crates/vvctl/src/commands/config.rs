@@ -67,6 +67,25 @@ pub enum ConfigCommand {
     /// dot-notation key it maps to, a one-line description, and whether it is
     /// currently set in the process environment.
     EnvList,
+
+    /// Merge two vectorvolt.yaml files (base + overlay) and emit the result.
+    ///
+    /// For each field: the overlay value wins when set; the base value is kept
+    /// when the overlay field is absent.  The merged YAML is printed to stdout.
+    /// Use `--output` to write it to a file instead, and `--show-diff` to
+    /// print what changed.
+    Merge {
+        /// Base config file.
+        base: PathBuf,
+        /// Overlay config file (wins over base for every field it sets).
+        overlay: PathBuf,
+        /// Write merged config to this file instead of stdout.
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// After merging, print a diff showing which fields changed.
+        #[arg(long)]
+        show_diff: bool,
+    },
 }
 
 pub fn run(cmd: ConfigCommand) -> Result<()> {
@@ -76,6 +95,12 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
         ConfigCommand::Validate { file } => cmd_validate(&file),
         ConfigCommand::Diff { base, other } => cmd_diff(&base, &other),
         ConfigCommand::EnvList => cmd_env_list(),
+        ConfigCommand::Merge {
+            base,
+            overlay,
+            output,
+            show_diff,
+        } => cmd_merge(&base, &overlay, output.as_deref(), show_diff),
     }
 }
 
@@ -181,6 +206,55 @@ fn cmd_env_list() -> Result<()> {
     for (env_key, dot_key, _desc) in table {
         let val = std::env::var(env_key).unwrap_or_else(|_| "(unset)".into());
         println!("{:<env_col$}  {:<key_col$}  {val}", env_key, dot_key);
+    }
+    Ok(())
+}
+
+fn cmd_merge(
+    base_path: &Path,
+    overlay_path: &Path,
+    output: Option<&Path>,
+    show_diff: bool,
+) -> Result<()> {
+    let base = VvConfig::from_file(base_path)
+        .with_context(|| format!("load base '{}'", base_path.display()))?;
+    let overlay = VvConfig::from_file(overlay_path)
+        .with_context(|| format!("load overlay '{}'", overlay_path.display()))?;
+    let merged = base.merge_with(&overlay);
+    let yaml = merged.to_yaml().context("serialize merged config")?;
+
+    match output {
+        Some(path) => {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create directory '{}'", parent.display()))?;
+            }
+            std::fs::write(path, &yaml)
+                .with_context(|| format!("write merged config to '{}'", path.display()))?;
+            println!("Merged config written to: {}", path.display());
+        }
+        None => print!("{yaml}"),
+    }
+
+    if show_diff {
+        let diffs = base.diff(&merged);
+        if diffs.is_empty() {
+            println!("# no fields changed (overlay was empty)");
+        } else {
+            let key_width = diffs.iter().map(|d| d.key.len()).max().unwrap_or(0);
+            for d in &diffs {
+                let sigil = match d.kind {
+                    ConfigDiffKind::Added => '+',
+                    ConfigDiffKind::Removed => '-',
+                    ConfigDiffKind::Changed => '~',
+                };
+                let base_val = d.base.as_deref().unwrap_or("(unset)");
+                let merged_val = d.other.as_deref().unwrap_or("(unset)");
+                println!("{sigil} {:<key_width$}  {base_val} -> {merged_val}", d.key);
+            }
+        }
     }
     Ok(())
 }
