@@ -1,4 +1,4 @@
-//! Integration tests for L114: `vvctl catalog gc` (VV-CTL-010).
+﻿//! Integration tests for L114: `vvctl catalog gc` (VV-CTL-010).
 
 use tempfile::TempDir;
 use vvctl::commands::catalog::{CatalogArgs, CatalogCommand, run};
@@ -56,7 +56,7 @@ fn gc_with_age(dir: &TempDir, secs: u64) -> CatalogArgs {
     )
 }
 
-// ── basic ─────────────────────────────────────────────────────────────────────
+// â”€â”€ basic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn gc_empty_catalog_is_noop() {
@@ -83,7 +83,7 @@ fn gc_multiple_valid_tables_is_noop() {
     assert!(dir.path().join("catalog").join("b").exists());
 }
 
-// ── orphan dirs ───────────────────────────────────────────────────────────────
+// â”€â”€ orphan dirs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn gc_removes_orphan_dir() {
@@ -114,7 +114,7 @@ fn gc_valid_table_not_removed_alongside_orphan() {
     assert!(dir.path().join("catalog").join("orders").exists());
 }
 
-// ── ghost entries ─────────────────────────────────────────────────────────────
+// â”€â”€ ghost entries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn gc_removes_ghost_entry() {
@@ -138,7 +138,7 @@ fn gc_dry_run_does_not_remove_ghost() {
     assert!(reg.load("ghost").is_ok(), "dry-run must not delete");
 }
 
-// ── stale snapshots ───────────────────────────────────────────────────────────
+// â”€â”€ stale snapshots â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn gc_no_max_age_keeps_snapshots() {
@@ -165,7 +165,7 @@ fn gc_high_max_age_keeps_fresh_snapshot() {
     let reg = dir.path().join("registry");
     let snaps = dir.path().join("snapshots");
     save_snapshot(&reg, &snaps).unwrap();
-    // 1 hour max age — just-created snapshot must survive.
+    // 1 hour max age â€” just-created snapshot must survive.
     run(gc_with_age(&dir, 3600)).unwrap();
     let entries: Vec<_> = std::fs::read_dir(&snaps)
         .unwrap()
@@ -174,7 +174,7 @@ fn gc_high_max_age_keeps_fresh_snapshot() {
     assert_eq!(entries.len(), 1);
 }
 
-// ── combined ─────────────────────────────────────────────────────────────────
+// â”€â”€ combined â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn gc_removes_both_orphan_and_ghost() {
@@ -190,7 +190,7 @@ fn gc_removes_both_orphan_and_ghost() {
     assert!(reg.load("ghost").is_err(), "ghost schema must be deleted");
 }
 
-// ── engine API ────────────────────────────────────────────────────────────────
+// â”€â”€ engine API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn engine_gc_clean_catalog_returns_zero_removed() {

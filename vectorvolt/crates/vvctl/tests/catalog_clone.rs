@@ -1,4 +1,4 @@
-//! Integration tests for L118: `vvctl catalog clone-table` (VV-CTL-014).
+﻿//! Integration tests for L118: `vvctl catalog clone-table` (VV-CTL-014).
 
 use tempfile::TempDir;
 use vectorvolt_engine::{ColumnDef, SchemaRegistry, ShardCatalog, TableSchema, clone_table};
@@ -51,7 +51,7 @@ fn make_table(dir: &TempDir, name: &str) {
     catalog.create_table(name, schema, 1024, 1).unwrap();
 }
 
-// ── CLI integration ───────────────────────────────────────────────────────────
+// â”€â”€ CLI integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn clone_via_cli_succeeds() {
@@ -106,7 +106,7 @@ fn clone_with_overwrite_replaces_dest() {
     assert!(reg.exists("src"));
 }
 
-// ── engine API ────────────────────────────────────────────────────────────────
+// â”€â”€ engine API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn engine_clone_creates_dest_schema() {

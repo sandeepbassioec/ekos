@@ -1,4 +1,4 @@
-//! Integration tests for L115: `vvctl catalog watch` (VV-CTL-011).
+﻿//! Integration tests for L115: `vvctl catalog watch` (VV-CTL-011).
 
 use std::time::Duration;
 
@@ -63,7 +63,7 @@ fn add_schema(dir: &TempDir, name: &str) {
     reg.save(name, &schema).unwrap();
 }
 
-// ── CLI integration ───────────────────────────────────────────────────────────
+// â”€â”€ CLI integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn watch_count_1_exits_after_initial() {
@@ -92,7 +92,7 @@ fn watch_verbose_count_2_exits() {
     run(watch_verbose(&dir, 2)).unwrap();
 }
 
-// ── engine API — WatchEvent kinds ────────────────────────────────────────────
+// â”€â”€ engine API â€” WatchEvent kinds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn first_event_is_initial() {
@@ -192,7 +192,7 @@ fn initial_export_contains_all_tables() {
     assert_eq!(table_count, 3);
 }
 
-// ── changed event content ─────────────────────────────────────────────────────
+// â”€â”€ changed event content â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn changed_event_diff_has_added_table() {
@@ -236,7 +236,7 @@ fn changed_event_current_export_reflects_new_state() {
     assert_eq!(current_tables, Some(2));
 }
 
-// ── CLI+engine combined ────────────────────────────────────────────────────────
+// â”€â”€ CLI+engine combined â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn watch_after_drop_table_shows_changed() {

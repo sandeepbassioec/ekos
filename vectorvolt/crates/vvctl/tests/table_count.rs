@@ -1,4 +1,4 @@
-//! Integration tests for Layer 135: vvctl table count (VV-ENG-010).
+﻿//! Integration tests for Layer 135: vvctl table count (VV-ENG-010).
 
 use std::path::PathBuf;
 
@@ -30,7 +30,7 @@ fn insert_row(dir: &TempDir, pk: u64, val: u64) {
     .unwrap();
 }
 
-// 1. Fresh table — count must be 0
+// 1. Fresh table â€” count must be 0
 #[test]
 fn count_empty_table_is_zero() {
     let dir = make_dir();
@@ -230,7 +230,7 @@ fn count_multi_column_table() {
     );
 }
 
-// 12. JSON output (verify Ok — stdout capture not needed)
+// 12. JSON output (verify Ok â€” stdout capture not needed)
 #[test]
 fn count_json_contains_total_key() {
     let dir = make_dir();

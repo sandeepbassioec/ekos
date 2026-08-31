@@ -1,4 +1,4 @@
-//! Integration tests for L123: `vvctl serve --master-config` (VV-CFG-011).
+﻿//! Integration tests for L123: `vvctl serve --master-config` (VV-CFG-011).
 //!
 //! Tests use `vvctl::commands::serve::bind()` to exercise the config
 //! loading path without starting a live server.
@@ -42,7 +42,7 @@ fn write_master_config(dir: &TempDir, yaml: &str) -> PathBuf {
     p
 }
 
-// ── CLI / bind integration ────────────────────────────────────────────────────
+// â”€â”€ CLI / bind integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn bind_without_master_config_master_config_is_none() {
@@ -137,7 +137,7 @@ fn master_config_invalid_yaml_errors() {
     assert!(result.is_err());
 }
 
-// ── engine API (VvConfig itself) ──────────────────────────────────────────────
+// â”€â”€ engine API (VvConfig itself) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn vv_config_network_section_round_trips() {

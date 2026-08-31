@@ -1,4 +1,4 @@
-//! Integration tests for L116: `vvctl catalog stats` (VV-CTL-012).
+﻿//! Integration tests for L116: `vvctl catalog stats` (VV-CTL-012).
 
 use tempfile::TempDir;
 use vectorvolt_engine::{ColumnDef, ShardCatalog, TableSchema, catalog_stats};
@@ -46,7 +46,7 @@ fn make_table(dir: &TempDir, name: &str) {
     catalog.create_table(name, schema, 1024, 1).unwrap();
 }
 
-// ── CLI integration ───────────────────────────────────────────────────────────
+// â”€â”€ CLI integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn stats_empty_catalog_exits_ok() {
@@ -76,7 +76,7 @@ fn stats_verbose_exits_ok() {
     run(stats_verbose(&dir)).unwrap();
 }
 
-// ── engine API ────────────────────────────────────────────────────────────────
+// â”€â”€ engine API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn engine_empty_catalog_returns_empty_report() {
@@ -155,7 +155,7 @@ fn engine_total_column_count_sums_tables() {
     make_table(&dir, "b");
     let (cat, reg) = engine_paths(&dir);
     let report = catalog_stats(&cat, &reg).unwrap();
-    assert_eq!(report.total_column_count(), 4); // 2 cols × 2 tables
+    assert_eq!(report.total_column_count(), 4); // 2 cols Ã— 2 tables
 }
 
 #[test]

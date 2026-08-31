@@ -1,4 +1,4 @@
-//! Integration tests for Layer 134: vvctl config set-key (VV-CFG-016).
+﻿//! Integration tests for Layer 134: vvctl config set-key (VV-CFG-016).
 
 use std::path::PathBuf;
 
@@ -29,7 +29,7 @@ observability:
   trace_level: info
 "#;
 
-// ── happy path ────────────────────────────────────────────────────────────────
+// â”€â”€ happy path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn set_key_writer_count_succeeds() {
@@ -188,7 +188,7 @@ fn set_key_multiple_keys_sequential() {
     assert_eq!(cfg.network.max_connections, Some(256));
 }
 
-// ── error cases ───────────────────────────────────────────────────────────────
+// â”€â”€ error cases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn set_key_unknown_key_errors() {

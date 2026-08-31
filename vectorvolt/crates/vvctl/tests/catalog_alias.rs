@@ -1,4 +1,4 @@
-//! Integration tests for L121: `vvctl catalog alias-*` (VV-CTL-017).
+﻿//! Integration tests for L121: `vvctl catalog alias-*` (VV-CTL-017).
 
 use tempfile::TempDir;
 use vectorvolt_engine::{
@@ -41,7 +41,7 @@ fn make_table(dir: &TempDir, name: &str) {
     catalog.create_table(name, schema, 1024, 1).unwrap();
 }
 
-// ── CLI integration ───────────────────────────────────────────────────────────
+// â”€â”€ CLI integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn cli_alias_create_succeeds() {
@@ -170,7 +170,7 @@ fn cli_alias_list_shows_all() {
     run(args(&dir, CatalogCommand::AliasList)).unwrap();
 }
 
-// ── engine API ────────────────────────────────────────────────────────────────
+// â”€â”€ engine API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn engine_create_and_resolve() {

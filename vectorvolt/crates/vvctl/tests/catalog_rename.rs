@@ -1,4 +1,4 @@
-//! Integration tests for L117: `vvctl catalog rename-table` (VV-CTL-013).
+﻿//! Integration tests for L117: `vvctl catalog rename-table` (VV-CTL-013).
 
 use tempfile::TempDir;
 use vectorvolt_engine::{ColumnDef, SchemaRegistry, ShardCatalog, TableSchema, rename_table};
@@ -49,7 +49,7 @@ fn make_table(dir: &TempDir, name: &str) {
     catalog.create_table(name, schema, 1024, 1).unwrap();
 }
 
-// ── CLI integration ───────────────────────────────────────────────────────────
+// â”€â”€ CLI integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn rename_via_cli_succeeds() {
@@ -97,7 +97,7 @@ fn rename_with_overwrite_succeeds() {
     assert!(!reg.exists("a"));
 }
 
-// ── engine API ────────────────────────────────────────────────────────────────
+// â”€â”€ engine API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn engine_rename_moves_schema() {

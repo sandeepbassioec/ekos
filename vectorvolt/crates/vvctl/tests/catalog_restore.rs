@@ -1,4 +1,4 @@
-//! Integration tests for L108: `vvctl catalog restore` + `serve --restore-catalog` (VV-CTL-004).
+﻿//! Integration tests for L108: `vvctl catalog restore` + `serve --restore-catalog` (VV-CTL-004).
 
 use tempfile::TempDir;
 use vvctl::commands::catalog::{CatalogArgs, CatalogCommand, run};
@@ -60,7 +60,7 @@ fn serve_args(dir: &TempDir, catalog: bool, restore_catalog: bool) -> ServeArgs 
     }
 }
 
-// ── vvctl catalog restore ─────────────────────────────────────────────────────
+// â”€â”€ vvctl catalog restore â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn restore_empty_registry_prints_nothing_to_restore() {
@@ -177,7 +177,7 @@ fn restore_then_list_returns_all_table_names() {
     assert!(names.contains(&"y".to_string()));
 }
 
-// ── serve --restore-catalog ───────────────────────────────────────────────────
+// â”€â”€ serve --restore-catalog â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn serve_with_catalog_no_restore_has_empty_catalog() {
@@ -186,7 +186,7 @@ fn serve_with_catalog_no_restore_has_empty_catalog() {
     run(create_args(&dir, "orders")).unwrap();
     let bound = bind(&serve_args(&dir, true, false)).unwrap();
     let cat = bound.catalog.unwrap();
-    // catalog opened fresh — no restore, so table not loaded
+    // catalog opened fresh â€” no restore, so table not loaded
     assert!(!cat.contains("orders"));
 }
 

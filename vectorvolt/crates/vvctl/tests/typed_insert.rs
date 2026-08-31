@@ -1,4 +1,4 @@
-//! Integration tests for L130: vvctl table typed-insert (VV-ENG-008 typed write side).
+﻿//! Integration tests for L130: vvctl table typed-insert (VV-ENG-008 typed write side).
 
 use std::path::PathBuf;
 
@@ -21,7 +21,7 @@ fn create_table(dir: &TempDir, cols: &[&str]) {
     .unwrap();
 }
 
-// ── happy path ────────────────────────────────────────────────────────────────
+// â”€â”€ happy path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn typed_insert_u64_only() {
@@ -158,7 +158,7 @@ fn typed_insert_multi_column() {
     .unwrap();
 }
 
-// ── error cases ───────────────────────────────────────────────────────────────
+// â”€â”€ error cases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn typed_insert_wrong_value_count() {

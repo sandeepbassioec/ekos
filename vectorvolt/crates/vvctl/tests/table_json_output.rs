@@ -1,4 +1,4 @@
-//! Integration tests for L131: --output json flag on vvctl table read commands (VV-CTL-016).
+﻿//! Integration tests for L131: --output json flag on vvctl table read commands (VV-CTL-016).
 
 use std::path::PathBuf;
 
@@ -30,7 +30,7 @@ fn create_and_insert(dir: &TempDir, cols: &[&str], pk: u64, vals: &[u64]) {
     let _ = values;
 }
 
-// ── get --output json ─────────────────────────────────────────────────────────
+// â”€â”€ get --output json â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn get_json_existing_row_succeeds() {
@@ -72,7 +72,7 @@ fn get_json_bool_column_succeeds() {
     .unwrap();
 }
 
-// ── scan --output json ────────────────────────────────────────────────────────
+// â”€â”€ scan --output json â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn scan_json_empty_result_is_array() {
@@ -132,7 +132,7 @@ fn scan_json_typed_decimal_succeeds() {
     .unwrap();
 }
 
-// ── stats --output json ───────────────────────────────────────────────────────
+// â”€â”€ stats --output json â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn stats_json_succeeds() {
@@ -160,7 +160,7 @@ fn stats_table_still_works() {
     .unwrap();
 }
 
-// ── schema --output json ──────────────────────────────────────────────────────
+// â”€â”€ schema --output json â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn schema_json_succeeds() {

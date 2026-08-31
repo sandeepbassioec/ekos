@@ -1,4 +1,4 @@
-//! Integration tests for Layer 137: vvctl table head (VV-CTL-019).
+﻿//! Integration tests for Layer 137: vvctl table head (VV-CTL-019).
 
 use std::path::PathBuf;
 
@@ -261,7 +261,7 @@ fn head_n_5_with_10_rows_returns_5() {
     for i in 0..10u64 {
         insert_row(&dir, i, i * 2);
     }
-    // Just verify it returns Ok — we can't capture stdout here
+    // Just verify it returns Ok â€” we can't capture stdout here
     assert!(
         run(TableCommand::Head {
             dir: table_dir(&dir),

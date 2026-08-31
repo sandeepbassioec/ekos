@@ -1,4 +1,4 @@
-//! Integration tests for Layer 136: vvctl wal replay (VV-WAL-012).
+﻿//! Integration tests for Layer 136: vvctl wal replay (VV-WAL-012).
 
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -24,7 +24,7 @@ fn write_wal_frames(dir: &TempDir, n: usize) -> PathBuf {
     wal_dir
 }
 
-// ── 1. Missing dir errors ─────────────────────────────────────────────────────
+// â”€â”€ 1. Missing dir errors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_missing_dir_errors() {
@@ -33,7 +33,7 @@ fn replay_missing_dir_errors() {
     assert!(result.is_err(), "expected error for missing dir");
 }
 
-// ── 2. Empty dir succeeds with 0 records ─────────────────────────────────────
+// â”€â”€ 2. Empty dir succeeds with 0 records â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_empty_dir_succeeds() {
@@ -43,7 +43,7 @@ fn replay_empty_dir_succeeds() {
     cmd_replay(&wal_dir, 0, &ReplayOutput::Table).unwrap();
 }
 
-// ── 3. Table output format succeeds ──────────────────────────────────────────
+// â”€â”€ 3. Table output format succeeds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_table_output_succeeds() {
@@ -52,7 +52,7 @@ fn replay_table_output_succeeds() {
     cmd_replay(&wal_dir, 0, &ReplayOutput::Table).unwrap();
 }
 
-// ── 4. JSON output format succeeds ───────────────────────────────────────────
+// â”€â”€ 4. JSON output format succeeds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_json_output_succeeds() {
@@ -61,7 +61,7 @@ fn replay_json_output_succeeds() {
     cmd_replay(&wal_dir, 0, &ReplayOutput::Json).unwrap();
 }
 
-// ── 5. Limit 0 reads all records ─────────────────────────────────────────────
+// â”€â”€ 5. Limit 0 reads all records â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_limit_zero_reads_all() {
@@ -70,7 +70,7 @@ fn replay_limit_zero_reads_all() {
     cmd_replay(&wal_dir, 0, &ReplayOutput::Table).unwrap();
 }
 
-// ── 6. With segments after writes returns Ok ─────────────────────────────────
+// â”€â”€ 6. With segments after writes returns Ok â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_with_segments_after_writes() {
@@ -79,7 +79,7 @@ fn replay_with_segments_after_writes() {
     cmd_replay(&wal_dir, 0, &ReplayOutput::Table).unwrap();
 }
 
-// ── 7. Single record insert, table output ────────────────────────────────────
+// â”€â”€ 7. Single record insert, table output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_one_record_table() {
@@ -88,7 +88,7 @@ fn replay_one_record_table() {
     cmd_replay(&wal_dir, 0, &ReplayOutput::Table).unwrap();
 }
 
-// ── 8. Single record insert, json output ─────────────────────────────────────
+// â”€â”€ 8. Single record insert, json output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_one_record_json() {
@@ -97,7 +97,7 @@ fn replay_one_record_json() {
     cmd_replay(&wal_dir, 0, &ReplayOutput::Json).unwrap();
 }
 
-// ── 9. Limit = 1 caps reads ──────────────────────────────────────────────────
+// â”€â”€ 9. Limit = 1 caps reads â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_limit_one_succeeds() {
@@ -106,7 +106,7 @@ fn replay_limit_one_succeeds() {
     cmd_replay(&wal_dir, 1, &ReplayOutput::Table).unwrap();
 }
 
-// ── 10. Limit = 100, fewer records available ─────────────────────────────────
+// â”€â”€ 10. Limit = 100, fewer records available â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_limit_100_with_fewer_records() {
@@ -115,7 +115,7 @@ fn replay_limit_100_with_fewer_records() {
     cmd_replay(&wal_dir, 100, &ReplayOutput::Table).unwrap();
 }
 
-// ── 11. Many records, table output ───────────────────────────────────────────
+// â”€â”€ 11. Many records, table output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_many_records_table() {
@@ -124,7 +124,7 @@ fn replay_many_records_table() {
     cmd_replay(&wal_dir, 0, &ReplayOutput::Table).unwrap();
 }
 
-// ── 12. Many records, json output ────────────────────────────────────────────
+// â”€â”€ 12. Many records, json output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_many_records_json() {
@@ -133,7 +133,7 @@ fn replay_many_records_json() {
     cmd_replay(&wal_dir, 0, &ReplayOutput::Json).unwrap();
 }
 
-// ── 13. WalCommand::Replay variant dispatches correctly ──────────────────────
+// â”€â”€ 13. WalCommand::Replay variant dispatches correctly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn replay_via_run_dispatch() {

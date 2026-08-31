@@ -2406,6 +2406,7 @@ dependencies = [
  "owo-colors",
  "reqwest",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "toml",

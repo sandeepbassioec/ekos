@@ -1,4 +1,4 @@
-//! Integration tests for L110: `vvctl catalog export` / `import` (VV-CTL-006).
+﻿//! Integration tests for L110: `vvctl catalog export` / `import` (VV-CTL-006).
 
 use std::path::PathBuf;
 
@@ -60,7 +60,7 @@ fn import_skip(dir: &TempDir, file: PathBuf) -> CatalogArgs {
     )
 }
 
-// ── export ────────────────────────────────────────────────────────────────────
+// â”€â”€ export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn export_empty_catalog_succeeds() {
@@ -122,7 +122,7 @@ fn export_json_is_valid_catalog_export() {
     assert_eq!(parsed.tables[0].name, "events");
 }
 
-// ── import ────────────────────────────────────────────────────────────────────
+// â”€â”€ import â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn import_creates_table_in_fresh_catalog() {

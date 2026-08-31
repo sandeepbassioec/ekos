@@ -1,4 +1,4 @@
-//! Integration tests for L128: vvctl table drop + truncate (VV-ENG-009 DDL completion).
+﻿//! Integration tests for L128: vvctl table drop + truncate (VV-ENG-009 DDL completion).
 
 use std::path::PathBuf;
 
@@ -27,7 +27,7 @@ fn create_and_insert(dir: &TempDir) {
     .unwrap();
 }
 
-// ── vvctl table drop ──────────────────────────────────────────────────────────
+// â”€â”€ vvctl table drop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn drop_without_force_errors() {
@@ -105,7 +105,7 @@ fn drop_idempotent_with_force_on_already_removed() {
     assert!(result.is_err());
 }
 
-// ── vvctl table truncate ──────────────────────────────────────────────────────
+// â”€â”€ vvctl table truncate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn truncate_preserves_schema() {
@@ -183,7 +183,7 @@ fn truncate_empty_table_succeeds() {
     assert!(table_dir(&dir).join("schema.txt").exists());
 }
 
-// ── drop vs truncate distinction ─────────────────────────────────────────────
+// â”€â”€ drop vs truncate distinction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn drop_removes_dir_truncate_does_not() {

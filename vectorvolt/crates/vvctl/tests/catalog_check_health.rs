@@ -1,4 +1,4 @@
-//! Integration tests for L113: `vvctl catalog check-health` (VV-CTL-009).
+﻿//! Integration tests for L113: `vvctl catalog check-health` (VV-CTL-009).
 
 use std::path::PathBuf;
 
@@ -72,7 +72,7 @@ fn check_health_strict(dir: &TempDir) -> CatalogArgs {
     )
 }
 
-// ── basic ─────────────────────────────────────────────────────────────────────
+// â”€â”€ basic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn check_health_empty_catalog_passes() {
@@ -95,7 +95,7 @@ fn check_health_multiple_valid_tables_passes() {
     run(check_health(&dir)).unwrap();
 }
 
-// ── orphan / ghost ────────────────────────────────────────────────────────────
+// â”€â”€ orphan / ghost â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn check_health_orphan_dir_fails() {
@@ -123,7 +123,7 @@ fn check_health_ghost_entry_fails() {
     );
 }
 
-// ── snapshot freshness ────────────────────────────────────────────────────────
+// â”€â”€ snapshot freshness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn check_health_no_max_age_passes_without_snapshot() {
@@ -155,7 +155,7 @@ fn check_health_fresh_snapshot_within_max_age_passes() {
     run(check_health_with_max_age(&dir, 3600)).unwrap();
 }
 
-// ── baseline diff ─────────────────────────────────────────────────────────────
+// â”€â”€ baseline diff â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn check_health_baseline_match_passes() {
@@ -188,7 +188,7 @@ fn check_health_baseline_mismatch_fails() {
     ))
     .unwrap();
 
-    // Add a table after capturing the baseline — live now differs.
+    // Add a table after capturing the baseline â€” live now differs.
     run(create_args(&dir, "shipments")).unwrap();
 
     let result = run(check_health_with_baseline(&dir, snap));
@@ -198,7 +198,7 @@ fn check_health_baseline_mismatch_fails() {
     );
 }
 
-// ── strict mode ───────────────────────────────────────────────────────────────
+// â”€â”€ strict mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn check_health_strict_clean_catalog_passes() {
@@ -216,7 +216,7 @@ fn check_health_strict_warning_fails() {
     let reg_dir = dir.path().join("registry");
     let catalog = ShardCatalog::with_registry(&cat, &reg_dir).unwrap();
     let schema = TableSchema::new(vec![
-        ColumnDef::from_line("ts:f64"), // non-u64 pk — warning
+        ColumnDef::from_line("ts:f64"), // non-u64 pk â€” warning
         ColumnDef::u64("val"),
     ])
     .unwrap();
@@ -229,7 +229,7 @@ fn check_health_strict_warning_fails() {
     assert!(result.is_err(), "strict mode should fail on warning");
 }
 
-// ── engine API ────────────────────────────────────────────────────────────────
+// â”€â”€ engine API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn engine_health_report_snapshot_count() {
