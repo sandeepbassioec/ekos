@@ -190,6 +190,19 @@ pub enum TableCommand {
         #[arg(long, short, value_enum, default_value = "table")]
         output: OutputFormat,
     },
+
+    /// Print the first N rows of a table ordered by primary key.
+    Head {
+        /// Table directory.
+        #[arg(short, long)]
+        dir: PathBuf,
+        /// Number of rows to show.
+        #[arg(short, long, default_value = "10")]
+        n: usize,
+        /// Output format.
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -217,6 +230,7 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::Drop { dir, force } => cmd_drop(dir, force),
         TableCommand::Truncate { dir } => cmd_truncate(dir),
         TableCommand::Count { dir, output } => cmd_count(&dir, output),
+        TableCommand::Head { dir, n, output } => cmd_head(&dir, n, output),
     }
 }
 
@@ -609,6 +623,70 @@ fn cmd_count(dir: &Path, output: OutputFormat) -> Result<()> {
             println!("total:    {total}");
             println!("buffered: {buffered}");
             println!("flushed:  {flushed}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_head(dir: &Path, n: usize, output: OutputFormat) -> Result<()> {
+    let schema = load_schema(dir)?;
+    let typed = load_typed_schema(dir)?;
+    let engine =
+        TableEngine::open(schema.clone(), dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let all_rows = engine.scan(0, 0, u64::MAX).with_context(|| "scan")?;
+    let rows: Vec<_> = all_rows.into_iter().take(n).collect();
+    match output {
+        OutputFormat::Json => {
+            let arr: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    let obj: serde_json::Map<String, serde_json::Value> = schema
+                        .iter()
+                        .zip(row.values.iter())
+                        .enumerate()
+                        .map(|(i, (name, raw))| {
+                            let col_type =
+                                typed.get(i).map(|c| c.col_type).unwrap_or(ColumnType::U64);
+                            (
+                                name.clone(),
+                                serde_json::Value::String(
+                                    TypedValue::from_bits(col_type, *raw).display_str(),
+                                ),
+                            )
+                        })
+                        .collect();
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&arr)?);
+        }
+        OutputFormat::Table => {
+            if rows.is_empty() {
+                println!("no rows");
+                return Ok(());
+            }
+            println!("{}", schema.join("\t"));
+            println!(
+                "{}",
+                schema
+                    .iter()
+                    .map(|_| "────────")
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            );
+            for row in &rows {
+                let line: Vec<String> = row
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, raw)| {
+                        let col_type = typed.get(i).map(|c| c.col_type).unwrap_or(ColumnType::U64);
+                        TypedValue::from_bits(col_type, *raw).display_str()
+                    })
+                    .collect();
+                println!("{}", line.join("\t"));
+            }
+            println!("\n{} row(s)", rows.len());
         }
     }
     Ok(())
