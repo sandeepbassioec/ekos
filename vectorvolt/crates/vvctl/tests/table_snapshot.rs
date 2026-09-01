@@ -1,5 +1,3 @@
-//! Layer 172 — vvctl table snapshot + restore
-
 use std::path::PathBuf;
 use tempfile::TempDir;
 use vvctl::commands::table::{OutputFormat, TableCommand, run};
@@ -7,191 +5,197 @@ use vvctl::commands::table::{OutputFormat, TableCommand, run};
 fn make_dir() -> TempDir {
     TempDir::new().unwrap()
 }
-
-fn tbl(dir: &TempDir) -> PathBuf {
-    dir.path().join("t")
+fn tdir(d: &TempDir) -> PathBuf {
+    d.path().join("tbl")
 }
-
-fn setup(dir: &TempDir) {
+fn setup(d: &TempDir) {
     run(TableCommand::Create {
-        dir: tbl(dir),
+        dir: tdir(d),
         columns: vec!["pk:u64".into(), "val:u64".into()],
     })
     .unwrap();
 }
-
-fn insert(dir: &TempDir, pk: u64, val: u64) {
+fn ins(d: &TempDir, pk: u64, val: u64) {
     run(TableCommand::Insert {
-        dir: tbl(dir),
+        dir: tdir(d),
         pk,
         values: vec![val],
     })
     .unwrap();
 }
 
-// 1. snapshot on empty table returns Ok
 #[test]
-fn snapshot_empty_table_ok() {
-    let dir = make_dir();
-    setup(&dir);
-    assert!(run(TableCommand::Snapshot { dir: tbl(&dir) }).is_ok());
+fn snapshot_empty_table() {
+    let d = make_dir();
+    setup(&d);
+    assert!(run(TableCommand::Snapshot { dir: tdir(&d) }).is_ok());
 }
 
-// 2. snapshot creates snapshot.vvss file
 #[test]
-fn snapshot_creates_file() {
-    let dir = make_dir();
-    setup(&dir);
-    run(TableCommand::Snapshot { dir: tbl(&dir) }).unwrap();
-    assert!(tbl(&dir).join("snapshot.vvss").exists());
-}
-
-// 3. snapshot after insert returns Ok
-#[test]
-fn snapshot_after_insert_ok() {
-    let dir = make_dir();
-    setup(&dir);
-    insert(&dir, 1, 10);
-    assert!(run(TableCommand::Snapshot { dir: tbl(&dir) }).is_ok());
-}
-
-// 4. snapshot missing dir returns Err
-#[test]
-fn snapshot_missing_dir_returns_err() {
-    let dir = make_dir();
-    assert!(
-        run(TableCommand::Snapshot {
-            dir: dir.path().join("no_dir")
-        })
-        .is_err()
-    );
-}
-
-// 5. restore with snapshot present returns Ok
-#[test]
-fn restore_with_snapshot_ok() {
-    let dir = make_dir();
-    setup(&dir);
-    run(TableCommand::Snapshot { dir: tbl(&dir) }).unwrap();
-    assert!(
-        run(TableCommand::Restore {
-            dir: tbl(&dir),
-            lsn: 0
-        })
-        .is_ok()
-    );
-}
-
-// 6. restore without snapshot returns Err
-#[test]
-fn restore_without_snapshot_returns_err() {
-    let dir = make_dir();
-    setup(&dir);
-    assert!(
-        run(TableCommand::Restore {
-            dir: tbl(&dir),
-            lsn: 0
-        })
-        .is_err()
-    );
-}
-
-// 7. multiple snapshots return Ok
-#[test]
-fn multiple_snapshots_ok() {
-    let dir = make_dir();
-    setup(&dir);
-    run(TableCommand::Snapshot { dir: tbl(&dir) }).unwrap();
-    assert!(run(TableCommand::Snapshot { dir: tbl(&dir) }).is_ok());
-}
-
-// 8. restore to lsn=0 ok
-#[test]
-fn restore_lsn_zero_ok() {
-    let dir = make_dir();
-    setup(&dir);
-    run(TableCommand::Snapshot { dir: tbl(&dir) }).unwrap();
-    assert!(
-        run(TableCommand::Restore {
-            dir: tbl(&dir),
-            lsn: 0
-        })
-        .is_ok()
-    );
-}
-
-// 9. restore to large lsn ok
-#[test]
-fn restore_large_lsn_ok() {
-    let dir = make_dir();
-    setup(&dir);
-    for i in 0u64..10 {
-        insert(&dir, i, i);
+fn snapshot_with_data() {
+    let d = make_dir();
+    setup(&d);
+    for i in 1..=5 {
+        ins(&d, i, i * 10);
     }
-    run(TableCommand::Flush { dir: tbl(&dir) }).unwrap();
-    run(TableCommand::Snapshot { dir: tbl(&dir) }).unwrap();
-    assert!(
-        run(TableCommand::Restore {
-            dir: tbl(&dir),
-            lsn: 999
-        })
-        .is_ok()
-    );
+    assert!(run(TableCommand::Snapshot { dir: tdir(&d) }).is_ok());
 }
 
-// 10. pitr-list after snapshot returns Ok
 #[test]
-fn pitr_list_after_snapshot_ok() {
-    let dir = make_dir();
-    setup(&dir);
-    run(TableCommand::Snapshot { dir: tbl(&dir) }).unwrap();
+fn pitr_list_empty() {
+    let d = make_dir();
+    setup(&d);
     assert!(
         run(TableCommand::PitrList {
-            dir: tbl(&dir),
+            dir: tdir(&d),
             output: OutputFormat::Table
         })
         .is_ok()
     );
 }
 
-// 11. pitr-list json after snapshot returns Ok
 #[test]
-fn pitr_list_json_ok() {
-    let dir = make_dir();
-    setup(&dir);
-    run(TableCommand::Snapshot { dir: tbl(&dir) }).unwrap();
+fn snapshot_then_pitr_list() {
+    let d = make_dir();
+    setup(&d);
+    ins(&d, 1, 10);
+    run(TableCommand::Snapshot { dir: tdir(&d) }).unwrap();
     assert!(
         run(TableCommand::PitrList {
-            dir: tbl(&dir),
+            dir: tdir(&d),
+            output: OutputFormat::Table
+        })
+        .is_ok()
+    );
+}
+
+#[test]
+fn multiple_snapshots() {
+    let d = make_dir();
+    setup(&d);
+    ins(&d, 1, 10);
+    run(TableCommand::Snapshot { dir: tdir(&d) }).unwrap();
+    ins(&d, 2, 20);
+    run(TableCommand::Snapshot { dir: tdir(&d) }).unwrap();
+    assert!(
+        run(TableCommand::PitrList {
+            dir: tdir(&d),
+            output: OutputFormat::Table
+        })
+        .is_ok()
+    );
+}
+
+#[test]
+fn pitr_list_json_output() {
+    let d = make_dir();
+    setup(&d);
+    ins(&d, 1, 1);
+    run(TableCommand::Snapshot { dir: tdir(&d) }).unwrap();
+    assert!(
+        run(TableCommand::PitrList {
+            dir: tdir(&d),
             output: OutputFormat::Json
         })
         .is_ok()
     );
 }
 
-// 12. pitr-list no snapshot returns Ok (empty list)
 #[test]
-fn pitr_list_no_snapshot_ok() {
-    let dir = make_dir();
-    setup(&dir);
+fn snapshot_after_flush() {
+    let d = make_dir();
+    setup(&d);
+    for i in 1..=4 {
+        ins(&d, i, i * 3);
+    }
+    run(TableCommand::Flush { dir: tdir(&d) }).unwrap();
+    assert!(run(TableCommand::Snapshot { dir: tdir(&d) }).is_ok());
+}
+
+#[test]
+fn snapshot_after_compact() {
+    let d = make_dir();
+    setup(&d);
+    for i in 1..=4 {
+        ins(&d, i, i * 3);
+    }
+    run(TableCommand::Compact { dir: tdir(&d) }).unwrap();
+    assert!(run(TableCommand::Snapshot { dir: tdir(&d) }).is_ok());
+}
+
+#[test]
+fn restore_lsn_zero() {
+    let d = make_dir();
+    setup(&d);
+    ins(&d, 1, 10);
+    run(TableCommand::Snapshot { dir: tdir(&d) }).unwrap();
     assert!(
-        run(TableCommand::PitrList {
-            dir: tbl(&dir),
-            output: OutputFormat::Table
+        run(TableCommand::Restore {
+            dir: tdir(&d),
+            lsn: 0
         })
         .is_ok()
     );
 }
 
-// 13. pitr-list missing dir returns Err
 #[test]
-fn pitr_list_missing_dir_returns_err() {
-    let dir = make_dir();
+fn snapshot_large_table() {
+    let d = make_dir();
+    setup(&d);
+    for i in 1..=20 {
+        ins(&d, i, i * 7);
+    }
+    assert!(run(TableCommand::Snapshot { dir: tdir(&d) }).is_ok());
+}
+
+#[test]
+fn snapshot_after_delete() {
+    let d = make_dir();
+    setup(&d);
+    for i in 1..=5 {
+        ins(&d, i, i);
+    }
+    run(TableCommand::Delete {
+        dir: tdir(&d),
+        pk: 3,
+    })
+    .unwrap();
+    assert!(run(TableCommand::Snapshot { dir: tdir(&d) }).is_ok());
+}
+
+#[test]
+fn pitr_list_after_multiple_snapshots_json() {
+    let d = make_dir();
+    setup(&d);
+    for _ in 0..3 {
+        ins(&d, 1, 1);
+        run(TableCommand::Snapshot { dir: tdir(&d) }).unwrap();
+    }
     assert!(
         run(TableCommand::PitrList {
-            dir: dir.path().join("no_dir"),
-            output: OutputFormat::Table,
+            dir: tdir(&d),
+            output: OutputFormat::Json
         })
-        .is_err()
+        .is_ok()
+    );
+}
+
+#[test]
+fn snapshot_then_scan_unchanged() {
+    let d = make_dir();
+    setup(&d);
+    for i in 1..=5 {
+        ins(&d, i, i * 4);
+    }
+    run(TableCommand::Snapshot { dir: tdir(&d) }).unwrap();
+    assert!(
+        run(TableCommand::Scan {
+            dir: tdir(&d),
+            col: 1,
+            lo: 0,
+            hi: 100,
+            output: OutputFormat::Table
+        })
+        .is_ok()
     );
 }

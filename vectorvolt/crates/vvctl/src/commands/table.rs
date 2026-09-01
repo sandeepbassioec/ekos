@@ -413,6 +413,21 @@ pub enum TableCommand {
         #[arg(long, short, value_enum, default_value = "table")]
         output: OutputFormat,
     },
+
+    /// Show the top-N rows by column value (highest first).
+    TopN {
+        /// Table directory.
+        dir: PathBuf,
+        /// Column index to sort by.
+        #[arg(long, default_value = "0")]
+        col: usize,
+        /// Number of rows to return.
+        #[arg(long, default_value = "10")]
+        n: usize,
+        /// Output format.
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -461,6 +476,12 @@ pub fn run(cmd: TableCommand) -> Result<()> {
         TableCommand::Snapshot { dir } => cmd_snapshot(dir),
         TableCommand::Restore { dir, lsn } => cmd_restore(dir, lsn),
         TableCommand::PitrList { dir, output } => cmd_pitr_list(dir, output),
+        TableCommand::TopN {
+            dir,
+            col,
+            n,
+            output,
+        } => cmd_top_n(dir, col, n, output),
     }
 }
 
@@ -1617,4 +1638,40 @@ fn load_typed_schema(dir: &Path) -> Result<TableSchema> {
 fn write_typed_schema(dir: &Path, schema: &TableSchema) -> Result<()> {
     let path = dir.join(SCHEMA_FILE);
     std::fs::write(&path, schema.to_text()).with_context(|| "write schema.txt")
+}
+
+fn cmd_top_n(dir: PathBuf, col: usize, n: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let col_idx = col;
+    let mut rows = engine
+        .scan(col_idx, 0, u64::MAX)
+        .with_context(|| "scan failed")?;
+    rows.sort_by(|a, b| {
+        let av = a.values.get(col_idx).copied().unwrap_or(0);
+        let bv = b.values.get(col_idx).copied().unwrap_or(0);
+        bv.cmp(&av)
+    });
+    let top: Vec<Vec<u64>> = rows
+        .into_iter()
+        .take(if n == 0 { usize::MAX } else { n })
+        .map(|r| r.values)
+        .collect();
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&top)?),
+        OutputFormat::Table => {
+            if top.is_empty() {
+                println!("(no rows)");
+            } else {
+                for row in &top {
+                    let parts: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                    println!("{}", parts.join("\t"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
