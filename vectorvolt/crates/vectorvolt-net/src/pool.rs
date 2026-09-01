@@ -17,6 +17,7 @@ use crate::{NetError, NetResult};
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A fixed-size pool of [`Connection`]s to a single server address.
+#[derive(Debug)]
 pub struct ConnectionPool {
     addr: SocketAddr,
     max: usize,
