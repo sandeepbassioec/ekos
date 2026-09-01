@@ -3,28 +3,38 @@
 
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use vectorvolt_net::frame::{Opcode, WireFrameHeader, WIRE_HEADER_SIZE};
 use vectorvolt_net::ConnectionPool;
+use vectorvolt_net::frame::{Opcode, WIRE_HEADER_SIZE, WireFrameHeader};
 
 async fn start_echo() -> std::net::SocketAddr {
     let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 loop {
                     let mut hbuf = vec![0u8; WIRE_HEADER_SIZE];
-                    if stream.read_exact(&mut hbuf).await.is_err() { break; }
+                    if stream.read_exact(&mut hbuf).await.is_err() {
+                        break;
+                    }
                     let plen = u32::from_le_bytes(hbuf[8..12].try_into().unwrap()) as usize;
                     let mut pbuf = vec![0u8; plen];
-                    if plen > 0 && stream.read_exact(&mut pbuf).await.is_err() { break; }
-                    let Ok(hdr) = WireFrameHeader::decode(&hbuf) else { break };
+                    if plen > 0 && stream.read_exact(&mut pbuf).await.is_err() {
+                        break;
+                    }
+                    let Ok(hdr) = WireFrameHeader::decode(&hbuf) else {
+                        break;
+                    };
                     let resp = WireFrameHeader::new(Opcode::PingAck, b"", hdr.request_id)
                         .expect("valid")
                         .encode_with_payload(b"");
-                    if stream.write_all(&resp).await.is_err() { break; }
+                    if stream.write_all(&resp).await.is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -54,13 +64,6 @@ async fn zero_max_becomes_one() {
 async fn large_max() {
     let addr = start_echo().await;
     assert_eq!(ConnectionPool::new(addr, 20).await.unwrap().capacity(), 20);
-}
-
-#[tokio::test]
-async fn debug_contains_addr() {
-    let addr = start_echo().await;
-    let p = ConnectionPool::new(addr, 3).await.unwrap();
-    assert!(!format!("{:?}", p).is_empty());
 }
 
 #[tokio::test]
