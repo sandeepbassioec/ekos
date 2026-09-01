@@ -200,7 +200,7 @@ fn fk_exists_batch_agrees_with_single_check() {
     let vals = [1u64, 2, 3];
     let engine = engine_with(&pks, &vals);
 
-    let results = engine.fk_exists_batch(&[10, 20, 30, 99]);
+    let results = engine.fk_exists_batch(&[10, 20, 30, 99]).unwrap();
     assert!(results[0]);
     assert!(results[1]);
     assert!(results[2]);
@@ -210,7 +210,7 @@ fn fk_exists_batch_agrees_with_single_check() {
 #[test]
 fn fk_exists_batch_empty_slice() {
     let engine = engine_with(&[1u64], &[1u64]);
-    assert!(engine.fk_exists_batch(&[]).is_empty());
+    assert!(engine.fk_exists_batch(&[]).unwrap().is_empty());
 }
 
 /// Verify count_scan == range_scan().len() at every row count 0..=20, covering
