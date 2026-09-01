@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, catalog, completion, config, config_audit, connect, hal, http, keygen, profile, serve,
-    server_cmd, store, support_bundle, table, topology, tune, wal,
+    bench, bench_net, catalog, completion, config, config_audit, connect, disconnect, hal, http,
+    keygen, ping, profile, serve, server_cmd, status_cmd, store, support_bundle, table, topology,
+    tune, wal,
 };
 use vvctl::ui;
 
@@ -107,6 +108,18 @@ enum Commands {
         #[arg(long)]
         path: Option<std::path::PathBuf>,
     },
+
+    /// Send N pings to a running VectorVolt server (VV-CTL-191).
+    Ping(ping::PingArgs),
+
+    /// Query server status (VV-CTL-194).
+    Status(status_cmd::StatusArgs),
+
+    /// Benchmark network request throughput (VV-CTL-198).
+    BenchNet(bench_net::BenchNetArgs),
+
+    /// Disconnect from a server (VV-CTL-200).
+    Disconnect(disconnect::DisconnectArgs),
 
     /// Print version and build info.
     Version,
@@ -243,6 +256,14 @@ fn main() -> Result<()> {
         Commands::SupportBundle(args) => support_bundle::run(args)?,
 
         Commands::ConfigAudit { path } => config_audit::run(path)?,
+
+        Commands::Ping(args) => ping::run(args)?,
+
+        Commands::Status(args) => status_cmd::run(args)?,
+
+        Commands::BenchNet(args) => bench_net::run(args)?,
+
+        Commands::Disconnect(args) => disconnect::run(args)?,
 
         Commands::Version => print_version(),
     }

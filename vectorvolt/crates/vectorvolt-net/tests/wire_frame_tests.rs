@@ -1,6 +1,6 @@
 //! Layer 185 — vectorvolt-net wire frame encode/decode tests
 
-use vectorvolt_net::protocol::{Header, HEADER_SIZE, OpCode, encode_frame};
+use vectorvolt_net::protocol::{HEADER_SIZE, Header, OpCode, encode_frame};
 
 // 1. HEADER_SIZE is 24 bytes
 #[test]

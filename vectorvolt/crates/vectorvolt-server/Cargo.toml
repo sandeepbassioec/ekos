@@ -4,24 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1"
-vectorvolt-net = { path = "../vectorvolt-net" }
+anyhow = { workspace = true }
+vectorvolt-net = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
-
-[[test]]
-name = "server_start"
-path = "tests/server_start.rs"
-
-[[test]]
-name = "request_handler"
-path = "tests/request_handler.rs"
-
-[[test]]
-name = "server_status"
-path = "tests/server_status.rs"
-
-[[test]]
-name = "server_metrics"
-path = "tests/server_metrics.rs"
+tempfile = { workspace = true }
