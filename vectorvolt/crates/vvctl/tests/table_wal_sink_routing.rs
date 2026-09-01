@@ -1,4 +1,4 @@
-﻿//! Tests for Layer 332: WAL sink routing (VV-CTL-332).
+//! Tests for Layer 332: WAL sink routing (VV-CTL-332).
 
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -89,7 +89,11 @@ fn after_trim_verify_ok() {
     let d = make_dir();
     setup(&d);
     ins(&d, 1, 10);
-    wal_run(WalCommand::Trim { dir: tdir(&d), before: 0 }).unwrap();
+    wal_run(WalCommand::Trim {
+        dir: tdir(&d),
+        before: 0,
+    })
+    .unwrap();
     assert!(
         wal_run(WalCommand::Verify {
             dir: tdir(&d).to_string_lossy().to_string(),
@@ -104,7 +108,11 @@ fn after_trim_scan_ok() {
     let d = make_dir();
     setup(&d);
     ins(&d, 1, 10);
-    wal_run(WalCommand::Trim { dir: tdir(&d), before: 0 }).unwrap();
+    wal_run(WalCommand::Trim {
+        dir: tdir(&d),
+        before: 0,
+    })
+    .unwrap();
     assert!(
         run(TableCommand::Scan {
             dir: tdir(&d),
@@ -122,7 +130,11 @@ fn after_trim_stats_ok() {
     let d = make_dir();
     setup(&d);
     ins(&d, 1, 10);
-    wal_run(WalCommand::Trim { dir: tdir(&d), before: 0 }).unwrap();
+    wal_run(WalCommand::Trim {
+        dir: tdir(&d),
+        before: 0,
+    })
+    .unwrap();
     assert!(
         wal_run(WalCommand::Stats {
             dir: tdir(&d),
@@ -137,7 +149,11 @@ fn after_trim_info_ok() {
     let d = make_dir();
     setup(&d);
     ins(&d, 1, 10);
-    wal_run(WalCommand::Trim { dir: tdir(&d), before: 0 }).unwrap();
+    wal_run(WalCommand::Trim {
+        dir: tdir(&d),
+        before: 0,
+    })
+    .unwrap();
     assert!(
         run(TableCommand::Info {
             dir: tdir(&d),
@@ -152,7 +168,11 @@ fn after_trim_check_ok() {
     let d = make_dir();
     setup(&d);
     ins(&d, 1, 10);
-    wal_run(WalCommand::Trim { dir: tdir(&d), before: 0 }).unwrap();
+    wal_run(WalCommand::Trim {
+        dir: tdir(&d),
+        before: 0,
+    })
+    .unwrap();
     assert!(run(TableCommand::Check { dir: tdir(&d) }).is_ok());
 }
 
@@ -161,7 +181,11 @@ fn after_trim_compact_ok() {
     let d = make_dir();
     setup(&d);
     ins(&d, 1, 10);
-    wal_run(WalCommand::Trim { dir: tdir(&d), before: 0 }).unwrap();
+    wal_run(WalCommand::Trim {
+        dir: tdir(&d),
+        before: 0,
+    })
+    .unwrap();
     assert!(run(TableCommand::Compact { dir: tdir(&d) }).is_ok());
 }
 
@@ -170,7 +194,11 @@ fn after_trim_vacuum_ok() {
     let d = make_dir();
     setup(&d);
     ins(&d, 1, 10);
-    wal_run(WalCommand::Trim { dir: tdir(&d), before: 0 }).unwrap();
+    wal_run(WalCommand::Trim {
+        dir: tdir(&d),
+        before: 0,
+    })
+    .unwrap();
     assert!(run(TableCommand::Vacuum { dir: tdir(&d) }).is_ok());
 }
 
@@ -179,7 +207,11 @@ fn after_trim_recount_ok() {
     let d = make_dir();
     setup(&d);
     ins(&d, 1, 10);
-    wal_run(WalCommand::Trim { dir: tdir(&d), before: 0 }).unwrap();
+    wal_run(WalCommand::Trim {
+        dir: tdir(&d),
+        before: 0,
+    })
+    .unwrap();
     assert!(
         run(TableCommand::Recount {
             dir: tdir(&d),
