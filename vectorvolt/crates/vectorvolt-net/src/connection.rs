@@ -18,6 +18,7 @@ use crate::{NetError, NetResult};
 /// Not `Clone` — each `Connection` owns one TCP stream.  Use
 /// [`crate::pool::ConnectionPool`] when multiple concurrent connections are
 /// needed.
+#[derive(Debug)]
 pub struct Connection {
     pub(crate) stream: TcpStream,
     pub(crate) next_id: u64,
