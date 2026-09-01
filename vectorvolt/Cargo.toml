@@ -10,6 +10,8 @@ members = [
     "crates/vectorvolt-txn",
     "crates/vectorvolt-engine",
     "crates/vectorvolt-projection",
+    "crates/vectorvolt-sink",
+    "crates/vectorvolt-sink-sdk",
     "crates/vectorvolt-net",
     "crates/vectorvolt-server",
     "crates/vectorvolt-http",
@@ -82,6 +84,8 @@ vectorvolt-replication = { path = "crates/vectorvolt-replication" }
 vectorvolt-txn     = { path = "crates/vectorvolt-txn" }
 vectorvolt-engine      = { path = "crates/vectorvolt-engine" }
 vectorvolt-projection  = { path = "crates/vectorvolt-projection" }
+vectorvolt-sink        = { path = "crates/vectorvolt-sink" }
+vectorvolt-sink-sdk    = { path = "crates/vectorvolt-sink-sdk" }
 vectorvolt-net     = { path = "crates/vectorvolt-net" }
 vectorvolt-http    = { path = "crates/vectorvolt-http" }
 # testing

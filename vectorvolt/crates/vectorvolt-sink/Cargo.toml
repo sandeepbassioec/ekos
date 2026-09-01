@@ -1,0 +1,21 @@
+[package]
+name        = "vectorvolt-sink"
+description = "VectorVolt sink trait, registry, WAL bridge, Postgres and Kafka sinks"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+
+[dependencies]
+vectorvolt-wal = { workspace = true }
+vectorvolt-txn = { workspace = true }
+thiserror      = { workspace = true }
+parking_lot    = { workspace = true }
+serde_json     = { workspace = true }
+async-trait    = "0.1"
+tokio          = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
