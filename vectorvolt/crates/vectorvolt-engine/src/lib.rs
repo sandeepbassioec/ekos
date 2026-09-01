@@ -54,6 +54,7 @@ mod mvcc;
 mod pagination;
 mod pitr;
 mod project;
+mod projections;
 mod range_delete;
 mod registry;
 mod row;
