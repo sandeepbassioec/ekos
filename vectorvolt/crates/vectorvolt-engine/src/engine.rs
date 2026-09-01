@@ -38,7 +38,7 @@ pub struct TableEngine {
     pub(crate) txn: TxnManager,
     /// Flushed partition files keyed by (file_id, partition_id).
     pub(crate) partitions: RwLock<HashMap<(u16, u16), PartitionReader>>,
-    partition_dir: PathBuf,
+    pub(crate) partition_dir: PathBuf,
     pub schema: TableSchema,
     /// How `compact` chooses what to merge.
     compaction_strategy: CompactionStrategy,
@@ -83,6 +83,8 @@ pub struct TableEngine {
     /// Durable append-only log of every [`ChangeEvent`] published by this
     /// table.  Enables SSE replay (`?from=<lsn>`) and view backfill.
     pub(crate) cdc_log: CdcLog,
+    /// CQRS projection store — mutations are fanned to attached reducers.
+    pub(crate) projections: parking_lot::Mutex<vectorvolt_projection::ProjectionStore>,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -502,6 +504,7 @@ impl TableEngine {
             changes_tx,
             lsn_counter: std::sync::atomic::AtomicU64::new(max_lsn),
             cdc_log,
+            projections: parking_lot::Mutex::new(vectorvolt_projection::ProjectionStore::new()),
         };
 
         // Rebuild any secondary indexes that were persisted before shutdown.
@@ -622,9 +625,12 @@ impl TableEngine {
                 .lsn_counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
-            let ev = ChangeEvent::insert(lsn, pk, vals);
+            let ev = ChangeEvent::insert(lsn, pk, vals.clone());
             let _ = self.cdc_log.append(&ev);
             let _ = self.changes_tx.send(ev);
+            self.projections
+                .lock()
+                .fan_out(&vectorvolt_txn::Mutation::Insert { pk, values: vals });
         }
         Ok(tip)
     }
@@ -649,6 +655,9 @@ impl TableEngine {
         let ev = ChangeEvent::delete(lsn, pk);
         let _ = self.cdc_log.append(&ev);
         let _ = self.changes_tx.send(ev);
+        self.projections
+            .lock()
+            .fan_out(&vectorvolt_txn::Mutation::Delete { pk });
         Ok(tip)
     }
 

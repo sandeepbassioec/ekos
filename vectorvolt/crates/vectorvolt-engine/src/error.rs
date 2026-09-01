@@ -51,6 +51,9 @@ pub enum EngineError {
 
     #[error("alter table failed: {0}")]
     AlterTableError(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;

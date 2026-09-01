@@ -21,7 +21,10 @@ pub mod format;
 pub mod lifecycle;
 pub mod manifest;
 pub mod partition;
+pub mod prefetch;
 pub mod reader;
+pub mod tier;
+pub mod tiered_writer;
 pub mod writer;
 
 pub use column::ColumnValues;
@@ -35,7 +38,10 @@ pub use lifecycle::{
 };
 pub use manifest::{Manifest, ManifestEdit, ManifestRecovery};
 pub use partition::MicroPartition;
+pub use prefetch::{AccessPattern, PrefetchAdvisor};
 pub use reader::PartitionReader;
+pub use tier::{StorageTier, TierConfig, TierStats, TieredStorageConfig};
+pub use tiered_writer::TieredWriter;
 pub use writer::{Compression, WriteOptions, write_partition, write_partition_with};
 
 // ── Error type ────────────────────────────────────────────────────────────────
