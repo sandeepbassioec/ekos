@@ -10,6 +10,7 @@ members = [
     "crates/vectorvolt-txn",
     "crates/vectorvolt-engine",
     "crates/vectorvolt-net",
+    "crates/vectorvolt-server",
     "crates/vectorvolt-http",
     "crates/vvctl",
 ]

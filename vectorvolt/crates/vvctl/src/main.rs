@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, catalog, config, connect, hal, http, keygen, profile, serve, store, table, tune, wal,
+    bench, bench_net, catalog, completion, config, config_audit, connect, disconnect, hal, http,
+    keygen, ping, profile, serve, server_cmd, status_cmd, store, support_bundle, table, topology,
+    tune, wal,
 };
 use vvctl::ui;
 
@@ -86,6 +88,38 @@ enum Commands {
 
     /// Emit the host SystemProfile as JSON or a human-readable table (VV-CFG-001).
     Profile(profile::ProfileArgs),
+
+    /// Show detected CPU/NUMA topology.
+    Topology(topology::TopologyArgs),
+
+    /// Print shell completion scripts.
+    Completion(completion::CompletionArgs),
+
+    /// Server management commands (status, health).
+    #[command(subcommand)]
+    Server(server_cmd::ServerCommand),
+
+    /// Collect diagnostics into a support bundle file.
+    SupportBundle(support_bundle::SupportBundleArgs),
+
+    /// Audit a config file for deprecated keys (VV-CTL-184).
+    ConfigAudit {
+        /// Path to config file (default: vectorvolt.yaml).
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+    },
+
+    /// Send N pings to a running VectorVolt server (VV-CTL-191).
+    Ping(ping::PingArgs),
+
+    /// Query server status (VV-CTL-194).
+    Status(status_cmd::StatusArgs),
+
+    /// Benchmark network request throughput (VV-CTL-198).
+    BenchNet(bench_net::BenchNetArgs),
+
+    /// Disconnect from a server (VV-CTL-200).
+    Disconnect(disconnect::DisconnectArgs),
 
     /// Print version and build info.
     Version,
@@ -212,6 +246,24 @@ fn main() -> Result<()> {
         Commands::Tune(args) => tune::run(args)?,
 
         Commands::Profile(args) => profile::run(args)?,
+
+        Commands::Topology(args) => topology::run(args)?,
+
+        Commands::Completion(args) => completion::run(args)?,
+
+        Commands::Server(cmd) => server_cmd::run(cmd)?,
+
+        Commands::SupportBundle(args) => support_bundle::run(args)?,
+
+        Commands::ConfigAudit { path } => config_audit::run(path)?,
+
+        Commands::Ping(args) => ping::run(args)?,
+
+        Commands::Status(args) => status_cmd::run(args)?,
+
+        Commands::BenchNet(args) => bench_net::run(args)?,
+
+        Commands::Disconnect(args) => disconnect::run(args)?,
 
         Commands::Version => print_version(),
     }

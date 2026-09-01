@@ -2282,6 +2282,7 @@ dependencies = [
 name = "vectorvolt-net"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crc32fast",
  "getrandom 0.3.4",
  "rcgen",
@@ -2316,6 +2317,15 @@ dependencies = [
  "tempfile",
  "thiserror",
  "vectorvolt-engine",
+]
+
+[[package]]
+name = "vectorvolt-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "vectorvolt-net",
 ]
 
 [[package]]

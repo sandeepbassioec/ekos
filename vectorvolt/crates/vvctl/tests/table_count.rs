@@ -148,6 +148,7 @@ fn count_after_truncate_is_zero() {
     .unwrap();
     run(TableCommand::Truncate {
         dir: table_dir(&dir),
+        force: true,
     })
     .unwrap();
     use vectorvolt_engine::TableEngine;

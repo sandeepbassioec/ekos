@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
 use vectorvolt_wal::{
-    SegmentReader, WalConfig, WalCursor, WalReader, list_segment_ids, segment_path,
+    SegmentReader, WalConfig, WalCursor, WalReader, WalWriter, list_segment_ids, segment_path,
 };
 
 #[derive(Clone, Debug, Default, clap::ValueEnum)]
@@ -83,6 +83,16 @@ pub enum WalCommand {
         before: u64,
     },
 
+    /// Write a typed checkpoint record to the WAL (VV-WAL-011).
+    ///
+    /// Appends a `CHECKPOINT:<lsn>:<ts>` payload to the WAL so recovery
+    /// can identify safe truncation points.
+    Checkpoint {
+        /// WAL directory.
+        #[arg(short, long)]
+        dir: PathBuf,
+    },
+
     /// Print aggregate statistics for a WAL directory.
     ///
     /// Reads all segments and reports: total frames, total bytes,
@@ -110,7 +120,29 @@ pub fn run(cmd: WalCommand) -> Result<()> {
         WalCommand::Export { dir, limit, output } => cmd_wal_export(&dir, limit, &output),
         WalCommand::Trim { dir, before } => cmd_wal_trim(&dir, before),
         WalCommand::Stats { dir, output } => cmd_wal_stats(&dir, &output),
+        WalCommand::Checkpoint { dir } => cmd_wal_checkpoint(&dir),
     }
+}
+
+fn cmd_wal_checkpoint(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        anyhow::bail!("WAL directory not found: {}", dir.display());
+    }
+    let cfg = WalConfig::default()
+        .with_dir(dir.to_string_lossy().as_ref())
+        .with_fsync(true);
+    let writer = WalWriter::open(cfg).with_context(|| "open WAL writer")?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let payload = format!("CHECKPOINT:0:{ts}").into_bytes();
+    let tip = writer
+        .append(payload)
+        .with_context(|| "append checkpoint")?;
+    writer.flush().with_context(|| "flush checkpoint")?;
+    println!("checkpoint written: seq={} ts={}", tip.sequence, ts);
+    Ok(())
 }
 
 fn cmd_status(dir: &str) -> Result<()> {

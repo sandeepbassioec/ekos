@@ -1,0 +1,11 @@
+[package]
+name = "vectorvolt-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+vectorvolt-net = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
