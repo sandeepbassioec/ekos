@@ -23,8 +23,11 @@ serde_yaml         = { workspace = true }
 toml               = { workspace = true }
 
 [dev-dependencies]
-tempfile  = { workspace = true }
-criterion = { workspace = true }
+tempfile         = { workspace = true }
+criterion        = { workspace = true }
+vectorvolt-sink  = { workspace = true }
+async-trait      = "0.1"
+tokio            = { workspace = true }
 
 [[bench]]
 name    = "engine_bench"
