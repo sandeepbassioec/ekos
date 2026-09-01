@@ -558,6 +558,49 @@ impl TxnManager {
         Ok(tip)
     }
 
+    /// Atomically update an existing row.
+    ///
+    /// Unlike `upsert`, this returns `PkNotFound` when the PK does not exist.
+    /// Logs a single `Mutation::Update` WAL record, then tombstones the old
+    /// physical row and inserts the new values — preventing the storage-orphan
+    /// problem of a plain delete + insert (VV-TXN-004.6).
+    pub fn update(&self, pk: u64, values: Vec<u64>) -> TxnResult<WalTip> {
+        if values.len() != self.schema.len() {
+            return Err(TxnError::SchemaMismatch {
+                expected: self.schema.len(),
+                got: values.len(),
+            });
+        }
+        // PK must exist — update is not an insert.
+        if self.pk_index.read().get(pk).is_none() {
+            return Err(TxnError::PkNotFound(pk));
+        }
+        // WAL first — single Update record covers the tombstone + re-insert.
+        let tip = self.commit(
+            Mutation::Update {
+                pk,
+                values: values.clone(),
+            }
+            .encode(),
+        )?;
+        // Tombstone the old descriptor.
+        self.pk_index.write().remove(pk);
+        // Secondary index + filter.
+        {
+            let mut sec = self.secondary_index.write();
+            for (col_idx, &val) in values.iter().enumerate().skip(1) {
+                sec.insert(col_value_hash(col_idx, val), pk as u32);
+            }
+        }
+        self.fk_filter.write().insert(pk)?;
+        // Push new row to writer thread.
+        let full = self.writer.insert(pk, values)?;
+        if full {
+            self.flush()?;
+        }
+        Ok(tip)
+    }
+
     // ── FLUSH ──────────────────────────────────────────────────────────────────
 
     /// Flush the write buffer to a `.vvsst` partition file.

@@ -435,7 +435,12 @@
       "PowerShell(cd C:\\\\VectorVolt\\\\vectorvolt; $e = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Select-String \"^error\"; if\\($e\\){$e|Select-Object -First 4}else{\"clippy: clean\"}; $o = cargo test --workspace 2>&1 | Out-String; $p=0;$f=0; [regex]::Matches\\($o,\"\\(\\\\d+\\) passed; \\(\\\\d+\\) failed\"\\) | ForEach-Object { $p+=[int]$_.Groups[1].Value; $f+=[int]$_.Groups[2].Value }; \"PASSED: $p FAILED: $f\"; \"fmt: $\\(\\(cargo fmt --all -- --check 2>&1 | Select-String 'Diff in'\\).Count\\)\"; cargo test --release -q -p vectorvolt-engine --test flush_contention -- --ignored --nocapture 2>&1 | Select-String \"^  [0-9a-z]\" | Select-Object -First 6)",
       "Bash(gh run *)",
       "PowerShell(gh run list --branch perf/decode-and-bench --limit 5)",
-      "PowerShell(ls C:\\\\VectorVolt\\\\docs\\\\ 2>$null; if \\(-not \\(Test-Path C:\\\\VectorVolt\\\\docs\\)\\) { \"no docs dir\" })"
+      "PowerShell(ls C:\\\\VectorVolt\\\\docs\\\\ 2>$null; if \\(-not \\(Test-Path C:\\\\VectorVolt\\\\docs\\)\\) { \"no docs dir\" })",
+      "Bash(find \"C:/RepairLink/code/rl-order-management-api\" -maxdepth 3 -type f | head -100 && echo \"---\" && ls \"C:/RepairLink/code/rl-order-management-api\")",
+      "PowerShell(pandoc \"C:\\\\RepairLink\\\\code\\\\rl-order-management-api\\\\src\\\\0001-oem-order-failure-recovery-sequencing.pdf\" -t markdown 2>&1)",
+      "PowerShell(python -c \"import pdfplumber; pdf = pdfplumber.open\\(r'C:\\\\RepairLink\\\\code\\\\rl-order-management-api\\\\src\\\\0001-oem-order-failure-recovery-sequencing.pdf'\\); [print\\(p.extract_text\\(\\)\\) for p in pdf.pages[:10]]\" 2>&1)",
+      "PowerShell(python -c \"import pdfplumber; pdf = pdfplumber.open\\(r'C:\\\\RepairLink\\\\code\\\\rl-order-management-api\\\\src\\\\0001-oem-order-failure-recovery-sequencing.pdf'\\); [print\\(p.extract_text\\(\\)\\) for p in pdf.pages[10:]]\" 2>&1)",
+      "PowerShell(python -c \"import pdfplumber; pdf = pdfplumber.open\\(r'C:\\\\RepairLink\\\\code\\\\rl-order-management-api\\\\src\\\\0002-native-oem-recovery-challenges-and-pricing-availability-blindspot.pdf'\\); [print\\(p.extract_text\\(\\)\\) for p in pdf.pages[:15]]\" 2>&1)"
     ]
   }
 }

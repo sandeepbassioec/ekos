@@ -2,15 +2,17 @@
 //!
 //! Binary layout (little-endian throughout):
 //!
-//! Insert:    op=0x00 | pk u64 | value_count u32 | values [u64; value_count]
-//! Delete:    op=0x01 | pk u64
-//! Upsert:    op=0x02 | pk u64 | value_count u32 | values [u64; value_count]
-//! DdlCreate: op=0x10 | name_len u32 | name bytes (UTF-8)
-//! DdlDrop:   op=0x11 | name_len u32 | name bytes (UTF-8)
-//! DdlAlter:  op=0x12 | name_len u32 | name bytes | add_count u32 | [col_len u32 | col bytes]* | drop_count u32 | [col_len u32 | col bytes]*
+//! Insert:     op=0x00 | pk u64 | value_count u32 | values [u64; value_count]
+//! Delete:     op=0x01 | pk u64
+//! Upsert:     op=0x02 | pk u64 | value_count u32 | values [u64; value_count]
+//! DdlCreate:  op=0x10 | name_len u32 | name bytes (UTF-8)
+//! DdlDrop:    op=0x11 | name_len u32 | name bytes (UTF-8)
+//! DdlAlter:   op=0x12 | name_len u32 | name bytes | add_count u32 | [col_len u32 | col bytes]* | drop_count u32 | [col_len u32 | col bytes]*
 //! InsertBatch: op=0x03 | row_count u32 | [(pk u64 | value_count u32 | values [u64; value_count])*]
-//! DeleteBatch:  op=0x04 | pk_count u32 | [pk u64]*
+//! DeleteBatch: op=0x04 | pk_count u32 | [pk u64]*
 //! UpsertBatch: op=0x05 | row_count u32 | [(pk u64 | value_count u32 | values [u64; value_count])*]
+//! Checkpoint:  op=0x06 | name_len u32 | name bytes (UTF-8) | lsn u64 | timestamp u64
+//! Update:      op=0x07 | pk u64 | value_count u32 | values [u64; value_count]
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read};
@@ -26,6 +28,11 @@ pub const OP_DDL_ALTER: u8 = 0x12;
 pub const OP_INSERT_BATCH: u8 = 0x03;
 pub const OP_DELETE_BATCH: u8 = 0x04;
 pub const OP_UPSERT_BATCH: u8 = 0x05;
+/// Typed checkpoint: records that all rows up to `lsn` are safe in SST files.
+pub const OP_CHECKPOINT: u8 = 0x06;
+/// In-place update: tombstones the old physical row and writes new column values
+/// under the same PK without orphaning the old storage (VV-TXN-004.6).
+pub const OP_UPDATE: u8 = 0x07;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mutation {
@@ -60,6 +67,21 @@ pub enum Mutation {
         add_columns: Vec<String>,
         drop_columns: Vec<String>,
     },
+    /// Durability checkpoint: all rows up to `lsn` are already in SST files.
+    /// Replaying a Checkpoint during WAL recovery is a no-op; it exists so the
+    /// WAL contains a precise record of the last safe compaction boundary.
+    Checkpoint {
+        table_name: String,
+        lsn: u64,
+        timestamp: u64,
+    },
+    /// Atomic update: tombstones the old physical row and writes new column
+    /// values.  Replayed as delete + insert during WAL recovery so storage
+    /// orphans from the old row are never visible after a restart.
+    Update {
+        pk: u64,
+        values: Vec<u64>,
+    },
 }
 
 impl Mutation {
@@ -71,7 +93,11 @@ impl Mutation {
             Mutation::InsertBatch { rows } => rows.first().map(|(pk, _)| *pk).unwrap_or(0),
             Mutation::DeleteBatch { pks } => pks.first().copied().unwrap_or(0),
             Mutation::UpsertBatch { rows } => rows.first().map(|(pk, _)| *pk).unwrap_or(0),
-            Mutation::DdlCreate { .. } | Mutation::DdlDrop { .. } | Mutation::DdlAlter { .. } => 0,
+            Mutation::DdlCreate { .. }
+            | Mutation::DdlDrop { .. }
+            | Mutation::DdlAlter { .. }
+            | Mutation::Checkpoint { .. } => 0,
+            Mutation::Update { pk, .. } => *pk,
         }
     }
 
@@ -161,6 +187,27 @@ impl Mutation {
                     let cb = col.as_bytes();
                     buf.write_u32::<LittleEndian>(cb.len() as u32).unwrap();
                     buf.extend_from_slice(cb);
+                }
+            }
+            Mutation::Checkpoint {
+                table_name,
+                lsn,
+                timestamp,
+            } => {
+                buf.write_u8(OP_CHECKPOINT).unwrap();
+                let name_bytes = table_name.as_bytes();
+                buf.write_u32::<LittleEndian>(name_bytes.len() as u32)
+                    .unwrap();
+                buf.extend_from_slice(name_bytes);
+                buf.write_u64::<LittleEndian>(*lsn).unwrap();
+                buf.write_u64::<LittleEndian>(*timestamp).unwrap();
+            }
+            Mutation::Update { pk, values } => {
+                buf.write_u8(OP_UPDATE).unwrap();
+                buf.write_u64::<LittleEndian>(*pk).unwrap();
+                buf.write_u32::<LittleEndian>(values.len() as u32).unwrap();
+                for &v in values {
+                    buf.write_u64::<LittleEndian>(v).unwrap();
                 }
             }
         }
@@ -348,6 +395,46 @@ impl Mutation {
                     drop_columns,
                 })
             }
+            OP_CHECKPOINT => {
+                let name_len = cur
+                    .read_u32::<LittleEndian>()
+                    .map_err(|_| TxnError::CorruptPayload("truncated checkpoint name_len".into()))?
+                    as usize;
+                let mut name_bytes = vec![0u8; name_len];
+                cur.read_exact(&mut name_bytes)
+                    .map_err(|_| TxnError::CorruptPayload("truncated checkpoint name".into()))?;
+                let table_name = String::from_utf8(name_bytes).map_err(|_| {
+                    TxnError::CorruptPayload("checkpoint name not valid UTF-8".into())
+                })?;
+                let lsn = cur
+                    .read_u64::<LittleEndian>()
+                    .map_err(|_| TxnError::CorruptPayload("truncated checkpoint lsn".into()))?;
+                let timestamp = cur.read_u64::<LittleEndian>().map_err(|_| {
+                    TxnError::CorruptPayload("truncated checkpoint timestamp".into())
+                })?;
+                Ok(Mutation::Checkpoint {
+                    table_name,
+                    lsn,
+                    timestamp,
+                })
+            }
+            OP_UPDATE => {
+                let pk = cur
+                    .read_u64::<LittleEndian>()
+                    .map_err(|_| TxnError::CorruptPayload("truncated update pk".into()))?;
+                let count = cur
+                    .read_u32::<LittleEndian>()
+                    .map_err(|_| TxnError::CorruptPayload("truncated update value_count".into()))?
+                    as usize;
+                let mut values = Vec::with_capacity(count);
+                for i in 0..count {
+                    let v = cur.read_u64::<LittleEndian>().map_err(|_| {
+                        TxnError::CorruptPayload(format!("truncated update value at index {i}"))
+                    })?;
+                    values.push(v);
+                }
+                Ok(Mutation::Update { pk, values })
+            }
             b => Err(TxnError::CorruptPayload(format!(
                 "unknown op byte {b:#04x}"
             ))),
@@ -396,5 +483,62 @@ mod tests {
         let mut buf = vec![0xFF];
         buf.extend_from_slice(&99u64.to_le_bytes());
         assert!(Mutation::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn checkpoint_round_trip() {
+        let m = Mutation::Checkpoint {
+            table_name: "orders".to_string(),
+            lsn: 4242,
+            timestamp: 1_700_000_000_000,
+        };
+        assert_eq!(Mutation::decode(&m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn checkpoint_pk_is_zero() {
+        let m = Mutation::Checkpoint {
+            table_name: "t".to_string(),
+            lsn: 1,
+            timestamp: 2,
+        };
+        assert_eq!(m.pk(), 0);
+    }
+
+    #[test]
+    fn update_round_trip() {
+        let m = Mutation::Update {
+            pk: 7,
+            values: vec![10, 20, 30],
+        };
+        assert_eq!(Mutation::decode(&m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn update_zero_values() {
+        let m = Mutation::Update {
+            pk: 0,
+            values: vec![],
+        };
+        assert_eq!(Mutation::decode(&m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn update_pk_preserved() {
+        let m = Mutation::Update {
+            pk: 999,
+            values: vec![1],
+        };
+        assert_eq!(m.pk(), 999);
+    }
+
+    #[test]
+    fn checkpoint_empty_name() {
+        let m = Mutation::Checkpoint {
+            table_name: String::new(),
+            lsn: 0,
+            timestamp: 0,
+        };
+        assert_eq!(Mutation::decode(&m.encode()).unwrap(), m);
     }
 }
