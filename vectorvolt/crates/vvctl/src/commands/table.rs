@@ -416,17 +416,250 @@ pub enum TableCommand {
 
     /// Show the top-N rows by column value (highest first).
     TopN {
-        /// Table directory.
         dir: PathBuf,
-        /// Column index to sort by.
         #[arg(long, default_value = "0")]
         col: usize,
-        /// Number of rows to return.
         #[arg(long, default_value = "10")]
         n: usize,
-        /// Output format.
         #[arg(long, short, value_enum, default_value = "table")]
         output: OutputFormat,
+    },
+
+    /// Show the bottom-N rows by column value (lowest first).
+    BottomN {
+        dir: PathBuf,
+        #[arg(long, default_value = "0")]
+        col: usize,
+        #[arg(long, default_value = "10")]
+        n: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Sum all values in a column.
+    SumField {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Average (mean) of a column.
+    AvgField {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Median of a column.
+    MedianField {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Percentile value of a column (0-100).
+    PercentileField {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, default_value = "50")]
+        pct: u32,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Field histogram: count rows per bucket.
+    Histogram {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, default_value = "10")]
+        bucket_size: u64,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Z-score filter: rows whose column value is more than N std-devs from mean.
+    ZScoreFilter {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Running cumulative sum of a column.
+    RunningSum {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Window rank: rank of a PK within a column range.
+    WindowRank {
+        dir: PathBuf,
+        #[arg(long)]
+        pk: u64,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Sum-product of two columns.
+    SumProduct {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col_a: usize,
+        #[arg(long, default_value = "2")]
+        col_b: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Range scan with equality filter on a second column.
+    FilterScan {
+        dir: PathBuf,
+        #[arg(long, default_value = "0")]
+        scan_col: usize,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
+        #[arg(long, default_value = "1")]
+        filter_col: usize,
+        #[arg(long, default_value = "0")]
+        filter_val: u64,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Count distinct values in a column.
+    CountDistinct {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Minimum value in a column.
+    ScalarMin {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Maximum value in a column.
+    ScalarMax {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Count unique (non-zero) values in a column.
+    UniqueCount {
+        dir: PathBuf,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Fetch multiple rows by primary key in one call.
+    BatchGet {
+        dir: PathBuf,
+        #[arg(required = true, num_args = 1..)]
+        pks: Vec<u64>,
+        #[arg(long, short, value_enum, default_value = "table")]
+        output: OutputFormat,
+    },
+
+    /// Delete multiple rows by primary key.
+    BatchDelete {
+        dir: PathBuf,
+        #[arg(required = true, num_args = 1..)]
+        pks: Vec<u64>,
+    },
+
+    /// Increment a column by 1 for a row.
+    IncrementField {
+        dir: PathBuf,
+        pk: u64,
+        #[arg(long, default_value = "1")]
+        col: usize,
+    },
+
+    /// Decrement a column by 1 for a row.
+    DecrementField {
+        dir: PathBuf,
+        pk: u64,
+        #[arg(long, default_value = "1")]
+        col: usize,
+    },
+
+    /// Add a constant to a column of one row.
+    SetFieldAdd {
+        dir: PathBuf,
+        pk: u64,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, default_value = "1")]
+        addend: u64,
+    },
+
+    /// Multiply a column of one row by a factor.
+    SetFieldMul {
+        dir: PathBuf,
+        pk: u64,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, default_value = "2")]
+        factor: u64,
+    },
+
+    /// Upsert (insert-or-replace) a row.
+    UpsertRow {
+        dir: PathBuf,
+        pk: u64,
+        #[arg(num_args = 0..)]
+        values: Vec<u64>,
+    },
+
+    /// Compare-and-swap: set column to new value only if it equals expected.
+    CompareAndSwap {
+        dir: PathBuf,
+        pk: u64,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long)]
+        expected: u64,
+        #[arg(long)]
+        replacement: u64,
+    },
+
+    /// Clamp a column value to [lo, hi].
+    ClampField {
+        dir: PathBuf,
+        pk: u64,
+        #[arg(long, default_value = "1")]
+        col: usize,
+        #[arg(long, default_value = "0")]
+        lo: u64,
+        #[arg(long, default_value = "18446744073709551615")]
+        hi: u64,
     },
 }
 
@@ -482,6 +715,85 @@ pub fn run(cmd: TableCommand) -> Result<()> {
             n,
             output,
         } => cmd_top_n(dir, col, n, output),
+        TableCommand::BottomN {
+            dir,
+            col,
+            n,
+            output,
+        } => cmd_bottom_n(dir, col, n, output),
+        TableCommand::SumField { dir, col, output } => cmd_sum_field(dir, col, output),
+        TableCommand::AvgField { dir, col, output } => cmd_avg_field(dir, col, output),
+        TableCommand::MedianField { dir, col, output } => cmd_median_field(dir, col, output),
+        TableCommand::PercentileField {
+            dir,
+            col,
+            pct,
+            output,
+        } => cmd_percentile_field(dir, col, pct, output),
+        TableCommand::Histogram {
+            dir,
+            col,
+            bucket_size,
+            output,
+        } => cmd_histogram(dir, col, bucket_size, output),
+        TableCommand::ZScoreFilter { dir, col, output } => cmd_zscore_filter(dir, col, output),
+        TableCommand::RunningSum { dir, col, output } => cmd_running_sum(dir, col, output),
+        TableCommand::WindowRank {
+            dir,
+            pk,
+            col,
+            output,
+        } => cmd_window_rank(dir, pk, col, output),
+        TableCommand::SumProduct {
+            dir,
+            col_a,
+            col_b,
+            output,
+        } => cmd_sum_product(dir, col_a, col_b, output),
+        TableCommand::FilterScan {
+            dir,
+            scan_col,
+            lo,
+            hi,
+            filter_col,
+            filter_val,
+            output,
+        } => cmd_filter_scan(dir, scan_col, lo, hi, filter_col, filter_val, output),
+        TableCommand::CountDistinct { dir, col, output } => cmd_count_distinct(dir, col, output),
+        TableCommand::ScalarMin { dir, col, output } => cmd_scalar_min(dir, col, output),
+        TableCommand::ScalarMax { dir, col, output } => cmd_scalar_max(dir, col, output),
+        TableCommand::UniqueCount { dir, col, output } => cmd_unique_count(dir, col, output),
+        TableCommand::BatchGet { dir, pks, output } => cmd_batch_get(dir, pks, output),
+        TableCommand::BatchDelete { dir, pks } => cmd_batch_delete(dir, pks),
+        TableCommand::IncrementField { dir, pk, col } => cmd_increment_field(dir, pk, col),
+        TableCommand::DecrementField { dir, pk, col } => cmd_decrement_field(dir, pk, col),
+        TableCommand::SetFieldAdd {
+            dir,
+            pk,
+            col,
+            addend,
+        } => cmd_set_field_add(dir, pk, col, addend),
+        TableCommand::SetFieldMul {
+            dir,
+            pk,
+            col,
+            factor,
+        } => cmd_set_field_mul(dir, pk, col, factor),
+        TableCommand::UpsertRow { dir, pk, values } => cmd_upsert_row(dir, pk, values),
+        TableCommand::CompareAndSwap {
+            dir,
+            pk,
+            col,
+            expected,
+            replacement,
+        } => cmd_compare_and_swap(dir, pk, col, expected, replacement),
+        TableCommand::ClampField {
+            dir,
+            pk,
+            col,
+            lo,
+            hi,
+        } => cmd_clamp_field(dir, pk, col, lo, hi),
     }
 }
 
@@ -1638,6 +1950,642 @@ fn load_typed_schema(dir: &Path) -> Result<TableSchema> {
 fn write_typed_schema(dir: &Path, schema: &TableSchema) -> Result<()> {
     let path = dir.join(SCHEMA_FILE);
     std::fs::write(&path, schema.to_text()).with_context(|| "write schema.txt")
+}
+
+// ── L203-L225 implementations ─────────────────────────────────────────────────
+
+fn cmd_bottom_n(dir: PathBuf, col: usize, n: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let mut rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    rows.sort_by(|a, b| {
+        let av = a.values.get(col).copied().unwrap_or(0);
+        let bv = b.values.get(col).copied().unwrap_or(0);
+        av.cmp(&bv)
+    });
+    let bot: Vec<Vec<u64>> = rows
+        .into_iter()
+        .take(if n == 0 { usize::MAX } else { n })
+        .map(|r| r.values)
+        .collect();
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&bot)?),
+        OutputFormat::Table => {
+            if bot.is_empty() {
+                println!("(no rows)");
+            } else {
+                for row in &bot {
+                    println!(
+                        "{}",
+                        row.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\t")
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_sum_field(dir: PathBuf, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let sum: u64 = rows
+        .iter()
+        .map(|r| r.values.get(col).copied().unwrap_or(0))
+        .sum();
+    match output {
+        OutputFormat::Json => println!("{{\"sum\":{sum}}}"),
+        OutputFormat::Table => println!("sum: {sum}"),
+    }
+    Ok(())
+}
+
+fn cmd_avg_field(dir: PathBuf, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let count = rows.len();
+    let sum: u64 = rows
+        .iter()
+        .map(|r| r.values.get(col).copied().unwrap_or(0))
+        .sum();
+    let avg = if count == 0 {
+        0.0f64
+    } else {
+        sum as f64 / count as f64
+    };
+    match output {
+        OutputFormat::Json => println!("{{\"avg\":{avg}}}"),
+        OutputFormat::Table => println!("avg: {avg:.4}"),
+    }
+    Ok(())
+}
+
+fn cmd_median_field(dir: PathBuf, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let mut vals: Vec<u64> = rows
+        .iter()
+        .map(|r| r.values.get(col).copied().unwrap_or(0))
+        .collect();
+    vals.sort_unstable();
+    let median = if vals.is_empty() {
+        0.0f64
+    } else if vals.len() % 2 == 1 {
+        vals[vals.len() / 2] as f64
+    } else {
+        (vals[vals.len() / 2 - 1] + vals[vals.len() / 2]) as f64 / 2.0
+    };
+    match output {
+        OutputFormat::Json => println!("{{\"median\":{median}}}"),
+        OutputFormat::Table => println!("median: {median:.4}"),
+    }
+    Ok(())
+}
+
+fn cmd_percentile_field(dir: PathBuf, col: usize, pct: u32, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    if pct > 100 {
+        bail!("percentile must be 0-100");
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let mut vals: Vec<u64> = rows
+        .iter()
+        .map(|r| r.values.get(col).copied().unwrap_or(0))
+        .collect();
+    vals.sort_unstable();
+    let result = if vals.is_empty() {
+        0u64
+    } else {
+        let idx = ((pct as f64 / 100.0) * (vals.len() - 1) as f64).round() as usize;
+        vals[idx.min(vals.len() - 1)]
+    };
+    let pct_label = pct;
+    match output {
+        OutputFormat::Json => println!("{{\"p{pct_label}\":{result}}}"),
+        OutputFormat::Table => println!("p{pct_label}: {result}"),
+    }
+    Ok(())
+}
+
+fn cmd_histogram(dir: PathBuf, col: usize, bucket_size: u64, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    if bucket_size == 0 {
+        bail!("bucket_size must be > 0");
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let mut buckets: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    for row in &rows {
+        let v = row.values.get(col).copied().unwrap_or(0);
+        *buckets.entry(v / bucket_size * bucket_size).or_insert(0) += 1;
+    }
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&buckets)?),
+        OutputFormat::Table => {
+            for (bucket, count) in &buckets {
+                println!("{bucket}: {count}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_zscore_filter(dir: PathBuf, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let vals: Vec<f64> = rows
+        .iter()
+        .map(|r| r.values.get(col).copied().unwrap_or(0) as f64)
+        .collect();
+    let n = vals.len();
+    if n < 2 {
+        match output {
+            OutputFormat::Json => println!("[]"),
+            OutputFormat::Table => println!("(no outliers)"),
+        }
+        return Ok(());
+    }
+    let mean = vals.iter().sum::<f64>() / n as f64;
+    let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    let std_dev = variance.sqrt();
+    let threshold = 2.0f64;
+    let outliers: Vec<Vec<u64>> = rows
+        .iter()
+        .filter(|r| {
+            let v = r.values.get(col).copied().unwrap_or(0) as f64;
+            std_dev > 0.0 && ((v - mean) / std_dev).abs() > threshold
+        })
+        .map(|r| r.values.clone())
+        .collect();
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&outliers)?),
+        OutputFormat::Table => {
+            if outliers.is_empty() {
+                println!("(no outliers)");
+            } else {
+                for row in &outliers {
+                    println!(
+                        "{}",
+                        row.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\t")
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_running_sum(dir: PathBuf, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let mut acc = 0u64;
+    let running: Vec<u64> = rows
+        .iter()
+        .map(|r| {
+            acc = acc.saturating_add(r.values.get(col).copied().unwrap_or(0));
+            acc
+        })
+        .collect();
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&running)?),
+        OutputFormat::Table => {
+            for v in &running {
+                println!("{v}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_window_rank(dir: PathBuf, pk: u64, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let target_row = engine.get(pk).with_context(|| "get row")?;
+    let target_val = target_row
+        .as_ref()
+        .and_then(|r| r.values.get(col).copied())
+        .unwrap_or(0);
+    let mut rank = 1usize;
+    for row in &rows {
+        let v = row.values.get(col).copied().unwrap_or(0);
+        if v > target_val {
+            rank += 1;
+        }
+    }
+    match output {
+        OutputFormat::Json => println!("{{\"pk\":{pk},\"rank\":{rank}}}"),
+        OutputFormat::Table => println!("rank: {rank}"),
+    }
+    Ok(())
+}
+
+fn cmd_sum_product(dir: PathBuf, col_a: usize, col_b: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(0, 0, u64::MAX).with_context(|| "scan")?;
+    let sum: u64 = rows
+        .iter()
+        .map(|r| {
+            let a = r.values.get(col_a).copied().unwrap_or(0);
+            let b = r.values.get(col_b).copied().unwrap_or(0);
+            a.saturating_mul(b)
+        })
+        .fold(0u64, |acc, v| acc.saturating_add(v));
+    match output {
+        OutputFormat::Json => println!("{{\"sum_product\":{sum}}}"),
+        OutputFormat::Table => println!("sum_product: {sum}"),
+    }
+    Ok(())
+}
+
+fn cmd_filter_scan(
+    dir: PathBuf,
+    scan_col: usize,
+    lo: u64,
+    hi: u64,
+    filter_col: usize,
+    filter_val: u64,
+    output: OutputFormat,
+) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(scan_col, lo, hi).with_context(|| "scan")?;
+    let filtered: Vec<Vec<u64>> = rows
+        .into_iter()
+        .filter(|r| r.values.get(filter_col).copied().unwrap_or(0) == filter_val)
+        .map(|r| r.values)
+        .collect();
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&filtered)?),
+        OutputFormat::Table => {
+            if filtered.is_empty() {
+                println!("(no rows)");
+            } else {
+                for row in &filtered {
+                    println!(
+                        "{}",
+                        row.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\t")
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_count_distinct(dir: PathBuf, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let distinct: std::collections::HashSet<u64> = rows
+        .iter()
+        .map(|r| r.values.get(col).copied().unwrap_or(0))
+        .collect();
+    let count = distinct.len();
+    match output {
+        OutputFormat::Json => println!("{{\"count_distinct\":{count}}}"),
+        OutputFormat::Table => println!("count_distinct: {count}"),
+    }
+    Ok(())
+}
+
+fn cmd_scalar_min(dir: PathBuf, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let min_val = rows
+        .iter()
+        .map(|r| r.values.get(col).copied().unwrap_or(u64::MAX))
+        .min()
+        .unwrap_or(0);
+    match output {
+        OutputFormat::Json => println!("{{\"min\":{min_val}}}"),
+        OutputFormat::Table => println!("min: {min_val}"),
+    }
+    Ok(())
+}
+
+fn cmd_scalar_max(dir: PathBuf, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let max_val = rows
+        .iter()
+        .map(|r| r.values.get(col).copied().unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    match output {
+        OutputFormat::Json => println!("{{\"max\":{max_val}}}"),
+        OutputFormat::Table => println!("max: {max_val}"),
+    }
+    Ok(())
+}
+
+fn cmd_unique_count(dir: PathBuf, col: usize, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let rows = engine.scan(col, 0, u64::MAX).with_context(|| "scan")?;
+    let count = rows
+        .iter()
+        .filter(|r| r.values.get(col).copied().unwrap_or(0) != 0)
+        .count();
+    match output {
+        OutputFormat::Json => println!("{{\"unique_count\":{count}}}"),
+        OutputFormat::Table => println!("unique_count: {count}"),
+    }
+    Ok(())
+}
+
+fn cmd_batch_get(dir: PathBuf, pks: Vec<u64>, output: OutputFormat) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let mut results: Vec<Option<Vec<u64>>> = Vec::new();
+    for pk in &pks {
+        let row = engine.get(*pk).with_context(|| format!("get pk={pk}"))?;
+        results.push(row.map(|r| r.values));
+    }
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&results)?),
+        OutputFormat::Table => {
+            for (pk, row) in pks.iter().zip(results.iter()) {
+                match row {
+                    Some(vals) => println!(
+                        "{pk}: {}",
+                        vals.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\t")
+                    ),
+                    None => println!("{pk}: (not found)"),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_batch_delete(dir: PathBuf, pks: Vec<u64>) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    let mut deleted = 0usize;
+    for pk in &pks {
+        if engine.get(*pk).with_context(|| "get")?.is_some() {
+            engine
+                .delete(*pk)
+                .with_context(|| format!("delete pk={pk}"))?;
+            deleted += 1;
+        }
+    }
+    engine.flush().with_context(|| "flush")?;
+    println!("deleted {deleted} row(s)");
+    Ok(())
+}
+
+fn cmd_increment_field(dir: PathBuf, pk: u64, col: usize) -> Result<()> {
+    if col == 0 {
+        bail!("cannot modify the primary-key column");
+    }
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    match engine.get(pk).with_context(|| "get row")? {
+        None => bail!("row not found: pk={pk}"),
+        Some(row) => {
+            let mut new_values = row.values.clone();
+            let v = new_values
+                .get_mut(col)
+                .ok_or_else(|| anyhow::anyhow!("col {col} out of range"))?;
+            *v = v.saturating_add(1);
+            engine.delete(pk).with_context(|| "delete")?;
+            engine.insert(pk, new_values).with_context(|| "insert")?;
+            engine.flush().with_context(|| "flush")?;
+            println!("incremented pk={pk} col={col}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_decrement_field(dir: PathBuf, pk: u64, col: usize) -> Result<()> {
+    if col == 0 {
+        bail!("cannot modify the primary-key column");
+    }
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    match engine.get(pk).with_context(|| "get row")? {
+        None => bail!("row not found: pk={pk}"),
+        Some(row) => {
+            let mut new_values = row.values.clone();
+            let v = new_values
+                .get_mut(col)
+                .ok_or_else(|| anyhow::anyhow!("col {col} out of range"))?;
+            *v = v.saturating_sub(1);
+            engine.delete(pk).with_context(|| "delete")?;
+            engine.insert(pk, new_values).with_context(|| "insert")?;
+            engine.flush().with_context(|| "flush")?;
+            println!("decremented pk={pk} col={col}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_set_field_add(dir: PathBuf, pk: u64, col: usize, addend: u64) -> Result<()> {
+    if col == 0 {
+        bail!("cannot modify the primary-key column");
+    }
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    match engine.get(pk).with_context(|| "get row")? {
+        None => bail!("row not found: pk={pk}"),
+        Some(row) => {
+            let mut new_values = row.values.clone();
+            let v = new_values
+                .get_mut(col)
+                .ok_or_else(|| anyhow::anyhow!("col {col} out of range"))?;
+            *v = v.saturating_add(addend);
+            engine.delete(pk).with_context(|| "delete")?;
+            engine.insert(pk, new_values).with_context(|| "insert")?;
+            engine.flush().with_context(|| "flush")?;
+            println!("added {addend} to pk={pk} col={col}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_set_field_mul(dir: PathBuf, pk: u64, col: usize, factor: u64) -> Result<()> {
+    if col == 0 {
+        bail!("cannot modify the primary-key column");
+    }
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    match engine.get(pk).with_context(|| "get row")? {
+        None => bail!("row not found: pk={pk}"),
+        Some(row) => {
+            let mut new_values = row.values.clone();
+            let v = new_values
+                .get_mut(col)
+                .ok_or_else(|| anyhow::anyhow!("col {col} out of range"))?;
+            *v = v.saturating_mul(factor);
+            engine.delete(pk).with_context(|| "delete")?;
+            engine.insert(pk, new_values).with_context(|| "insert")?;
+            engine.flush().with_context(|| "flush")?;
+            println!("multiplied pk={pk} col={col} by {factor}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_upsert_row(dir: PathBuf, pk: u64, values: Vec<u64>) -> Result<()> {
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    if engine.get(pk).with_context(|| "get")?.is_some() {
+        engine.delete(pk).with_context(|| "delete existing")?;
+    }
+    let mut full = vec![pk];
+    full.extend_from_slice(&values);
+    engine.insert(pk, full).with_context(|| "insert")?;
+    engine.flush().with_context(|| "flush")?;
+    println!("upserted pk={pk}");
+    Ok(())
+}
+
+fn cmd_compare_and_swap(
+    dir: PathBuf,
+    pk: u64,
+    col: usize,
+    expected: u64,
+    replacement: u64,
+) -> Result<()> {
+    if col == 0 {
+        bail!("cannot modify the primary-key column");
+    }
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    match engine.get(pk).with_context(|| "get row")? {
+        None => bail!("row not found: pk={pk}"),
+        Some(row) => {
+            let current = row.values.get(col).copied().unwrap_or(0);
+            if current != expected {
+                bail!("CAS failed: current={current} expected={expected}");
+            }
+            let mut new_values = row.values.clone();
+            new_values[col] = replacement;
+            engine.delete(pk).with_context(|| "delete")?;
+            engine.insert(pk, new_values).with_context(|| "insert")?;
+            engine.flush().with_context(|| "flush")?;
+            println!("swapped pk={pk} col={col} {expected} -> {replacement}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_clamp_field(dir: PathBuf, pk: u64, col: usize, lo: u64, hi: u64) -> Result<()> {
+    if col == 0 {
+        bail!("cannot modify the primary-key column");
+    }
+    if !dir.join(SCHEMA_FILE).exists() {
+        bail!("no table at '{}'", dir.display());
+    }
+    let schema = load_schema(&dir)?;
+    let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
+    match engine.get(pk).with_context(|| "get row")? {
+        None => bail!("row not found: pk={pk}"),
+        Some(row) => {
+            let mut new_values = row.values.clone();
+            let v = new_values
+                .get_mut(col)
+                .ok_or_else(|| anyhow::anyhow!("col {col} out of range"))?;
+            *v = (*v).clamp(lo, hi);
+            engine.delete(pk).with_context(|| "delete")?;
+            engine.insert(pk, new_values).with_context(|| "insert")?;
+            engine.flush().with_context(|| "flush")?;
+            println!("clamped pk={pk} col={col} to [{lo},{hi}]");
+        }
+    }
+    Ok(())
 }
 
 fn cmd_top_n(dir: PathBuf, col: usize, n: usize, output: OutputFormat) -> Result<()> {
