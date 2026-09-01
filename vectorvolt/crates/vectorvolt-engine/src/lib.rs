@@ -52,6 +52,7 @@ mod groupby;
 mod index_catalog;
 mod mvcc;
 mod pagination;
+mod pitr;
 mod project;
 mod range_delete;
 mod registry;

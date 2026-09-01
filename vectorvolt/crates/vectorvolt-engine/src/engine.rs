@@ -38,7 +38,7 @@ pub struct TableEngine {
     pub(crate) txn: TxnManager,
     /// Flushed partition files keyed by (file_id, partition_id).
     pub(crate) partitions: RwLock<HashMap<(u16, u16), PartitionReader>>,
-    partition_dir: PathBuf,
+    pub(crate) partition_dir: PathBuf,
     pub schema: TableSchema,
     /// How `compact` chooses what to merge.
     compaction_strategy: CompactionStrategy,
