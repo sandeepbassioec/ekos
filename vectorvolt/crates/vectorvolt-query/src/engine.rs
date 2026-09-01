@@ -80,24 +80,32 @@ impl QueryEngine {
             return Ok(Vec::new());
         };
 
-        let mut results: Vec<QueryRow> = Vec::new();
-        for pk32 in iter {
-            let pk = pk32 as u64;
-            if let Some(row) = self.pk_lookup(pk)? {
-                results.push(row);
-            }
-        }
-        Ok(results)
+        // Collect all matching PKs first, then issue a single batched lookup
+        // (VV-QRY-003.5). This replaces N individual CuckooMap probes with one
+        // vectorized `get_batch` call, cutting the secondary-scan probe cost
+        // from O(N × CuckooMap-probe) to O(1 batch + N × read_value).
+        let pks: Vec<u64> = iter.map(|pk32| pk32 as u64).collect();
+        let rows = self.pk_lookup_batch(&pks)?;
+        Ok(rows.into_iter().flatten().collect())
     }
 
     // ── FK existence check ────────────────────────────────────────────────────
 
-    /// Return `true` if `fk_value` is probably present (CuckooFilter, ~0.78% FP rate).
+    /// Return `true` if `fk_value` is definitely present in the target table.
     ///
-    /// A `false` return is a definite miss. A `true` return may be a false positive.
-    #[inline]
-    pub fn fk_exists(&self, fk_value: u64) -> bool {
-        self.catalog.fk_filter.contains(fk_value)
+    /// Two-phase check: the CuckooFilter is consulted first (a definite miss
+    /// returns `false` without touching storage). When the filter returns `true`
+    /// (which may be a false positive at ~0.78% rate) a real `pk_lookup` is
+    /// performed against the partition map. Only rows confirmed present in
+    /// storage return `true` (VV-QRY-004.3).
+    pub fn fk_exists(&self, fk_value: u64) -> QueryResult<bool> {
+        if !self.catalog.fk_filter.contains(fk_value) {
+            return Ok(false);
+        }
+        // Filter said "maybe present" — re-check against real storage to
+        // eliminate false positives.
+        let confirmed = self.pk_lookup(fk_value)?.is_some();
+        Ok(confirmed)
     }
 
     // ── SIMD analytics ───────────────────────────────────────────────────────
@@ -233,12 +241,31 @@ impl QueryEngine {
             .collect()
     }
 
-    /// Batch FK existence check using `CuckooFilter::contains_batch`.
+    /// Batch FK existence check with false-positive recheck (VV-QRY-004.3).
     ///
-    /// Returns one `bool` per input value in the same order.
-    #[inline]
-    pub fn fk_exists_batch(&self, fk_values: &[u64]) -> Vec<bool> {
-        self.catalog.fk_filter.contains_batch(fk_values)
+    /// Returns one `bool` per input value in the same order. Values that pass
+    /// the CuckooFilter are re-verified against storage; only confirmed rows
+    /// return `true`.
+    pub fn fk_exists_batch(&self, fk_values: &[u64]) -> QueryResult<Vec<bool>> {
+        let filter_hits = self.catalog.fk_filter.contains_batch(fk_values);
+        // Collect only the values the filter said "maybe present".
+        let candidates: Vec<u64> = fk_values
+            .iter()
+            .zip(filter_hits.iter())
+            .filter_map(|(&v, &hit)| if hit { Some(v) } else { None })
+            .collect();
+        // One batched storage lookup for all candidates.
+        let confirmed_rows = self.pk_lookup_batch(&candidates)?;
+        let mut confirmed_set = std::collections::HashSet::new();
+        for (v, row_opt) in candidates.iter().zip(confirmed_rows.iter()) {
+            if row_opt.is_some() {
+                confirmed_set.insert(*v);
+            }
+        }
+        Ok(fk_values
+            .iter()
+            .map(|v| confirmed_set.contains(v))
+            .collect())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -368,10 +395,10 @@ mod tests {
     #[test]
     fn fk_exists_hit_and_miss() {
         let engine = simple_engine();
-        assert!(engine.fk_exists(1));
-        assert!(engine.fk_exists(2));
+        assert!(engine.fk_exists(1).unwrap());
+        assert!(engine.fk_exists(2).unwrap());
         // 99 was never inserted — very unlikely to be a false positive at this size
-        assert!(!engine.fk_exists(99));
+        assert!(!engine.fk_exists(99).unwrap());
     }
 
     #[test]

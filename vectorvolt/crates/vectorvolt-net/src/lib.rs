@@ -27,12 +27,18 @@
 
 pub mod auth;
 pub mod client;
+pub mod connection;
+pub mod frame;
+pub mod pool;
 pub mod protocol;
 pub mod server;
 pub mod tls;
 
 pub use auth::{AuthConfig, AuthError, AuthState, Scope, Secret};
 pub use client::Client;
+pub use connection::Connection;
+pub use frame::{Opcode, WIRE_HEADER_SIZE, WIRE_MAGIC, WIRE_VERSION, WireFrameHeader};
+pub use pool::{ConnectionPool, PooledConn};
 pub use protocol::{Header, OpCode, Request, Response};
 pub use server::{Server, ServerConfig, ServerStats};
 pub use tls::{ClientTlsConfig, ServerTlsConfig};
@@ -145,50 +151,6 @@ pub fn decode_frame(data: &[u8]) -> Option<Frame> {
         len,
         payload: data[4..4 + len as usize].to_vec(),
     })
-}
-
-/// Lightweight net client stub (VV-NET-190).
-#[derive(Debug, Clone)]
-pub struct NetClient {
-    pub addr: String,
-}
-
-impl NetClient {
-    pub fn connect(addr: &str) -> anyhow::Result<Self> {
-        Ok(Self {
-            addr: addr.to_string(),
-        })
-    }
-
-    pub fn ping(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-/// Connection pool stub (VV-NET-195).
-#[derive(Debug, Clone)]
-pub struct ConnectionPool {
-    pub max: usize,
-}
-
-impl ConnectionPool {
-    pub fn new(max: usize) -> Self {
-        Self { max }
-    }
-
-    pub fn size(&self) -> usize {
-        self.max
-    }
-}
-
-/// TLS configuration stub (VV-NET-199).
-#[derive(Debug, Clone, Default)]
-pub struct TlsConfig {
-    pub enabled: bool,
-}
-
-pub fn apply_tls(_cfg: &TlsConfig, listener: std::net::TcpListener) -> std::net::TcpListener {
-    listener
 }
 
 /// Error codes carried in [`Response::Error`].

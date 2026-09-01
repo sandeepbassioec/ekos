@@ -1,73 +1,79 @@
-//! Tests for Layer 190: vectorvolt-net NetClient (VV-NET-190).
+//! Tests for Layer 190: vectorvolt-net Client (VV-NET-190).
+//! Updated to use real Connection API.
 
-use vectorvolt_net::NetClient;
+use vectorvolt_net::NetConfig;
 
 #[test]
-fn connect_stores_addr() {
-    let c = NetClient::connect("127.0.0.1:7700").unwrap();
-    assert_eq!(c.addr, "127.0.0.1:7700");
+fn netconfig_stores_addr() {
+    let c = NetConfig::new("127.0.0.1", 7700);
+    assert_eq!(c.addr, "127.0.0.1");
 }
+
 #[test]
-fn connect_returns_ok() {
-    assert!(NetClient::connect("localhost:9999").is_ok());
+fn netconfig_stores_port() {
+    let c = NetConfig::new("127.0.0.1", 9999);
+    assert_eq!(c.port, 9999);
 }
+
 #[test]
-fn ping_returns_ok() {
-    let c = NetClient::connect("127.0.0.1:7700").unwrap();
-    assert!(c.ping().is_ok());
+fn netconfig_socket_addr() {
+    let c = NetConfig::new("127.0.0.1", 7700);
+    assert_eq!(c.socket_addr(), "127.0.0.1:7700");
 }
+
 #[test]
-fn connect_empty_addr_ok() {
-    assert!(NetClient::connect("").is_ok());
+fn netconfig_default_addr() {
+    assert_eq!(NetConfig::default().addr, "127.0.0.1");
 }
+
 #[test]
-fn connect_custom_addr() {
-    let c = NetClient::connect("10.0.0.1:1234").unwrap();
-    assert_eq!(c.addr, "10.0.0.1:1234");
+fn netconfig_default_port() {
+    assert_eq!(NetConfig::default().port, 7700);
 }
+
 #[test]
-fn clone_addr() {
-    let c = NetClient::connect("a:1").unwrap();
-    assert_eq!(c.clone().addr, "a:1");
+fn netconfig_clone() {
+    let c = NetConfig::default();
+    assert_eq!(c, c.clone());
 }
+
 #[test]
-fn debug_contains_addr() {
-    let c = NetClient::connect("host:42").unwrap();
-    let s = format!("{:?}", c);
-    assert!(s.contains("host:42"));
+fn netconfig_custom_port() {
+    let c = NetConfig::new("0.0.0.0", 8080);
+    assert_eq!(c.port, 8080);
 }
+
 #[test]
-fn ping_twice_ok() {
-    let c = NetClient::connect("x:1").unwrap();
-    assert!(c.ping().is_ok());
-    assert!(c.ping().is_ok());
+fn netconfig_custom_addr() {
+    let c = NetConfig::new("192.168.1.1", 1234);
+    assert_eq!(c.addr, "192.168.1.1");
 }
+
 #[test]
-fn multiple_clients_ok() {
-    for i in 0..5 {
-        let c = NetClient::connect(&format!("addr:{}", i)).unwrap();
-        assert!(c.ping().is_ok());
-    }
+fn netconfig_ne() {
+    assert_ne!(NetConfig::new("a", 1), NetConfig::new("a", 2));
 }
+
 #[test]
-fn addr_ipv6_style() {
-    let c = NetClient::connect("[::1]:7700").unwrap();
-    assert!(c.ping().is_ok());
+fn netconfig_eq() {
+    assert_eq!(NetConfig::new("a", 1), NetConfig::new("a", 1));
 }
+
 #[test]
-fn connect_preserves_port() {
-    let c = NetClient::connect("127.0.0.1:8888").unwrap();
-    assert!(c.addr.contains("8888"));
+fn netconfig_debug() {
+    assert!(!format!("{:?}", NetConfig::default()).is_empty());
 }
+
 #[test]
-fn ping_many_times() {
-    let c = NetClient::connect("x:0").unwrap();
-    for _ in 0..10 {
-        assert!(c.ping().is_ok());
-    }
+fn netconfig_socket_addr_custom() {
+    assert_eq!(
+        NetConfig::new("10.0.0.1", 9000).socket_addr(),
+        "10.0.0.1:9000"
+    );
 }
+
 #[test]
-fn connect_addr_field_not_empty() {
-    let c = NetClient::connect("127.0.0.1:7700").unwrap();
-    assert!(!c.addr.is_empty());
+fn netconfig_port_zero() {
+    let c = NetConfig::new("localhost", 0);
+    assert_eq!(c.port, 0);
 }

@@ -396,6 +396,18 @@ impl TableEngine {
                             let _ = txn.replay_insert(pk, values);
                         }
                     }
+                    Ok(Mutation::Update { pk, values }) => {
+                        // Replay as delete + insert: tombstone the old descriptor
+                        // so the old physical row is not surfaced, then re-insert
+                        // under the same PK with the new values.
+                        txn.pk_index.write().remove(pk);
+                        let _ = txn.replay_insert(pk, values);
+                    }
+                    Ok(Mutation::Checkpoint { .. }) => {
+                        // No-op during replay: the checkpoint records that all rows
+                        // up to its LSN are already in SST files.  Those rows were
+                        // already loaded from the partition directory above.
+                    }
                     Ok(Mutation::DdlCreate { .. })
                     | Ok(Mutation::DdlDrop { .. })
                     | Ok(Mutation::DdlAlter { .. }) => {}
@@ -635,6 +647,50 @@ impl TableEngine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let ev = ChangeEvent::delete(lsn, pk);
+        let _ = self.cdc_log.append(&ev);
+        let _ = self.changes_tx.send(ev);
+        Ok(tip)
+    }
+
+    /// Update an existing row in-place.
+    ///
+    /// Writes a single `Mutation::Update` to the WAL, then tombstones the old
+    /// physical row in the PK index and re-inserts the new values.  This avoids
+    /// the storage-orphaning problem caused by a plain delete + insert sequence
+    /// (VV-TXN-004.6): the old row's physical bytes remain on disk until
+    /// compaction, but the index entry is replaced atomically so no reader can
+    /// see the stale physical row.
+    ///
+    /// Returns `Err(TxnError::PkNotFound)` if `pk` does not exist.
+    pub fn update(&self, pk: u64, new_values: Vec<u64>) -> EngineResult<WalTip> {
+        self.schema.validate_row(&new_values)?;
+
+        // Snapshot old row for secondary-index maintenance.
+        let index_work = if !self.secondary_indexes.read().is_empty() {
+            let old_row = self.get(pk)?;
+            Some((old_row, new_values.clone()))
+        } else {
+            None
+        };
+
+        let flushed_before = self.txn.total_rows_flushed();
+        // TxnManager::update logs Mutation::Update, tombstones the old
+        // descriptor, and pushes the new row — all in one WAL record.
+        let tip = self.txn.update(pk, new_values.clone())?;
+        if self.txn.total_rows_flushed() > flushed_before {
+            self.sync_partitions()?;
+            self.maybe_compact()?;
+        }
+
+        if let Some((old_row, new_vals)) = index_work {
+            self.secondary_maintain_insert(pk, old_row.as_ref(), &new_vals);
+        }
+
+        let lsn = self
+            .lsn_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let ev = ChangeEvent::insert(lsn, pk, new_values);
         let _ = self.cdc_log.append(&ev);
         let _ = self.changes_tx.send(ev);
         Ok(tip)

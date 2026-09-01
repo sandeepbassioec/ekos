@@ -1,5 +1,5 @@
 //! Tests for Layer 308.
-use vectorvolt_net::{ConnectionPool, NetClient, NetConfig};
+use vectorvolt_net::NetConfig;
 
 #[test]
 fn net_config_default_addr() {
@@ -40,29 +40,20 @@ fn net_config_custom_addr() {
     assert_eq!(c.addr, "10.0.0.1");
 }
 #[test]
-fn net_client_connect_stub() {
-    let c = NetClient::connect("127.0.0.1:9999").unwrap();
-    assert_eq!(c.addr, "127.0.0.1:9999");
+fn net_config_ne_different_addr() {
+    assert_ne!(NetConfig::new("a", 1), NetConfig::new("b", 1));
 }
 #[test]
-fn net_client_ping_stub() {
-    let c = NetClient::connect("localhost:1").unwrap();
-    assert!(c.ping().is_ok());
+fn net_config_ne_different_port() {
+    assert_ne!(NetConfig::new("a", 1), NetConfig::new("a", 2));
 }
 #[test]
-fn net_client_debug() {
-    let c = NetClient::connect("x").unwrap();
-    let s = format!("{c:?}");
-    assert!(!s.is_empty());
+fn net_config_port_max() {
+    let c = NetConfig::new("h", 65535);
+    assert_eq!(c.port, 65535);
 }
 #[test]
-fn net_client_clone() {
-    let c = NetClient::connect("x").unwrap();
-    let c2 = c.clone();
-    assert_eq!(c.addr, c2.addr);
-}
-#[test]
-fn connection_pool_max() {
-    let p = ConnectionPool::new(10);
-    assert_eq!(p.size(), 10);
+fn net_config_socket_addr_zero() {
+    let c = NetConfig::new("127.0.0.1", 0);
+    assert_eq!(c.socket_addr(), "127.0.0.1:0");
 }

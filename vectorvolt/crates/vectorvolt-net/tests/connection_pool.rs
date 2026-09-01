@@ -1,66 +1,116 @@
 //! Tests for Layer 195: vectorvolt-net ConnectionPool (VV-NET-195).
+//! Updated to real async pool API.
 
+use std::sync::Arc;
+use tokio::net::TcpListener;
 use vectorvolt_net::ConnectionPool;
+use vectorvolt_net::frame::{Opcode, WIRE_HEADER_SIZE, WireFrameHeader};
 
-#[test]
-fn new_stores_max() {
-    assert_eq!(ConnectionPool::new(10).max, 10);
+async fn start_echo() -> std::net::SocketAddr {
+    let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                loop {
+                    let mut hbuf = vec![0u8; WIRE_HEADER_SIZE];
+                    if stream.read_exact(&mut hbuf).await.is_err() {
+                        break;
+                    }
+                    let plen = u32::from_le_bytes(hbuf[8..12].try_into().unwrap()) as usize;
+                    let mut pbuf = vec![0u8; plen];
+                    if plen > 0 && stream.read_exact(&mut pbuf).await.is_err() {
+                        break;
+                    }
+                    let Ok(hdr) = WireFrameHeader::decode(&hbuf) else {
+                        break;
+                    };
+                    let resp = WireFrameHeader::new(Opcode::PingAck, b"", hdr.request_id)
+                        .expect("valid")
+                        .encode_with_payload(b"");
+                    if stream.write_all(&resp).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
 }
-#[test]
-fn size_equals_max() {
-    assert_eq!(ConnectionPool::new(5).size(), 5);
+
+#[tokio::test]
+async fn new_stores_max() {
+    let addr = start_echo().await;
+    assert_eq!(ConnectionPool::new(addr, 10).await.unwrap().capacity(), 10);
 }
-#[test]
-fn zero_max() {
-    assert_eq!(ConnectionPool::new(0).size(), 0);
+
+#[tokio::test]
+async fn size_equals_max() {
+    let addr = start_echo().await;
+    assert_eq!(ConnectionPool::new(addr, 5).await.unwrap().capacity(), 5);
 }
-#[test]
-fn large_max() {
-    assert_eq!(ConnectionPool::new(10000).size(), 10000);
+
+#[tokio::test]
+async fn zero_max_becomes_one() {
+    let addr = start_echo().await;
+    assert_eq!(ConnectionPool::new(addr, 0).await.unwrap().capacity(), 1);
 }
-#[test]
-fn clone_preserves_max() {
-    let p = ConnectionPool::new(7);
-    assert_eq!(p.clone().max, 7);
+
+#[tokio::test]
+async fn large_max() {
+    let addr = start_echo().await;
+    assert_eq!(ConnectionPool::new(addr, 20).await.unwrap().capacity(), 20);
 }
-#[test]
-fn debug_contains_max() {
-    let p = ConnectionPool::new(42);
-    let s = format!("{:?}", p);
-    assert!(s.contains("42"));
+
+#[tokio::test]
+async fn multiple_pools() {
+    let addr = start_echo().await;
+    let a = ConnectionPool::new(addr, 1).await.unwrap();
+    let b = ConnectionPool::new(addr, 2).await.unwrap();
+    assert_ne!(a.capacity(), b.capacity());
 }
-#[test]
-fn size_consistent() {
-    let p = ConnectionPool::new(3);
-    assert_eq!(p.size(), p.max);
+
+#[tokio::test]
+async fn max_1() {
+    let addr = start_echo().await;
+    assert_eq!(ConnectionPool::new(addr, 1).await.unwrap().capacity(), 1);
 }
-#[test]
-fn multiple_pools() {
-    let a = ConnectionPool::new(1);
-    let b = ConnectionPool::new(2);
-    assert_ne!(a.size(), b.size());
+
+#[tokio::test]
+async fn pool_max_field() {
+    let addr = start_echo().await;
+    assert_eq!(ConnectionPool::new(addr, 99).await.unwrap().capacity(), 99);
 }
-#[test]
-fn max_1() {
-    assert_eq!(ConnectionPool::new(1).size(), 1);
+
+#[tokio::test]
+async fn size_consistent_with_capacity() {
+    let addr = start_echo().await;
+    let p = ConnectionPool::new(addr, 3).await.unwrap();
+    assert_eq!(p.capacity(), 3);
 }
-#[test]
-fn max_usize_max() {
-    let p = ConnectionPool::new(usize::MAX);
-    assert_eq!(p.size(), usize::MAX);
+
+#[tokio::test]
+async fn new_returns_pool() {
+    let addr = start_echo().await;
+    let p = ConnectionPool::new(addr, 4).await.unwrap();
+    assert_eq!(p.capacity(), 4);
 }
-#[test]
-fn pool_max_field() {
-    let p = ConnectionPool::new(99);
-    assert_eq!(p.max, 99);
+
+#[tokio::test]
+async fn acquire_works() {
+    let addr = start_echo().await;
+    let p = ConnectionPool::new(addr, 2).await.unwrap();
+    let _c = p.acquire().await.unwrap();
+    assert_eq!(p.capacity(), 2);
 }
-#[test]
-fn clone_is_independent() {
-    let a = ConnectionPool::new(8);
-    let b = a.clone();
-    assert_eq!(a.size(), b.size());
-}
-#[test]
-fn new_returns_correct_type() {
-    let _: ConnectionPool = ConnectionPool::new(4);
+
+#[tokio::test]
+async fn health_check_ok() {
+    let addr = start_echo().await;
+    let p = ConnectionPool::new(addr, 2).await.unwrap();
+    assert_eq!(p.health_check().await, 2);
 }
