@@ -75,6 +75,9 @@ pub enum WalError {
 
     #[error("GroupCommit channel full — backpressure")]
     Backpressure,
+
+    #[error("snapshot decode error: {0}")]
+    SnapshotDecodeError(String),
 }
 
 pub type WalResult<T> = Result<T, WalError>;
