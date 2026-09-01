@@ -1,0 +1,22 @@
+[package]
+name        = "vectorvolt-cluster"
+version.workspace    = true
+authors.workspace    = true
+edition              = "2024"
+license.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+description          = "VectorVolt cluster layer — SWIM, Raft, consistent hashing, quorum"
+
+[dependencies]
+tokio      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+uuid       = { version = "1.11", features = ["v4", "serde"] }
+dashmap    = "6.1"
+async-trait = "0.1"
+rand       = "0.8"
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
