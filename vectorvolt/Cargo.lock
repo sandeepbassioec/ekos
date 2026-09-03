@@ -2362,6 +2362,7 @@ dependencies = [
  "vectorvolt-sink",
  "vectorvolt-storage",
  "vectorvolt-txn",
+ "vectorvolt-vector",
  "vectorvolt-wal",
 ]
 
