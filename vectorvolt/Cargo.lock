@@ -2633,7 +2633,10 @@ dependencies = [
  "vectorvolt-hal",
  "vectorvolt-http",
  "vectorvolt-net",
+ "vectorvolt-query",
+ "vectorvolt-reader",
  "vectorvolt-store",
+ "vectorvolt-vector",
  "vectorvolt-wal",
 ]
 

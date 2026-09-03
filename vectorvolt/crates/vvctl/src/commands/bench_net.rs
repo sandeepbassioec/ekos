@@ -1,4 +1,4 @@
-//! `vvctl bench-net` — micro-benchmark network round trips (VV-CTL-198).
+﻿//! `vvctl bench-net` — micro-benchmark network round trips (VV-CTL-198).
 
 use anyhow::Result;
 use clap::Args;
