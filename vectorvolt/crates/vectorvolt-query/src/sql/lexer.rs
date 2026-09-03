@@ -197,14 +197,10 @@ impl<'a> Lexer<'a> {
         let s = &input[start..end];
         let adv = end - pos;
         if is_float {
-            let v: f64 = s
-                .parse()
-                .map_err(|_| LexError::UnexpectedChar('.', pos))?;
+            let v: f64 = s.parse().map_err(|_| LexError::UnexpectedChar('.', pos))?;
             Ok((Token::Float(if negative { -v } else { v }), adv))
         } else {
-            let v: i64 = s
-                .parse()
-                .map_err(|_| LexError::UnexpectedChar('0', pos))?;
+            let v: i64 = s.parse().map_err(|_| LexError::UnexpectedChar('0', pos))?;
             Ok((Token::Integer(if negative { -v } else { v }), adv))
         }
     }

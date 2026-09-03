@@ -367,10 +367,7 @@ mod tests {
         match parse("SELECT * FROM t WHERE pk > 1 AND val < 100") {
             Stmt::Select(s) => assert!(matches!(
                 s.where_clause,
-                Some(Expr::BinOp {
-                    op: BinOp::And,
-                    ..
-                })
+                Some(Expr::BinOp { op: BinOp::And, .. })
             )),
             _ => panic!(),
         }
