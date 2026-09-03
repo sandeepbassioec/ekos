@@ -1,6 +1,6 @@
 //! Tests for vvctl cluster-topology (VV-CTL-005).
 use vvctl::commands::cluster_topology::{
-    format_json, format_table, format_tree, NodeInfo, NodeRole,
+    NodeInfo, NodeRole, format_json, format_table, format_tree,
 };
 
 fn leader() -> NodeInfo {

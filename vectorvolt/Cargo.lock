@@ -2329,6 +2329,7 @@ dependencies = [
  "anyhow",
  "axum",
  "dashmap",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2338,6 +2339,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "vectorvolt-net",
+ "vectorvolt-sdk",
 ]
 
 [[package]]
@@ -2456,6 +2458,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "vectorvolt-net",
+]
+
+[[package]]
 name = "vectorvolt-server"
 version = "0.1.0"
 dependencies = [
@@ -2570,6 +2585,7 @@ name = "vvctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bytes",
  "chrono",
  "clap",
@@ -2580,6 +2596,7 @@ dependencies = [
  "indicatif",
  "owo-colors",
  "reqwest",
+ "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
@@ -2587,6 +2604,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "vectorvolt-control",
  "vectorvolt-engine",
  "vectorvolt-hal",
  "vectorvolt-http",

@@ -99,7 +99,9 @@ impl RbacStore {
             None => return false,
         };
         for rname in &role_names {
-            if let Some(role) = self.roles.get(rname) && role.permissions.contains(perm) {
+            if let Some(role) = self.roles.get(rname)
+                && role.permissions.contains(perm)
+            {
                 return true;
             }
         }

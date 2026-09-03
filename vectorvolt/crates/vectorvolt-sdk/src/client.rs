@@ -9,7 +9,9 @@ pub struct VectorVoltClient {
 impl VectorVoltClient {
     /// Create a client. Does not check connectivity — that happens on first call.
     pub async fn connect(addr: &str) -> Result<Self, SdkError> {
-        Ok(Self { addr: addr.to_string() })
+        Ok(Self {
+            addr: addr.to_string(),
+        })
     }
 
     fn map_err(e: impl std::fmt::Display) -> SdkError {
@@ -64,7 +66,11 @@ impl VectorVoltClient {
             let mut c = vectorvolt_net::Client::connect(&addr).map_err(Self::map_err)?;
             c.use_table(&table).map_err(Self::map_err)?;
             let rows = c.range_scan(0, 0, u64::MAX, 0).map_err(Self::map_err)?;
-            Ok(rows.into_iter().enumerate().map(|(i, vals)| (i as u64, vals)).collect())
+            Ok(rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, vals)| (i as u64, vals))
+                .collect())
         })
         .await
         .map_err(|e| SdkError::Op(e.to_string()))?

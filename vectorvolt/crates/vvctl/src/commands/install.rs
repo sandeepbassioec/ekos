@@ -146,7 +146,10 @@ mod tests {
 
     #[test]
     fn test_uninstall_dry_run_no_force() {
-        let args = UninstallArgs { force: false, purge_data: false };
+        let args = UninstallArgs {
+            force: false,
+            purge_data: false,
+        };
         let _ = args.force;
     }
 

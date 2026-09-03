@@ -57,7 +57,11 @@ pub fn format_tree(nodes: &[NodeInfo], total_shards: usize) -> String {
     );
     let last = nodes.len() - 1;
     for (i, node) in nodes.iter().enumerate() {
-        let prefix = if i == last { "└── " } else { "├── " };
+        let prefix = if i == last {
+            "└── "
+        } else {
+            "├── "
+        };
         out.push_str(&format!(
             "{}{} [{}] addr={} shards={}/{}\n",
             prefix, node.id, node.role, node.addr, node.shard_count, total_shards
@@ -72,7 +76,10 @@ pub fn format_json(nodes: &[NodeInfo]) -> String {
 }
 
 pub fn format_table(nodes: &[NodeInfo]) -> String {
-    let mut out = format!("{:<20} {:<12} {:<25} {:<10}\n", "ID", "ROLE", "ADDR", "SHARDS");
+    let mut out = format!(
+        "{:<20} {:<12} {:<25} {:<10}\n",
+        "ID", "ROLE", "ADDR", "SHARDS"
+    );
     out.push_str(&"-".repeat(70));
     out.push('\n');
     for node in nodes {

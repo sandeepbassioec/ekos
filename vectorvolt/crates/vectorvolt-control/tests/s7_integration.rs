@@ -2,11 +2,11 @@
 
 use std::net::TcpListener;
 use vectorvolt_control::{
+    ControlConfig, ControlServer,
     audit::AuditLog,
     metrics::Metrics,
     rbac::{Permission, RbacStore},
     tenant::{TenantQuota, TenantRegistry},
-    ControlConfig, ControlServer,
 };
 
 fn free_port() -> u16 {
@@ -86,8 +86,22 @@ fn test_rbac_admin_all_perms_readonly_read_only() {
 #[test]
 fn test_audit_log_tenant_isolation() {
     let log = AuditLog::new();
-    log.record("t1".into(), "user1".into(), "INSERT".into(), "table1".into(), true, None);
-    log.record("t2".into(), "user2".into(), "DELETE".into(), "table2".into(), true, None);
+    log.record(
+        "t1".into(),
+        "user1".into(),
+        "INSERT".into(),
+        "table1".into(),
+        true,
+        None,
+    );
+    log.record(
+        "t2".into(),
+        "user2".into(),
+        "DELETE".into(),
+        "table2".into(),
+        true,
+        None,
+    );
     let t1_events = log.query("t1");
     let t2_events = log.query("t2");
     assert_eq!(t1_events.len(), 1);
@@ -144,7 +158,8 @@ fn test_support_bundle_sanitize() {
 
 #[test]
 fn test_topology_format_tree() {
-    let output = "├── node-1 [LEADER] addr=127.0.0.1:50051\n└── node-2 [FOLLOWER] addr=127.0.0.2:50051\n";
+    let output =
+        "├── node-1 [LEADER] addr=127.0.0.1:50051\n└── node-2 [FOLLOWER] addr=127.0.0.2:50051\n";
     assert!(output.contains('├'));
     assert!(output.contains('└'));
     assert!(output.contains("LEADER"));
@@ -183,7 +198,14 @@ fn test_full_tenant_rbac_audit_metrics() {
     store.load_predefined();
     store.assign_role("user1", "Admin").unwrap();
 
-    log.record("t1".into(), "user1".into(), "INSERT".into(), "orders".into(), true, None);
+    log.record(
+        "t1".into(),
+        "user1".into(),
+        "INSERT".into(),
+        "orders".into(),
+        true,
+        None,
+    );
 
     use std::sync::atomic::Ordering;
     metrics.inserts_total.fetch_add(1, Ordering::Relaxed);

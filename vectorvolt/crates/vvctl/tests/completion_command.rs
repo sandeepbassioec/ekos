@@ -1,7 +1,7 @@
 //! Tests for vvctl completion command (VV-CFG-023).
 use vvctl::commands::completion::{
-    bash_completion, fish_completion, generate_completion, powershell_completion, zsh_completion,
-    CompletionShell,
+    CompletionShell, bash_completion, fish_completion, generate_completion, powershell_completion,
+    zsh_completion,
 };
 
 #[test]

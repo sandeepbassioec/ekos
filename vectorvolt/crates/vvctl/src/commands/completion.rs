@@ -153,7 +153,8 @@ Register-ArgumentCompleter -Native -CommandName vvctl -ScriptBlock {
         [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
     }
 }
-"#.to_string()
+"#
+    .to_string()
 }
 
 pub fn generate_completion(shell: &CompletionShell) -> String {

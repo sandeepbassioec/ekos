@@ -1,7 +1,7 @@
 //! Tests for vvctl support-bundle (VV-CFG-024).
 use tempfile::TempDir;
 use vvctl::commands::support_bundle::{
-    sanitize_config, system_profile_json, version_txt, run, SupportBundleArgs,
+    SupportBundleArgs, run, sanitize_config, system_profile_json, version_txt,
 };
 
 #[test]
@@ -65,7 +65,9 @@ fn test_version_txt_contains_vectorvolt() {
 fn test_run_creates_output_dir() {
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs { output: out.clone() };
+    let args = SupportBundleArgs {
+        output: out.clone(),
+    };
     run(args).unwrap();
     assert!(out.exists());
 }
@@ -74,7 +76,9 @@ fn test_run_creates_output_dir() {
 fn test_run_creates_config_yaml() {
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs { output: out.clone() };
+    let args = SupportBundleArgs {
+        output: out.clone(),
+    };
     run(args).unwrap();
     assert!(out.join("config.yaml").exists());
 }
@@ -83,7 +87,9 @@ fn test_run_creates_config_yaml() {
 fn test_run_creates_system_profile_json() {
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs { output: out.clone() };
+    let args = SupportBundleArgs {
+        output: out.clone(),
+    };
     run(args).unwrap();
     assert!(out.join("system_profile.json").exists());
 }
@@ -92,7 +98,9 @@ fn test_run_creates_system_profile_json() {
 fn test_run_creates_version_txt() {
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs { output: out.clone() };
+    let args = SupportBundleArgs {
+        output: out.clone(),
+    };
     run(args).unwrap();
     assert!(out.join("version.txt").exists());
 }
@@ -101,7 +109,9 @@ fn test_run_creates_version_txt() {
 fn test_config_yaml_sanitized() {
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs { output: out.clone() };
+    let args = SupportBundleArgs {
+        output: out.clone(),
+    };
     run(args).unwrap();
     let contents = std::fs::read_to_string(out.join("config.yaml")).unwrap();
     assert!(!contents.contains("secret-token"));
