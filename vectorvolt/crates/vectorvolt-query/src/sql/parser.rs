@@ -274,7 +274,6 @@ impl SqlParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::ast::*;
     use crate::sql::lexer::Lexer;
 
     fn parse(sql: &str) -> Stmt {
