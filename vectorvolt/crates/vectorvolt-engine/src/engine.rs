@@ -85,6 +85,11 @@ pub struct TableEngine {
     pub(crate) cdc_log: CdcLog,
     /// CQRS projection store — mutations are fanned to attached reducers.
     pub(crate) projections: parking_lot::Mutex<vectorvolt_projection::ProjectionStore>,
+    /// HNSW vector index sidecar — one index per vector column (keyed by col_idx).
+    #[allow(dead_code)]
+    pub(crate) vector_indexes: parking_lot::RwLock<
+        std::collections::HashMap<usize, vectorvolt_vector::HnswIndex>,
+    >,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -505,6 +510,7 @@ impl TableEngine {
             lsn_counter: std::sync::atomic::AtomicU64::new(max_lsn),
             cdc_log,
             projections: parking_lot::Mutex::new(vectorvolt_projection::ProjectionStore::new()),
+            vector_indexes: parking_lot::RwLock::new(std::collections::HashMap::new()),
         };
 
         // Rebuild any secondary indexes that were persisted before shutdown.

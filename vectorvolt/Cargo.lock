@@ -2569,6 +2569,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-vector"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "vectorvolt-wal"
 version = "0.1.0"
 dependencies = [

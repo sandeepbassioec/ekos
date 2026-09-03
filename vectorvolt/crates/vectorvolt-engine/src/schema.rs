@@ -34,6 +34,9 @@ pub enum ColumnType {
     Timestamp,
     /// Decimal fixed-point: value × 10⁻⁶, stored as two's-complement `u64`.
     Decimal,
+    /// Floating-point vector of `usize` dimensions.
+    /// Vectors are stored in a sidecar HNSW index, not in the columnar layout.
+    Vector(usize),
 }
 
 impl ColumnType {
@@ -41,7 +44,16 @@ impl ColumnType {
     ///
     /// Unknown tokens map to [`ColumnType::U64`] for forward compatibility.
     pub fn from_token(s: &str) -> Self {
-        match s.trim() {
+        let s = s.trim();
+        if let Some(rest) = s.strip_prefix("vector(").and_then(|r| r.strip_suffix(')'))
+            && let Ok(n) = rest.parse::<usize>()
+        {
+            return Self::Vector(n);
+        }
+        if s == "vector" {
+            return Self::Vector(0);
+        }
+        match s {
             "i64" => Self::I64,
             "f64" => Self::F64,
             "bool" => Self::Bool,
@@ -60,6 +72,7 @@ impl ColumnType {
             Self::Bool => "bool",
             Self::Timestamp => "timestamp",
             Self::Decimal => "decimal",
+            Self::Vector(_) => "vector",
         }
     }
 
@@ -75,6 +88,8 @@ impl ColumnType {
                 value,
             });
         }
+        // Vector columns are stored as 0 in the columnar layout (data lives in
+        // the HNSW sidecar). Any u64 value is technically valid here.
         Ok(())
     }
 }
@@ -293,6 +308,9 @@ pub enum TypedValue {
     Timestamp(u64),
     /// Fixed-point decimal: `raw_bits as i64` / 1_000_000 (6 decimal places).
     Decimal(i64),
+    /// Floating-point vector. Not stored in the columnar u64 layout; the u64
+    /// representation is always 0. Data lives in the HNSW sidecar index.
+    Vector(Vec<f32>),
 }
 
 impl TypedValue {
@@ -305,6 +323,8 @@ impl TypedValue {
             ColumnType::Bool => Self::Bool(bits != 0),
             ColumnType::Timestamp => Self::Timestamp(bits),
             ColumnType::Decimal => Self::Decimal(bits as i64),
+            // Vectors live in the HNSW sidecar; the columnar slot is unused.
+            ColumnType::Vector(_) => Self::U64(bits),
         }
     }
 
@@ -317,6 +337,7 @@ impl TypedValue {
             Self::Bool(v) => *v as u64,
             Self::Timestamp(v) => *v,
             Self::Decimal(v) => *v as u64,
+            Self::Vector(_) => 0,
         }
     }
 
@@ -338,6 +359,10 @@ impl TypedValue {
                 let whole = v / 1_000_000;
                 let frac = (v % 1_000_000).abs();
                 format!("{whole}.{frac:06}")
+            }
+            Self::Vector(v) => {
+                let inner: Vec<String> = v.iter().map(|f| format!("{f}")).collect();
+                format!("[{}]", inner.join(", "))
             }
         }
     }
@@ -392,6 +417,8 @@ impl TypedValue {
                         })
                 }
             }
+            // Vectors live in the HNSW sidecar; parse returns a zero placeholder.
+            ColumnType::Vector(_) => Ok(Self::U64(0)),
         }
     }
 }
