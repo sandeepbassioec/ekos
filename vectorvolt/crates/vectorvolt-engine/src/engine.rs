@@ -1,4 +1,4 @@
-﻿//! [`TableEngine`] â€” per-table shard layer that wires the write and read paths.
+//! [`TableEngine`] â€” per-table shard layer that wires the write and read paths.
 //!
 //! ## Architecture
 //!
@@ -87,9 +87,8 @@ pub struct TableEngine {
     pub(crate) projections: parking_lot::Mutex<vectorvolt_projection::ProjectionStore>,
     /// HNSW vector index sidecar — one index per vector column (keyed by col_idx).
     #[allow(dead_code)]
-    pub(crate) vector_indexes: parking_lot::RwLock<
-        std::collections::HashMap<usize, vectorvolt_vector::HnswIndex>,
-    >,
+    pub(crate) vector_indexes:
+        parking_lot::RwLock<std::collections::HashMap<usize, vectorvolt_vector::HnswIndex>>,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -722,6 +721,34 @@ impl TableEngine {
             self.maybe_compact()?;
         }
         Ok(result)
+    }
+    // -- Vector sidecar -----------------------------------------------------------
+
+    /// Insert a vector for `pk` into the HNSW sidecar for `col_idx`.
+    pub fn insert_vector(&self, col_idx: usize, pk: u64, vector: Vec<f32>) {
+        let mut indexes = self.vector_indexes.write();
+        let idx = indexes
+            .entry(col_idx)
+            .or_insert_with(|| vectorvolt_vector::HnswIndex::new(16, 200));
+        idx.insert(pk, vector);
+    }
+
+    /// Return the k nearest neighbours to `query` in the HNSW index for `col_idx`.
+    pub fn search_vector(&self, col_idx: usize, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        let indexes = self.vector_indexes.read();
+        indexes
+            .get(&col_idx)
+            .map(|idx| idx.search(query, k))
+            .unwrap_or_default()
+    }
+
+    /// Retrieve the stored vector for `pk` from the HNSW index for `col_idx`.
+    pub fn get_vector(&self, col_idx: usize, pk: u64) -> Option<Vec<f32>> {
+        self.vector_indexes
+            .read()
+            .get(&col_idx)
+            .and_then(|idx| idx.get_vector(pk))
+            .cloned()
     }
 
     // â”€â”€ Read path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
