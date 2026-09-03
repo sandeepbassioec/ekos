@@ -195,7 +195,20 @@ impl SqlParser {
                 Token::KwBool => "bool".to_owned(),
                 Token::KwText => "text".to_owned(),
                 Token::KwTimestamp => "timestamp".to_owned(),
-                Token::Ident(s) => s,
+                Token::Ident(s) => {
+                    // Handle parameterized types like vector(N)
+                    if self.peek() == &Token::LParen {
+                        self.advance(); // consume '('
+                        let dim = match self.advance().clone() {
+                            Token::Integer(n) => n,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        self.expect(&Token::RParen)?;
+                        format!("{s}({dim})")
+                    } else {
+                        s
+                    }
+                }
                 t => return Err(ParseError::UnexpectedToken(t)),
             };
             columns.push(ColTypeDef { name, col_type });

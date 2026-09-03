@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use store::OutputFormat;
 use vvctl::commands::{
     bench, bench_net, catalog, cluster_topology, completion, config, config_audit, connect,
-    control, disconnect, hal, http, install, keygen, ping, profile, serve, server_cmd, status_cmd,
-    store, support_bundle, table, topology, tune, wal,
+    control, disconnect, hal, http, install, keygen, ping, profile, reader, serve, server_cmd,
+    sql, status_cmd, store, support_bundle, table, topology, tune, vector, wal,
 };
 use vvctl::ui;
 
@@ -108,6 +108,15 @@ enum Commands {
         #[arg(long)]
         path: Option<std::path::PathBuf>,
     },
+
+    /// Interactive SQL REPL (or one-shot exec with --exec).
+    Sql(sql::SqlArgs),
+
+    /// Vector insert / search / get commands.
+    Vector(vector::VectorArgs),
+
+    /// PostgreSQL wire protocol reader server.
+    Reader(reader::ReaderArgs),
 
     /// Send N pings to a running VectorVolt server (VV-CTL-191).
     Ping(ping::PingArgs),
@@ -269,6 +278,12 @@ fn main() -> Result<()> {
         Commands::SupportBundle(args) => support_bundle::run(args)?,
 
         Commands::ConfigAudit { path } => config_audit::run(path)?,
+
+        Commands::Sql(args) => sql::run(args)?,
+
+        Commands::Vector(args) => vector::run(args)?,
+
+        Commands::Reader(args) => reader::run(args)?,
 
         Commands::Ping(args) => ping::run(args)?,
 
