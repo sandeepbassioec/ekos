@@ -20,6 +20,7 @@ members = [
     "crates/vectorvolt-control",
     "crates/vectorvolt-sdk",
     "crates/vectorvolt-reader",
+    "crates/vectorvolt-vector",
 ]
 resolver = "2"
 
@@ -95,6 +96,7 @@ vectorvolt-net     = { path = "crates/vectorvolt-net" }
 vectorvolt-http    = { path = "crates/vectorvolt-http" }
 vectorvolt-control = { path = "crates/vectorvolt-control" }
 vectorvolt-reader  = { path = "crates/vectorvolt-reader" }
+vectorvolt-vector  = { path = "crates/vectorvolt-vector" }
 # testing
 tempfile       = "3.14"
 

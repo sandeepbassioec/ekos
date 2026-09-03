@@ -1,0 +1,12 @@
+[package]
+name        = "vectorvolt-vector"
+description = "VectorVolt HNSW approximate nearest-neighbour index"
+version.workspace   = true
+authors.workspace   = true
+edition.workspace   = true
+license.workspace   = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde     = { workspace = true }
