@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, bench_net, catalog, completion, config, config_audit, connect, disconnect, hal, http,
-    keygen, ping, profile, serve, server_cmd, status_cmd, store, support_bundle, table, topology,
-    tune, wal,
+    bench, bench_net, catalog, cluster_topology, completion, config, config_audit, connect,
+    control, disconnect, hal, http, install, keygen, ping, profile, serve, server_cmd, status_cmd,
+    store, support_bundle, table, topology, tune, wal,
 };
 use vvctl::ui;
 
@@ -120,6 +120,19 @@ enum Commands {
 
     /// Disconnect from a server (VV-CTL-200).
     Disconnect(disconnect::DisconnectArgs),
+
+    /// Post-install setup (VV-CFG-022).
+    Install(install::InstallArgs),
+
+    /// Remove VectorVolt configuration (VV-CFG-022).
+    Uninstall(install::UninstallArgs),
+
+    /// Show cluster node/shard distribution (VV-CTL-005).
+    ClusterTopology(cluster_topology::ClusterTopologyArgs),
+
+    /// Control plane subcommands (VV-CTL-006).
+    #[command(subcommand)]
+    Control(control::ControlCommand),
 
     /// Print version and build info.
     Version,
@@ -264,6 +277,14 @@ fn main() -> Result<()> {
         Commands::BenchNet(args) => bench_net::run(args)?,
 
         Commands::Disconnect(args) => disconnect::run(args)?,
+
+        Commands::Install(args) => install::run_install(args)?,
+
+        Commands::Uninstall(args) => install::run_uninstall(args)?,
+
+        Commands::ClusterTopology(args) => cluster_topology::run(args)?,
+
+        Commands::Control(cmd) => control::run(cmd)?,
 
         Commands::Version => print_version(),
     }
