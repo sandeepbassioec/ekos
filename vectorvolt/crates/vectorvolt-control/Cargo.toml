@@ -1,0 +1,31 @@
+[package]
+name        = "vectorvolt-control"
+description = "VectorVolt control plane — HTTP admin API, tenancy, RBAC, audit"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+
+[dependencies]
+axum           = { workspace = true }
+tokio          = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+tower          = { workspace = true }
+tower-http     = { version = "0.6", features = ["cors"] }
+dashmap        = "6"
+anyhow         = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+vectorvolt-net = { path = "../vectorvolt-net" }
+
+[dev-dependencies]
+tokio          = { workspace = true }
+tower          = { workspace = true, features = ["util"] }
+serde_json     = { workspace = true }
+tempfile       = { workspace = true }
+vectorvolt-sdk = { path = "../vectorvolt-sdk" }
+axum           = { workspace = true }
+reqwest        = { workspace = true }

@@ -48,14 +48,14 @@ public sealed class HttpClientTests2 : IDisposable
         await Seed();
         var buckets = await _client.HistogramAsync("t", col: 1, lo: 0, hi: 60, buckets: 3);
         Assert.Equal(3, buckets.Length);
-        Assert.Equal(5UL, buckets.Sum(b => (long)b.Count));
+        Assert.Equal(5L, buckets.Sum(b => (long)b.Count));
     }
 
     [Fact]
     public async Task Histogram_EmptyTable_AllZeroCounts()
     {
         var buckets = await _client.HistogramAsync("t", col: 0, lo: 0, hi: 100, buckets: 5);
-        Assert.Equal(0UL, buckets.Sum(b => (long)b.Count));
+        Assert.Equal(0L, buckets.Sum(b => (long)b.Count));
     }
 
     // ── Layer 50: Percentile ─────────────────────────────────────────────────

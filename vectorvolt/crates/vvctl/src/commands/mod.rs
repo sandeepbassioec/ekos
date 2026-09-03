@@ -1,14 +1,17 @@
 pub mod bench;
 pub mod bench_net;
 pub mod catalog;
+pub mod cluster_topology;
 pub mod completion;
 pub mod config;
 pub mod config_audit;
 pub mod connect;
 pub mod connect_simple;
+pub mod control;
 pub mod disconnect;
 pub mod hal;
 pub mod http;
+pub mod install;
 pub mod keygen;
 pub mod ping;
 pub mod profile;
