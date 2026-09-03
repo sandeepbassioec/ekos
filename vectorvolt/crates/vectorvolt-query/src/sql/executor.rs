@@ -241,6 +241,10 @@ impl SqlExecutor {
         &self,
         engine: &vectorvolt_engine::TableEngine,
     ) -> Result<Vec<EngineRow>, ExecError> {
+        // Flush any buffered rows so scan() can see them in partition files.
+        engine
+            .flush()
+            .map_err(|e| ExecError::Engine(e.to_string()))?;
         let raw = engine
             .scan(0, 0, u64::MAX)
             .map_err(|e| ExecError::Engine(e.to_string()))?;
@@ -250,12 +254,11 @@ impl SqlExecutor {
             if !seen.insert(row.pk) {
                 continue;
             }
-            match engine
+            if let Some(current) = engine
                 .get(row.pk)
                 .map_err(|e| ExecError::Engine(e.to_string()))?
             {
-                Some(current) => live.push(current),
-                None => {} // deleted
+                live.push(current);
             }
         }
         Ok(live)
