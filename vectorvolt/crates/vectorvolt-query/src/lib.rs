@@ -23,6 +23,7 @@
 pub mod catalog;
 pub mod engine;
 pub mod row;
+pub mod sql;
 
 mod error;
 mod executor;
