@@ -65,13 +65,24 @@ pub enum LedgerCommand {
 
 pub fn run(cmd: LedgerCommand) -> Result<()> {
     match cmd {
-        LedgerCommand::CreateAccount { dir, id, name, currency } => {
+        LedgerCommand::CreateAccount {
+            dir,
+            id,
+            name,
+            currency,
+        } => {
             let ledger = Ledger::open(&dir)?;
             ledger.accounts.create(id, &name, &currency)?;
             println!("account {id} created");
         }
 
-        LedgerCommand::Post { dir, debit, credit, amount, desc } => {
+        LedgerCommand::Post {
+            dir,
+            debit,
+            credit,
+            amount,
+            desc,
+        } => {
             let ledger = Ledger::open(&dir)?;
             let entry_id = ledger.post(debit, credit, amount, &desc)?;
             println!("posted entry {entry_id}");
@@ -81,7 +92,10 @@ pub fn run(cmd: LedgerCommand) -> Result<()> {
             let ledger = Ledger::open(&dir)?;
             let balance = ledger.balance(account)?;
             if json {
-                println!("{}", serde_json::json!({ "account": account, "balance_cents": balance }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "account": account, "balance_cents": balance })
+                );
             } else {
                 println!("account {account} balance: {balance} cents");
             }
