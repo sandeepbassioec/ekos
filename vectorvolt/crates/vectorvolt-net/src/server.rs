@@ -1022,16 +1022,13 @@ fn serve_request(
             Err(e) => engine_error(e),
         },
 
-        Request::Delete { pk } => match engine.delete(pk) {
-            Ok(_) => Response::Ok { affected: 1 },
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found") || msg.contains("PkNotFound") {
-                    Response::Ok { affected: 0 }
-                } else {
-                    engine_error(e)
-                }
-            }
+        Request::Delete { pk } => match engine.get(pk) {
+            Err(e) => engine_error(e),
+            Ok(None) => Response::Ok { affected: 0 },
+            Ok(Some(_)) => match engine.delete(pk) {
+                Ok(_) => Response::Ok { affected: 1 },
+                Err(e) => engine_error(e),
+            },
         },
 
         Request::RangeScan { col, lo, hi, limit } => match engine.scan(col as usize, lo, hi) {
