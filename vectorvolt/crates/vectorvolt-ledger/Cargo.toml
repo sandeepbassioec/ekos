@@ -16,3 +16,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+vectorvolt-chaos    = { workspace = true }
+vectorvolt-workflow = { path = "../vectorvolt-workflow" }
+vectorvolt-orders   = { path = "../vectorvolt-orders" }

@@ -2473,6 +2473,9 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "vectorvolt-chaos",
+ "vectorvolt-orders",
+ "vectorvolt-workflow",
 ]
 
 [[package]]
