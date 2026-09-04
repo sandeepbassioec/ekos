@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vectorvolt"
+version = "0.1.0"
+description = "VectorVolt Python SDK — ultra-low-latency OLTP client"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "WorkerRuntime", email = "hello@workerruntime.com" }]
+keywords = ["database", "vectorvolt", "sdk"]
+
+[project.urls]
+Homepage   = "https://workerruntime.com"
+Repository = "https://github.com/workerruntime/vectorvolt"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vectorvolt"]
