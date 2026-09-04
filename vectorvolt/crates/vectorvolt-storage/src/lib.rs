@@ -15,6 +15,7 @@
 //! Two CRC32 checksums protect the header and the entire file.
 
 pub mod bitpack;
+pub mod direct_io;
 pub mod column;
 pub mod compaction;
 pub mod format;

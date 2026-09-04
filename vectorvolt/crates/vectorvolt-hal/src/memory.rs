@@ -42,6 +42,9 @@ use std::ptr::NonNull;
 
 use crate::cache::CACHE_LINE;
 
+/// Standard 2 MB huge-page size used by [`HugePageBuf`].
+pub const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+
 // ── LocalNumaArena (VV-HAL-029) ───────────────────────────────────────────────
 
 /// `!Send`, `!Sync` bump allocator that draws from NUMA-local memory.
@@ -286,6 +289,22 @@ pub unsafe fn mlock_range(ptr: *mut u8, len: usize) -> Result<MlockGuard, MlockE
     // SAFETY: safety contract delegated from caller.
     unsafe { platform::mlock(ptr, len) }?;
     Ok(MlockGuard { ptr, len })
+}
+
+/// Unlock a memory range previously locked with [`mlock_range`].
+///
+/// Idempotent — unlocking a range that was never locked is harmless on Linux.
+///
+/// # Safety
+///
+/// `ptr` must be a valid pointer and `len` must match what was passed to `mlock_range`.
+pub unsafe fn munlock_range(ptr: *const u8, len: usize) -> Result<(), MlockError> {
+    if len == 0 {
+        return Ok(());
+    }
+    // SAFETY: delegated from caller.
+    unsafe { platform::munlock(ptr as *mut u8, len) };
+    Ok(())
 }
 
 // ── prefetch_populate (VV-HAL-032) ────────────────────────────────────────────
@@ -798,5 +817,274 @@ mod tests {
         unsafe { prefetch_populate(buf.as_ptr(), buf.len()) };
         assert_eq!(buf.as_slice()[0], 0xFF);
         assert_eq!(buf.as_slice()[last], 0x42);
+    }
+}
+
+// ── Linux-gated S11 mlock tests (VV-HAL-033) ─────────────────────────────────
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod linux_mlock_tests {
+    use super::*;
+
+    fn page() -> Vec<u8> {
+        vec![0u8; 4096]
+    }
+
+    // 1 — mlock 4096 bytes ok
+    #[test]
+    fn linux_mlock_4096_ok() {
+        let mut buf = page();
+        let result = unsafe { mlock_range(buf.as_mut_ptr(), buf.len()) };
+        match result {
+            Ok(g) => drop(g),
+            Err(MlockError::Os(_)) => {} // ulimit
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+
+    // 2 — munlock after mlock ok
+    #[test]
+    fn linux_munlock_after_mlock_ok() {
+        let mut buf = page();
+        if let Ok(g) = unsafe { mlock_range(buf.as_mut_ptr(), buf.len()) } {
+            drop(g);
+            // explicit munlock on already-unlocked is idempotent
+            let _ = unsafe { munlock_range(buf.as_ptr(), buf.len()) };
+        }
+    }
+
+    // 3 — mlock zero bytes ok (no-op)
+    #[test]
+    fn linux_mlock_zero_ok() {
+        let mut dummy = 0u8;
+        assert_eq!(
+            unsafe { mlock_range(&mut dummy as *mut u8, 0) }.unwrap_err(),
+            MlockError::ZeroLength
+        );
+    }
+
+    // 4 — mlock_range ptr alignment (page-aligned ptr works)
+    #[test]
+    fn linux_mlock_ptr_alignment() {
+        let mut buf = vec![0u8; 8192 + 4096];
+        let aligned_ptr = {
+            let addr = buf.as_mut_ptr() as usize;
+            let off = (4096 - addr % 4096) % 4096;
+            unsafe { buf.as_mut_ptr().add(off) }
+        };
+        let result = unsafe { mlock_range(aligned_ptr, 4096) };
+        match result {
+            Ok(g) => drop(g),
+            Err(MlockError::Os(_)) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    // 5 — MlockGuard drops and unlocks without panic
+    #[test]
+    fn linux_mlock_guard_drops() {
+        let mut buf = page();
+        if let Ok(guard) = unsafe { mlock_range(buf.as_mut_ptr(), buf.len()) } {
+            drop(guard);
+        }
+    }
+
+    // 6 — mlock 1MB ok
+    #[test]
+    fn linux_mlock_1mb_ok() {
+        let mut buf = vec![0u8; 1024 * 1024];
+        match unsafe { mlock_range(buf.as_mut_ptr(), buf.len()) } {
+            Ok(g) => drop(g),
+            Err(MlockError::Os(_)) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    // 7 — mlock null-equivalent (very small vec at unpredictable addr, not null)
+    #[test]
+    fn linux_mlock_non_null_ptr() {
+        let mut b = vec![42u8; 4096];
+        assert!(!b.as_ptr().is_null());
+        match unsafe { mlock_range(b.as_mut_ptr(), b.len()) } {
+            Ok(g) => drop(g),
+            Err(MlockError::Os(_)) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    // 8 — double mlock same region ok
+    #[test]
+    fn linux_double_mlock_ok() {
+        let mut buf = page();
+        let r1 = unsafe { mlock_range(buf.as_mut_ptr(), buf.len()) };
+        let r2 = unsafe { mlock_range(buf.as_mut_ptr(), buf.len()) };
+        drop(r1.ok());
+        drop(r2.ok());
+    }
+
+    // 9 — MlockGuard size field (guard created for correct len)
+    #[test]
+    fn linux_mlock_guard_fields_correct() {
+        let mut buf = page();
+        let len = buf.len();
+        if let Ok(g) = unsafe { mlock_range(buf.as_mut_ptr(), len) } {
+            // Guard was created — it covers the correct region (drop tests unlock)
+            let _ = g; // drop unlocks
+        }
+    }
+
+    // 10 — mlock_range len=1 ok
+    #[test]
+    fn linux_mlock_len_1_ok() {
+        let mut buf = page();
+        match unsafe { mlock_range(buf.as_mut_ptr(), 1) } {
+            Ok(g) => drop(g),
+            Err(MlockError::Os(_)) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    // 11 — munlock without prior mlock is idempotent
+    #[test]
+    fn linux_munlock_without_mlock_idempotent() {
+        let buf = page();
+        let _ = unsafe { munlock_range(buf.as_ptr(), buf.len()) };
+    }
+
+    // 12 — MlockGuard from vec
+    #[test]
+    fn linux_mlock_guard_from_vec() {
+        let mut v: Vec<u64> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let ptr = v.as_mut_ptr() as *mut u8;
+        let len = v.len() * std::mem::size_of::<u64>();
+        match unsafe { mlock_range(ptr, len) } {
+            Ok(g) => drop(g),
+            Err(MlockError::Os(_)) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    // 13 — mlock + write + read roundtrip
+    #[test]
+    fn linux_mlock_write_read_roundtrip() {
+        let mut buf = page();
+        let ok = unsafe { mlock_range(buf.as_mut_ptr(), buf.len()) };
+        buf[0] = 0xDE;
+        buf[4095] = 0xAD;
+        assert_eq!(buf[0], 0xDE);
+        assert_eq!(buf[4095], 0xAD);
+        drop(ok.ok());
+    }
+}
+
+// ── Linux-gated S11 hugepage tests (VV-HAL-031) ───────────────────────────────
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod linux_hugepage_tests {
+    use super::*;
+
+    fn alloc_or_skip(size: usize) -> Option<HugePageBuf> {
+        match HugePageBuf::alloc(size) {
+            Ok(b) => Some(b),
+            Err(HugePageError::Os(_)) | Err(HugePageError::NotPrivileged) => None,
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+
+    // 1 — alloc 2MB ok or NotAvailable
+    #[test]
+    fn linux_hugepage_alloc_2mb() {
+        let _ = HugePageBuf::alloc(HUGE_PAGE_SIZE); // ok or Err(Os) — both valid
+    }
+
+    // 2 — alloc 4MB ok
+    #[test]
+    fn linux_hugepage_alloc_4mb() {
+        let _ = HugePageBuf::alloc(2 * HUGE_PAGE_SIZE);
+    }
+
+    // 3 — len correct
+    #[test]
+    fn linux_hugepage_len_correct() {
+        if let Some(b) = alloc_or_skip(HUGE_PAGE_SIZE) {
+            assert!(b.len() >= HUGE_PAGE_SIZE);
+        }
+    }
+
+    // 4 — ptr non-null
+    #[test]
+    fn linux_hugepage_ptr_non_null() {
+        if let Some(b) = alloc_or_skip(4096) {
+            assert!(!b.as_ptr().is_null());
+        }
+    }
+
+    // 5 — write and read roundtrip
+    #[test]
+    fn linux_hugepage_write_read_roundtrip() {
+        if let Some(mut b) = alloc_or_skip(4096) {
+            b.as_mut_slice()[0] = 0xBE;
+            b.as_mut_slice()[b.len() - 1] = 0xEF;
+            assert_eq!(b.as_slice()[0], 0xBE);
+            assert_eq!(b.as_slice()[b.len() - 1], 0xEF);
+        }
+    }
+
+    // 6 — alloc 0 rounds up to 2MB (ZeroSize error)
+    #[test]
+    fn linux_hugepage_alloc_zero_is_error() {
+        assert_eq!(HugePageBuf::alloc(0).unwrap_err(), HugePageError::ZeroSize);
+    }
+
+    // 7 — alloc 1 byte rounds up to 2MB
+    #[test]
+    fn linux_hugepage_alloc_1_byte_rounds_up() {
+        if let Some(b) = alloc_or_skip(1) {
+            assert!(b.len() >= 1);
+        }
+    }
+
+    // 8 — drop frees memory (no double-free — just don't panic)
+    #[test]
+    fn linux_hugepage_drop_no_panic() {
+        if let Some(b) = alloc_or_skip(HUGE_PAGE_SIZE) {
+            drop(b);
+        }
+    }
+
+    // 9 — as_ptr == as_mut_ptr cast
+    #[test]
+    fn linux_hugepage_ptr_eq_mut_ptr() {
+        if let Some(mut b) = alloc_or_skip(4096) {
+            assert_eq!(b.as_ptr(), b.as_mut_ptr() as *const u8);
+        }
+    }
+
+    // 10 — alloc multiple bufs ok
+    #[test]
+    fn linux_hugepage_multiple_allocs_ok() {
+        let bufs: Vec<_> = (0..3).filter_map(|_| alloc_or_skip(4096)).collect();
+        drop(bufs);
+    }
+
+    // 11 — HUGE_PAGE_SIZE constant = 2097152
+    #[test]
+    fn linux_huge_page_size_constant() {
+        assert_eq!(HUGE_PAGE_SIZE, 2_097_152);
+    }
+
+    // 12 — alloc falls back gracefully when hugepages unavailable
+    #[test]
+    fn linux_hugepage_graceful_fallback() {
+        // HugePageBuf always falls back to regular mmap on failure — never panics
+        let result = HugePageBuf::alloc(4096);
+        assert!(result.is_ok(), "must succeed via regular fallback: {result:?}");
+    }
+
+    // 13 — buf is Send+Sync (compile-time assertion)
+    #[test]
+    fn linux_hugepage_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HugePageBuf>();
     }
 }

@@ -46,6 +46,7 @@ pub mod reader;
 pub mod segment;
 pub mod snapshot;
 pub mod sync_commit;
+pub mod uring_writer;
 pub mod writer;
 
 // Convenience re-exports.

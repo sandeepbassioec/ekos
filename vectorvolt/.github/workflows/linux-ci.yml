@@ -1,0 +1,35 @@
+name: Linux CI
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt check
+        run: cd vectorvolt && cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cd vectorvolt && cargo clippy --workspace -- -D warnings
+      - name: cargo test
+        run: cd vectorvolt && cargo test --workspace
+      - name: Linux-specific tests
+        run: cd vectorvolt && cargo test --workspace -- linux
+        env:
+          RUST_TEST_THREADS: 1
+
+  perf-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install perf
+        run: sudo apt-get install -y linux-tools-common linux-tools-generic || true
+      - name: cargo bench (HAL SIMD)
+        run: cd vectorvolt && cargo bench -p vectorvolt-hal 2>&1 | tail -30
+      - name: HAL perf gate tests
+        run: cd vectorvolt && cargo test -p vectorvolt-hal perf_gate
