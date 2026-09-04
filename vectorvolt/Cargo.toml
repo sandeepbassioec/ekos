@@ -21,6 +21,7 @@ members = [
     "crates/vectorvolt-sdk",
     "crates/vectorvolt-reader",
     "crates/vectorvolt-vector",
+    "crates/vectorvolt-graph",
 ]
 resolver = "2"
 
@@ -43,7 +44,6 @@ reqwest        = { version = "0.12", default-features = false, features = ["json
 # error handling
 anyhow         = "1.0"
 thiserror      = "2.0"
-vectorvolt-cluster = { path = "crates/vectorvolt-cluster" }
 # hashing
 getrandom      = "0.3"
 subtle         = "2.6"
@@ -94,9 +94,13 @@ vectorvolt-sink        = { path = "crates/vectorvolt-sink" }
 vectorvolt-sink-sdk    = { path = "crates/vectorvolt-sink-sdk" }
 vectorvolt-net     = { path = "crates/vectorvolt-net" }
 vectorvolt-http    = { path = "crates/vectorvolt-http" }
+vectorvolt-cluster = { path = "crates/vectorvolt-cluster" }
 vectorvolt-control = { path = "crates/vectorvolt-control" }
+vectorvolt-sdk     = { path = "crates/vectorvolt-sdk" }
 vectorvolt-reader  = { path = "crates/vectorvolt-reader" }
 vectorvolt-vector  = { path = "crates/vectorvolt-vector" }
+vectorvolt-graph   = { path = "crates/vectorvolt-graph" }
+rayon              = "1.10"
 # testing
 tempfile       = "3.14"
 
