@@ -79,22 +79,42 @@ fn cmd_numa(json: bool) -> Result<()> {
         println!("  \"nodes\": [");
         for (i, node) in topo.nodes.iter().enumerate() {
             let comma = if i + 1 < topo.nodes.len() { "," } else { "" };
-            println!("    {{\"node_id\": {}, \"cpu_count\": {}, \"memory_mb\": {}}}{comma}",
+            println!(
+                "    {{\"node_id\": {}, \"cpu_count\": {}, \"memory_mb\": {}}}{comma}",
                 node.node_id,
                 node.cpu_ids.len(),
-                node.memory_mb.map(|m| m.to_string()).unwrap_or_else(|| "null".into()),
+                node.memory_mb
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "null".into()),
             );
         }
         println!("  ]");
         println!("}}");
     } else {
-        println!("NUMA topology: {} node(s), {} total CPUs, is_numa={}", topo.node_count(), topo.total_cpus(), topo.is_numa());
-        println!("{:<8} {:<12} {:<14} CPU list", "Node", "CPUs", "Memory (MB)");
+        println!(
+            "NUMA topology: {} node(s), {} total CPUs, is_numa={}",
+            topo.node_count(),
+            topo.total_cpus(),
+            topo.is_numa()
+        );
+        println!(
+            "{:<8} {:<12} {:<14} CPU list",
+            "Node", "CPUs", "Memory (MB)"
+        );
         println!("{}", "-".repeat(60));
         for node in &topo.nodes {
             let cpu_list = format_cpu_list(&node.cpu_ids);
-            let mem = node.memory_mb.map(|m| m.to_string()).unwrap_or_else(|| "n/a".into());
-            println!("{:<8} {:<12} {:<14} {}", node.node_id, node.cpu_ids.len(), mem, cpu_list);
+            let mem = node
+                .memory_mb
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "n/a".into());
+            println!(
+                "{:<8} {:<12} {:<14} {}",
+                node.node_id,
+                node.cpu_ids.len(),
+                mem,
+                cpu_list
+            );
         }
     }
     Ok(())
@@ -112,12 +132,20 @@ fn format_cpu_list(cpus: &[usize]) -> String {
         if c == prev + 1 {
             prev = c;
         } else {
-            if start == prev { ranges.push(start.to_string()); } else { ranges.push(format!("{start}-{prev}")); }
+            if start == prev {
+                ranges.push(start.to_string());
+            } else {
+                ranges.push(format!("{start}-{prev}"));
+            }
             start = c;
             prev = c;
         }
     }
-    if start == prev { ranges.push(start.to_string()); } else { ranges.push(format!("{start}-{prev}")); }
+    if start == prev {
+        ranges.push(start.to_string());
+    } else {
+        ranges.push(format!("{start}-{prev}"));
+    }
     ranges.join(",")
 }
 
@@ -181,7 +209,10 @@ fn cmd_direct_write(path: &str, size_kb: usize) -> Result<()> {
     w.fsync()?;
     let elapsed = t.elapsed();
     let mb_s = (n as f64 / elapsed.as_secs_f64()) / (1024.0 * 1024.0);
-    println!("Wrote {n} bytes to {path} in {:.3}ms ({mb_s:.1} MB/s)", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "Wrote {n} bytes to {path} in {:.3}ms ({mb_s:.1} MB/s)",
+        elapsed.as_secs_f64() * 1000.0
+    );
     Ok(())
 }
 
@@ -200,7 +231,10 @@ fn cmd_uring_bench(path: &str, iops: usize) -> Result<()> {
     w.fsync()?;
     let elapsed = t.elapsed();
     let iops_achieved = iops as f64 / elapsed.as_secs_f64();
-    println!("Completed {iops} writes in {:.3}ms = {iops_achieved:.0} IOPS", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "Completed {iops} writes in {:.3}ms = {iops_achieved:.0} IOPS",
+        elapsed.as_secs_f64() * 1000.0
+    );
     Ok(())
 }
 

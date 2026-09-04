@@ -48,10 +48,15 @@ pub fn run(cmd: ChaosCommand) -> Result<()> {
             // Optionally inject a fault into the injector.
             if let Some(f) = &fault {
                 let fault_spec = match f {
-                    FaultArg::Delay => Fault::Delay { min_ms: 1, max_ms: 10 },
+                    FaultArg::Delay => Fault::Delay {
+                        min_ms: 1,
+                        max_ms: 10,
+                    },
                     FaultArg::Loss => Fault::PacketLoss { probability: 0.5 },
                     FaultArg::Corrupt => Fault::Corrupt { probability: 0.1 },
-                    FaultArg::Crash => Fault::Crash { after_n_ops: ticks.saturating_sub(1).max(1) },
+                    FaultArg::Crash => Fault::Crash {
+                        after_n_ops: ticks.saturating_sub(1).max(1),
+                    },
                 };
                 harness.injector.add_fault(fault_spec);
             }

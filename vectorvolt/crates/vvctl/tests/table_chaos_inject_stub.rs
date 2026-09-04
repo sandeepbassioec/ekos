@@ -9,13 +9,21 @@ use vvctl::commands::ledger_cmd::{LedgerCommand, run as ledger_run};
 
 #[test]
 fn chaos_simulate_runs_without_panic() {
-    let result = chaos_run(ChaosCommand::Simulate { seed: 42, ticks: 5, fault: None });
+    let result = chaos_run(ChaosCommand::Simulate {
+        seed: 42,
+        ticks: 5,
+        fault: None,
+    });
     assert!(result.is_ok());
 }
 
 #[test]
 fn chaos_simulate_ticks_zero_ok() {
-    let result = chaos_run(ChaosCommand::Simulate { seed: 0, ticks: 0, fault: None });
+    let result = chaos_run(ChaosCommand::Simulate {
+        seed: 0,
+        ticks: 0,
+        fault: None,
+    });
     assert!(result.is_ok());
 }
 
@@ -53,7 +61,11 @@ fn chaos_fault_crash_schedules_crash() {
 #[test]
 fn chaos_output_is_valid_json() {
     // Run and capture output by verifying the command succeeds (stdout checked via is_ok).
-    let result = chaos_run(ChaosCommand::Simulate { seed: 1, ticks: 3, fault: None });
+    let result = chaos_run(ChaosCommand::Simulate {
+        seed: 1,
+        ticks: 3,
+        fault: None,
+    });
     assert!(result.is_ok());
 }
 
@@ -143,7 +155,9 @@ fn ledger_trial_balance_zero() {
         desc: "check".into(),
     })
     .unwrap();
-    let result = ledger_run(LedgerCommand::TrialBalance { dir: dir.path().to_path_buf() });
+    let result = ledger_run(LedgerCommand::TrialBalance {
+        dir: dir.path().to_path_buf(),
+    });
     assert!(result.is_ok());
 }
 
