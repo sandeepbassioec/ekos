@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use store::OutputFormat;
 use vvctl::commands::{
     bench, bench_net, catalog, chaos, completion, config, config_audit, connect, disconnect, graph,
-    hal, http, keygen, ledger_cmd, ping, profile, serve, server_cmd, status_cmd, store,
+    hal, http, keygen, ledger_cmd, linux, ping, profile, serve, server_cmd, status_cmd, store,
     support_bundle, table, topology, tune, wal,
 };
 use vvctl::ui;
@@ -132,6 +132,9 @@ enum Commands {
     /// Double-entry ledger commands.
     #[command(subcommand)]
     Ledger(ledger_cmd::LedgerCommand),
+
+    /// Linux-specific hardware diagnostics (NUMA, affinity, hugepages, O_DIRECT, io_uring).
+    Linux(linux::LinuxArgs),
 
     /// Print version and build info.
     Version,
@@ -282,6 +285,8 @@ fn main() -> Result<()> {
         Commands::Chaos(cmd) => chaos::run(cmd)?,
 
         Commands::Ledger(cmd) => ledger_cmd::run(cmd)?,
+
+        Commands::Linux(args) => linux::run(&args)?,
 
         Commands::Version => print_version(),
     }
