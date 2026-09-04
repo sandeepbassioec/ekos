@@ -24,6 +24,7 @@ members = [
     "crates/vectorvolt-graph",
     "crates/vectorvolt-chaos",
     "crates/vectorvolt-ledger",
+    "crates/vectorvolt-workflow",
 ]
 resolver = "2"
 
