@@ -2715,6 +2715,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-xdp"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2758,6 +2766,7 @@ dependencies = [
  "vectorvolt-store",
  "vectorvolt-vector",
  "vectorvolt-wal",
+ "vectorvolt-xdp",
 ]
 
 [[package]]

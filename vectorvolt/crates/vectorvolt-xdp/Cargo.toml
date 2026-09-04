@@ -1,0 +1,13 @@
+[package]
+name = "vectorvolt-xdp"
+version = "0.1.0"
+edition = "2024"
+description = "AF_XDP zero-copy kernel-bypass networking for VectorVolt (Linux only)"
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
