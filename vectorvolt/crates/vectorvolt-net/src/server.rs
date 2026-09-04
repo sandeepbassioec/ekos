@@ -1119,9 +1119,13 @@ fn serve_request(
             let mut succeeded: u32 = 0;
             let mut skipped: u32 = 0;
             for pk in pks {
-                match engine.delete(pk) {
-                    Ok(_) => succeeded = succeeded.saturating_add(1),
-                    Err(_) => skipped = skipped.saturating_add(1),
+                match engine.get(pk) {
+                    Ok(Some(_)) => match engine.delete(pk) {
+                        Ok(_) => succeeded = succeeded.saturating_add(1),
+                        Err(e) => return engine_error(e),
+                    },
+                    Ok(None) => skipped = skipped.saturating_add(1),
+                    Err(e) => return engine_error(e),
                 }
             }
             Response::BatchResult { succeeded, skipped }
