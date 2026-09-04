@@ -86,14 +86,13 @@ impl TableEngine {
             pks
         };
 
-        // Delete each matched PK.  PkNotFound means a concurrent delete beat
-        // us — not an error from the caller's perspective.
+        // Delete each matched PK.  Check existence first — delete() is
+        // idempotent (Ok for missing PKs) so we must guard the count.
         let mut deleted = 0usize;
         for pk in pks_to_delete {
-            match self.delete(pk) {
-                Ok(_) => deleted += 1,
-                Err(crate::EngineError::Txn(vectorvolt_txn::TxnError::PkNotFound(_))) => {}
-                Err(e) => return Err(e),
+            if self.get(pk)?.is_some() {
+                self.delete(pk)?;
+                deleted += 1;
             }
         }
         Ok(deleted)
