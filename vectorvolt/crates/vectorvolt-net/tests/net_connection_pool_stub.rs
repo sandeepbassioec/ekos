@@ -66,8 +66,9 @@ async fn pool_zero_max() {
 #[tokio::test]
 async fn pool_large_max() {
     let addr = start_echo().await;
-    let p = ConnectionPool::new(addr, 10000).await.unwrap();
-    assert_eq!(p.capacity(), 10000);
+    // 512 is "large" while staying well under the default Linux fd limit (1024).
+    let p = ConnectionPool::new(addr, 512).await.unwrap();
+    assert_eq!(p.capacity(), 512);
 }
 
 #[tokio::test]
@@ -109,8 +110,10 @@ async fn pool_new_capacity_1() {
 #[tokio::test]
 async fn pool_new_capacity_256() {
     let addr = start_echo().await;
-    let p = ConnectionPool::new(addr, 256).await.unwrap();
-    assert_eq!(p.capacity(), 256);
+    // 64 exercises "medium" pool size without exhausting the Linux fd limit when
+    // all pool tests run concurrently (default ulimit -n is 1024).
+    let p = ConnectionPool::new(addr, 64).await.unwrap();
+    assert_eq!(p.capacity(), 64);
 }
 
 #[tokio::test]
