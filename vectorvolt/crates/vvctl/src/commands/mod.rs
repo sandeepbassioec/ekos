@@ -1,5 +1,7 @@
 pub mod bench;
 pub mod bench_net;
+pub mod chaos;
+pub mod ledger_cmd;
 pub mod catalog;
 pub mod cluster_topology;
 pub mod completion;
