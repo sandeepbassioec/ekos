@@ -2465,6 +2465,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-ledger"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "vectorvolt-net"
 version = "0.1.0"
 dependencies = [
