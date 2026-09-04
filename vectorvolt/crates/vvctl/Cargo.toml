@@ -33,6 +33,7 @@ vectorvolt-engine = { workspace = true }
 vectorvolt-net    = { workspace = true }
 vectorvolt-http   = { workspace = true }
 vectorvolt-hal   = { workspace = true }
+vectorvolt-graph = { workspace = true }
 tempfile         = { workspace = true }
 bytes            = { workspace = true }
 anyhow         = { workspace = true }

@@ -465,6 +465,13 @@ pub fn execute(engine: &TableEngine, query: Query) -> QueryResult<QueryResponse>
         Query::CreateTable { .. } | Query::DropTable { .. } => Err(
             crate::error::QueryError::Syntax("DDL queries must use execute_ddl()".into()),
         ),
+
+        // Graph queries require a graph store; not available in table executor.
+        Query::GraphTraverse { .. }
+        | Query::GraphNeighbors { .. }
+        | Query::GraphPagerank { .. } => Err(crate::error::QueryError::Syntax(
+            "graph queries require a graph store".into(),
+        )),
     }
 }
 

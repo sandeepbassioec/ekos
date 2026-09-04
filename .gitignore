@@ -2,6 +2,12 @@
 vectorvolt/target/
 target/
 
+# Node
+node_modules/
+dist/
+.next/
+.nuxt/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -10,3 +16,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Worktrees
+.claude/worktrees/

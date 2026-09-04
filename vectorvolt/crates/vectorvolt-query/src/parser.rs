@@ -264,6 +264,16 @@ pub enum Query {
     /// `PURGE EXPIRED NOW <n>`
     PurgeExpired { now: u64 },
 
+    // ── Layer S9: graph functions ─────────────────────────────────────────────
+    /// `GRAPH_TRAVERSE from=<node> depth=<n>`
+    GraphTraverse { from: u64, depth: usize },
+
+    /// `GRAPH_NEIGHBORS from=<node>`
+    GraphNeighbors { from: u64 },
+
+    /// `GRAPH_PAGERANK damping=<d> iterations=<n>`
+    GraphPagerank { damping_pct: u64, iterations: usize },
+
     // ── Layer 82: DDL ─────────────────────────────────────────────────────────
     /// `CREATE TABLE <name> COL <col_name> <type> [COL <col_name> <type> ...]`
     ///
@@ -826,6 +836,37 @@ impl Parser {
                 self.expect_keyword(Keyword::Now)?;
                 let now = self.expect_int()?;
                 Ok(Query::PurgeExpired { now })
+            }
+
+            // ── Layer S9: graph functions ──────────────────────────────────
+            Keyword::GraphTraverse => {
+                self.expect_keyword(Keyword::From)?;
+                self.expect_eq()?;
+                let from = self.expect_int()?;
+                self.expect_keyword(Keyword::Depth)?;
+                self.expect_eq()?;
+                let depth = self.expect_int()? as usize;
+                Ok(Query::GraphTraverse { from, depth })
+            }
+
+            Keyword::GraphNeighbors => {
+                self.expect_keyword(Keyword::From)?;
+                self.expect_eq()?;
+                let from = self.expect_int()?;
+                Ok(Query::GraphNeighbors { from })
+            }
+
+            Keyword::GraphPagerank => {
+                self.expect_keyword(Keyword::Depth)?;
+                self.expect_eq()?;
+                let damping_pct = self.expect_int()?;
+                self.expect_keyword(Keyword::Limit)?;
+                self.expect_eq()?;
+                let iterations = self.expect_int()? as usize;
+                Ok(Query::GraphPagerank {
+                    damping_pct,
+                    iterations,
+                })
             }
 
             // ── Layer 82: DDL ─────────────────────────────────────────────────

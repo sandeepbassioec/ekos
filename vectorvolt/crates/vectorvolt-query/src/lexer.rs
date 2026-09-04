@@ -4,6 +4,7 @@ pub enum Token {
     Keyword(Keyword),
     Int(u64),
     Ident(String),
+    Str(String),
     Eq,
 }
 
@@ -98,6 +99,12 @@ pub enum Keyword {
     BoolKw,
     TimestampKw,
     DecimalKw,
+    // Layer S9 — graph functions
+    GraphTraverse,
+    GraphNeighbors,
+    GraphPagerank,
+    From,
+    Depth,
 }
 
 impl Keyword {
@@ -177,6 +184,11 @@ impl Keyword {
             "BOOL" => Some(Self::BoolKw),
             "TIMESTAMP" => Some(Self::TimestampKw),
             "DECIMAL" => Some(Self::DecimalKw),
+            "GRAPH_TRAVERSE" => Some(Self::GraphTraverse),
+            "GRAPH_NEIGHBORS" => Some(Self::GraphNeighbors),
+            "GRAPH_PAGERANK" => Some(Self::GraphPagerank),
+            "FROM" => Some(Self::From),
+            "DEPTH" => Some(Self::Depth),
             _ => None,
         }
     }
@@ -197,6 +209,18 @@ pub fn tokenize(input: &str) -> Vec<Token> {
         if ch == '=' {
             chars.next();
             tokens.push(Token::Eq);
+            continue;
+        }
+        if ch == '\'' {
+            chars.next();
+            let mut s = String::new();
+            for c in chars.by_ref() {
+                if c == '\'' {
+                    break;
+                }
+                s.push(c);
+            }
+            tokens.push(Token::Str(s));
             continue;
         }
         if ch.is_ascii_digit() {
