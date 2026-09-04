@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, bench_net, catalog, cluster_topology, completion, config, config_audit, connect,
-    control, disconnect, hal, http, install, keygen, ping, profile, reader, serve, server_cmd,
-    sql, status_cmd, store, support_bundle, table, topology, tune, vector, wal,
+    bench, bench_net, catalog, completion, config, config_audit, connect, disconnect, graph, hal,
+    http, keygen, ping, profile, serve, server_cmd, status_cmd, store, support_bundle, table,
+    topology, tune, wal,
 };
 use vvctl::ui;
 
@@ -109,15 +109,6 @@ enum Commands {
         path: Option<std::path::PathBuf>,
     },
 
-    /// Interactive SQL REPL (or one-shot exec with --exec).
-    Sql(sql::SqlArgs),
-
-    /// Vector insert / search / get commands.
-    Vector(vector::VectorArgs),
-
-    /// PostgreSQL wire protocol reader server.
-    Reader(reader::ReaderArgs),
-
     /// Send N pings to a running VectorVolt server (VV-CTL-191).
     Ping(ping::PingArgs),
 
@@ -130,18 +121,9 @@ enum Commands {
     /// Disconnect from a server (VV-CTL-200).
     Disconnect(disconnect::DisconnectArgs),
 
-    /// Post-install setup (VV-CFG-022).
-    Install(install::InstallArgs),
-
-    /// Remove VectorVolt configuration (VV-CFG-022).
-    Uninstall(install::UninstallArgs),
-
-    /// Show cluster node/shard distribution (VV-CTL-005).
-    ClusterTopology(cluster_topology::ClusterTopologyArgs),
-
-    /// Control plane subcommands (VV-CTL-006).
+    /// Graph engine commands (add/remove edges, traverse, cascade, pagerank).
     #[command(subcommand)]
-    Control(control::ControlCommand),
+    Graph(graph::GraphCommand),
 
     /// Print version and build info.
     Version,
@@ -279,12 +261,6 @@ fn main() -> Result<()> {
 
         Commands::ConfigAudit { path } => config_audit::run(path)?,
 
-        Commands::Sql(args) => sql::run(args)?,
-
-        Commands::Vector(args) => vector::run(args)?,
-
-        Commands::Reader(args) => reader::run(args)?,
-
         Commands::Ping(args) => ping::run(args)?,
 
         Commands::Status(args) => status_cmd::run(args)?,
@@ -293,13 +269,7 @@ fn main() -> Result<()> {
 
         Commands::Disconnect(args) => disconnect::run(args)?,
 
-        Commands::Install(args) => install::run_install(args)?,
-
-        Commands::Uninstall(args) => install::run_uninstall(args)?,
-
-        Commands::ClusterTopology(args) => cluster_topology::run(args)?,
-
-        Commands::Control(cmd) => control::run(cmd)?,
+        Commands::Graph(cmd) => graph::run(cmd)?,
 
         Commands::Version => print_version(),
     }
