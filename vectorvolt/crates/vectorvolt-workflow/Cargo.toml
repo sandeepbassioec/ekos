@@ -1,0 +1,18 @@
+[package]
+name = "vectorvolt-workflow"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "VectorVolt Workflow Engine — DAG step execution reference domain"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

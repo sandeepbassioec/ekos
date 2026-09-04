@@ -438,6 +438,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-deque"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1488,6 +1507,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "rcgen"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2309,6 +2348,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "vectorvolt-chaos"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "vectorvolt-cluster"
 version = "0.1.0"
 dependencies = [
@@ -2367,6 +2415,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-graph"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "rayon",
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "vectorvolt-hal"
 version = "0.1.0"
 dependencies = [
@@ -2406,6 +2465,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-ledger"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "vectorvolt-chaos",
+ "vectorvolt-orders",
+ "vectorvolt-workflow",
+]
+
+[[package]]
 name = "vectorvolt-net"
 version = "0.1.0"
 dependencies = [
@@ -2422,6 +2495,17 @@ dependencies = [
  "thiserror",
  "tokio",
  "vectorvolt-engine",
+]
+
+[[package]]
+name = "vectorvolt-orders"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -2599,6 +2683,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-workflow"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2628,10 +2723,13 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "vectorvolt-chaos",
  "vectorvolt-control",
  "vectorvolt-engine",
+ "vectorvolt-graph",
  "vectorvolt-hal",
  "vectorvolt-http",
+ "vectorvolt-ledger",
  "vectorvolt-net",
  "vectorvolt-query",
  "vectorvolt-reader",

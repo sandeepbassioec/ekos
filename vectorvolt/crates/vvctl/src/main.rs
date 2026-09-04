@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, bench_net, catalog, completion, config, config_audit, connect, disconnect, graph, hal,
-    http, keygen, ping, profile, serve, server_cmd, status_cmd, store, support_bundle, table,
-    topology, tune, wal,
+    bench, bench_net, catalog, chaos, completion, config, config_audit, connect, disconnect, graph,
+    hal, http, keygen, ledger_cmd, ping, profile, serve, server_cmd, status_cmd, store,
+    support_bundle, table, topology, tune, wal,
 };
 use vvctl::ui;
 
@@ -124,6 +124,14 @@ enum Commands {
     /// Graph engine commands (add/remove edges, traverse, cascade, pagerank).
     #[command(subcommand)]
     Graph(graph::GraphCommand),
+
+    /// Chaos injection and deterministic simulation testing.
+    #[command(subcommand)]
+    Chaos(chaos::ChaosCommand),
+
+    /// Double-entry ledger commands.
+    #[command(subcommand)]
+    Ledger(ledger_cmd::LedgerCommand),
 
     /// Print version and build info.
     Version,
@@ -270,6 +278,10 @@ fn main() -> Result<()> {
         Commands::Disconnect(args) => disconnect::run(args)?,
 
         Commands::Graph(cmd) => graph::run(cmd)?,
+
+        Commands::Chaos(cmd) => chaos::run(cmd)?,
+
+        Commands::Ledger(cmd) => ledger_cmd::run(cmd)?,
 
         Commands::Version => print_version(),
     }

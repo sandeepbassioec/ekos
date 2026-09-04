@@ -22,6 +22,10 @@ members = [
     "crates/vectorvolt-reader",
     "crates/vectorvolt-vector",
     "crates/vectorvolt-graph",
+    "crates/vectorvolt-chaos",
+    "crates/vectorvolt-ledger",
+    "crates/vectorvolt-workflow",
+    "crates/vectorvolt-orders",
 ]
 resolver = "2"
 
@@ -100,6 +104,10 @@ vectorvolt-sdk     = { path = "crates/vectorvolt-sdk" }
 vectorvolt-reader  = { path = "crates/vectorvolt-reader" }
 vectorvolt-vector  = { path = "crates/vectorvolt-vector" }
 vectorvolt-graph   = { path = "crates/vectorvolt-graph" }
+vectorvolt-chaos   = { path = "crates/vectorvolt-chaos" }
+vectorvolt-ledger   = { path = "crates/vectorvolt-ledger" }
+vectorvolt-workflow = { path = "crates/vectorvolt-workflow" }
+vectorvolt-orders   = { path = "crates/vectorvolt-orders" }
 rayon              = "1.10"
 # testing
 tempfile       = "3.14"

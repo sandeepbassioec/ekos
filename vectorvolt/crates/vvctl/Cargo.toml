@@ -56,3 +56,5 @@ indicatif           = "0.17"
 vectorvolt-query    = { workspace = true }
 vectorvolt-vector   = { path = "../vectorvolt-vector" }
 vectorvolt-reader   = { path = "../vectorvolt-reader" }
+vectorvolt-chaos    = { workspace = true }
+vectorvolt-ledger   = { workspace = true }
