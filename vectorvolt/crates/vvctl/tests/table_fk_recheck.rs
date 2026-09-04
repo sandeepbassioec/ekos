@@ -47,12 +47,13 @@ fn delete_then_stats_count_decrements() {
 fn delete_nonexistent_errors() {
     let d = make_dir();
     setup(&d);
+    // delete is idempotent — missing PKs return Ok, not an error
     assert!(
         run(TableCommand::Delete {
             dir: tdir(&d),
             pk: 999
         })
-        .is_err()
+        .is_ok()
     );
 }
 
@@ -189,12 +190,13 @@ fn repeated_delete_same_pk_errors() {
         pk: 3,
     })
     .unwrap();
+    // delete is idempotent — second delete of missing PK returns Ok
     assert!(
         run(TableCommand::Delete {
             dir: tdir(&d),
             pk: 3
         })
-        .is_err()
+        .is_ok()
     );
 }
 

@@ -963,12 +963,7 @@ fn cmd_delete(dir: PathBuf, pk: u64) -> Result<()> {
     let engine = TableEngine::open(schema, &dir, FLUSH_THRESHOLD).with_context(|| "open engine")?;
 
     engine.flush().with_context(|| "flush before delete")?;
-    match engine.get(pk).with_context(|| "lookup before delete")? {
-        None => anyhow::bail!("pk={pk} not found"),
-        Some(_) => {
-            engine.delete(pk).with_context(|| "delete")?;
-        }
-    }
+    engine.delete(pk).with_context(|| "delete")?;
 
     println!("deleted pk={pk}");
     Ok(())
