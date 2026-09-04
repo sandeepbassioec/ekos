@@ -16,7 +16,7 @@ use tracing::{debug, info};
 
 // ── State shared between WalWriter and GroupCommitBatcher ─────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WalTip {
     pub sequence: u64,
     pub frame_hash: [u8; 32],
