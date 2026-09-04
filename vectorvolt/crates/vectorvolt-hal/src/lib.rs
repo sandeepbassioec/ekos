@@ -57,9 +57,11 @@ pub mod topology;
 pub mod wait;
 
 pub use affinity::{
-    AffinityError, AffinityGuard, cached_topology, current_core, pin_current_thread_to,
-    pin_current_thread_to_set,
+    AffinityError, AffinityGuard, cached_topology, current_core, is_supported,
+    pin_current_thread_to, pin_current_thread_to_set,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use affinity::{available_cores, get_thread_affinity, pin_thread_to_core};
 pub use cache::{CACHE_LINE, CacheAligned, CachePadded};
 pub use memory::{
     HugePageBuf, HugePageError, LocalNumaArena, MlockError, MlockGuard, mlock_range,

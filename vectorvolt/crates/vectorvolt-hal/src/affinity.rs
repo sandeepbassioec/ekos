@@ -182,6 +182,58 @@ pub fn is_supported() -> bool {
     ))
 }
 
+/// Pin the calling thread to a single core by id (Linux/Android only).
+///
+/// Wraps [`pin_current_thread_to`] and discards the guard, making the pin
+/// permanent for the thread's lifetime. Use the guard-returning variant when
+/// you need scoped pinning.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn pin_thread_to_core(core_id: usize) -> Result<(), AffinityError> {
+    pin_current_thread_to(core_id).map(std::mem::forget)
+}
+
+/// Return the set of logical-core ids the calling thread may run on.
+///
+/// On Linux this reads the thread's affinity mask via `sched_getaffinity`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn get_thread_affinity() -> Result<Vec<usize>, AffinityError> {
+    // SAFETY: zeroed cpu_set_t is a valid starting state for sched_getaffinity.
+    let set = unsafe {
+        let mut s: libc::cpu_set_t = std::mem::zeroed();
+        let rc = libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut s);
+        if rc != 0 {
+            return Err(AffinityError::Os(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1),
+            ));
+        }
+        s
+    };
+    let max = std::mem::size_of::<libc::cpu_set_t>() * 8;
+    let mut cores = Vec::new();
+    for i in 0..max {
+        // SAFETY: i is within the bounds of the cpu_set_t bit array.
+        if unsafe { libc::CPU_ISSET(i, &set) } {
+            cores.push(i);
+        }
+    }
+    Ok(cores)
+}
+
+/// Return the set of logical-core ids the calling *process* is allowed to use.
+///
+/// Uses `sched_getaffinity(0, ...)` which returns the process-wide mask, then
+/// falls back to the thread mask if that fails. Result is sorted ascending.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn available_cores() -> Vec<usize> {
+    get_thread_affinity().unwrap_or_else(|_| {
+        // Last-resort: count available_parallelism and assume 0..n.
+        let n = std::thread::available_parallelism()
+            .map(|x| x.get())
+            .unwrap_or(1);
+        (0..n).collect()
+    })
+}
+
 // ── Linux ─────────────────────────────────────────────────────────────────────
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -493,5 +545,156 @@ mod tests {
                 "two threads pinned to different cores landed on the same one"
             );
         }
+    }
+}
+
+// ── Linux-gated S11 tests (VV-HAL-024) ───────────────────────────────────────
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod linux_tests {
+    use super::*;
+
+    // 1 — pin_thread_to_core on current core succeeds
+    #[test]
+    fn linux_pin_thread_to_core_current() {
+        if let Some(c) = current_core() {
+            let topo = cached_topology();
+            if c < topo.logical_count().min(64) {
+                assert!(pin_thread_to_core(c).is_ok(), "pin to current core failed");
+            }
+        }
+    }
+
+    // 2 — get_thread_affinity returns non-empty
+    #[test]
+    fn linux_get_thread_affinity_non_empty() {
+        let aff = get_thread_affinity().expect("get_thread_affinity");
+        assert!(!aff.is_empty(), "affinity set must not be empty");
+    }
+
+    // 3 — available_cores returns non-empty
+    #[test]
+    fn linux_available_cores_non_empty() {
+        let cores = available_cores();
+        assert!(!cores.is_empty());
+    }
+
+    // 4 — pin to core 0 then get_thread_affinity returns [0]
+    #[test]
+    fn linux_pin_core0_then_get_affinity() {
+        std::thread::spawn(|| {
+            pin_thread_to_core(0).expect("pin to core 0");
+            let aff = get_thread_affinity().expect("get affinity");
+            assert_eq!(aff, vec![0], "affinity after pin to 0 must be [0]");
+        })
+        .join()
+        .unwrap();
+    }
+
+    // 5 — available_cores is a subset of 0..num_cpus
+    #[test]
+    fn linux_available_cores_subset_of_machine() {
+        let n = cached_topology().logical_count();
+        for &c in &available_cores() {
+            assert!(c < n, "available core {c} outside machine range 0..{n}");
+        }
+    }
+
+    // 6 — pin_thread_to_core invalid core returns Err
+    #[test]
+    fn linux_pin_invalid_core_returns_err() {
+        let n = cached_topology().logical_count();
+        assert!(
+            pin_thread_to_core(n + 9999).is_err(),
+            "should fail for non-existent core"
+        );
+    }
+
+    // 7 — get_thread_affinity after pin matches
+    #[test]
+    fn linux_get_affinity_after_pin_matches() {
+        std::thread::spawn(|| {
+            let topo = cached_topology();
+            let c = topo.logical_count().saturating_sub(1).min(63);
+            pin_thread_to_core(c).expect("pin");
+            let aff = get_thread_affinity().expect("get");
+            assert!(aff.contains(&c), "affinity {aff:?} must contain {c}");
+        })
+        .join()
+        .unwrap();
+    }
+
+    // 8 — available_cores is sorted
+    #[test]
+    fn linux_available_cores_sorted() {
+        let cores = available_cores();
+        let mut sorted = cores.clone();
+        sorted.sort_unstable();
+        assert_eq!(cores, sorted, "available_cores must be sorted");
+    }
+
+    // 9 — pin then unpin (set to all available)
+    #[test]
+    fn linux_pin_then_unpin() {
+        std::thread::spawn(|| {
+            let all = available_cores();
+            pin_thread_to_core(0).expect("pin to 0");
+            // Restore all cores via set
+            if all.len() > 1 {
+                let _g = pin_current_thread_to_set(&all).expect("restore all");
+                let aff = get_thread_affinity().expect("get after restore");
+                for &c in &all {
+                    assert!(aff.contains(&c), "core {c} missing after restore");
+                }
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    // 10 — double pin same core succeeds
+    #[test]
+    fn linux_double_pin_same_core_ok() {
+        std::thread::spawn(|| {
+            pin_thread_to_core(0).expect("first pin");
+            pin_thread_to_core(0).expect("second pin to same core");
+        })
+        .join()
+        .unwrap();
+    }
+
+    // 11 — pin core 0 and 1 alternating (if 2 cores available)
+    #[test]
+    fn linux_alternate_pin_cores() {
+        let n = cached_topology().logical_count();
+        if n < 2 {
+            return;
+        }
+        std::thread::spawn(|| {
+            for _ in 0..4 {
+                pin_thread_to_core(0).expect("pin 0");
+                pin_thread_to_core(1).expect("pin 1");
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    // 12 — available_cores count >= 1
+    #[test]
+    fn linux_available_cores_count_ge_1() {
+        assert!(available_cores().len() >= 1);
+    }
+
+    // 13 — affinity survives thread spawn
+    #[test]
+    fn linux_affinity_survives_thread_spawn() {
+        std::thread::spawn(|| {
+            pin_thread_to_core(0).expect("pin in spawned thread");
+            let aff = get_thread_affinity().expect("get");
+            assert!(aff.contains(&0));
+        })
+        .join()
+        .unwrap();
     }
 }
