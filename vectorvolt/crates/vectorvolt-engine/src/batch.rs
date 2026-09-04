@@ -54,10 +54,11 @@ impl TableEngine {
     pub fn batch_delete(&self, pks: &[u64]) -> EngineResult<usize> {
         let mut deleted = 0usize;
         for &pk in pks {
-            match self.delete(pk) {
-                Ok(_) => deleted += 1,
-                Err(crate::EngineError::Txn(vectorvolt_txn::TxnError::PkNotFound(_))) => {}
-                Err(e) => return Err(e),
+            // Check existence first — delete() is idempotent (returns Ok for
+            // missing PKs), so we must distinguish "existed" from "was absent".
+            if self.get(pk)?.is_some() {
+                self.delete(pk)?;
+                deleted += 1;
             }
         }
         Ok(deleted)
