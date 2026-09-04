@@ -1,4 +1,4 @@
-//! `vvctl disconnect` — disconnect from a running VectorVolt server (VV-CTL-200).
+﻿//! `vvctl disconnect` — disconnect from a running VectorVolt server (VV-CTL-200).
 
 use anyhow::Result;
 use clap::Args;

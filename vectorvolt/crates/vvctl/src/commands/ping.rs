@@ -1,4 +1,4 @@
-//! `vvctl ping` — send ping requests to a running VectorVolt server (VV-CTL-191).
+﻿//! `vvctl ping` — send ping requests to a running VectorVolt server (VV-CTL-191).
 
 use anyhow::Result;
 use clap::Args;

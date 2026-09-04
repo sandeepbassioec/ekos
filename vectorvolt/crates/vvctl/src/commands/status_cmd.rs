@@ -1,4 +1,4 @@
-//! `vvctl status` — query server status (VV-CTL-194).
+﻿//! `vvctl status` — query server status (VV-CTL-194).
 
 use anyhow::Result;
 use clap::Args;

@@ -1,4 +1,4 @@
-//! `vvctl connect-simple` — open a simple connection to a VectorVolt server (VV-CTL-196).
+﻿//! `vvctl connect-simple` — open a simple connection to a VectorVolt server (VV-CTL-196).
 
 use anyhow::Result;
 use clap::Args;
