@@ -860,9 +860,16 @@ fn serve_request(
             let mut found = None;
             for row in sorted {
                 let pk = row.values[0];
-                if engine.delete(pk).is_ok() {
-                    found = Some(row.values);
-                    break;
+                match engine.get(pk) {
+                    Ok(Some(_)) => match engine.delete(pk) {
+                        Ok(_) => {
+                            found = Some(row.values);
+                            break;
+                        }
+                        Err(e) => return engine_error(e),
+                    },
+                    Ok(None) => continue,
+                    Err(e) => return engine_error(e),
                 }
             }
             match found {
@@ -881,9 +888,16 @@ fn serve_request(
             let mut found = None;
             for row in sorted {
                 let pk = row.values[0];
-                if engine.delete(pk).is_ok() {
-                    found = Some(row.values);
-                    break;
+                match engine.get(pk) {
+                    Ok(Some(_)) => match engine.delete(pk) {
+                        Ok(_) => {
+                            found = Some(row.values);
+                            break;
+                        }
+                        Err(e) => return engine_error(e),
+                    },
+                    Ok(None) => continue,
+                    Err(e) => return engine_error(e),
                 }
             }
             match found {
