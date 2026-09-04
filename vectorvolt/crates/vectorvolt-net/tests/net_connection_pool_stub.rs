@@ -66,9 +66,9 @@ async fn pool_zero_max() {
 #[tokio::test]
 async fn pool_large_max() {
     let addr = start_echo().await;
-    // 512 is "large" while staying well under the default Linux fd limit (1024).
-    let p = ConnectionPool::new(addr, 512).await.unwrap();
-    assert_eq!(p.capacity(), 512);
+    // 100 is "large" while staying under the Linux TCP listen backlog (default 128).
+    let p = ConnectionPool::new(addr, 100).await.unwrap();
+    assert_eq!(p.capacity(), 100);
 }
 
 #[tokio::test]
