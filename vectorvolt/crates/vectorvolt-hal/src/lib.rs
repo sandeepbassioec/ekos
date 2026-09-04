@@ -64,8 +64,8 @@ pub use affinity::{
 pub use affinity::{available_cores, get_thread_affinity, pin_thread_to_core};
 pub use cache::{CACHE_LINE, CacheAligned, CachePadded};
 pub use memory::{
-    HugePageBuf, HugePageError, LocalNumaArena, MlockError, MlockGuard, mlock_range,
-    prefetch_populate,
+    HUGE_PAGE_SIZE, HugePageBuf, HugePageError, LocalNumaArena, MlockError, MlockGuard,
+    mlock_range, munlock_range, prefetch_populate,
 };
 pub use prefetch::{Locality, prefetch, prefetch_ahead, prefetch_write};
 pub use simd::SimdTier;
