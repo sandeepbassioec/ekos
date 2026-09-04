@@ -1023,10 +1023,11 @@ mod linux_hugepage_tests {
     #[test]
     fn linux_hugepage_write_read_roundtrip() {
         if let Some(mut b) = alloc_or_skip(4096) {
+            let last = b.len() - 1;
             b.as_mut_slice()[0] = 0xBE;
-            b.as_mut_slice()[b.len() - 1] = 0xEF;
+            b.as_mut_slice()[last] = 0xEF;
             assert_eq!(b.as_slice()[0], 0xBE);
-            assert_eq!(b.as_slice()[b.len() - 1], 0xEF);
+            assert_eq!(b.as_slice()[last], 0xEF);
         }
     }
 
