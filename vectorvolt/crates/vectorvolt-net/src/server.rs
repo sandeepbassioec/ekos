@@ -838,8 +838,13 @@ fn serve_request(
             let pks: Vec<u64> = rows.into_iter().map(|r| r.values[0]).collect();
             let mut count = 0u64;
             for pk in pks {
-                if engine.delete(pk).is_ok() {
-                    count += 1;
+                match engine.get(pk) {
+                    Ok(Some(_)) => match engine.delete(pk) {
+                        Ok(_) => count += 1,
+                        Err(e) => return engine_error(e),
+                    },
+                    Ok(None) => {}
+                    Err(e) => return engine_error(e),
                 }
             }
             Response::Ok { affected: count }
