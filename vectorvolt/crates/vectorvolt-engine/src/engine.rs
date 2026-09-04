@@ -640,7 +640,7 @@ impl TableEngine {
         Ok(tip)
     }
 
-    /// Remove a row. Returns `Err(TxnError::PkNotFound)` for unknown PKs.
+    /// Remove a row. Idempotent — deleting a non-existent PK returns `Ok`.
     ///
     /// All live secondary indexes are updated after the delete succeeds.
     pub fn delete(&self, pk: u64) -> EngineResult<WalTip> {
@@ -649,7 +649,11 @@ impl TableEngine {
         } else {
             None
         };
-        let tip = self.txn.delete(pk)?;
+        let tip = match self.txn.delete(pk) {
+            Ok(tip) => tip,
+            Err(vectorvolt_txn::TxnError::PkNotFound(_)) => return Ok(WalTip::default()),
+            Err(e) => return Err(e.into()),
+        };
         if let Some(row) = old_row {
             self.secondary_maintain_delete(pk, &row);
         }

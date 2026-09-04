@@ -122,7 +122,11 @@ fn mutation_to_events(table: &str, mutation: &Mutation) -> Vec<SinkEvent> {
                 values: values.clone(),
             })
             .collect(),
-        Mutation::DdlCreate { .. } | Mutation::DdlDrop { .. } | Mutation::DdlAlter { .. } => vec![],
+        Mutation::DdlCreate { .. }
+        | Mutation::DdlDrop { .. }
+        | Mutation::DdlAlter { .. }
+        | Mutation::Checkpoint { .. }
+        | Mutation::Update { .. } => vec![],
     }
 }
 
