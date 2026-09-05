@@ -31,3 +31,4 @@ pub mod topology;
 pub mod tune;
 pub mod vector;
 pub mod wal;
+pub mod xdp_cmd;

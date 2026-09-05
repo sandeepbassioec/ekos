@@ -59,3 +59,4 @@ vectorvolt-vector   = { path = "../vectorvolt-vector" }
 vectorvolt-reader   = { path = "../vectorvolt-reader" }
 vectorvolt-chaos    = { workspace = true }
 vectorvolt-ledger   = { workspace = true }
+vectorvolt-xdp      = { workspace = true }

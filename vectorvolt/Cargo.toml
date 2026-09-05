@@ -26,6 +26,7 @@ members = [
     "crates/vectorvolt-ledger",
     "crates/vectorvolt-workflow",
     "crates/vectorvolt-orders",
+    "crates/vectorvolt-xdp",
 ]
 resolver = "2"
 
@@ -84,6 +85,8 @@ rustls-pemfile = "2.2"
 rcgen          = "0.13"
 # memory-mapped I/O
 memmap2        = "0.9"
+# low-level POSIX / kernel FFI
+libc           = "0.2"
 # internal crates
 vectorvolt-hal     = { path = "crates/vectorvolt-hal" }
 vectorvolt-wal     = { path = "crates/vectorvolt-wal" }
@@ -108,6 +111,7 @@ vectorvolt-chaos   = { path = "crates/vectorvolt-chaos" }
 vectorvolt-ledger   = { path = "crates/vectorvolt-ledger" }
 vectorvolt-workflow = { path = "crates/vectorvolt-workflow" }
 vectorvolt-orders   = { path = "crates/vectorvolt-orders" }
+vectorvolt-xdp      = { path = "crates/vectorvolt-xdp" }
 rayon              = "1.10"
 # testing
 tempfile       = "3.14"
