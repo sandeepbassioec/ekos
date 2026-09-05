@@ -10,6 +10,7 @@ use vectorvolt_engine::{TableEngine, TableRegistry};
 use crate::auth::{AuthConfig, AuthState, Scope};
 use crate::protocol::{HEADER_SIZE, Header, Request, Response, encode_response, verify_payload};
 use crate::tls::{ServerConn, ServerTlsConfig};
+use crate::transport::TransportKind;
 use crate::{NetError, NetResult, error_code};
 
 // ── Per-connection transaction state ─────────────────────────────────────────
@@ -50,6 +51,12 @@ pub struct ServerConfig {
     /// anonymous peer, auth without TLS is a known peer over a readable channel.
     /// Production wants both; the two knobs make it visible when only one is set.
     pub tls: Option<ServerTlsConfig>,
+
+    /// Network transport to use for new connections (default: TCP).
+    ///
+    /// Set to [`TransportKind::Xdp`] (Linux only) to bypass the kernel TCP
+    /// stack and receive frames directly via AF_XDP.  Requires `CAP_NET_RAW`.
+    pub transport: TransportKind,
 }
 
 impl ServerConfig {
@@ -80,13 +87,16 @@ impl ServerConfig {
             addr,
             max_connections: 256,
             nodelay: true,
-            // Disabled by default. An embedded or single-process deployment does
-            // not want a handshake, and a server that silently required one would
-            // simply appear broken. `requires_auth()` reports which mode is
-            // active, so a deployment can assert it rather than assume.
             auth: AuthConfig::disabled(),
             tls: None,
+            transport: TransportKind::Tcp,
         }
+    }
+
+    /// Use the given transport instead of TCP.
+    pub fn with_transport(mut self, transport: TransportKind) -> Self {
+        self.transport = transport;
+        self
     }
 }
 

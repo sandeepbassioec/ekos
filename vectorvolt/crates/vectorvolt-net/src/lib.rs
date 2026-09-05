@@ -29,19 +29,23 @@ pub mod auth;
 pub mod client;
 pub mod connection;
 pub mod frame;
+pub mod metrics;
 pub mod pool;
 pub mod protocol;
 pub mod server;
 pub mod tls;
+pub mod transport;
 
 pub use auth::{AuthConfig, AuthError, AuthState, Scope, Secret};
 pub use client::Client;
 pub use connection::Connection;
 pub use frame::{Opcode, WIRE_HEADER_SIZE, WIRE_MAGIC, WIRE_VERSION, WireFrameHeader};
+pub use metrics::{prometheus_text, summary_line};
 pub use pool::{ConnectionPool, PooledConn};
 pub use protocol::{Header, OpCode, Request, Response};
 pub use server::{Server, ServerConfig, ServerStats};
 pub use tls::{ClientTlsConfig, ServerTlsConfig};
+pub use transport::TransportKind;
 pub use vectorvolt_engine::TableRegistry;
 
 /// Errors from framing, parsing, or transport.
