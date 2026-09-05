@@ -1,186 +1,74 @@
-//! `vvctl install` / `vvctl uninstall` — post-install setup (VV-CFG-022).
+//! `vvctl install` — provision the host for VectorVolt (VV-SEC-003).
+//!
+//! Creates the `vectorvolt` system user (Linux, requires root), sets data
+//! directory permissions to 700/600, and prints a master key to stdout for
+//! the operator to persist in a secrets manager.
 
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
+use vectorvolt_crypto::{KeyStore, ensure_system_user, harden_data_dir};
 
-#[derive(Args)]
-pub struct InstallArgs {}
+#[derive(Debug, Args)]
+pub struct InstallArgs {
+    /// Data directory to harden (created if absent)
+    #[arg(long, default_value = "/var/lib/vectorvolt")]
+    pub data_dir: PathBuf,
 
-#[derive(Args)]
-pub struct UninstallArgs {
-    /// Force removal without prompt.
-    #[arg(long)]
-    pub force: bool,
-    /// Also remove data directory.
-    #[arg(long)]
-    pub purge_data: bool,
+    /// Skip system user creation (useful when running as non-root in CI)
+    #[arg(long, default_value_t = false)]
+    pub skip_user: bool,
+
+    /// Generate and print a new master key instead of requiring one
+    #[arg(long, default_value_t = false)]
+    pub gen_key: bool,
 }
 
-pub fn data_dir() -> PathBuf {
-    if cfg!(windows) {
-        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-        PathBuf::from(appdata).join("VectorVolt").join("data")
-    } else if cfg!(target_os = "macos") {
-        dirs_or_home()
-            .join("Library")
-            .join("Application Support")
-            .join("VectorVolt")
+pub fn run(args: InstallArgs) -> Result<()> {
+    println!("VectorVolt install — hardening host for data-at-rest security");
+    println!();
+
+    // ── Step 1: system user ──────────────────────────────────────────────────
+    if !args.skip_user {
+        match ensure_system_user() {
+            Ok(true) => println!("  ✔ created system user 'vectorvolt'"),
+            Ok(false) => println!("  · system user 'vectorvolt' already exists"),
+            Err(e) => eprintln!("  ⚠ could not create system user: {e}  (re-run as root)"),
+        }
     } else {
-        PathBuf::from("/var/lib/vectorvolt")
+        println!("  · skipped system user creation (--skip-user)");
     }
-}
 
-fn dirs_or_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-}
-
-pub fn config_path() -> PathBuf {
-    data_dir()
-        .parent()
-        .unwrap_or(&data_dir())
-        .join("vectorvolt.yaml")
-}
-
-pub fn default_config_yaml() -> String {
-    format!(
-        "# VectorVolt configuration\nversion: \"0.1.0\"\ndata_dir: {:?}\nbind_addr: \"127.0.0.1:7700\"\nlog_level: \"info\"\n",
-        data_dir()
-    )
-}
-
-pub fn run_install(_args: InstallArgs) -> Result<()> {
-    let data = data_dir();
-    std::fs::create_dir_all(&data)?;
-    let cfg = config_path();
-    if !cfg.exists() {
-        std::fs::write(&cfg, default_config_yaml())?;
+    // ── Step 2: create + harden data dir ────────────────────────────────────
+    if !args.data_dir.exists() {
+        std::fs::create_dir_all(&args.data_dir)?;
+        println!("  ✔ created {}", args.data_dir.display());
     }
-    println!("VectorVolt installed successfully.");
-    println!("  data dir:    {}", data.display());
-    println!("  config file: {}", cfg.display());
-    println!("\nNext steps:");
-    println!("  vvctl serve --config {}", cfg.display());
+    let report = harden_data_dir(&args.data_dir)?;
+    println!(
+        "  ✔ hardened {} dirs, {} files (chmod 700/600)",
+        report.dirs_hardened, report.files_hardened
+    );
+    if report.chown_skipped {
+        eprintln!("  ⚠ chown skipped — re-run as root to transfer ownership to 'vectorvolt'");
+    }
+
+    // ── Step 3: master key ───────────────────────────────────────────────────
+    if args.gen_key {
+        let key = KeyStore::generate()?;
+        println!();
+        println!("  ✔ generated master key (store in your secrets manager — shown once):");
+        println!();
+        println!("    VECTORVOLT_MASTER_KEY={}", key.to_hex());
+        println!();
+        println!("  Set this env var before starting vectorvolt-server.");
+        println!("  The key is NEVER written to disk by VectorVolt.");
+    } else {
+        println!();
+        println!("  tip: run with --gen-key to generate a new master key");
+    }
+
+    println!();
+    println!("  Installation complete.");
     Ok(())
-}
-
-pub fn run_uninstall(args: UninstallArgs) -> Result<()> {
-    let cfg = config_path();
-    let data = data_dir();
-    if !args.force {
-        println!("Would remove: {}", cfg.display());
-        println!("To actually remove, run: vvctl uninstall --force");
-        println!("To also remove data: vvctl uninstall --force --purge-data");
-        return Ok(());
-    }
-    if cfg.exists() {
-        std::fs::remove_file(&cfg)?;
-        println!("Removed config: {}", cfg.display());
-    }
-    if args.purge_data && data.exists() {
-        std::fs::remove_dir_all(&data)?;
-        println!("Removed data dir: {}", data.display());
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_data_dir_non_empty() {
-        let d = data_dir();
-        assert!(!d.as_os_str().is_empty());
-    }
-
-    #[test]
-    fn test_config_path_non_empty() {
-        let p = config_path();
-        assert!(!p.as_os_str().is_empty());
-    }
-
-    #[test]
-    fn test_config_path_ends_yaml() {
-        let p = config_path();
-        assert!(p.to_string_lossy().ends_with(".yaml"));
-    }
-
-    #[test]
-    fn test_default_config_yaml_contains_version() {
-        let y = default_config_yaml();
-        assert!(y.contains("version:"));
-    }
-
-    #[test]
-    fn test_default_config_yaml_contains_bind_addr() {
-        let y = default_config_yaml();
-        assert!(y.contains("bind_addr:"));
-    }
-
-    #[test]
-    fn test_default_config_yaml_contains_log_level() {
-        let y = default_config_yaml();
-        assert!(y.contains("log_level:"));
-    }
-
-    #[test]
-    fn test_install_creates_data_dir() {
-        let tmp = TempDir::new().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        assert!(data.exists());
-    }
-
-    #[test]
-    fn test_install_writes_config() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = tmp.path().join("vectorvolt.yaml");
-        std::fs::write(&cfg, default_config_yaml()).unwrap();
-        let contents = std::fs::read_to_string(&cfg).unwrap();
-        assert!(contents.contains("version:"));
-    }
-
-    #[test]
-    fn test_uninstall_dry_run_no_force() {
-        let args = UninstallArgs {
-            force: false,
-            purge_data: false,
-        };
-        let _ = args.force;
-    }
-
-    #[test]
-    fn test_uninstall_removes_config() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = tmp.path().join("vectorvolt.yaml");
-        std::fs::write(&cfg, "# test").unwrap();
-        assert!(cfg.exists());
-        std::fs::remove_file(&cfg).unwrap();
-        assert!(!cfg.exists());
-    }
-
-    #[test]
-    fn test_uninstall_purge_data_removes_dir() {
-        let tmp = TempDir::new().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::remove_dir_all(&data).unwrap();
-        assert!(!data.exists());
-    }
-
-    #[test]
-    fn test_data_dir_has_vectorvolt_component() {
-        let d = data_dir();
-        let s = d.to_string_lossy().to_lowercase();
-        assert!(s.contains("vectorvolt") || !s.is_empty());
-    }
-
-    #[test]
-    fn test_default_config_yaml_non_empty() {
-        assert!(!default_config_yaml().is_empty());
-    }
 }

@@ -1,0 +1,19 @@
+[package]
+name        = "vectorvolt-crypto"
+description = "Data-at-rest encryption and key storage for VectorVolt (VV-SEC-001..004)"
+version.workspace   = true
+authors.workspace   = true
+edition.workspace   = true
+license.workspace   = true
+
+[dependencies]
+thiserror = { workspace = true }
+aes-gcm   = { workspace = true }
+rand      = { workspace = true }
+zeroize   = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

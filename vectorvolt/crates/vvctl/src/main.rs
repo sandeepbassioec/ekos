@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use store::OutputFormat;
 use vvctl::commands::{
     bench, bench_net, catalog, chaos, completion, config, config_audit, connect, disconnect, graph,
-    hal, http, keygen, ledger_cmd, linux, ping, profile, serve, server_cmd, status_cmd, store,
-    support_bundle, table, topology, tune, wal, xdp_cmd,
+    hal, http, install, keygen, ledger_cmd, linux, ping, profile, serve, server_cmd, status_cmd,
+    store, support_bundle, table, topology, tune, wal, xdp_cmd,
 };
 use vvctl::ui;
 
@@ -139,6 +139,9 @@ enum Commands {
     /// AF_XDP kernel-bypass networking commands (stats, bench, umem layout).
     #[command(subcommand)]
     Xdp(xdp_cmd::XdpCommand),
+
+    /// Provision the host: create system user, harden data dir, generate master key (VV-SEC-003).
+    Install(install::InstallArgs),
 
     /// Print version and build info.
     Version,
@@ -293,6 +296,8 @@ fn main() -> Result<()> {
         Commands::Linux(args) => linux::run(&args)?,
 
         Commands::Xdp(cmd) => xdp_cmd::run(cmd)?,
+
+        Commands::Install(args) => install::run(args)?,
 
         Commands::Version => print_version(),
     }
