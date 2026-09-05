@@ -54,6 +54,7 @@ getrandom    = { workspace = true }
 comfy-table         = "7"
 owo-colors          = "3"
 indicatif           = "0.17"
+dialoguer           = { workspace = true }
 vectorvolt-query    = { workspace = true }
 vectorvolt-vector   = { path = "../vectorvolt-vector" }
 vectorvolt-reader   = { path = "../vectorvolt-reader" }

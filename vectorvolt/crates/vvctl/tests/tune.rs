@@ -1,4 +1,4 @@
-﻿//! Layer 85 â€” `vvctl tune` (VV-CFG-006).
+//! Layer 85 â€” `vvctl tune` (VV-CFG-006).
 //!
 //! Tests the `DerivedConfig` probe + TOML emission path without requiring a
 //! live interactive terminal.
@@ -157,6 +157,54 @@ fn explain_mentions_cache_flush_threshold_and_fsync() {
     assert!(
         text.contains("fsync"),
         "explain must mention fsync:\n{text}"
+    );
+}
+
+// ── diff_toml (VV-CFG-006 / S15) ─────────────────────────────────────────────
+
+#[test]
+fn diff_toml_no_drift_when_toml_matches_derived() {
+    let cfg = DerivedConfig::probe(64);
+    let toml = cfg.to_annotated_toml(false);
+    let diffs = cfg.diff_toml(&toml);
+    assert!(
+        diffs.is_empty(),
+        "expected no drift against self-generated TOML; got: {diffs:?}"
+    );
+}
+
+#[test]
+fn diff_toml_detects_flush_threshold_drift() {
+    let cfg = DerivedConfig::probe(64);
+    let wrong_threshold = if cfg.flush_threshold == 1_024 {
+        2_048
+    } else {
+        1_024
+    };
+    let toml = format!(
+        "flush_threshold = {wrong_threshold}\ndurability = \"{}\"\nmax_partitions = {}\n",
+        cfg.durability, cfg.max_partitions
+    );
+    let diffs = cfg.diff_toml(&toml);
+    let field_names: Vec<_> = diffs.iter().map(|(f, _, _)| *f).collect();
+    assert!(
+        field_names.contains(&"flush_threshold"),
+        "flush_threshold drift should be reported; diffs: {diffs:?}"
+    );
+}
+
+#[test]
+fn diff_toml_parse_error_returns_error_sentinel() {
+    let cfg = DerivedConfig::probe(64);
+    let bad_toml = "this is [not valid toml !!";
+    let diffs = cfg.diff_toml(bad_toml);
+    assert!(
+        !diffs.is_empty(),
+        "parse error should produce an error sentinel entry"
+    );
+    assert_eq!(
+        diffs[0].0, "(parse error)",
+        "first diff entry should be the parse-error sentinel"
     );
 }
 
