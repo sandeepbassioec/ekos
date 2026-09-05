@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package vectorvolt;
+
+// VectorVolt gRPC write service (VV-NET-004..016 / S16).
+service WriteService {
+    // Single-row insert.
+    rpc Insert(InsertRequest) returns (WriteReply);
+    // Single-row delete.
+    rpc Delete(DeleteRequest) returns (WriteReply);
+    // Point query by primary key.
+    rpc Query(QueryRequest) returns (QueryReply);
+    // Begin a multi-statement transaction; returns a txn_id.
+    rpc BeginTxn(BeginTxnRequest) returns (BeginTxnReply);
+    // Buffer an insert or delete inside an open transaction.
+    rpc Execute(ExecuteRequest) returns (WriteReply);
+    // Commit all buffered ops in a transaction atomically.
+    rpc CommitTxn(CommitTxnRequest) returns (CommitReply);
+    // Abort a transaction, discarding all buffered ops.
+    rpc AbortTxn(AbortTxnRequest) returns (WriteReply);
+    // Liveness check.
+    rpc Ping(PingRequest) returns (PingReply);
+}
+
+message InsertRequest {
+    uint64 pk = 1;
+    repeated uint64 values = 2;
+}
+
+message DeleteRequest {
+    uint64 pk = 1;
+}
+
+message WriteReply {
+    string status = 1;
+    string error = 2;
+}
+
+message QueryRequest {
+    uint64 pk = 1;
+}
+
+message QueryReply {
+    bool found = 1;
+    uint64 pk = 2;
+    repeated uint64 values = 3;
+}
+
+message BeginTxnRequest {}
+
+message BeginTxnReply {
+    uint64 txn_id = 1;
+}
+
+message ExecuteRequest {
+    uint64 txn_id = 1;
+    string op = 2;
+    uint64 pk = 3;
+    repeated uint64 values = 4;
+}
+
+message CommitTxnRequest {
+    uint64 txn_id = 1;
+}
+
+message CommitReply {
+    string status = 1;
+    uint64 ops = 2;
+}
+
+message AbortTxnRequest {
+    uint64 txn_id = 1;
+}
+
+message PingRequest {}
+message PingReply { string version = 1; }

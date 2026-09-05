@@ -156,6 +156,18 @@ pub struct ServeArgs {
     /// XDP ring size (power of two). Only used with `--transport xdp`.
     #[arg(long, default_value = "256")]
     pub xdp_ring_size: u32,
+
+    /// Also start a gRPC write server on this port (default 50051, 0 = disabled).
+    ///
+    /// Exposes the same insert/delete/query/txn operations as the wire-protocol
+    /// TCP server but via gRPC (HTTP/2, protobuf). Useful for integrations with
+    /// gRPC-native ecosystems.
+    #[arg(long, default_value = "50051")]
+    pub grpc_port: u16,
+
+    /// Disable the gRPC server (equivalent to `--grpc-port 0`).
+    #[arg(long)]
+    pub no_grpc: bool,
 }
 
 /// Everything needed to run the server, extracted so tests can bind without blocking.
@@ -506,6 +518,34 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eprintln!("  http      : disabled (use --http-addr to enable)");
     }
 
+    // ── gRPC write server (optional, VV-NET-004..016 / S16) ──────────────────
+    let mut grpc_shutdown = if !args.no_grpc && args.grpc_port > 0
+        && let Some(ref eng) = engine
+    {
+        let grpc_addr: SocketAddr = format!("127.0.0.1:{}", args.grpc_port).parse().unwrap();
+        let grpc_engine = Arc::clone(eng);
+        use vectorvolt_server::GrpcServer;
+        let grpc_srv = GrpcServer::standalone(grpc_addr, grpc_engine);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::Builder::new()
+            .name("grpc-server".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                rt.block_on(async move {
+                    eprintln!("  grpc      : grpc://{grpc_addr}");
+                    if let Err(e) = grpc_srv.run(rx).await {
+                        eprintln!("gRPC server error: {e}");
+                    }
+                });
+            })
+            .expect("spawn grpc-server thread");
+        Some(tx)
+    } else {
+        eprintln!("  grpc      : disabled");
+        None
+    };
+
     eprintln!();
     eprintln!("Ready. Press Ctrl-C to stop.");
 
@@ -529,6 +569,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eprintln!("  connections served : {c}");
         eprintln!("  requests handled   : {r}");
         shutdown_handle.shutdown();
+        if let Some(gtx) = grpc_shutdown.take() {
+            let _ = gtx.send(());
+        }
     })
     .with_context(|| "install Ctrl-C handler")?;
 

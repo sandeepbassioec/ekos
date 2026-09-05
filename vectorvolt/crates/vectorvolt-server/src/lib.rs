@@ -27,19 +27,21 @@ use vectorvolt_engine::TableEngine;
 use vectorvolt_net::frame::{Opcode, WIRE_HEADER_SIZE};
 
 pub use config::ServerConfig;
+pub use grpc::{GrpcServer, GrpcWriteService};
 
 pub mod config;
+pub mod grpc;
 
 // ── MVCC transaction state ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-enum PendingOp {
+pub enum PendingOp {
     Insert { pk: u64, values: Vec<u64> },
     Delete { pk: u64 },
 }
 
-struct TxnState {
-    ops: Vec<PendingOp>,
+pub struct TxnState {
+    pub ops: Vec<PendingOp>,
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -322,8 +324,7 @@ async fn handle_abort(
 
 // ── helpers for tests ─────────────────────────────────────────────────────────
 
-/// Helper used by tests: spawns the server and returns its bound address +
-/// shutdown sender.
+/// Spawn the TCP server for tests; returns `(addr, shutdown_tx)`.
 pub async fn spawn_server_for_test(
     schema: Vec<String>,
     data_dir: impl Into<std::path::PathBuf>,
@@ -336,6 +337,40 @@ pub async fn spawn_server_for_test(
     let addr = srv.local_addr()?;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(srv.run(rx));
+    Ok((addr, tx))
+}
+
+/// Spawn a gRPC server for tests; returns `(addr, shutdown_tx)`.
+///
+/// Binds a TCP listener at :0 to learn the OS-assigned port, then hands it
+/// to tonic via `serve_with_incoming` so there is no TOCTOU race.
+pub async fn spawn_grpc_for_test(
+    schema: Vec<String>,
+    data_dir: impl Into<std::path::PathBuf>,
+) -> anyhow::Result<(SocketAddr, tokio::sync::oneshot::Sender<()>)> {
+    use grpc::proto::write_service_server::WriteServiceServer;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server as TonicServer;
+
+    let engine = Arc::new(TableEngine::open(schema, data_dir, 1_000_000)?);
+    let txns: Arc<DashMap<u64, AsyncMutex<TxnState>>> = Arc::new(DashMap::new());
+    let txn_seq = Arc::new(AtomicU64::new(1));
+    let svc =
+        grpc::GrpcWriteService::new(Arc::clone(&engine), Arc::clone(&txns), Arc::clone(&txn_seq));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let incoming = TcpListenerStream::new(listener);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = TonicServer::builder()
+            .add_service(WriteServiceServer::new(svc))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = rx.await;
+            })
+            .await;
+    });
     Ok((addr, tx))
 }
 
