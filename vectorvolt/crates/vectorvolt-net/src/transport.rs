@@ -18,7 +18,7 @@
 use std::io::{Read, Write};
 
 #[cfg(target_os = "linux")]
-use crate::NetResult;
+use crate::{NetError, NetResult};
 #[cfg(target_os = "linux")]
 use std::io;
 
