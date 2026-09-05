@@ -121,8 +121,10 @@ mod linux {
         r.consume(4);
         assert!(r.is_empty());
         r.produce(2);
+        // producer advanced to 6 → slot 6 & 3 = 2
         assert_eq!(r.producer_slot(), 2);
-        assert_eq!(r.consumer_slot(), 2);
+        // consumer still at 4 → slot 4 & 3 = 0 (hasn't moved)
+        assert_eq!(r.consumer_slot(), 0);
     }
 
     #[test]
