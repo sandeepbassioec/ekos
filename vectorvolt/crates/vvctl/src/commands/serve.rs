@@ -136,6 +136,26 @@ pub struct ServeArgs {
     /// `--http-addr` is not specified.
     #[arg(long)]
     pub http_token: Option<String>,
+
+    /// Network transport: "tcp" (default) or "xdp" (Linux, requires CAP_NET_RAW).
+    ///
+    /// XDP bypasses the kernel TCP/IP stack for lower latency on supported NICs.
+    /// Requires `--xdp-iface` when set to "xdp".
+    #[arg(long, default_value = "tcp")]
+    pub transport: String,
+
+    /// Network interface for XDP transport (e.g. "eth0", "lo").
+    /// Only used when `--transport xdp` is set.
+    #[arg(long, default_value = "lo")]
+    pub xdp_iface: String,
+
+    /// NIC queue index for XDP (default 0). Only used with `--transport xdp`.
+    #[arg(long, default_value = "0")]
+    pub xdp_queue: u32,
+
+    /// XDP ring size (power of two). Only used with `--transport xdp`.
+    #[arg(long, default_value = "256")]
+    pub xdp_ring_size: u32,
 }
 
 /// Everything needed to run the server, extracted so tests can bind without blocking.
@@ -172,6 +192,21 @@ pub fn cli_overrides_from_args(args: &ServeArgs) -> CliOverrides {
         o = o.with_max_partitions(v);
     }
     o
+}
+
+fn build_transport_kind(args: &ServeArgs) -> Result<vectorvolt_net::TransportKind> {
+    match args.transport.as_str() {
+        "tcp" => Ok(vectorvolt_net::TransportKind::Tcp),
+        #[cfg(target_os = "linux")]
+        "xdp" => Ok(vectorvolt_net::TransportKind::Xdp {
+            iface: args.xdp_iface.clone(),
+            queue_id: args.xdp_queue,
+            ring_size: args.xdp_ring_size,
+        }),
+        #[cfg(not(target_os = "linux"))]
+        "xdp" => anyhow::bail!("--transport xdp is only supported on Linux"),
+        other => anyhow::bail!("unknown transport {:?} — valid values: tcp, xdp", other),
+    }
 }
 
 pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
@@ -302,8 +337,13 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         _ => bail!("--cert and --key must both be provided, or neither"),
     };
 
+    // ── Transport ─────────────────────────────────────────────────────────────
+    let transport_kind = build_transport_kind(args)?;
+
     // ── Server ────────────────────────────────────────────────────────────────
-    let mut config = ServerConfig::new(args.addr).with_auth(auth.clone());
+    let mut config = ServerConfig::new(args.addr)
+        .with_auth(auth.clone())
+        .with_transport(transport_kind);
     config.max_connections = args.max_connections;
     if let Some(t) = tls {
         config = config.with_tls(t);
@@ -394,6 +434,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     );
     eprintln!("  max conns : {}", args.max_connections);
     eprintln!("  flush thr : {} rows", engine_opts_flush_threshold);
+    eprintln!("  transport : {}", args.transport);
     if let Some(ref mc) = master_config {
         let sections: Vec<&str> = [
             mc.hal != Default::default(),

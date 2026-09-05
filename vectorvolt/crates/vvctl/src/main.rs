@@ -46,7 +46,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start a VectorVolt table server (opens a table and listens for connections).
-    Serve(serve::ServeArgs),
+    Serve(Box<serve::ServeArgs>),
 
     /// In-process ShardCatalog management — create, list, drop, and describe tables
     /// without needing a running server (VV-CTL-002).
@@ -226,7 +226,7 @@ fn main() -> Result<()> {
     let fmt = cli.output;
 
     match cli.command {
-        Commands::Serve(args) => serve::run(args)?,
+        Commands::Serve(args) => serve::run(*args)?,
 
         Commands::Catalog(args) => catalog::run(args)?,
 

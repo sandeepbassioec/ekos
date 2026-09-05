@@ -2514,6 +2514,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "vectorvolt-engine",
+ "vectorvolt-xdp",
 ]
 
 [[package]]
