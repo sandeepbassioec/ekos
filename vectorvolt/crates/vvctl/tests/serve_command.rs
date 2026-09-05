@@ -1,4 +1,4 @@
-//! Tests for Layer 188: vvctl serve command args (VV-CTL-188).
+﻿//! Tests for Layer 188: vvctl serve command args (VV-CTL-188).
 // NOTE: ServeArgs fields match the actual struct in commands/serve.rs
 
 use std::net::SocketAddr;
@@ -25,6 +25,10 @@ fn make_args(addr: &str) -> ServeArgs {
         restore_catalog: false,
         http_addr: None,
         http_token: None,
+        transport: "tcp".to_string(),
+        xdp_iface: "lo".to_string(),
+        xdp_queue: 0,
+        xdp_ring_size: 256,
     }
 }
 
