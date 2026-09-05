@@ -1,21 +1,16 @@
-# Layer 79 — Criterion performance regression gate (VV-TST-008).
+# Criterion performance regression gate (VV-TST-008).
 #
-# This workflow runs the HAL SIMD Criterion benchmarks and fails if any
-# measurement regresses more than 20 % versus the stored baseline.
-#
-# DISABLED: auto-triggers are commented out pending GitHub billing fix.
-# Re-enable by uncommenting the `on:` block below.
-#
-# Manual run:
-#   gh workflow run bench.yml
+# Runs the HAL SIMD Criterion benchmarks on push to main and on PRs.
+# Fails if any measurement regresses more than 20 % versus the stored baseline.
+# Manual run: gh workflow run bench.yml
 
 name: bench
 
 on:
-  # push:
-  #   branches: [main]
-  # pull_request:
-  #   branches: [main]
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:

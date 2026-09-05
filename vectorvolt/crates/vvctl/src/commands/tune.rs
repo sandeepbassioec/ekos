@@ -29,6 +29,8 @@
 use crate::ui;
 use anyhow::{Context, Result};
 use clap::Args;
+use dialoguer::Confirm;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
@@ -264,7 +266,16 @@ pub fn run(args: TuneArgs) -> Result<()> {
     } else {
         args.row_bytes
     };
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    spinner.set_message("probing hardware…");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
     let cfg = DerivedConfig::probe(row_bytes);
+    spinner.finish_and_clear();
 
     ui::section_header("VectorVolt tune — derived engine configuration");
 
@@ -308,9 +319,12 @@ pub fn run(args: TuneArgs) -> Result<()> {
             ui::print_ok("no drift — derived values match the existing config");
         } else {
             ui::print_warn(&format!("{} field(s) differ:", diffs.len()));
+            let mut t = ui::styled_table();
+            t.set_header(["Field", "File value", "Derived value"]);
             for (field, current, derived) in &diffs {
-                println!("  {field}: file={current}  derived={derived}");
+                t.add_row([*field, current.as_str(), derived.as_str()]);
             }
+            println!("{t}");
         }
     }
 
@@ -327,10 +341,12 @@ pub fn run(args: TuneArgs) -> Result<()> {
     // --apply: write to disk.
     if let Some(ref path) = args.apply {
         if !args.force {
-            println!("\nWrite derived config to {}? [y/N] ", path.display());
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line)?;
-            if !line.trim().eq_ignore_ascii_case("y") {
+            let ok = Confirm::new()
+                .with_prompt(format!("Write derived config to {}?", path.display()))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if !ok {
                 println!("Aborted.");
                 return Ok(());
             }
