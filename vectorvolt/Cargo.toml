@@ -27,6 +27,7 @@ members = [
     "crates/vectorvolt-workflow",
     "crates/vectorvolt-orders",
     "crates/vectorvolt-xdp",
+    "crates/vectorvolt-crypto",
 ]
 resolver = "2"
 
@@ -112,7 +113,12 @@ vectorvolt-ledger   = { path = "crates/vectorvolt-ledger" }
 vectorvolt-workflow = { path = "crates/vectorvolt-workflow" }
 vectorvolt-orders   = { path = "crates/vectorvolt-orders" }
 vectorvolt-xdp      = { path = "crates/vectorvolt-xdp" }
+vectorvolt-crypto   = { path = "crates/vectorvolt-crypto" }
 rayon              = "1.10"
+# cryptography
+aes-gcm            = "0.10"
+rand               = "0.8"
+zeroize            = { version = "1", features = ["derive"] }
 # testing
 tempfile       = "3.14"
 
