@@ -43,6 +43,10 @@ fn single_table_args(dir: &TempDir) -> ServeArgs {
         http_addr: None,
         master_config: None,
         http_token: None,
+        transport: "tcp".to_string(),
+        xdp_iface: "lo".to_string(),
+        xdp_queue: 0,
+        xdp_ring_size: 256,
     }
 }
 
