@@ -1,0 +1,17 @@
+[package]
+name        = "vectorvolt-metrics"
+description = "Prometheus-compatible metrics registry and HTTP endpoint for VectorVolt"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+
+[dependencies]
+tokio   = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio   = { workspace = true }
+reqwest = { workspace = true }

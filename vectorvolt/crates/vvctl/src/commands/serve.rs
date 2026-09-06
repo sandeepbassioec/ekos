@@ -169,6 +169,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_grpc: bool,
 
+    /// Expose a Prometheus `/metrics` endpoint on this port (default 9100, 0 = disabled).
+    ///
+    /// Serves connections-accepted, active-connections, requests-total, errors-total,
+    /// WAL entries, and byte counters in Prometheus text exposition format.
+    #[arg(long, default_value = "9100")]
+    pub metrics_port: u16,
+
     /// Unseal the master key from the TPM blob at `<dir>/tpm_sealed.bin` on startup.
     ///
     /// Fails immediately if the TPM is not present, the blob is missing, or the PCR
@@ -204,6 +211,7 @@ impl Default for ServeArgs {
             xdp_ring_size: 256,
             grpc_port: 50051,
             no_grpc: false,
+            metrics_port: 9100,
             tpm_unseal: false,
         }
     }
@@ -606,6 +614,52 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eprintln!("  grpc      : disabled");
         None
     };
+
+    // ── Prometheus metrics endpoint (VV-OBS-005) ─────────────────────────────
+    if args.metrics_port > 0 {
+        use std::sync::atomic::Ordering;
+        use vectorvolt_metrics::{MetricsRegistry, MetricsServer};
+        let metrics_reg = std::sync::Arc::new(MetricsRegistry::default());
+        let metrics_stats = server.stats();
+        let sync_reg = std::sync::Arc::clone(&metrics_reg);
+        std::thread::Builder::new()
+            .name("metrics-sync".into())
+            .spawn(move || {
+                loop {
+                    sync_reg.connections_accepted.store(
+                        metrics_stats.connections_accepted.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    sync_reg.requests_total.store(
+                        metrics_stats.requests_handled.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    sync_reg.errors_total.store(
+                        metrics_stats.protocol_errors.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            })
+            .expect("spawn metrics-sync thread");
+        let mp = args.metrics_port;
+        std::thread::Builder::new()
+            .name("metrics-http".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                rt.block_on(async move {
+                    MetricsServer::new(metrics_reg).serve(mp).await;
+                });
+            })
+            .expect("spawn metrics-http thread");
+        eprintln!(
+            "  metrics   : http://127.0.0.1:{}/metrics",
+            args.metrics_port
+        );
+    } else {
+        eprintln!("  metrics   : disabled (use --metrics-port to enable)");
+    }
 
     eprintln!();
     eprintln!("Ready. Press Ctrl-C to stop.");
