@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/vectorvolt-otel",
     "crates/vectorvolt-hal",
     "crates/vectorvolt-wal",
     "crates/vectorvolt-store",
@@ -69,6 +70,11 @@ clap           = { version = "4.5", features = ["derive", "color"] }
 # logging / tracing
 tracing        = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry distributed tracing (VV-OBS-001..006)
+opentelemetry          = { version = "0.26", features = ["trace"] }
+opentelemetry_sdk      = { version = "0.26", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp     = { version = "0.26", features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry  = "0.27"
 # time
 chrono         = { version = "0.4", features = ["serde"] }
 # serialization
@@ -118,6 +124,7 @@ vectorvolt-orders   = { path = "crates/vectorvolt-orders" }
 vectorvolt-xdp      = { path = "crates/vectorvolt-xdp" }
 vectorvolt-crypto   = { path = "crates/vectorvolt-crypto" }
 vectorvolt-tpm      = { path = "crates/vectorvolt-tpm" }
+vectorvolt-otel     = { path = "crates/vectorvolt-otel" }
 rayon              = "1.10"
 # cryptography
 aes-gcm            = "0.10"
