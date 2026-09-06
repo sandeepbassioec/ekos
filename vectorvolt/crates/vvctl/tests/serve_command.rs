@@ -32,6 +32,7 @@ fn make_args(addr: &str) -> ServeArgs {
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
     }
 }
 
@@ -91,3 +92,4 @@ fn serve_args_addr_is_socket_addr() {
     let a: SocketAddr = "127.0.0.1:7700".parse().unwrap();
     assert_eq!(make_args("127.0.0.1:7700").addr, a);
 }
+

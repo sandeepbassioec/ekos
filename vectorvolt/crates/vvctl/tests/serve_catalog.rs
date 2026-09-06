@@ -50,6 +50,7 @@ fn single_table_args(dir: &TempDir) -> ServeArgs {
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
     }
 }
 
@@ -247,3 +248,4 @@ fn bind_single_table_uses_cli_flush_threshold() {
     // engine is present in single-table mode
     assert!(bound.engine.is_some());
 }
+

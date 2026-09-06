@@ -52,6 +52,7 @@ fn start_plain(dir: &TempDir) -> (SocketAddr, impl FnOnce()) {
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
         catalog: false,
         restore_catalog: false,
     };
@@ -97,6 +98,7 @@ fn start_authed(dir: &TempDir, secret_hex: &str) -> (SocketAddr, impl FnOnce()) 
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
         catalog: false,
         restore_catalog: false,
     };
@@ -169,6 +171,7 @@ fn bind_creates_schema_file_for_new_table() {
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
         catalog: false,
         restore_catalog: false,
     };
@@ -209,6 +212,7 @@ fn bind_reads_existing_schema_from_disk() {
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
         catalog: false,
         restore_catalog: false,
     };
@@ -246,6 +250,7 @@ fn bind_fails_when_no_table_and_no_columns() {
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
         catalog: false,
         restore_catalog: false,
     };
@@ -282,6 +287,7 @@ fn bind_fails_with_cert_but_no_key() {
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
         catalog: false,
         restore_catalog: false,
     };
