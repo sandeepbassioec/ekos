@@ -63,3 +63,4 @@ vectorvolt-ledger   = { workspace = true }
 vectorvolt-xdp      = { workspace = true }
 vectorvolt-crypto   = { workspace = true }
 vectorvolt-server   = { path = "../vectorvolt-server" }
+vectorvolt-tpm      = { workspace = true }

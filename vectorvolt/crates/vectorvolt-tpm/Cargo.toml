@@ -1,0 +1,22 @@
+[package]
+name        = "vectorvolt-tpm"
+description = "TPM 2.0 key sealing for VectorVolt (VV-SEC-005)"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+# Enable real TPM operations via tss-esapi (requires libtss2-esapi system library on Linux).
+tpm = ["tss-esapi"]
+
+[dependencies]
+thiserror  = { workspace = true }
+zeroize    = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi = { version = "7", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
