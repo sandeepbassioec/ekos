@@ -124,6 +124,8 @@ aes-gcm            = "0.10"
 rand               = "0.8"
 zeroize            = { version = "1", features = ["derive"] }
 dialoguer          = "0.11"
+clap_complete      = "4"
+zip                = "2"
 # testing
 tempfile       = "3.14"
 

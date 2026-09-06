@@ -49,6 +49,9 @@ fn start_plain(dir: &TempDir) -> (SocketAddr, impl FnOnce()) {
         flush_threshold: None,
         durability: None,
         max_partitions: None,
+        grpc_port: 50051,
+        no_grpc: false,
+        tpm_unseal: false,
         catalog: false,
         restore_catalog: false,
     };
@@ -91,6 +94,9 @@ fn start_authed(dir: &TempDir, secret_hex: &str) -> (SocketAddr, impl FnOnce()) 
         flush_threshold: None,
         durability: None,
         max_partitions: None,
+        grpc_port: 50051,
+        no_grpc: false,
+        tpm_unseal: false,
         catalog: false,
         restore_catalog: false,
     };
@@ -160,6 +166,9 @@ fn bind_creates_schema_file_for_new_table() {
         flush_threshold: None,
         durability: None,
         max_partitions: None,
+        grpc_port: 50051,
+        no_grpc: false,
+        tpm_unseal: false,
         catalog: false,
         restore_catalog: false,
     };
@@ -197,6 +206,9 @@ fn bind_reads_existing_schema_from_disk() {
         flush_threshold: None,
         durability: None,
         max_partitions: None,
+        grpc_port: 50051,
+        no_grpc: false,
+        tpm_unseal: false,
         catalog: false,
         restore_catalog: false,
     };
@@ -231,6 +243,9 @@ fn bind_fails_when_no_table_and_no_columns() {
         flush_threshold: None,
         durability: None,
         max_partitions: None,
+        grpc_port: 50051,
+        no_grpc: false,
+        tpm_unseal: false,
         catalog: false,
         restore_catalog: false,
     };
@@ -264,6 +279,9 @@ fn bind_fails_with_cert_but_no_key() {
         flush_threshold: None,
         durability: None,
         max_partitions: None,
+        grpc_port: 50051,
+        no_grpc: false,
+        tpm_unseal: false,
         catalog: false,
         restore_catalog: false,
     };

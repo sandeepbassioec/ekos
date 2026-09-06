@@ -52,6 +52,9 @@ impl E2EHarness {
             flush_threshold: None,
             durability: None,
             max_partitions: None,
+            grpc_port: 50051,
+            no_grpc: false,
+            tpm_unseal: false,
             catalog: false,
             restore_catalog: false,
         };

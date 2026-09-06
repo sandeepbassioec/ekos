@@ -177,6 +177,38 @@ pub struct ServeArgs {
     pub tpm_unseal: bool,
 }
 
+impl Default for ServeArgs {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::from("."),
+            columns: vec![],
+            addr: "127.0.0.1:5995".parse().unwrap(),
+            max_connections: 256,
+            secret: None,
+            key_id: "default".into(),
+            cert: None,
+            key: None,
+            multi: false,
+            config: None,
+            master_config: None,
+            flush_threshold: None,
+            durability: None,
+            max_partitions: None,
+            catalog: false,
+            restore_catalog: false,
+            http_addr: None,
+            http_token: None,
+            transport: "tcp".into(),
+            xdp_iface: "lo".into(),
+            xdp_queue: 0,
+            xdp_ring_size: 256,
+            grpc_port: 50051,
+            no_grpc: false,
+            tpm_unseal: false,
+        }
+    }
+}
+
 /// Everything needed to run the server, extracted so tests can bind without blocking.
 pub struct BoundServer {
     pub server: Server,
@@ -409,8 +441,16 @@ pub fn run(args: ServeArgs) -> Result<()> {
         match vectorvolt_tpm::unseal(&sealed_path) {
             Ok(key_hex) => {
                 // Expose as env var for vectorvolt-crypto to pick up.
-                unsafe { std::env::set_var("VECTORVOLT_MASTER_KEY", String::from_utf8_lossy(&key_hex).as_ref()) };
-                eprintln!("TPM unseal: master key loaded from {}", sealed_path.display());
+                unsafe {
+                    std::env::set_var(
+                        "VECTORVOLT_MASTER_KEY",
+                        String::from_utf8_lossy(&key_hex).as_ref(),
+                    )
+                };
+                eprintln!(
+                    "TPM unseal: master key loaded from {}",
+                    sealed_path.display()
+                );
             }
             Err(e) => anyhow::bail!("TPM unseal failed — refusing to start: {e}"),
         }
@@ -539,7 +579,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
     }
 
     // ── gRPC write server (optional, VV-NET-004..016 / S16) ──────────────────
-    let mut grpc_shutdown = if !args.no_grpc && args.grpc_port > 0
+    let mut grpc_shutdown = if !args.no_grpc
+        && args.grpc_port > 0
         && let Some(ref eng) = engine
     {
         let grpc_addr: SocketAddr = format!("127.0.0.1:{}", args.grpc_port).parse().unwrap();

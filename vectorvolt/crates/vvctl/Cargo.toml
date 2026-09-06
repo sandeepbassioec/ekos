@@ -64,3 +64,5 @@ vectorvolt-xdp      = { workspace = true }
 vectorvolt-crypto   = { workspace = true }
 vectorvolt-server   = { path = "../vectorvolt-server" }
 vectorvolt-tpm      = { workspace = true }
+clap_complete       = { workspace = true }
+zip                 = { workspace = true }

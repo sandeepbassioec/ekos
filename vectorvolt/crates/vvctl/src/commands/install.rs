@@ -69,8 +69,13 @@ pub fn run(args: InstallArgs) -> Result<()> {
         if args.tpm_seal {
             let sealed_path = args.data_dir.join("tpm_sealed.bin");
             match vectorvolt_tpm::seal(key.to_hex().as_bytes(), &sealed_path) {
-                Ok(()) => println!("  ✔ master key sealed into TPM at {}", sealed_path.display()),
-                Err(e) => eprintln!("  ⚠ TPM seal failed: {e}  (is TPM 2.0 present and feature enabled?)"),
+                Ok(()) => println!(
+                    "  ✔ master key sealed into TPM at {}",
+                    sealed_path.display()
+                ),
+                Err(e) => {
+                    eprintln!("  ⚠ TPM seal failed: {e}  (is TPM 2.0 present and feature enabled?)")
+                }
             }
         } else {
             println!("  Set this env var before starting vectorvolt-server.");
