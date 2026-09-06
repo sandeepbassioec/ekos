@@ -40,6 +40,7 @@ fn base_args(dir: &TempDir) -> ServeArgs {
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
     }
 }
 
