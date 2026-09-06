@@ -31,6 +31,7 @@ members = [
     "crates/vectorvolt-xdp",
     "crates/vectorvolt-crypto",
     "crates/vectorvolt-tpm",
+    "crates/vectorvolt-semantic",
 ]
 resolver = "2"
 
@@ -83,6 +84,9 @@ serde          = { version = "1.0", features = ["derive"] }
 serde_json     = "1.0"
 serde_yaml     = "0.9"
 toml           = { version = "0.8", features = ["parse"] }
+# scripting / dynamic evaluation
+dashmap        = "6"
+rhai           = { version = "1.20", default-features = false, features = ["sync"] }
 # bitmap / probabilistic
 roaring        = "0.10"
 # compression (cold-tier storage)
@@ -110,6 +114,7 @@ vectorvolt-engine      = { path = "crates/vectorvolt-engine" }
 vectorvolt-projection  = { path = "crates/vectorvolt-projection" }
 vectorvolt-sink        = { path = "crates/vectorvolt-sink" }
 vectorvolt-sink-sdk    = { path = "crates/vectorvolt-sink-sdk" }
+vectorvolt-semantic = { path = "crates/vectorvolt-semantic" }
 vectorvolt-net     = { path = "crates/vectorvolt-net" }
 vectorvolt-http    = { path = "crates/vectorvolt-http" }
 vectorvolt-cluster = { path = "crates/vectorvolt-cluster" }
