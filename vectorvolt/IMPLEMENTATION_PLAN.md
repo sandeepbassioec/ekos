@@ -247,7 +247,11 @@ YAML configuration surface.
 | VV-PRJ-015 | InProcessReadCache | LRU cache in front of `ReadModelRegistry`; configurable `max_entries` and TTL; zero-copy `Arc<ReadModelSnapshot>` returns |
 | VV-PRJ-016 | RedisReadCache | Optional Redis cache tier — on cache miss, hydrate from storage and write-through to Redis; on hit, return without touching local storage; configurable TTL per read model |
 | VV-PRJ-017 | YamlReadModelConfig | `read_models:` section in `vectorvolt.yaml`; declares name, source table, reducer type (`count \| sum \| min \| max \| custom`), partition key, cache strategy, and Redis URL |
-| VV-CFG-040 | PartitionConfig | `partitioning:` YAML section per entity: `strategy: date \| customer \| hash \| none`, `column:`, `granularity:`, `shard_count:` |
+| VV-PRJ-018 | CustomReducer | `reducer: custom` fully designed — developer provides a Rhai script (`.rhai` file path) that receives `(state: Map, row: Map) -> Map`; the engine calls it on every committed mutation; zero Rust required for custom aggregation logic |
+| VV-PRJ-019 | ReducerCallbackSink | Alternative to scripts: `reducer: http_callback` with a `url:` field — engine POSTs `{ state, row }` JSON to the developer's service and expects `{ new_state }` back; decouples aggregation logic entirely from VectorVolt |
+| VV-PRJ-020 | ExpressionPartitionStrategy | `strategy: expression` with a `formula:` field (Rhai expression over column values, e.g. `values[1] / 100000`); result is modulo `shard_count` to select shard; covers value-range and computed routing |
+| VV-PRJ-021 | ExplicitShardMap | `strategy: explicit` with a `shard_map:` table — maps discrete column values to shard indices (e.g. `EU: 0`, `US: 1`, `APAC: 2`); useful for region/tenant routing |
+| VV-CFG-040 | PartitionConfig | `partitioning:` YAML section per entity: `strategy: date \| customer \| hash \| expression \| explicit \| none`, `column:`, `granularity:`, `shard_count:`, `formula:` (for expression), `shard_map:` (for explicit) |
 | VV-CFG-041 | CacheConfig | `cache:` YAML section: `in_process: { max_entries, ttl_s }`, `redis: { url, ttl_s, key_prefix }` |
 
 ### YAML Shape (target)
@@ -257,19 +261,35 @@ entities:
   - name: orders
     schema: orders.yaml
     partitioning:
-      strategy: date         # routes writes by date column value
+      strategy: date           # built-in: routes writes by date column value
       column: created_at
-      granularity: month     # one partition file per calendar month
+      granularity: month       # one partition file per calendar month
 
   - name: line_items
     partitioning:
-      strategy: customer     # routes by customer_id FK — same shard as parent order
+      strategy: customer       # built-in: Fibonacci hash on FK column
       column: customer_id
+
+  - name: payments
+    partitioning:
+      strategy: expression     # CUSTOM: developer-provided Rhai formula
+      column: amount_cents
+      formula: "values[0] / 100000"   # bucket = (amount / $1000) % shard_count
+      shard_count: 4
+
+  - name: tenants
+    partitioning:
+      strategy: explicit       # CUSTOM: explicit value → shard map
+      column: region
+      shard_map:
+        EU: 0
+        US: 1
+        APAC: 2
 
 read_models:
   - name: monthly_order_totals
     source: orders
-    reducer: sum
+    reducer: sum               # built-in aggregation
     group_by: month(created_at)
     cache:
       in_process:
@@ -282,12 +302,32 @@ read_models:
 
   - name: customer_order_count
     source: orders
-    reducer: count
+    reducer: count             # built-in aggregation
     group_by: customer_id
     cache:
       in_process:
         max_entries: 50000
         ttl_s: 30
+
+  - name: rolling_avg_order_value   # CUSTOM reducer via Rhai script
+    source: orders
+    reducer: custom
+    reducer_script: ./reducers/rolling_avg.rhai   # developer owns this file
+    group_by: customer_id
+    cache:
+      in_process:
+        max_entries: 10000
+        ttl_s: 120
+
+  - name: enriched_order_summary    # CUSTOM reducer via HTTP callback
+    source: orders
+    reducer: http_callback
+    url: https://myservice.internal/vv/reducer/order-summary
+    group_by: customer_id
+    cache:
+      in_process:
+        max_entries: 5000
+        ttl_s: 60
 ```
 
 ### Implementation Layers (S22)
@@ -295,17 +335,21 @@ read_models:
 | Layer | VV-ID | Description |
 |-------|-------|-------------|
 | S22-L1 | VV-CFG-040 | `PartitionConfig` struct — parse `partitioning:` section from YAML; extend `VvConfig` |
-| S22-L2 | VV-PRJ-010 | `SemanticPartitionKey` trait + `PartitionStrategy` enum (Date/Customer/Hash/None) |
-| S22-L3 | VV-PRJ-011 | `DateRangeRouter` — maps `created_at` timestamp → partition bucket index by year/month/day |
-| S22-L4 | VV-PRJ-012 | `CustomerRouter` — Fibonacci hash on customer FK column → shard index (reuses `AggregateRouter` internals) |
-| S22-L5 | VV-PRJ-013 | `PartitionPruner` — extend zone-map query path; given a WHERE on the partition column, compute bucket set and skip non-matching partitions |
-| S22-L6 | VV-PRJ-014 | `ReadModelRegistry` — named lifecycle: register, start, stop, replay-from-wal, snapshot |
-| S22-L7 | VV-PRJ-015 | `InProcessReadCache` — `Arc<DashMap<K, (Instant, Arc<ReadModelSnapshot>)>>` + TTL eviction |
-| S22-L8 | VV-PRJ-016 | `RedisReadCache` — `redis` crate (async), GET/SET/SETEX, write-through on miss, invalidate on mutation |
-| S22-L9 | VV-CFG-041 | `CacheConfig` YAML section; wire into `VvConfig`; pass to `ReadModelRegistry` at startup |
-| S22-L10 | VV-PRJ-017 | `YamlReadModelConfig` parser; `vvctl serve` reads `read_models:` block and auto-registers projections |
-| S22-L11 | VV-CTL-xxx | `vvctl projection list/status/replay/invalidate-cache` subcommands |
-| S22-L12 | — | Integration tests: date-partition prune (verify only 1 of 12 monthly partitions scanned), Redis cache hit/miss round-trip, YAML config end-to-end |
+| S22-L2 | VV-PRJ-010 | `SemanticPartitionKey` trait + `PartitionStrategy` enum (Date/Customer/Hash/Expression/Explicit/None) |
+| S22-L3 | VV-PRJ-011 | `DateRangeRouter` — maps timestamp → partition bucket by year/month/day |
+| S22-L4 | VV-PRJ-012 | `CustomerRouter` — Fibonacci hash on FK column → shard index |
+| S22-L5 | VV-PRJ-020 | `ExpressionRouter` — evaluates developer-provided Rhai `formula:` over column values; result mod `shard_count` |
+| S22-L6 | VV-PRJ-021 | `ExplicitShardMap` — YAML `shard_map:` table; maps discrete string/int column values to shard indices |
+| S22-L7 | VV-PRJ-013 | `PartitionPruner` — extend zone-map query path; skip non-matching partitions given a WHERE on the partition column |
+| S22-L8 | VV-PRJ-014 | `ReadModelRegistry` — named lifecycle: register, start, stop, replay-from-wal, snapshot |
+| S22-L9 | VV-PRJ-015 | `InProcessReadCache` — `Arc<DashMap<K, (Instant, Arc<ReadModelSnapshot>)>>` + TTL eviction |
+| S22-L10 | VV-PRJ-016 | `RedisReadCache` — `redis` crate (async), GET/SET/SETEX, write-through on miss, invalidate on mutation |
+| S22-L11 | VV-PRJ-018 | `RhaiReducer` — loads developer's `.rhai` script at startup; calls `reduce(state, row)` on every committed mutation; sandboxed, no I/O |
+| S22-L12 | VV-PRJ-019 | `HttpCallbackReducer` — POSTs `{ state, row }` JSON to developer URL; expects `{ new_state }` response; async, with timeout + retry |
+| S22-L13 | VV-CFG-041 | `CacheConfig` YAML section; wire into `VvConfig`; pass to `ReadModelRegistry` at startup |
+| S22-L14 | VV-PRJ-017 | `YamlReadModelConfig` parser; `vvctl serve` reads `read_models:` block and auto-registers all projections |
+| S22-L15 | VV-CTL-xxx | `vvctl projection list/status/replay/invalidate-cache` subcommands |
+| S22-L16 | — | Integration tests: date-prune (1 of 12 partitions scanned), expression partition routing, explicit shard map, Rhai custom reducer, HTTP callback reducer, Redis cache round-trip |
 
 ### Dependencies / Prerequisites
 
@@ -352,9 +396,13 @@ handling an event.
 
 | VV-ID | Name | Description |
 |-------|------|-------------|
-| VV-EVT-001 | DomainEventSchema | YAML declaration of a domain event: `name`, `trigger` (insert/update/delete/condition), `fields` mapped from entity columns |
-| VV-EVT-002 | DomainEventEmitter | Engine hook that fires after a committed WAL entry; maps raw `Mutation` → typed `DomainEvent` using the schema; supports filter expressions (`when: values[2] > 1000`) |
-| VV-EVT-003 | DomainEventEnvelope | Wire format for domain events: `{ event_type, entity, pk, timestamp_ns, payload: { field: value } }`; serialised as JSON and MessagePack |
+| VV-EVT-001 | DomainEventSchema | YAML declaration of a domain event: `name`, `version` (semver), `trigger` (insert/update/delete/condition), `fields` mapped from entity columns with support for direct (`pk`, `values[N]`), computed (`expr:`), nested (`object:`) and cross-entity enriched (`lookup:`) field types |
+| VV-EVT-002 | DomainEventEmitter | Engine hook that fires after a committed WAL entry; maps raw `Mutation` → typed `DomainEvent` using the schema; evaluates `when:` Rhai filter expression; resolves computed and nested fields |
+| VV-EVT-003 | DomainEventEnvelope | Wire format: `{ event_type, schema_version, entity, pk, timestamp_ns, payload: <developer-defined shape> }`; serialised as JSON and MessagePack; `schema_version` is a semver string from the YAML declaration |
+| VV-EVT-013 | SchemaVersionRegistry | Local file-based registry (`event_schemas/` directory) that stores every version of every event schema; `vvctl events schema list/show/diff` shows version history; consumers can request a specific version |
+| VV-EVT-014 | ComputedEventField | `expr:` field type in YAML event schema — Rhai expression over column values (e.g. `total_dollars: { expr: "values[1] / 100" }`); evaluated at emit time |
+| VV-EVT-015 | NestedEventField | `object:` field type — groups sub-fields into a nested JSON object in the payload (e.g. `address: { object: { city: values[3], country: values[4] } }`) |
+| VV-EVT-016 | LookupEnrichmentField | `lookup:` field type — at emit time, reads a value from another VectorVolt table (e.g. `customer_name: { lookup: { table: customers, pk: values[0], column: 1 } }`); adds cross-entity data without denormalising storage |
 | VV-EVT-004 | KafkaBrokerSink | Real `rdkafka` producer sink — replaces `mpsc` stand-in; configurable topic, partition key, compression, acks |
 | VV-EVT-005 | RedisStreamSink | `XADD` to a Redis Stream per event type; configurable stream name, maxlen, and consumer group name |
 | VV-EVT-006 | HttpWebhookSink | POST `DomainEventEnvelope` JSON to a configurable URL; retry with exponential back-off; optional HMAC-SHA256 signature header |
@@ -372,12 +420,28 @@ domain_events:
   - entity: orders
     events:
       - name: OrderPlaced
+        version: "1.2.0"             # schema version — tracked in SchemaVersionRegistry
         trigger: insert
         fields:
+          # Direct column mapping
           order_id:    pk
           customer_id: values[0]
           total_cents: values[1]
-          status:      values[2]
+          status_code: values[2]
+          # Computed field — developer-defined Rhai expression
+          total_dollars:
+            expr: "values[1] / 100"
+          # Nested object field — groups sub-fields into JSON sub-object
+          address:
+            object:
+              city:    values[3]
+              country: values[4]
+          # Cross-entity lookup enrichment — reads from another table at emit time
+          customer_name:
+            lookup:
+              table:  customers
+              pk:     values[0]      # FK = customer_id
+              column: 1              # column index in customers table
         routes:
           - sink: kafka
             topic: orders.placed
@@ -387,17 +451,21 @@ domain_events:
             hmac_secret: ${CRM_WEBHOOK_SECRET}
 
       - name: LargeOrderPlaced
+        version: "1.0.0"
         trigger: insert
-        when: "values[1] > 100000"   # total_cents > $1000
+        when: "values[1] > 100000"   # Rhai filter: total_cents > $1000
         fields:
           order_id:    pk
           total_cents: values[1]
+          total_dollars:
+            expr: "values[1] / 100"
         routes:
           - sink: redis_stream
             stream: vv:events:large-orders
             maxlen: 10000
 
       - name: OrderCancelled
+        version: "1.0.0"
         trigger: delete
         fields:
           order_id: pk
@@ -423,18 +491,22 @@ sinks:
 
 | Layer | VV-ID | Description |
 |-------|-------|-------------|
-| S23-L1 | VV-EVT-001 | `DomainEventSchema` struct; YAML parser for `domain_events:` block; extend `VvConfig` |
-| S23-L2 | VV-EVT-003 | `DomainEventEnvelope` — JSON + MessagePack serialisation; `serde_json` + `rmp-serde` |
-| S23-L3 | VV-EVT-002 | `DomainEventEmitter` — post-commit hook in `TxnManager`; evaluates `when:` filter; maps `Mutation` fields to envelope payload using schema |
-| S23-L4 | VV-EVT-008 | `EventOutbox` — WAL frame type `OUTBOX`; background flusher loop; at-least-once delivery guarantee |
-| S23-L5 | VV-EVT-007 | `InProcessChannelSink` — `tokio::sync::broadcast`; allows S22 read model updaters to consume events without broker round-trip |
-| S23-L6 | VV-EVT-004 | `KafkaBrokerSink` — `rdkafka` producer; topic from route config; partition key from field mapping |
-| S23-L7 | VV-EVT-005 | `RedisStreamSink` — `XADD` via `redis` crate async; maxlen trimming |
-| S23-L8 | VV-EVT-006 | `HttpWebhookSink` — `reqwest` POST; HMAC-SHA256 `X-VV-Signature` header; retry with exponential back-off |
-| S23-L9 | VV-EVT-009 | `YamlEventRouteConfig` parser; `vvctl serve` reads `domain_events:` block and wires emitter + sinks at startup |
-| S23-L10 | VV-EVT-012 | `EventDlq` — local WAL segment for failed envelopes; `vvctl events dlq list/replay/drop` |
-| S23-L11 | VV-EVT-011 | `vvctl events replay --entity --from --to` — re-emit WAL range through emitter pipeline |
-| S23-L12 | VV-EVT-010 | End-to-end integration test: insert order → `OrderPlaced` fires → in-process consumer receives envelope → consumer calls `TxnManager::insert()` on a second table (simulating CRUD callback) |
+| S23-L1 | VV-EVT-001 | `DomainEventSchema` struct + YAML parser; supports `version`, `trigger`, direct/computed/nested/lookup `fields` |
+| S23-L2 | VV-EVT-013 | `SchemaVersionRegistry` — file-based registry under `event_schemas/`; stores each version as JSON; `vvctl events schema list/show/diff` |
+| S23-L3 | VV-EVT-003 | `DomainEventEnvelope` with `schema_version` field — JSON + MessagePack serialisation |
+| S23-L4 | VV-EVT-014 | `ComputedEventField` — Rhai expression evaluator; sandboxed, no I/O; called at emit time for each `expr:` field |
+| S23-L5 | VV-EVT-015 | `NestedEventField` — builds a JSON sub-object from `object:` field groups |
+| S23-L6 | VV-EVT-016 | `LookupEnrichmentField` — at emit time reads from a VectorVolt table by PK; non-blocking (result cached per emit batch) |
+| S23-L7 | VV-EVT-002 | `DomainEventEmitter` — post-commit hook; evaluates `when:` Rhai filter; resolves all field types; builds `DomainEventEnvelope` |
+| S23-L8 | VV-EVT-008 | `EventOutbox` — `OUTBOX` WAL frame type; background flusher loop; at-least-once guarantee |
+| S23-L9 | VV-EVT-007 | `InProcessChannelSink` — `tokio::sync::broadcast`; feeds S22 read model updaters without a broker |
+| S23-L10 | VV-EVT-004 | `KafkaBrokerSink` — real `rdkafka` producer; `kafka` feature flag; topic + partition key from config |
+| S23-L11 | VV-EVT-005 | `RedisStreamSink` — `XADD` via `redis` crate async; configurable maxlen |
+| S23-L12 | VV-EVT-006 | `HttpWebhookSink` — `reqwest` POST; HMAC-SHA256 signature; exponential back-off retry |
+| S23-L13 | VV-EVT-009 | `YamlEventRouteConfig` parser; `vvctl serve` wires emitter + all sinks at startup |
+| S23-L14 | VV-EVT-012 | `EventDlq` — failed envelopes in local WAL segment; `vvctl events dlq list/replay/drop` |
+| S23-L15 | VV-EVT-011 | `vvctl events replay --entity --from --to` through emitter pipeline |
+| S23-L16 | VV-EVT-010 | E2E integration test: insert order → `OrderPlaced` with nested address + computed total_dollars + customer_name lookup → consumer receives typed envelope → CRUD callback |
 
 ### Dependencies / Prerequisites
 
@@ -458,16 +530,22 @@ sinks:
 
 | New VV-ID | Extends / Relates to | Relationship |
 |-----------|---------------------|--------------|
-| VV-PRJ-010..013 | VV-ENG-023 `AggregateRouter` | Reuses Fibonacci hash; extends to date and customer strategies |
+| VV-PRJ-010..013 | VV-ENG-023 `AggregateRouter` | Reuses Fibonacci hash; extends to date, customer, expression, explicit strategies |
 | VV-PRJ-014..015 | VV-PRJ-003..008 `ProjectionStore` | Replaces ad-hoc store with named, lifecycle-managed, cached registry |
 | VV-PRJ-016 | VV-SNK-014..035 (Redis planned sink) | Promotes Redis from write-path sink to read-cache tier |
 | VV-PRJ-017 | VV-ENG-020 YAML schema | Extends same YAML config file with `read_models:` section |
+| VV-PRJ-018 | VV-PRJ-003..008 `Reducer` trait | Rhai script as a custom reducer — developer owns the aggregation logic, no Rust required |
+| VV-PRJ-019 | VV-PRJ-018 | HTTP callback as alternative to Rhai — aggregation logic lives in developer's own service |
+| VV-PRJ-020 | VV-ENG-023 `AggregateRouter` | Expression-based routing via Rhai — generalises the hash to any formula |
+| VV-PRJ-021 | VV-PRJ-020 | Explicit shard map — discrete value-to-shard table for region/tenant routing |
 | VV-CFG-040..041 | VV-CFG-037 YAML-primary config | New sections in same `vectorvolt.yaml`; same precedence chain |
-| VV-EVT-001..003 | VV-SNK-040 `Sink` trait | Promotes from storage CDC to typed business domain events |
+| VV-EVT-001..003 | VV-SNK-040 `Sink` trait | Promotes from storage CDC to typed business domain events with schema versioning |
 | VV-EVT-004 | VV-SNK-013 `KafkaSink` | Replaces mpsc stand-in with real `rdkafka` producer |
 | VV-EVT-005 | VV-SNK-014..035 (Redis planned) | Implements Redis Streams specifically from the planned NoSQL sink list |
 | VV-EVT-008 | VV-WAL-* | Adds `OUTBOX` WAL frame type; reuses WAL segment infrastructure |
 | VV-EVT-011 | Layer 67 CDC event log | Extends replay API to domain-event-aware replay |
+| VV-EVT-013 | VV-EVT-001 | Schema version registry — tracks every version of every event schema; enables consumer compatibility checking |
+| VV-EVT-014..016 | VV-EVT-001..002 | Rich field types (computed/nested/lookup) — developer shapes the event payload in YAML, no Rust required |
 
 ---
 
