@@ -168,6 +168,13 @@ pub struct ServeArgs {
     /// Disable the gRPC server (equivalent to `--grpc-port 0`).
     #[arg(long)]
     pub no_grpc: bool,
+
+    /// Unseal the master key from the TPM blob at `<dir>/tpm_sealed.bin` on startup.
+    ///
+    /// Fails immediately if the TPM is not present, the blob is missing, or the PCR
+    /// policy does not match (boot chain tampered). Requires Linux + TPM 2.0 hardware.
+    #[arg(long)]
+    pub tpm_unseal: bool,
 }
 
 /// Everything needed to run the server, extracted so tests can bind without blocking.
@@ -396,6 +403,19 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
 }
 
 pub fn run(args: ServeArgs) -> Result<()> {
+    // ── TPM unseal (VV-SEC-005) ───────────────────────────────────────────────
+    if args.tpm_unseal {
+        let sealed_path = args.dir.join("tpm_sealed.bin");
+        match vectorvolt_tpm::unseal(&sealed_path) {
+            Ok(key_hex) => {
+                // Expose as env var for vectorvolt-crypto to pick up.
+                unsafe { std::env::set_var("VECTORVOLT_MASTER_KEY", String::from_utf8_lossy(&key_hex).as_ref()) };
+                eprintln!("TPM unseal: master key loaded from {}", sealed_path.display());
+            }
+            Err(e) => anyhow::bail!("TPM unseal failed — refusing to start: {e}"),
+        }
+    }
+
     let BoundServer {
         server,
         auth,

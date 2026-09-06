@@ -28,6 +28,7 @@ members = [
     "crates/vectorvolt-orders",
     "crates/vectorvolt-xdp",
     "crates/vectorvolt-crypto",
+    "crates/vectorvolt-tpm",
 ]
 resolver = "2"
 
@@ -116,6 +117,7 @@ vectorvolt-workflow = { path = "crates/vectorvolt-workflow" }
 vectorvolt-orders   = { path = "crates/vectorvolt-orders" }
 vectorvolt-xdp      = { path = "crates/vectorvolt-xdp" }
 vectorvolt-crypto   = { path = "crates/vectorvolt-crypto" }
+vectorvolt-tpm      = { path = "crates/vectorvolt-tpm" }
 rayon              = "1.10"
 # cryptography
 aes-gcm            = "0.10"

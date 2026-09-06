@@ -22,6 +22,10 @@ pub struct InstallArgs {
     /// Generate and print a new master key instead of requiring one
     #[arg(long, default_value_t = false)]
     pub gen_key: bool,
+
+    /// Seal the master key into the TPM (requires Linux + TPM 2.0 hardware and --gen-key)
+    #[arg(long, default_value_t = false)]
+    pub tpm_seal: bool,
 }
 
 pub fn run(args: InstallArgs) -> Result<()> {
@@ -61,8 +65,18 @@ pub fn run(args: InstallArgs) -> Result<()> {
         println!();
         println!("    VECTORVOLT_MASTER_KEY={}", key.to_hex());
         println!();
-        println!("  Set this env var before starting vectorvolt-server.");
-        println!("  The key is NEVER written to disk by VectorVolt.");
+
+        if args.tpm_seal {
+            let sealed_path = args.data_dir.join("tpm_sealed.bin");
+            match vectorvolt_tpm::seal(key.to_hex().as_bytes(), &sealed_path) {
+                Ok(()) => println!("  ✔ master key sealed into TPM at {}", sealed_path.display()),
+                Err(e) => eprintln!("  ⚠ TPM seal failed: {e}  (is TPM 2.0 present and feature enabled?)"),
+            }
+        } else {
+            println!("  Set this env var before starting vectorvolt-server.");
+            println!("  The key is NEVER written to disk by VectorVolt.");
+            println!("  tip: add --tpm-seal to bind the key to the TPM boot chain");
+        }
     } else {
         println!();
         println!("  tip: run with --gen-key to generate a new master key");
