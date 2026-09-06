@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 use store::OutputFormat;
@@ -12,6 +12,12 @@ use vvctl::ui;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOMEPAGE: &str = "https://workerruntime.com";
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
+}
 
 #[derive(Parser)]
 #[command(
@@ -38,6 +44,10 @@ struct Cli {
     /// Machine-readable values are still printed.
     #[arg(short, long, global = true)]
     quiet: bool,
+
+    /// Log format: "text" (human-readable, default) or "json" (structured, for log aggregators).
+    #[arg(long, global = true, default_value = "text")]
+    log_format: LogFormat,
 
     #[command(subcommand)]
     command: Commands,
@@ -217,14 +227,30 @@ fn main() -> Result<()> {
     ui::init(cli.no_color, cli.quiet);
 
     let level = if cli.verbose { "debug" } else { "warn" };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
-        )
-        .with_target(false)
-        .compact()
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    match cli.log_format {
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
+        }
+        LogFormat::Text => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .compact()
+                .init();
+        }
+    }
+
+    // Completion must be handled before the normal dispatch: clap_complete
+    // needs a fresh Command instance built from the Cli type.
+    if let Commands::Completion(ref args) = cli.command {
+        completion::generate(&args.shell, &mut Cli::command());
+        return Ok(());
+    }
 
     let fmt = cli.output;
 

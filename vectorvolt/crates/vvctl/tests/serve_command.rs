@@ -29,6 +29,9 @@ fn make_args(addr: &str) -> ServeArgs {
         xdp_iface: "lo".to_string(),
         xdp_queue: 0,
         xdp_ring_size: 256,
+        grpc_port: 50051,
+        no_grpc: false,
+        tpm_unseal: false,
     }
 }
 

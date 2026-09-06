@@ -1,8 +1,18 @@
 //! Tests for vvctl completion command (VV-CFG-023).
-use vvctl::commands::completion::{
-    CompletionShell, bash_completion, fish_completion, generate_completion, powershell_completion,
-    zsh_completion,
-};
+use vvctl::commands::completion::{CompletionShell, generate_to_string, stub_command};
+
+fn bash_completion() -> String {
+    generate_to_string(&CompletionShell::Bash, &mut stub_command())
+}
+fn zsh_completion() -> String {
+    generate_to_string(&CompletionShell::Zsh, &mut stub_command())
+}
+fn fish_completion() -> String {
+    generate_to_string(&CompletionShell::Fish, &mut stub_command())
+}
+fn powershell_completion() -> String {
+    generate_to_string(&CompletionShell::Powershell, &mut stub_command())
+}
 
 #[test]
 fn test_bash_completion_non_empty() {
@@ -74,7 +84,7 @@ fn test_completion_valid_utf8() {
         CompletionShell::Fish,
         CompletionShell::Powershell,
     ] {
-        let s = generate_completion(&shell);
+        let s = generate_to_string(&shell, &mut stub_command());
         assert!(std::str::from_utf8(s.as_bytes()).is_ok());
     }
 }
@@ -87,7 +97,7 @@ fn test_completion_length_gt_100() {
         CompletionShell::Fish,
         CompletionShell::Powershell,
     ] {
-        let s = generate_completion(&shell);
+        let s = generate_to_string(&shell, &mut stub_command());
         assert!(
             s.len() > 100,
             "completion for {:?} too short: {}",

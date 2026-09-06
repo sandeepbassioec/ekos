@@ -62,57 +62,70 @@ fn test_version_txt_contains_vectorvolt() {
 }
 
 #[test]
-fn test_run_creates_output_dir() {
+fn test_run_creates_zip_file() {
     let tmp = TempDir::new().unwrap();
-    let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs {
+    let out = tmp.path().join("bundle.zip");
+    run(SupportBundleArgs {
         output: out.clone(),
-    };
-    run(args).unwrap();
+        data_dir: None,
+    })
+    .unwrap();
     assert!(out.exists());
 }
 
 #[test]
-fn test_run_creates_config_yaml() {
+fn test_run_zip_contains_system_info() {
     let tmp = TempDir::new().unwrap();
-    let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs {
+    let out = tmp.path().join("bundle.zip");
+    run(SupportBundleArgs {
         output: out.clone(),
-    };
-    run(args).unwrap();
-    assert!(out.join("config.yaml").exists());
+        data_dir: None,
+    })
+    .unwrap();
+    let bytes = std::fs::read(&out).unwrap();
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader).unwrap();
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert!(names.contains(&"system_info.json".to_string()));
 }
 
 #[test]
-fn test_run_creates_system_profile_json() {
+fn test_run_zip_contains_env() {
     let tmp = TempDir::new().unwrap();
-    let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs {
+    let out = tmp.path().join("bundle.zip");
+    run(SupportBundleArgs {
         output: out.clone(),
-    };
-    run(args).unwrap();
-    assert!(out.join("system_profile.json").exists());
+        data_dir: None,
+    })
+    .unwrap();
+    let bytes = std::fs::read(&out).unwrap();
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader).unwrap();
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert!(names.contains(&"env.txt".to_string()));
 }
 
 #[test]
-fn test_run_creates_version_txt() {
+fn test_run_zip_nonzero_size() {
     let tmp = TempDir::new().unwrap();
-    let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs {
+    let out = tmp.path().join("bundle.zip");
+    run(SupportBundleArgs {
         output: out.clone(),
-    };
-    run(args).unwrap();
-    assert!(out.join("version.txt").exists());
+        data_dir: None,
+    })
+    .unwrap();
+    let len = std::fs::metadata(&out).unwrap().len();
+    assert!(len > 0);
 }
 
 #[test]
 fn test_config_yaml_sanitized() {
-    let tmp = TempDir::new().unwrap();
-    let out = tmp.path().join("bundle");
-    let args = SupportBundleArgs {
-        output: out.clone(),
-    };
-    run(args).unwrap();
-    let contents = std::fs::read_to_string(out.join("config.yaml")).unwrap();
-    assert!(!contents.contains("secret-token"));
+    // sanitize_config masks sensitive keys
+    let yaml = "token: secret-token\nbind_addr: 127.0.0.1:7700\n";
+    let result = sanitize_config(yaml);
+    assert!(!result.contains("secret-token"));
 }
