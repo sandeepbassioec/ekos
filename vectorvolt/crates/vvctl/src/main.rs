@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use store::OutputFormat;
 use vvctl::commands::{
@@ -48,6 +50,15 @@ struct Cli {
     /// Log format: "text" (human-readable, default) or "json" (structured, for log aggregators).
     #[arg(long, global = true, default_value = "text")]
     log_format: LogFormat,
+
+    /// OTLP gRPC endpoint for distributed tracing (e.g. http://localhost:4317).
+    /// Omit to disable OpenTelemetry export (zero overhead).
+    #[arg(long, global = true)]
+    otel_endpoint: Option<String>,
+
+    /// Service name reported in OpenTelemetry spans (default: vvctl).
+    #[arg(long, global = true, default_value = "vvctl")]
+    otel_service_name: String,
 
     #[command(subcommand)]
     command: Commands,
@@ -226,21 +237,30 @@ fn main() -> Result<()> {
 
     ui::init(cli.no_color, cli.quiet);
 
+    // Init OTel BEFORE the tracing subscriber so the global provider is set first.
+    let _otel_guard = vectorvolt_otel::init(cli.otel_endpoint.as_deref(), &cli.otel_service_name);
+
     let level = if cli.verbose { "debug" } else { "warn" };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    let otel_layer = vectorvolt_otel::layer(&_otel_guard);
     match cli.log_format {
         LogFormat::Json => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
+            tracing_subscriber::registry()
+                .with(otel_layer)
+                .with(tracing_subscriber::fmt::layer().json())
+                .with(filter)
                 .init();
         }
         LogFormat::Text => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .compact()
+            tracing_subscriber::registry()
+                .with(otel_layer)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_target(false)
+                        .compact(),
+                )
+                .with(filter)
                 .init();
         }
     }

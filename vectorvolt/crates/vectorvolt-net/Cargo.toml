@@ -19,6 +19,7 @@ subtle     = { workspace = true }
 rustls         = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio              = { workspace = true }
+tracing            = { workspace = true }
 static_assertions  = "1.1"
 
 [dev-dependencies]

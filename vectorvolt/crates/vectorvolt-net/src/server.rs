@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tracing::{debug, info_span};
 
 use vectorvolt_engine::{TableEngine, TableRegistry};
 
@@ -204,6 +205,9 @@ impl Server {
                 .fetch_add(1, Ordering::Relaxed);
             self.live.fetch_add(1, Ordering::AcqRel);
 
+            let peer = stream.peer_addr().ok();
+            debug!(peer = ?peer, "accepted connection");
+
             let registry = Arc::clone(&self.registry);
             let stats = Arc::clone(&self.stats);
             let live = Arc::clone(&self.live);
@@ -211,6 +215,8 @@ impl Server {
             let auth = self.config.auth.clone();
             let tls = self.config.tls.clone();
             std::thread::spawn(move || {
+                let span = info_span!("vv.connection", peer = ?peer);
+                let _enter = span.enter();
                 // The handshake runs on the connection thread, not the accept
                 // loop. It involves several round trips, so doing it inline would
                 // let one slow or hostile peer stall every pending accept — a
@@ -279,6 +285,7 @@ fn read_exact_or_eof<R: Read>(stream: &mut R, buf: &mut [u8]) -> NetResult<bool>
     Ok(true)
 }
 
+#[tracing::instrument(skip_all, name = "vv.handle_connection")]
 fn handle_connection(
     mut stream: ServerConn,
     registry: &TableRegistry,

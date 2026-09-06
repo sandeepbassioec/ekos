@@ -64,5 +64,7 @@ vectorvolt-xdp      = { workspace = true }
 vectorvolt-crypto   = { workspace = true }
 vectorvolt-server   = { path = "../vectorvolt-server" }
 vectorvolt-tpm      = { workspace = true }
+vectorvolt-otel     = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 clap_complete       = { workspace = true }
 zip                 = { workspace = true }
