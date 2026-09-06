@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/vectorvolt-otel",
+    "crates/vectorvolt-metrics",
     "crates/vectorvolt-hal",
     "crates/vectorvolt-wal",
     "crates/vectorvolt-store",
@@ -125,6 +126,7 @@ vectorvolt-xdp      = { path = "crates/vectorvolt-xdp" }
 vectorvolt-crypto   = { path = "crates/vectorvolt-crypto" }
 vectorvolt-tpm      = { path = "crates/vectorvolt-tpm" }
 vectorvolt-otel     = { path = "crates/vectorvolt-otel" }
+vectorvolt-metrics  = { path = "crates/vectorvolt-metrics" }
 rayon              = "1.10"
 # cryptography
 aes-gcm            = "0.10"
