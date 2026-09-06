@@ -9,9 +9,9 @@ fn make_dir() -> TempDir {
 fn mk(d: &TempDir, sub: &str) -> PathBuf {
     d.path().join(sub).join("tbl")
 }
-fn setup_at(p: &PathBuf) {
+fn setup_at(p: &std::path::Path) {
     run(TableCommand::Create {
-        dir: p.clone(),
+        dir: p.to_path_buf(),
         columns: vec!["pk:u64".into(), "val:u64".into()],
     })
     .unwrap();
@@ -103,14 +103,14 @@ fn swim_all_check_ok() {
         let p = mk(&d, sub);
         setup_at(&p);
         run(TableCommand::Insert {
-            dir: p.clone(),
+            dir: p.to_path_buf(),
             pk: 1,
             values: vec![1],
         })
         .unwrap();
         run(TableCommand::Check { dir: p }).unwrap();
     }
-    assert!(true);
+    // all iterations completed
 }
 #[test]
 fn swim_all_vacuum_ok() {
@@ -119,14 +119,14 @@ fn swim_all_vacuum_ok() {
         let p = mk(&d, sub);
         setup_at(&p);
         run(TableCommand::Insert {
-            dir: p.clone(),
+            dir: p.to_path_buf(),
             pk: 1,
             values: vec![1],
         })
         .unwrap();
         run(TableCommand::Vacuum { dir: p }).unwrap();
     }
-    assert!(true);
+    // all iterations completed
 }
 #[test]
 fn swim_diff_m1_m2_ok() {

@@ -6,9 +6,9 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, bench_net, catalog, chaos, completion, config, config_audit, connect, disconnect, graph,
-    hal, http, install, keygen, ledger_cmd, linux, ping, profile, serve, server_cmd, status_cmd,
-    store, support_bundle, table, topology, tune, wal, xdp_cmd,
+    bench, bench_net, catalog, chaos, cluster_cmd, completion, config, config_audit, connect,
+    disconnect, graph, hal, http, install, keygen, ledger_cmd, linux, ping, profile, serve,
+    server_cmd, status_cmd, store, support_bundle, table, topology, tune, wal, xdp_cmd,
 };
 use vvctl::ui;
 
@@ -163,6 +163,9 @@ enum Commands {
 
     /// Provision the host: create system user, harden data dir, generate master key (VV-SEC-003).
     Install(install::InstallArgs),
+
+    /// Cluster membership management (nodes, join, leave, status, ring).
+    Cluster(cluster_cmd::ClusterArgs),
 
     /// Print version and build info.
     Version,
@@ -344,6 +347,8 @@ fn main() -> Result<()> {
         Commands::Xdp(cmd) => xdp_cmd::run(cmd)?,
 
         Commands::Install(args) => install::run(args)?,
+
+        Commands::Cluster(args) => cluster_cmd::run(args)?,
 
         Commands::Version => print_version(),
     }

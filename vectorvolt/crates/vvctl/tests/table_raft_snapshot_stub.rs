@@ -1,7 +1,7 @@
 //! Tests for Layer 355.
 use std::path::PathBuf;
 use tempfile::TempDir;
-use vvctl::commands::table::{ExportFormat, OutputFormat, TableCommand, run};
+use vvctl::commands::table::{OutputFormat, TableCommand, run};
 
 fn make_dir() -> TempDir {
     TempDir::new().unwrap()

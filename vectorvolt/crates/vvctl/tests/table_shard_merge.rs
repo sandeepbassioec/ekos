@@ -9,9 +9,9 @@ fn make_dir() -> TempDir {
 fn mk(d: &TempDir, sub: &str) -> PathBuf {
     d.path().join(sub)
 }
-fn setup_at(p: &PathBuf) {
+fn setup_at(p: &std::path::Path) {
     run(TableCommand::Create {
-        dir: p.clone(),
+        dir: p.to_path_buf(),
         columns: vec!["pk:u64".into(), "val:u64".into()],
     })
     .unwrap();

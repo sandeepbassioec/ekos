@@ -1,5 +1,4 @@
 //! Tests for Layer 369.
-use std::path::PathBuf;
 use tempfile::TempDir;
 use vvctl::commands::table::{OutputFormat, TableCommand, run};
 
