@@ -43,6 +43,8 @@ description = "VectorVolt — ultra-low-latency kernel-bypass data engine"
 [workspace.dependencies]
 # async
 tokio          = { version = "1.45", features = ["full"] }
+tonic          = { version = "0.12", features = ["transport"] }
+prost          = "0.13"
 axum           = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
 tokio-stream   = { version = "0.1", features = ["sync"] }
 tower          = { version = "0.5", default-features = false }
