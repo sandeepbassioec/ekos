@@ -1,15 +1,12 @@
 use std::path::PathBuf;
 use tempfile::TempDir;
-use vvctl::commands::table::{ExportFormat, OutputFormat, TableCommand, run};
+use vvctl::commands::table::{ExportFormat, TableCommand, run};
 
 fn make_dir() -> TempDir {
     TempDir::new().unwrap()
 }
 fn tdir(d: &TempDir) -> PathBuf {
     d.path().join("tbl")
-}
-fn tdir2(d: &TempDir) -> PathBuf {
-    d.path().join("tbl2")
 }
 fn setup(d: &TempDir) {
     run(TableCommand::Create {

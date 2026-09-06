@@ -2,6 +2,7 @@ pub mod bench;
 pub mod bench_net;
 pub mod catalog;
 pub mod chaos;
+pub mod cluster_cmd;
 pub mod cluster_topology;
 pub mod completion;
 pub mod config;

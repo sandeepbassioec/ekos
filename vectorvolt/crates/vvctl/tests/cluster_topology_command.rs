@@ -59,14 +59,14 @@ fn test_leader_marked() {
 
 #[test]
 fn test_follower_marked() {
-    let nodes = vec![leader(), follower("node-2", "127.0.0.2:50051")];
+    let nodes = [leader(), follower("node-2", "127.0.0.2:50051")];
     let out = format_tree(&nodes, 150);
     assert!(out.contains("FOLLOWER"));
 }
 
 #[test]
 fn test_shard_counts_visible() {
-    let nodes = vec![leader(), follower("node-2", "127.0.0.2:50051")];
+    let nodes = [leader(), follower("node-2", "127.0.0.2:50051")];
     let total: usize = nodes.iter().map(|n| n.shard_count).sum();
     let out = format_tree(&nodes, total);
     assert!(out.contains("150"));
@@ -114,14 +114,14 @@ fn test_dead_node_shows_dead() {
 
 #[test]
 fn test_shard_sum_equals_total() {
-    let nodes = vec![leader(), follower("node-2", "127.0.0.2:50051")];
+    let nodes = [leader(), follower("node-2", "127.0.0.2:50051")];
     let total: usize = nodes.iter().map(|n| n.shard_count).sum();
     assert_eq!(total, 150);
 }
 
 #[test]
 fn test_tree_has_box_drawing_chars() {
-    let nodes = vec![leader(), follower("node-2", "127.0.0.2:50051")];
+    let nodes = [leader(), follower("node-2", "127.0.0.2:50051")];
     let out = format_tree(&nodes, 150);
     assert!(out.contains('├') || out.contains('└'));
 }

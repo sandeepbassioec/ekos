@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use tempfile::TempDir;
-use vvctl::commands::table::{OutputFormat, TableCommand, run};
+use vvctl::commands::table::{TableCommand, run};
 
 fn make_dir() -> TempDir {
     TempDir::new().unwrap()
