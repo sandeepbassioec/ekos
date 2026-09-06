@@ -25,6 +25,7 @@ vectorvolt-control = { path = "../vectorvolt-control" }
 axum               = { workspace = true }
 
 [dependencies]
+vectorvolt-semantic = { workspace = true }
 vectorvolt-wal     = { path = "../vectorvolt-wal" }
 vectorvolt-store   = { path = "../vectorvolt-store" }
 vectorvolt-storage = { workspace = true }

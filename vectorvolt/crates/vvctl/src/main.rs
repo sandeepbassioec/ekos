@@ -7,8 +7,8 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use store::OutputFormat;
 use vvctl::commands::{
     bench, bench_net, catalog, chaos, cluster_cmd, completion, config, config_audit, connect,
-    disconnect, graph, hal, http, install, keygen, ledger_cmd, linux, ping, profile, serve,
-    server_cmd, status_cmd, store, support_bundle, table, topology, tune, wal, xdp_cmd,
+    disconnect, graph, hal, http, install, keygen, ledger_cmd, linux, ping, profile, projection_cmd,
+    serve, server_cmd, status_cmd, store, support_bundle, table, topology, tune, wal, xdp_cmd,
 };
 use vvctl::ui;
 
@@ -160,6 +160,10 @@ enum Commands {
     /// AF_XDP kernel-bypass networking commands (stats, bench, umem layout).
     #[command(subcommand)]
     Xdp(xdp_cmd::XdpCommand),
+
+    /// Manage materialized read models (list, status, replay, invalidate-cache) — S22.
+    #[command(subcommand)]
+    Projection(projection_cmd::ProjectionCommand),
 
     /// Provision the host: create system user, harden data dir, generate master key (VV-SEC-003).
     Install(install::InstallArgs),
@@ -345,6 +349,10 @@ fn main() -> Result<()> {
         Commands::Linux(args) => linux::run(&args)?,
 
         Commands::Xdp(cmd) => xdp_cmd::run(cmd)?,
+
+        Commands::Projection(cmd) => {
+            projection_cmd::run(projection_cmd::ProjectionArgs { command: cmd })?
+        }
 
         Commands::Install(args) => install::run(args)?,
 

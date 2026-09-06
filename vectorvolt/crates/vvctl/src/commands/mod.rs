@@ -20,6 +20,7 @@ pub mod ledger_cmd;
 pub mod linux;
 pub mod ping;
 pub mod profile;
+pub mod projection_cmd;
 pub mod reader;
 pub mod serve;
 pub mod server_cmd;
