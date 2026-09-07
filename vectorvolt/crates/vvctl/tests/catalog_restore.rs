@@ -64,6 +64,7 @@ fn serve_args(dir: &TempDir, catalog: bool, restore_catalog: bool) -> ServeArgs 
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        metrics_port: 0,
     }
 }
 
@@ -235,3 +236,4 @@ fn serve_restore_catalog_empty_registry_is_noop() {
     let cat = bound.catalog.unwrap();
     assert_eq!(cat.table_count(), 0);
 }
+
