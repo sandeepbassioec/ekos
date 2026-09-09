@@ -2,10 +2,14 @@
 pub enum Stmt {
     Select(SelectStmt),
     Insert(InsertStmt),
+    InsertSelect(InsertSelectStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
+    AlterTable(AlterTableStmt),
+    Truncate(TruncateStmt),
+    RenameTable(RenameTableStmt),
     Explain(Box<SelectStmt>),
     Begin,
     Commit,
@@ -46,6 +50,7 @@ pub struct SelectStmt {
     pub table: String,
     pub where_clause: Option<Expr>,
     pub group_by: Option<String>,
+    pub having: Option<Expr>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<u64>,
     pub distinct: bool,
@@ -56,6 +61,14 @@ pub struct InsertStmt {
     pub table: String,
     pub columns: Vec<String>,
     pub values: Vec<Expr>,
+    pub or_replace: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertSelectStmt {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub select: Box<SelectStmt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +103,29 @@ pub struct DropTableStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum AlterOp {
+    AddColumn(ColTypeDef),
+    DropColumn(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableStmt {
+    pub table: String,
+    pub op: AlterOp,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TruncateStmt {
+    pub table: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenameTableStmt {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Col(String),
     Lit(LitVal),
@@ -102,6 +138,17 @@ pub enum Expr {
     Match {
         col: String,
         term: String,
+    },
+    /// `col IN (v1, v2, ...)`
+    In {
+        col: String,
+        values: Vec<LitVal>,
+    },
+    /// `col BETWEEN lo AND hi`
+    Between {
+        col: String,
+        lo: LitVal,
+        hi: LitVal,
     },
 }
 
