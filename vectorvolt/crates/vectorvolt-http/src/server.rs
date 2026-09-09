@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use tokio::net::TcpListener;
 use vectorvolt_engine::{TableRegistry, ViewRegistry};
+use vectorvolt_query::SqlExecutor;
 
 use crate::handlers;
 use crate::metrics::Metrics;
@@ -24,6 +25,8 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub webhooks: Arc<WebhookRegistry>,
     pub multi_txns: Arc<MultiTxnRegistry>,
+    /// SQL executor for `POST /sql`.
+    pub sql: Arc<SqlExecutor>,
     /// When `Some`, every non-observability request must carry
     /// `Authorization: Bearer <token>`.
     pub api_token: Option<String>,
@@ -67,11 +70,13 @@ impl HttpServer {
         let views = Arc::new(ViewRegistry::new());
         let webhooks = Arc::new(WebhookRegistry::new());
         let multi_txns = Arc::new(MultiTxnRegistry::new());
+        let sql = Arc::new(SqlExecutor::new(Arc::clone(&registry)));
         let app = build_router(
             registry,
             views,
             webhooks,
             multi_txns,
+            sql,
             metrics,
             config.api_token,
         );
@@ -123,6 +128,7 @@ fn build_router(
     views: Arc<ViewRegistry>,
     webhooks: Arc<WebhookRegistry>,
     multi_txns: Arc<MultiTxnRegistry>,
+    sql: Arc<SqlExecutor>,
     metrics: Arc<Metrics>,
     api_token: Option<String>,
 ) -> Router {
@@ -131,6 +137,7 @@ fn build_router(
         views,
         webhooks,
         multi_txns,
+        sql,
         metrics,
         api_token,
     });
@@ -138,6 +145,8 @@ fn build_router(
         // Observability
         .route("/health", get(obs::health))
         .route("/metrics", get(obs::prometheus_metrics))
+        // SQL gateway (S28)
+        .route("/sql", post(handlers::sql_handler))
         // Table management
         .route("/tables", get(handlers::list_tables))
         .route("/tables/{table}", post(handlers::create_table))

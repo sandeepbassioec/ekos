@@ -20,10 +20,10 @@ use crate::types::{
     OkResp, PageResp, PercentileQuery, PercentileResp, PurgedResp, QueryResp, RangeQuery,
     RegisterWebhookBody, RegisterWebhookResp, RowResp, RowsResp, ScanPageQuery, ScanProjectQuery,
     ScanProjectResp, ScanQuery, ScanSortedQuery, ScanWhereQuery, SchemaResp, SecondaryQuery,
-    SnapshotInfoResp, SnapshotResp, SubscribeQuery, TablesResp, TtlNowQuery, UpdateFieldBody,
-    UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp, ViewEntryResp, ViewInfoResp,
-    ViewStateResp, ViewsListResp, WebhookEntryResp, WebhooksListResp, WindowAggQuery,
-    WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
+    SnapshotInfoResp, SnapshotResp, SqlBody, SqlResp, SubscribeQuery, TablesResp, TtlNowQuery,
+    UpdateFieldBody, UpdateWhereQuery, UpdatedResp, ValueCountEntry, ValueCountsResp,
+    ViewEntryResp, ViewInfoResp, ViewStateResp, ViewsListResp, WebhookEntryResp, WebhooksListResp,
+    WindowAggQuery, WindowCountQuery, WindowRankQuery, WindowResp, WindowRowResp,
 };
 
 fn engine_err(st: &AppState, e: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp>) {
@@ -1592,6 +1592,72 @@ pub async fn delete_webhook_handler(
             }
             st.webhooks.remove(id);
             Json(OkResp { ok: true }).into_response()
+        }
+    }
+}
+
+// ── SQL gateway (S28) ─────────────────────────────────────────────────────────
+
+/// `POST /sql` — execute arbitrary SQL and return a structured JSON response.
+///
+/// Request: `{"sql": "SELECT * FROM t WHERE pk = 1"}`
+///
+/// Response shape varies by statement type:
+/// - SELECT → `{"type":"rows","columns":[...],"rows":[[...],...]}`
+/// - INSERT/DELETE → `{"type":"affected","affected":N}`
+/// - CREATE/DROP → `{"type":"ok","ok":true,"message":"..."}`
+/// - EXPLAIN → `{"type":"explain","plan":[...]}`
+pub async fn sql_handler(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<SqlBody>,
+) -> impl IntoResponse {
+    use vectorvolt_query::SqlQueryResult;
+
+    match st.sql.execute(&body.sql) {
+        Err(e) => {
+            st.metrics.record_err();
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ErrorResp {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Ok(result) => {
+            st.metrics.record_ok();
+            let resp = match result {
+                SqlQueryResult::Rows { columns, rows } => {
+                    SqlResp::Rows(crate::types::SqlRowsResp { columns, rows })
+                }
+                SqlQueryResult::Affected(n) => {
+                    SqlResp::Affected(crate::types::SqlAffectedResp { affected: n })
+                }
+                SqlQueryResult::Created => SqlResp::Ok(crate::types::SqlOkResp {
+                    ok: true,
+                    message: "table created".into(),
+                }),
+                SqlQueryResult::Dropped => SqlResp::Ok(crate::types::SqlOkResp {
+                    ok: true,
+                    message: "table dropped".into(),
+                }),
+                SqlQueryResult::ExplainPlan(plan) => {
+                    SqlResp::Explain(crate::types::SqlExplainResp { plan })
+                }
+                SqlQueryResult::TxBegin => SqlResp::Ok(crate::types::SqlOkResp {
+                    ok: true,
+                    message: "transaction begun".into(),
+                }),
+                SqlQueryResult::TxCommit => SqlResp::Ok(crate::types::SqlOkResp {
+                    ok: true,
+                    message: "transaction committed".into(),
+                }),
+                SqlQueryResult::TxRollback => SqlResp::Ok(crate::types::SqlOkResp {
+                    ok: true,
+                    message: "transaction rolled back".into(),
+                }),
+            };
+            Json(resp).into_response()
         }
     }
 }

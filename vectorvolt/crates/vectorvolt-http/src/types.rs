@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+﻿use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
 pub struct RowResp {
@@ -6,7 +6,7 @@ pub struct RowResp {
     pub values: Vec<u64>,
 }
 
-// ── Layer 44 response types ───────────────────────────────────────────────────
+// â”€â”€ Layer 44 response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Serialize)]
 pub struct CountResp {
@@ -54,7 +54,7 @@ pub struct RangeQuery {
     pub hi: u64,
 }
 
-// ── Layer 50 query params ─────────────────────────────────────────────────────
+// â”€â”€ Layer 50 query params â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Deserialize)]
 pub struct HistogramQuery {
@@ -69,11 +69,11 @@ pub struct PercentileQuery {
     pub col: usize,
     pub lo: u64,
     pub hi: u64,
-    /// Integer 0–100 (e.g. 95 means P95).
+    /// Integer 0â€“100 (e.g. 95 means P95).
     pub p: u64,
 }
 
-// ── Layer 50 response types ───────────────────────────────────────────────────
+// â”€â”€ Layer 50 response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Serialize)]
 pub struct BucketResp {
@@ -143,7 +143,7 @@ pub struct OkResp {
     pub ok: bool,
 }
 
-// ── query endpoint ────────────────────────────────────────────────────────────
+// â”€â”€ query endpoint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// JSON envelope returned by `POST /tables/{table}/query`.
 ///
@@ -257,7 +257,7 @@ pub enum QueryResp {
     },
 }
 
-// ── Layer 53 response types ───────────────────────────────────────────────────
+// â”€â”€ Layer 53 response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Serialize)]
 pub struct DistinctResp {
@@ -275,7 +275,7 @@ pub struct ValueCountsResp {
     pub entries: Vec<ValueCountEntry>,
 }
 
-// ── Layer 54 query params + response types ────────────────────────────────────
+// â”€â”€ Layer 54 query params + response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateWhereQuery {
@@ -300,7 +300,7 @@ pub struct UpdatedResp {
     pub updated: usize,
 }
 
-// ── Layer 55 request + response types ────────────────────────────────────────
+// â”€â”€ Layer 55 request + response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Deserialize)]
 pub struct BatchPksBody {
@@ -317,7 +317,7 @@ pub struct BatchDeleteResp {
     pub deleted: usize,
 }
 
-// ── Layer 56 request + response types ────────────────────────────────────────
+// â”€â”€ Layer 56 request + response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Up to 3 AND-predicates: col0/lo0/hi0 required; col1/lo1/hi1 and col2/lo2/hi2 optional.
 #[derive(Debug, Deserialize)]
@@ -333,9 +333,9 @@ pub struct ScanWhereQuery {
     pub hi2: Option<u64>,
 }
 
-// ── Layer 57 query params + response types ────────────────────────────────────
+// â”€â”€ Layer 57 query params + response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// `?filter_col=<n>&lo=<lo>&hi=<hi>&proj=<csv>` — `proj` is comma-separated
+/// `?filter_col=<n>&lo=<lo>&hi=<hi>&proj=<csv>` â€” `proj` is comma-separated
 /// column indices (e.g. `"1,2,3"`); omitting it returns PKs only.
 #[derive(Debug, Deserialize)]
 pub struct ScanProjectQuery {
@@ -375,7 +375,7 @@ impl ScanWhereQuery {
     }
 }
 
-// ── Layer 58 request + response types ────────────────────────────────────────
+// â”€â”€ Layer 58 request + response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Deserialize)]
 pub struct CasBody {
@@ -393,7 +393,7 @@ pub struct CasResp {
     pub swapped: bool,
 }
 
-// ── Layer 59 request + response types ────────────────────────────────────────
+// â”€â”€ Layer 59 request + response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Deserialize)]
 pub struct BatchInsertRowBody {
@@ -411,7 +411,7 @@ pub struct BatchInsertResp {
     pub inserted: usize,
 }
 
-// ── Layer 60 request + response types ────────────────────────────────────────
+// â”€â”€ Layer 60 request + response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Deserialize)]
 pub struct InsertTtlBody {
@@ -429,7 +429,7 @@ pub struct PurgedResp {
     pub purged: usize,
 }
 
-// ── Layer 51 query params + response types ────────────────────────────────────
+// â”€â”€ Layer 51 query params + response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Deserialize)]
 pub struct GroupByQuery {
@@ -459,7 +459,7 @@ pub struct GroupResp {
     pub entries: Vec<GroupEntryResp>,
 }
 
-// ── Layer 52 query params + response types ────────────────────────────────────
+// â”€â”€ Layer 52 query params + response types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Deserialize)]
 pub struct WindowAggQuery {
@@ -496,7 +496,7 @@ pub struct WindowResp {
     pub rows: Vec<WindowRowResp>,
 }
 
-// ── Layer 66 — Materialized Views ────────────────────────────────────────────
+// â”€â”€ Layer 66 â€” Materialized Views â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Request body for `POST /views`.
 #[derive(Debug, Deserialize)]
@@ -543,7 +543,7 @@ pub struct ViewsListResp {
     pub views: Vec<ViewInfoResp>,
 }
 
-// ── Layer 65 query params ─────────────────────────────────────────────────────
+// â”€â”€ Layer 65 query params â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Optional column-range filter for `GET /tables/{t}/subscribe`.
 ///
@@ -562,7 +562,7 @@ pub struct SubscribeQuery {
     pub from: Option<u64>,
 }
 
-// ── Layer 67 types ────────────────────────────────────────────────────────────
+// â”€â”€ Layer 67 types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Query params for `GET /tables/{t}/cdc/log`.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -578,7 +578,7 @@ pub struct CdcLogResp {
     pub count: usize,
 }
 
-// ── Layer 68 types ────────────────────────────────────────────────────────────
+// â”€â”€ Layer 68 types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Response body for `GET /tables/{t}/cdc/stats`.
 #[derive(Debug, Serialize)]
@@ -603,7 +603,7 @@ pub struct CdcCompactResp {
     pub removed: usize,
 }
 
-// ── Layer 69 types ────────────────────────────────────────────────────────────
+// â”€â”€ Layer 69 types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Response body for `POST /tables/{t}/snapshot`.
 #[derive(Debug, Serialize)]
@@ -620,7 +620,7 @@ pub struct SnapshotInfoResp {
     pub byte_size: u64,
 }
 
-// ── Layer 70 types ────────────────────────────────────────────────────────────
+// â”€â”€ Layer 70 types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Request body for `POST /tables/{t}/webhooks`.
 #[derive(Debug, Deserialize)]
@@ -649,7 +649,7 @@ pub struct WebhooksListResp {
     pub webhooks: Vec<WebhookEntryResp>,
 }
 
-// ── Layer 71 types ────────────────────────────────────────────────────────────
+// â”€â”€ Layer 71 types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Response body for `POST /multi_txn`.
 #[derive(Debug, Serialize)]
@@ -691,4 +691,48 @@ pub struct MultiTxnRollbackResp {
 pub struct MultiTxnInfoResp {
     pub txn_id: u64,
     pub pending_ops: usize,
+}
+
+// ── SQL gateway types (S28) ───────────────────────────────────────────────────
+
+/// Request body for `POST /sql`.
+#[derive(Debug, Deserialize)]
+pub struct SqlBody {
+    pub sql: String,
+}
+
+/// Response for a successful `POST /sql` SELECT.
+#[derive(Debug, Serialize)]
+pub struct SqlRowsResp {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Response for a non-SELECT `POST /sql` statement.
+#[derive(Debug, Serialize)]
+pub struct SqlAffectedResp {
+    pub affected: u64,
+}
+
+/// Response for DDL `POST /sql` statements.
+#[derive(Debug, Serialize)]
+pub struct SqlOkResp {
+    pub ok: bool,
+    pub message: String,
+}
+
+/// Response for EXPLAIN `POST /sql`.
+#[derive(Debug, Serialize)]
+pub struct SqlExplainResp {
+    pub plan: Vec<String>,
+}
+
+/// Unified SQL response envelope.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SqlResp {
+    Rows(SqlRowsResp),
+    Affected(SqlAffectedResp),
+    Ok(SqlOkResp),
+    Explain(SqlExplainResp),
 }
