@@ -78,6 +78,9 @@ pub fn run(args: QueryArgs) -> Result<()> {
         QueryResult::Affected(n) => println!("Affected {n} row(s)."),
         QueryResult::Created => println!("Table created."),
         QueryResult::Dropped => println!("Table dropped."),
+        QueryResult::TxBegin => println!("BEGIN"),
+        QueryResult::TxCommit => println!("COMMIT"),
+        QueryResult::TxRollback => println!("ROLLBACK"),
         QueryResult::ExplainPlan(lines) => {
             println!("Query Plan");
             println!("----------");

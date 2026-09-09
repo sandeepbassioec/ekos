@@ -6,6 +6,9 @@ pub enum Stmt {
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
     Explain(Box<SelectStmt>),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq)]

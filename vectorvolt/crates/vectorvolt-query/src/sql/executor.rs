@@ -1,7 +1,10 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
-use vectorvolt_engine::{ColumnDef, ColumnType, EngineRow, TableRegistry, TableSchema, TypedValue};
+use vectorvolt_engine::{
+    ColumnDef, ColumnType, EngineRow, TableRegistry, TableSchema, TxnId, TypedValue,
+};
 
 use crate::sql::ast::*;
 use crate::sql::lexer::{LexError, Lexer};
@@ -23,6 +26,10 @@ pub enum ExecError {
     Engine(String),
     #[error("wrong column count: expected {expected}, got {got}")]
     ColumnCountMismatch { expected: usize, got: usize },
+    #[error("no active transaction")]
+    NoActiveTxn,
+    #[error("transaction already active")]
+    TxnAlreadyActive,
 }
 
 #[derive(Debug, Clone)]
@@ -35,15 +42,26 @@ pub enum QueryResult {
     Created,
     Dropped,
     ExplainPlan(Vec<String>),
+    TxBegin,
+    TxCommit,
+    TxRollback,
 }
+
+/// Per-table open transaction id, keyed by table name.
+type TxnMap = HashMap<String, TxnId>;
 
 pub struct SqlExecutor {
     registry: Arc<TableRegistry>,
+    /// Active transaction state. `None` = auto-commit mode.
+    txn: Mutex<Option<TxnMap>>,
 }
 
 impl SqlExecutor {
     pub fn new(registry: Arc<TableRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            txn: Mutex::new(None),
+        }
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, ExecError> {
@@ -60,7 +78,60 @@ impl SqlExecutor {
             Stmt::CreateTable(s) => self.exec_create_table(s),
             Stmt::DropTable(s) => self.exec_drop_table(s),
             Stmt::Explain(s) => self.explain_select(*s),
+            Stmt::Begin => self.exec_begin(),
+            Stmt::Commit => self.exec_commit(),
+            Stmt::Rollback => self.exec_rollback(),
         }
+    }
+
+    fn exec_begin(&self) -> Result<QueryResult, ExecError> {
+        let mut guard = self.txn.lock().unwrap();
+        if guard.is_some() {
+            return Err(ExecError::TxnAlreadyActive);
+        }
+        *guard = Some(HashMap::new());
+        Ok(QueryResult::TxBegin)
+    }
+
+    fn exec_commit(&self) -> Result<QueryResult, ExecError> {
+        let mut guard = self.txn.lock().unwrap();
+        let txn_map = guard.take().ok_or(ExecError::NoActiveTxn)?;
+        for (table, txn_id) in txn_map {
+            let engine = self
+                .registry
+                .get(&table)
+                .map_err(|_| ExecError::TableNotFound(table.clone()))?;
+            engine
+                .commit_txn(txn_id)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        }
+        Ok(QueryResult::TxCommit)
+    }
+
+    fn exec_rollback(&self) -> Result<QueryResult, ExecError> {
+        let mut guard = self.txn.lock().unwrap();
+        let txn_map = guard.take().ok_or(ExecError::NoActiveTxn)?;
+        for (table, txn_id) in txn_map {
+            if let Ok(engine) = self.registry.get(&table) {
+                let _ = engine.rollback_txn(txn_id);
+            }
+        }
+        Ok(QueryResult::TxRollback)
+    }
+
+    /// Return the active txn_id for `table`, creating one via `engine.begin()` if needed.
+    /// Returns `None` when not in a transaction (auto-commit mode).
+    fn txn_id_for(&self, table: &str) -> Option<TxnId> {
+        let mut guard = self.txn.lock().unwrap();
+        let map = guard.as_mut()?;
+        if let Some(&id) = map.get(table) {
+            return Some(id);
+        }
+        // Lazy begin: open a txn for this table on first DML touch.
+        let engine = self.registry.get(table).ok()?;
+        let id = engine.begin();
+        map.insert(table.to_owned(), id);
+        Some(id)
     }
 
     fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
@@ -191,9 +262,15 @@ impl SqlExecutor {
         }
 
         let pk = row_vals[0];
-        engine
-            .insert(pk, row_vals)
-            .map_err(|e| ExecError::Engine(e.to_string()))?;
+        if let Some(txn_id) = self.txn_id_for(&stmt.table) {
+            engine
+                .insert_txn(txn_id, pk, row_vals)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        } else {
+            engine
+                .insert(pk, row_vals)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        }
 
         Ok(QueryResult::Affected(1))
     }
@@ -212,10 +289,18 @@ impl SqlExecutor {
         let to_delete = self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema)?;
         let count = to_delete.len() as u64;
 
-        for row in to_delete {
-            engine
-                .delete(row.pk)
-                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        if let Some(txn_id) = self.txn_id_for(&stmt.table) {
+            for row in to_delete {
+                engine
+                    .delete_txn(txn_id, row.pk)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+            }
+        } else {
+            for row in to_delete {
+                engine
+                    .delete(row.pk)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+            }
         }
 
         Ok(QueryResult::Affected(count))
@@ -729,6 +814,74 @@ mod tests {
             .unwrap()
         {
             QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_begin_commit() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        assert!(matches!(ex.execute("BEGIN").unwrap(), QueryResult::TxBegin));
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 100)")
+            .unwrap();
+        assert!(matches!(
+            ex.execute("COMMIT").unwrap(),
+            QueryResult::TxCommit
+        ));
+        match ex.execute("SELECT * FROM t").unwrap() {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_begin_rollback() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 100)")
+            .unwrap();
+        assert!(matches!(
+            ex.execute("ROLLBACK").unwrap(),
+            QueryResult::TxRollback
+        ));
+        match ex.execute("SELECT * FROM t").unwrap() {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_double_begin_err() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        assert!(matches!(
+            ex.execute("BEGIN"),
+            Err(ExecError::TxnAlreadyActive)
+        ));
+        ex.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn test_commit_without_begin_err() {
+        let (ex, _dir) = setup();
+        assert!(matches!(ex.execute("COMMIT"), Err(ExecError::NoActiveTxn)));
+    }
+
+    #[test]
+    fn test_abort_alias() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        ex.execute("INSERT INTO t (pk) VALUES (1)").unwrap();
+        assert!(matches!(
+            ex.execute("ABORT").unwrap(),
+            QueryResult::TxRollback
+        ));
+        match ex.execute("SELECT * FROM t").unwrap() {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
             _ => panic!(),
         }
     }

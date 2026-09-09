@@ -63,6 +63,18 @@ impl SqlParser {
                     _ => Err(ParseError::UnexpectedToken(Token::Explain)),
                 }
             }
+            Token::Begin => {
+                self.advance();
+                Ok(Stmt::Begin)
+            }
+            Token::Commit => {
+                self.advance();
+                Ok(Stmt::Commit)
+            }
+            Token::Rollback => {
+                self.advance();
+                Ok(Stmt::Rollback)
+            }
             t => Err(ParseError::UnexpectedToken(t)),
         }
     }
