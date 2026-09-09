@@ -78,10 +78,14 @@ impl SqlExecutor {
         match stmt {
             Stmt::Select(s) => self.exec_select(s),
             Stmt::Insert(s) => self.exec_insert(s),
+            Stmt::InsertSelect(s) => self.exec_insert_select(s),
             Stmt::Update(s) => self.exec_update(s),
             Stmt::Delete(s) => self.exec_delete(s),
             Stmt::CreateTable(s) => self.exec_create_table(s),
             Stmt::DropTable(s) => self.exec_drop_table(s),
+            Stmt::AlterTable(s) => self.exec_alter_table(s),
+            Stmt::Truncate(s) => self.exec_truncate(s),
+            Stmt::RenameTable(s) => self.exec_rename_table(s),
             Stmt::Explain(s) => self.explain_select(*s),
             Stmt::Begin => self.exec_begin(),
             Stmt::Commit => self.exec_commit(),
@@ -378,10 +382,141 @@ impl SqlExecutor {
             out_rows.push(out_row);
         }
 
+        if let Some(having) = &stmt.having {
+            out_rows.retain(|row| {
+                let row_map: std::collections::HashMap<String, String> = col_headers
+                    .iter()
+                    .cloned()
+                    .zip(row.iter().cloned())
+                    .collect();
+                Self::eval_having(having, &row_map)
+            });
+        }
+
         Ok(QueryResult::Rows {
             columns: col_headers,
             rows: out_rows,
         })
+    }
+
+    fn eval_having(expr: &Expr, row: &std::collections::HashMap<String, String>) -> bool {
+        match expr {
+            Expr::BinOp { op, left, right } => match op {
+                BinOp::And => Self::eval_having(left, row) && Self::eval_having(right, row),
+                BinOp::Or => Self::eval_having(left, row) || Self::eval_having(right, row),
+                _ => {
+                    let lv = Self::having_val(left, row);
+                    let rv = Self::having_val(right, row);
+                    compare_values(&lv, op, &rv)
+                }
+            },
+            _ => false,
+        }
+    }
+
+    fn having_val(expr: &Expr, row: &std::collections::HashMap<String, String>) -> String {
+        match expr {
+            Expr::Col(name) => row.get(name).cloned().unwrap_or_default(),
+            Expr::Lit(lit) => match lit {
+                LitVal::Int(n) => n.to_string(),
+                LitVal::Float(f) => format!("{f:.6}"),
+                LitVal::Str(s) => s.clone(),
+                LitVal::Bool(b) => b.to_string(),
+            },
+            _ => String::new(),
+        }
+    }
+
+    fn exec_insert_select(&self, stmt: InsertSelectStmt) -> Result<QueryResult, ExecError> {
+        let result = self.exec_select(*stmt.select)?;
+        let (src_cols, src_rows) = match result {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            _ => return Err(ExecError::Engine("expected rows from SELECT".into())),
+        };
+        let engine = self
+            .registry
+            .get(&stmt.table)
+            .map_err(|_| ExecError::TableNotFound(stmt.table.clone()))?;
+        let schema = &engine.schema;
+        let col_count = schema.col_count();
+        let mut count = 0u64;
+        for row_strs in src_rows {
+            let mut vals: Vec<u64> = vec![0u64; col_count];
+            for (col_name, val_str) in src_cols.iter().zip(row_strs.iter()) {
+                if let Some((idx, col_def)) = schema.find(col_name)
+                    && let Ok(tv) = TypedValue::parse(col_def.col_type, val_str)
+                {
+                    vals[idx] = tv.to_bits();
+                }
+            }
+            let pk = vals[0];
+            engine
+                .insert(pk, vals)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+            count += 1;
+        }
+        Ok(QueryResult::Affected(count))
+    }
+
+    fn exec_alter_table(&self, stmt: AlterTableStmt) -> Result<QueryResult, ExecError> {
+        match stmt.op {
+            AlterOp::AddColumn(col_def) => {
+                let col = ColumnDef::new(col_def.name, ColumnType::from_token(&col_def.col_type));
+                self.registry
+                    .alter_table(&stmt.table, &[col], &[])
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+            }
+            AlterOp::DropColumn(col_name) => {
+                self.registry
+                    .alter_table(&stmt.table, &[], &[col_name.as_str()])
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+            }
+        }
+        Ok(QueryResult::Affected(0))
+    }
+
+    fn exec_truncate(&self, stmt: TruncateStmt) -> Result<QueryResult, ExecError> {
+        let engine = self
+            .registry
+            .get(&stmt.table)
+            .map_err(|_| ExecError::TableNotFound(stmt.table.clone()))?;
+        let all_rows = self.scan_live(&engine)?;
+        for row in all_rows {
+            engine
+                .delete(row.pk)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        }
+        Ok(QueryResult::Affected(0))
+    }
+
+    fn exec_rename_table(&self, stmt: RenameTableStmt) -> Result<QueryResult, ExecError> {
+        let (schema, all_rows) = {
+            let engine = self
+                .registry
+                .get(&stmt.old_name)
+                .map_err(|_| ExecError::TableNotFound(stmt.old_name.clone()))?;
+            let schema = engine.schema.clone();
+            let rows = self.scan_live(&engine)?;
+            (schema, rows)
+        };
+        self.registry
+            .create_table_typed(&stmt.new_name, schema)
+            .map_err(|e| ExecError::Engine(e.to_string()))?;
+        {
+            let new_engine = self
+                .registry
+                .get(&stmt.new_name)
+                .map_err(|_| ExecError::TableNotFound(stmt.new_name.clone()))?;
+            for row in all_rows {
+                new_engine
+                    .insert(row.pk, row.values)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+            }
+        }
+        self.registry
+            .drop_table(&stmt.old_name)
+            .map_err(|e| ExecError::Engine(e.to_string()))?;
+        Ok(QueryResult::Affected(0))
     }
 
     fn exec_insert(&self, stmt: InsertStmt) -> Result<QueryResult, ExecError> {
@@ -415,6 +550,15 @@ impl SqlExecutor {
         if let Some(txn_id) = self.txn_id_for(&stmt.table) {
             engine
                 .insert_txn(txn_id, pk, row_vals)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        } else if stmt.or_replace
+            && engine
+                .get(pk)
+                .map_err(|e| ExecError::Engine(e.to_string()))?
+                .is_some()
+        {
+            engine
+                .update(pk, row_vals)
                 .map_err(|e| ExecError::Engine(e.to_string()))?;
         } else {
             engine
@@ -692,6 +836,43 @@ impl SqlExecutor {
                     Err(_) => Ok(false),
                 }
             }
+            Expr::In { col, values } => {
+                let (idx, col_def) = schema
+                    .find(col)
+                    .ok_or_else(|| ExecError::ColumnNotFound(col.clone()))?;
+                let bits = row.values.get(idx).copied().unwrap_or(0);
+                let cell = TypedValue::from_bits(col_def.col_type, bits).display_str();
+                Ok(values.iter().any(|v| {
+                    let vs = match v {
+                        LitVal::Int(n) => n.to_string(),
+                        LitVal::Float(f) => format!("{f:.6}"),
+                        LitVal::Str(s) => s.clone(),
+                        LitVal::Bool(b) => b.to_string(),
+                    };
+                    compare_values(&cell, &BinOp::Eq, &vs)
+                }))
+            }
+            Expr::Between { col, lo, hi } => {
+                let (idx, col_def) = schema
+                    .find(col)
+                    .ok_or_else(|| ExecError::ColumnNotFound(col.clone()))?;
+                let bits = row.values.get(idx).copied().unwrap_or(0);
+                let cell = TypedValue::from_bits(col_def.col_type, bits).display_str();
+                let lo_s = match lo {
+                    LitVal::Int(n) => n.to_string(),
+                    LitVal::Float(f) => format!("{f:.6}"),
+                    LitVal::Str(s) => s.clone(),
+                    LitVal::Bool(b) => b.to_string(),
+                };
+                let hi_s = match hi {
+                    LitVal::Int(n) => n.to_string(),
+                    LitVal::Float(f) => format!("{f:.6}"),
+                    LitVal::Str(s) => s.clone(),
+                    LitVal::Bool(b) => b.to_string(),
+                };
+                Ok(compare_values(&cell, &BinOp::Gte, &lo_s)
+                    && compare_values(&cell, &BinOp::Lte, &hi_s))
+            }
             _ => Err(ExecError::TypeError("expected boolean expression".into())),
         }
     }
@@ -716,9 +897,11 @@ impl SqlExecutor {
                 LitVal::Str(s) => s.clone(),
                 LitVal::Bool(b) => b.to_string(),
             }),
-            Expr::BinOp { .. } | Expr::Match { .. } => Err(ExecError::TypeError(
-                "expected scalar value expression".into(),
-            )),
+            Expr::BinOp { .. } | Expr::Match { .. } | Expr::In { .. } | Expr::Between { .. } => {
+                Err(ExecError::TypeError(
+                    "expected scalar value expression".into(),
+                ))
+            }
         }
     }
 
@@ -1435,8 +1618,166 @@ mod tests {
         let r = ex.execute("SELECT COUNT(*) FROM t GROUP BY cat").unwrap();
         if let QueryResult::Rows { columns, rows } = r {
             assert_eq!(columns, vec!["cat", "count"]);
-            // Two groups: cat=1 → 2 rows, cat=2 → 1 row
             assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s32_alter_add_column() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        let r = ex.execute("ALTER TABLE t ADD COLUMN extra U64");
+        assert!(r.is_ok(), "{r:?}");
+        let rows = ex.execute("SELECT * FROM t").unwrap();
+        if let QueryResult::Rows { columns, .. } = rows {
+            assert!(columns.iter().any(|c| c == "extra"), "extra column missing");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s32_alter_drop_column() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, a U64, b U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, a, b) VALUES (1, 1, 2)")
+            .unwrap();
+        let r = ex.execute("ALTER TABLE t DROP COLUMN b");
+        assert!(r.is_ok(), "{r:?}");
+        let rows = ex.execute("SELECT * FROM t").unwrap();
+        if let QueryResult::Rows { columns, .. } = rows {
+            assert!(
+                !columns.iter().any(|c| c == "b"),
+                "b column should be dropped"
+            );
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s32_insert_or_replace() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT OR REPLACE INTO t (pk, v) VALUES (1, 99)")
+            .unwrap();
+        let rows = ex.execute("SELECT * FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = rows {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "99");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s32_having() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, cat U64, v U64)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, cat, v) VALUES (1, 1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, cat, v) VALUES (2, 1, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, cat, v) VALUES (3, 2, 30)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT COUNT(*) FROM t GROUP BY cat HAVING count > 1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "2");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s32_where_in() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        for i in 1u64..=5 {
+            ex.execute(&format!("INSERT INTO t (pk, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex.execute("SELECT * FROM t WHERE pk IN (1, 3, 5)").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 3);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s32_where_between() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        for i in 1u64..=10 {
+            ex.execute(&format!("INSERT INTO t (pk, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex
+            .execute("SELECT * FROM t WHERE v BETWEEN 3 AND 7")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 5);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s32_insert_select() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE src (pk U64, v U64)").unwrap();
+        ex.execute("CREATE TABLE dst (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO src (pk, v) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO src (pk, v) VALUES (2, 20)")
+            .unwrap();
+        let r = ex.execute("INSERT INTO dst SELECT * FROM src").unwrap();
+        assert!(matches!(r, QueryResult::Affected(2)));
+        let rows = ex.execute("SELECT * FROM dst").unwrap();
+        if let QueryResult::Rows { rows, .. } = rows {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s32_truncate() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 20)").unwrap();
+        let r = ex.execute("TRUNCATE TABLE t");
+        assert!(r.is_ok(), "{r:?}");
+        let rows = ex.execute("SELECT * FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = rows {
+            assert_eq!(rows.len(), 0);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s32_rename_table() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE old_t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO old_t (pk, v) VALUES (1, 42)")
+            .unwrap();
+        let r = ex.execute("RENAME TABLE old_t TO new_t");
+        assert!(r.is_ok(), "{r:?}");
+        assert!(ex.execute("SELECT * FROM old_t").is_err());
+        let rows = ex.execute("SELECT * FROM new_t").unwrap();
+        if let QueryResult::Rows { rows, .. } = rows {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "42");
         } else {
             panic!("expected rows");
         }

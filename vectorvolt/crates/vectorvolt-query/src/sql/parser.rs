@@ -57,6 +57,9 @@ impl SqlParser {
             Token::Delete => self.parse_delete(),
             Token::Create => self.parse_create_table(),
             Token::Drop => self.parse_drop_table(),
+            Token::Alter => self.parse_alter_table(),
+            Token::Truncate => self.parse_truncate(),
+            Token::Rename => self.parse_rename_table(),
             Token::Explain => {
                 self.advance(); // EXPLAIN
                 match self.parse_select()? {
@@ -146,6 +149,11 @@ impl SqlParser {
             self.expect(&Token::By)?;
             group_by = Some(self.expect_ident()?);
         }
+        let mut having = None;
+        if self.peek() == &Token::Having {
+            self.advance();
+            having = Some(self.parse_expr()?);
+        }
         let mut order_by = None;
         if self.peek() == &Token::Order {
             self.advance(); // ORDER
@@ -195,6 +203,7 @@ impl SqlParser {
             table,
             where_clause,
             group_by,
+            having,
             order_by,
             limit,
             distinct,
@@ -203,8 +212,26 @@ impl SqlParser {
 
     fn parse_insert(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // INSERT
+        let or_replace = if self.peek() == &Token::Or {
+            self.advance();
+            self.expect(&Token::Replace)?;
+            true
+        } else {
+            false
+        };
         self.expect(&Token::Into)?;
         let table = self.expect_ident()?;
+        // INSERT INTO t SELECT ...
+        if self.peek() == &Token::Select {
+            let sel = self.parse_select()?;
+            if let Stmt::Select(s) = sel {
+                return Ok(Stmt::InsertSelect(InsertSelectStmt {
+                    table,
+                    columns: vec![],
+                    select: Box::new(s),
+                }));
+            }
+        }
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
         loop {
@@ -232,7 +259,56 @@ impl SqlParser {
             table,
             columns,
             values,
+            or_replace,
         }))
+    }
+
+    fn parse_alter_table(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // ALTER
+        self.expect(&Token::Table)?;
+        let table = self.expect_ident()?;
+        let op = match self.peek().clone() {
+            Token::Add => {
+                self.advance();
+                self.expect(&Token::Column)?;
+                let name = self.expect_ident()?;
+                let col_type = match self.advance().clone() {
+                    Token::KwU64 => "u64".to_owned(),
+                    Token::KwI64 => "i64".to_owned(),
+                    Token::KwF64 => "f64".to_owned(),
+                    Token::KwBool => "bool".to_owned(),
+                    Token::KwText => "text".to_owned(),
+                    Token::KwTimestamp => "timestamp".to_owned(),
+                    Token::Ident(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                AlterOp::AddColumn(ColTypeDef { name, col_type })
+            }
+            Token::Drop => {
+                self.advance();
+                self.expect(&Token::Column)?;
+                let name = self.expect_ident()?;
+                AlterOp::DropColumn(name)
+            }
+            t => return Err(ParseError::UnexpectedToken(t)),
+        };
+        Ok(Stmt::AlterTable(AlterTableStmt { table, op }))
+    }
+
+    fn parse_truncate(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // TRUNCATE
+        self.expect(&Token::Table)?;
+        let table = self.expect_ident()?;
+        Ok(Stmt::Truncate(TruncateStmt { table }))
+    }
+
+    fn parse_rename_table(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // RENAME
+        self.expect(&Token::Table)?;
+        let old_name = self.expect_ident()?;
+        self.expect(&Token::To)?;
+        let new_name = self.expect_ident()?;
+        Ok(Stmt::RenameTable(RenameTableStmt { old_name, new_name }))
     }
 
     fn parse_update(&mut self) -> Result<Stmt, ParseError> {
@@ -354,6 +430,56 @@ impl SqlParser {
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_primary()?;
+        if self.peek() == &Token::In {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            let mut values = Vec::new();
+            loop {
+                let expr = self.parse_primary()?;
+                match expr {
+                    Expr::Lit(v) => values.push(v),
+                    _ => return Err(ParseError::Other("IN values must be literals".to_owned())),
+                }
+                if self.peek() == &Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::RParen)?;
+            let col = match left {
+                Expr::Col(c) => c,
+                _ => {
+                    return Err(ParseError::Other(
+                        "IN left side must be a column".to_owned(),
+                    ));
+                }
+            };
+            return Ok(Expr::In { col, values });
+        }
+        if self.peek() == &Token::Between {
+            self.advance();
+            let lo_expr = self.parse_primary()?;
+            let lo = match lo_expr {
+                Expr::Lit(v) => v,
+                _ => return Err(ParseError::Other("BETWEEN lo must be a literal".to_owned())),
+            };
+            self.expect(&Token::And)?;
+            let hi_expr = self.parse_primary()?;
+            let hi = match hi_expr {
+                Expr::Lit(v) => v,
+                _ => return Err(ParseError::Other("BETWEEN hi must be a literal".to_owned())),
+            };
+            let col = match left {
+                Expr::Col(c) => c,
+                _ => {
+                    return Err(ParseError::Other(
+                        "BETWEEN left side must be a column".to_owned(),
+                    ));
+                }
+            };
+            return Ok(Expr::Between { col, lo, hi });
+        }
         let op = match self.peek().clone() {
             Token::Eq => BinOp::Eq,
             Token::Neq => BinOp::Neq,
@@ -391,6 +517,11 @@ impl SqlParser {
             Token::Float(f) => Ok(Expr::Lit(LitVal::Float(f))),
             Token::Str(s) => Ok(Expr::Lit(LitVal::Str(s))),
             Token::Boolean(b) => Ok(Expr::Lit(LitVal::Bool(b))),
+            // Aggregate keywords may appear as column names in HAVING clauses.
+            Token::Count => Ok(Expr::Col("count".to_owned())),
+            Token::Sum => Ok(Expr::Col("sum".to_owned())),
+            Token::Min => Ok(Expr::Col("min".to_owned())),
+            Token::Max => Ok(Expr::Col("max".to_owned())),
             t => Err(ParseError::UnexpectedToken(t)),
         }
     }
