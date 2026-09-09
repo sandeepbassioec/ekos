@@ -172,6 +172,16 @@ impl<'a> Planner<'a> {
                     .map(|cd| cd.name.clone())
                     .collect::<Vec<_>>(),
                 crate::sql::ast::SelectExpr::Col(name) => vec![name.clone()],
+                crate::sql::ast::SelectExpr::Agg { func, col } => {
+                    use crate::sql::ast::AggFunc;
+                    let label = match func {
+                        AggFunc::Count => "count".to_owned(),
+                        AggFunc::Sum => format!("sum({})", col.as_deref().unwrap_or("?")),
+                        AggFunc::Min => format!("min({})", col.as_deref().unwrap_or("?")),
+                        AggFunc::Max => format!("max({})", col.as_deref().unwrap_or("?")),
+                    };
+                    vec![label]
+                }
             })
             .collect();
         let after_project = PhysicalPlan::Project {

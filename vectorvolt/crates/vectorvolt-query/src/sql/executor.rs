@@ -148,7 +148,7 @@ impl SqlExecutor {
         let schema = &engine.schema;
         let col_names: Vec<String> = schema.columns().iter().map(|c| c.name.clone()).collect();
 
-        // Determine output columns
+        // Determine output columns (Agg variants handled separately below)
         let out_cols: Vec<(String, usize)> = stmt
             .columns
             .iter()
@@ -165,6 +165,7 @@ impl SqlExecutor {
                         vec![]
                     }
                 }
+                SelectExpr::Agg { .. } => vec![],
             })
             .collect();
 
@@ -183,6 +184,15 @@ impl SqlExecutor {
         // Filter by WHERE (still needed for non-pushdown predicates or compound exprs)
         let filtered =
             self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
+
+        // ── Aggregate path (COUNT/SUM/MIN/MAX with optional GROUP BY) ─────────
+        let has_agg = stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, SelectExpr::Agg { .. }));
+        if has_agg {
+            return self.exec_aggregate(filtered, &stmt, schema);
+        }
 
         // Sort by ORDER BY
         let mut sorted = filtered;
@@ -275,6 +285,102 @@ impl SqlExecutor {
         Ok(QueryResult::Rows {
             columns: out_col_names,
             rows,
+        })
+    }
+
+    /// Evaluate aggregate SELECT expressions (COUNT/SUM/MIN/MAX) with optional GROUP BY.
+    fn exec_aggregate(
+        &self,
+        rows: Vec<vectorvolt_engine::EngineRow>,
+        stmt: &SelectStmt,
+        schema: &vectorvolt_engine::TableSchema,
+    ) -> Result<QueryResult, ExecError> {
+        use std::collections::BTreeMap;
+
+        let group_col_idx: Option<usize> = stmt
+            .group_by
+            .as_ref()
+            .and_then(|col| schema.find(col).map(|(i, _)| i));
+
+        let mut groups: BTreeMap<String, Vec<&vectorvolt_engine::EngineRow>> = BTreeMap::new();
+        for row in &rows {
+            let key = match group_col_idx {
+                Some(idx) => row
+                    .values
+                    .get(idx)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
+            groups.entry(key).or_default().push(row);
+        }
+
+        let mut col_headers: Vec<String> = Vec::new();
+        if let Some(gcol) = &stmt.group_by {
+            col_headers.push(gcol.clone());
+        }
+        for expr in &stmt.columns {
+            if let SelectExpr::Agg { func, col } = expr {
+                col_headers.push(match func {
+                    AggFunc::Count => "count".to_owned(),
+                    AggFunc::Sum => format!("sum({})", col.as_deref().unwrap_or("?")),
+                    AggFunc::Min => format!("min({})", col.as_deref().unwrap_or("?")),
+                    AggFunc::Max => format!("max({})", col.as_deref().unwrap_or("?")),
+                });
+            }
+        }
+
+        let mut out_rows: Vec<Vec<String>> = Vec::new();
+        for (group_key, group_rows) in &groups {
+            let mut out_row: Vec<String> = Vec::new();
+            if stmt.group_by.is_some() {
+                out_row.push(group_key.clone());
+            }
+            for expr in &stmt.columns {
+                if let SelectExpr::Agg { func, col } = expr {
+                    let col_idx = col.as_ref().and_then(|c| schema.find(c).map(|(i, _)| i));
+                    let val_str = match func {
+                        AggFunc::Count => group_rows.len().to_string(),
+                        AggFunc::Sum => {
+                            let s: u64 = group_rows
+                                .iter()
+                                .map(|r| {
+                                    col_idx.and_then(|i| r.values.get(i)).copied().unwrap_or(0)
+                                })
+                                .sum();
+                            s.to_string()
+                        }
+                        AggFunc::Min => {
+                            let m = group_rows
+                                .iter()
+                                .map(|r| {
+                                    col_idx
+                                        .and_then(|i| r.values.get(i))
+                                        .copied()
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .min();
+                            m.map(|v| v.to_string()).unwrap_or_default()
+                        }
+                        AggFunc::Max => {
+                            let m = group_rows
+                                .iter()
+                                .map(|r| {
+                                    col_idx.and_then(|i| r.values.get(i)).copied().unwrap_or(0)
+                                })
+                                .max();
+                            m.map(|v| v.to_string()).unwrap_or_default()
+                        }
+                    };
+                    out_row.push(val_str);
+                }
+            }
+            out_rows.push(out_row);
+        }
+
+        Ok(QueryResult::Rows {
+            columns: col_headers,
+            rows: out_rows,
         })
     }
 
@@ -1264,5 +1370,75 @@ mod tests {
         ex.execute("INSERT INTO t (pk, v) VALUES (2, 2)").unwrap();
         let r = ex.execute("UPDATE t SET v = 0");
         assert!(matches!(r, Ok(QueryResult::Affected(2))));
+    }
+
+    #[test]
+    fn test_agg_count_star() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 20)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (3, 30)").unwrap();
+        let r = ex.execute("SELECT COUNT(*) FROM t").unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert_eq!(columns, vec!["count"]);
+            assert_eq!(rows[0][0], "3");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_agg_sum_min_max() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 20)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (3, 30)").unwrap();
+        let r = ex.execute("SELECT SUM(v), MIN(v), MAX(v) FROM t").unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert_eq!(columns, vec!["sum(v)", "min(v)", "max(v)"]);
+            assert_eq!(rows[0][0], "60");
+            assert_eq!(rows[0][1], "10");
+            assert_eq!(rows[0][2], "30");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_agg_count_with_where() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 5)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 15)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (3, 25)").unwrap();
+        let r = ex.execute("SELECT COUNT(*) FROM t WHERE v >= 15").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "2");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_agg_group_by() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, cat U64, v U64)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, cat, v) VALUES (1, 1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, cat, v) VALUES (2, 1, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, cat, v) VALUES (3, 2, 30)")
+            .unwrap();
+        let r = ex.execute("SELECT COUNT(*) FROM t GROUP BY cat").unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert_eq!(columns, vec!["cat", "count"]);
+            // Two groups: cat=1 → 2 rows, cat=2 → 1 row
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
     }
 }
