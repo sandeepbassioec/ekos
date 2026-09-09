@@ -34,6 +34,7 @@ pub enum QueryResult {
     Affected(u64),
     Created,
     Dropped,
+    ExplainPlan(Vec<String>),
 }
 
 pub struct SqlExecutor {
@@ -58,6 +59,7 @@ impl SqlExecutor {
             Stmt::Delete(s) => self.exec_delete(s),
             Stmt::CreateTable(s) => self.exec_create_table(s),
             Stmt::DropTable(s) => self.exec_drop_table(s),
+            Stmt::Explain(s) => self.explain_select(*s),
         }
     }
 
@@ -90,11 +92,22 @@ impl SqlExecutor {
             })
             .collect();
 
-        // Get all rows via scan on PK column (col 0), then verify via get() to
-        // exclude rows deleted since the last compaction (tombstones).
-        let all_rows = self.scan_live(&engine)?;
+        // Use range scan (pushdown) when WHERE is a simple single-column predicate;
+        // fall back to full scan otherwise.
+        let all_rows = if let Some(expr) = &stmt.where_clause
+            && let Some((col_idx, lo, hi)) = Self::try_pushdown(expr, schema)
+        {
+            engine
+                .flush()
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+            engine
+                .scan(col_idx, lo, hi)
+                .map_err(|e| ExecError::Engine(e.to_string()))?
+        } else {
+            self.scan_live(&engine)?
+        };
 
-        // Filter by WHERE
+        // Filter by WHERE (still needed for non-pushdown predicates or compound exprs)
         let filtered = self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema)?;
 
         // Sort by ORDER BY
@@ -229,6 +242,100 @@ impl SqlExecutor {
             .drop_table(&stmt.table)
             .map_err(|_| ExecError::TableNotFound(stmt.table.clone()))?;
         Ok(QueryResult::Dropped)
+    }
+
+    /// Try to extract a simple single-column range predicate for pushdown.
+    ///
+    /// Returns `(col_name, lo_inclusive, hi_inclusive)` when WHERE is:
+    ///   `col OP lit` or `col OP lit AND col OP lit` (same column, collapsible to range).
+    fn try_pushdown(expr: &Expr, schema: &TableSchema) -> Option<(usize, u64, u64)> {
+        match expr {
+            Expr::BinOp { op, left, right } => {
+                // Single comparison: col OP lit
+                if let (Expr::Col(name), Expr::Lit(LitVal::Int(n))) =
+                    (left.as_ref(), right.as_ref())
+                    && let Some((idx, _)) = schema.find(name)
+                {
+                    let v = *n as u64;
+                    return match op {
+                        BinOp::Eq => Some((idx, v, v)),
+                        BinOp::Gte => Some((idx, v, u64::MAX)),
+                        BinOp::Gt => Some((idx, v.saturating_add(1), u64::MAX)),
+                        BinOp::Lte => Some((idx, 0, v)),
+                        BinOp::Lt => Some((idx, 0, v.saturating_sub(1))),
+                        _ => None,
+                    };
+                }
+                // AND of two comparisons on the same column → range
+                if *op == BinOp::And
+                    && let (Some((i1, lo, _)), Some((i2, _, hi))) = (
+                        Self::try_pushdown(left, schema),
+                        Self::try_pushdown(right, schema),
+                    )
+                    && i1 == i2
+                {
+                    return Some((i1, lo, hi));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Build and return an EXPLAIN plan for a SELECT without executing it.
+    fn explain_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
+        let engine = self
+            .registry
+            .get(&stmt.table)
+            .map_err(|_| ExecError::TableNotFound(stmt.table.clone()))?;
+        let schema = &engine.schema;
+
+        let mut plan: Vec<String> = Vec::new();
+
+        // Scan node
+        if let Some(expr) = &stmt.where_clause
+            && let Some((col_idx, lo, hi)) = Self::try_pushdown(expr, schema)
+        {
+            let col_name = schema.get(col_idx).map(|c| c.name.as_str()).unwrap_or("?");
+            plan.push(format!(
+                "RangeScan  table={} col={} lo={} hi={}",
+                stmt.table, col_name, lo, hi
+            ));
+        } else {
+            plan.push(format!("FullScan   table={}", stmt.table));
+        }
+
+        // Filter node (always shown when WHERE exists)
+        if stmt.where_clause.is_some() {
+            plan.push("Filter     WHERE <expr>".to_string());
+        }
+
+        // Project node
+        let cols: Vec<String> = stmt
+            .columns
+            .iter()
+            .map(|c| match c {
+                SelectExpr::Star => "*".to_string(),
+                SelectExpr::Col(n) => n.clone(),
+            })
+            .collect();
+        plan.push(format!("Project    {}", cols.join(", ")));
+
+        // Sort node
+        if let Some((col, asc)) = &stmt.order_by {
+            plan.push(format!(
+                "Sort       {} {}",
+                col,
+                if *asc { "ASC" } else { "DESC" }
+            ));
+        }
+
+        // Limit node
+        if let Some(n) = stmt.limit {
+            plan.push(format!("Limit      {n}"));
+        }
+
+        Ok(QueryResult::ExplainPlan(plan))
     }
 
     /// Scan all rows and verify each is still live via `get()`.
@@ -551,6 +658,77 @@ mod tests {
             .unwrap()
         {
             QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_explain_full_scan() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        match ex.execute("EXPLAIN SELECT * FROM t").unwrap() {
+            QueryResult::ExplainPlan(lines) => {
+                assert!(lines[0].contains("FullScan"));
+                assert!(lines[0].contains("table=t"));
+                assert!(lines.iter().any(|l| l.contains("Project")));
+            }
+            _ => panic!("expected ExplainPlan"),
+        }
+    }
+
+    #[test]
+    fn test_explain_range_scan_pushdown() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        match ex.execute("EXPLAIN SELECT * FROM t WHERE pk = 5").unwrap() {
+            QueryResult::ExplainPlan(lines) => {
+                assert!(lines[0].contains("RangeScan"), "got: {}", lines[0]);
+                assert!(lines[0].contains("col=pk"));
+                assert!(lines[0].contains("lo=5"));
+                assert!(lines[0].contains("hi=5"));
+            }
+            _ => panic!("expected ExplainPlan"),
+        }
+    }
+
+    #[test]
+    fn test_explain_limit_and_order() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        match ex
+            .execute("EXPLAIN SELECT pk FROM t ORDER BY val DESC LIMIT 10")
+            .unwrap()
+        {
+            QueryResult::ExplainPlan(lines) => {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("Sort") && l.contains("DESC"))
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("Limit") && l.contains("10"))
+                );
+            }
+            _ => panic!("expected ExplainPlan"),
+        }
+    }
+
+    #[test]
+    fn test_pushdown_range_narrows_results() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        for i in 1u64..=10 {
+            ex.execute(&format!("INSERT INTO t (pk, val) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        // pk >= 5 AND pk <= 7 → expect exactly rows 5,6,7
+        match ex
+            .execute("SELECT * FROM t WHERE pk >= 5 AND pk <= 7")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
             _ => panic!(),
         }
     }

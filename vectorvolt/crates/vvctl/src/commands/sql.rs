@@ -80,6 +80,11 @@ fn exec_and_print(executor: &SqlExecutor, sql: &str, csv: bool) {
         Ok(QueryResult::Affected(n)) => println!("OK  {n} row(s) affected"),
         Ok(QueryResult::Created) => println!("OK  table created"),
         Ok(QueryResult::Dropped) => println!("OK  table dropped"),
+        Ok(QueryResult::ExplainPlan(lines)) => {
+            for line in &lines {
+                println!("{line}");
+            }
+        }
         Err(e) => eprintln!("ERROR  {e}"),
     }
 }

@@ -5,6 +5,7 @@ pub enum Stmt {
     Delete(DeleteStmt),
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
+    Explain(Box<SelectStmt>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

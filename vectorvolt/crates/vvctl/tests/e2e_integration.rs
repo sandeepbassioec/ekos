@@ -1,4 +1,4 @@
-﻿/// Layer 49 ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â End-to-end integration tests exercising the full stack:
+/// Layer 49 ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â End-to-end integration tests exercising the full stack:
 /// TCP server (vectorvolt-net), HTTP gateway (vectorvolt-http), and
 /// the DSL query bridge, all started in the same process.
 ///
@@ -55,7 +55,7 @@ impl E2EHarness {
             grpc_port: 50051,
             no_grpc: false,
             tpm_unseal: false,
-        metrics_port: 0,
+            metrics_port: 0,
             catalog: false,
             restore_catalog: false,
         };
@@ -468,4 +468,3 @@ async fn http_dsl_scan_returns_results() {
         resp.status()
     );
 }
-

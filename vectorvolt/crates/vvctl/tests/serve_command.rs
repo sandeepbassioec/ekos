@@ -1,4 +1,4 @@
-﻿//! Tests for Layer 188: vvctl serve command args (VV-CTL-188).
+//! Tests for Layer 188: vvctl serve command args (VV-CTL-188).
 // NOTE: ServeArgs fields match the actual struct in commands/serve.rs
 
 use std::net::SocketAddr;
@@ -92,4 +92,3 @@ fn serve_args_addr_is_socket_addr() {
     let a: SocketAddr = "127.0.0.1:7700".parse().unwrap();
     assert_eq!(make_args("127.0.0.1:7700").addr, a);
 }
-
