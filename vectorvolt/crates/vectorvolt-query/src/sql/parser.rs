@@ -63,6 +63,18 @@ impl SqlParser {
                     _ => Err(ParseError::UnexpectedToken(Token::Explain)),
                 }
             }
+            Token::Begin => {
+                self.advance();
+                Ok(Stmt::Begin)
+            }
+            Token::Commit => {
+                self.advance();
+                Ok(Stmt::Commit)
+            }
+            Token::Rollback => {
+                self.advance();
+                Ok(Stmt::Rollback)
+            }
             t => Err(ParseError::UnexpectedToken(t)),
         }
     }
@@ -281,6 +293,18 @@ impl SqlParser {
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.advance().clone() {
+            Token::Match => {
+                // MATCH(col, 'term')
+                self.expect(&Token::LParen)?;
+                let col = self.expect_ident()?;
+                self.expect(&Token::Comma)?;
+                let term = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                self.expect(&Token::RParen)?;
+                Ok(Expr::Match { col, term })
+            }
             Token::Ident(s) => Ok(Expr::Col(s)),
             Token::Integer(n) => Ok(Expr::Lit(LitVal::Int(n))),
             Token::Float(f) => Ok(Expr::Lit(LitVal::Float(f))),

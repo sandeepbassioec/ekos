@@ -6,10 +6,10 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 use store::OutputFormat;
 use vvctl::commands::{
-    bench, bench_net, catalog, chaos, cluster_cmd, completion, config, config_audit, connect,
-    disconnect, events_cmd, graph, hal, http, install, keygen, ledger_cmd, linux, ping, profile,
-    projection_cmd, query_cmd, serve, server_cmd, status_cmd, store, support_bundle, table,
-    topology, tune, wal, xdp_cmd,
+    bench, bench_net, catalog, cdc_cmd, chaos, cluster_cmd, completion, config, config_audit,
+    connect, disconnect, events_cmd, graph, hal, http, install, keygen, ledger_cmd, linux, ping,
+    profile, projection_cmd, query_cmd, serve, server_cmd, status_cmd, store, support_bundle,
+    table, topology, tune, wal, xdp_cmd,
 };
 use vvctl::ui;
 
@@ -171,6 +171,9 @@ enum Commands {
 
     /// Cluster membership management (nodes, join, leave, status, ring).
     Cluster(cluster_cmd::ClusterArgs),
+
+    /// Change Data Capture — inspect, query, and compact a table's CDC event log (S25-A).
+    Cdc(cdc_cmd::CdcArgs),
 
     /// Domain event schema discovery and DLQ management (list, show, diff) — S23/S24.
     Events(events_cmd::EventsArgs),
@@ -364,6 +367,8 @@ fn main() -> Result<()> {
         Commands::Install(args) => install::run(args)?,
 
         Commands::Cluster(args) => cluster_cmd::run(args)?,
+
+        Commands::Cdc(args) => cdc_cmd::run(args)?,
 
         Commands::Events(args) => events_cmd::run(args)?,
 

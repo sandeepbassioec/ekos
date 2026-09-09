@@ -6,6 +6,9 @@ pub enum Stmt {
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
     Explain(Box<SelectStmt>),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +65,11 @@ pub enum Expr {
         op: BinOp,
         left: Box<Expr>,
         right: Box<Expr>,
+    },
+    /// `MATCH(col, 'term')` — full-text search predicate.
+    Match {
+        col: String,
+        term: String,
     },
 }
 

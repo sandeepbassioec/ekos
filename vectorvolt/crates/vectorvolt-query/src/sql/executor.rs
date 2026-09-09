@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
-use vectorvolt_engine::{ColumnDef, ColumnType, EngineRow, TableRegistry, TableSchema, TypedValue};
+use vectorvolt_engine::{
+    ColumnDef, ColumnType, EngineRow, TableRegistry, TableSchema, TxnId, TypedValue,
+};
 
 use crate::sql::ast::*;
+use crate::sql::fts::TextStore;
 use crate::sql::lexer::{LexError, Lexer};
 use crate::sql::parser::{ParseError, SqlParser};
 
@@ -23,6 +27,10 @@ pub enum ExecError {
     Engine(String),
     #[error("wrong column count: expected {expected}, got {got}")]
     ColumnCountMismatch { expected: usize, got: usize },
+    #[error("no active transaction")]
+    NoActiveTxn,
+    #[error("transaction already active")]
+    TxnAlreadyActive,
 }
 
 #[derive(Debug, Clone)]
@@ -35,15 +43,26 @@ pub enum QueryResult {
     Created,
     Dropped,
     ExplainPlan(Vec<String>),
+    TxBegin,
+    TxCommit,
+    TxRollback,
 }
+
+/// Per-table open transaction id, keyed by table name.
+type TxnMap = HashMap<String, TxnId>;
 
 pub struct SqlExecutor {
     registry: Arc<TableRegistry>,
+    /// Active transaction state. `None` = auto-commit mode.
+    txn: Mutex<Option<TxnMap>>,
 }
 
 impl SqlExecutor {
     pub fn new(registry: Arc<TableRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            txn: Mutex::new(None),
+        }
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, ExecError> {
@@ -60,7 +79,60 @@ impl SqlExecutor {
             Stmt::CreateTable(s) => self.exec_create_table(s),
             Stmt::DropTable(s) => self.exec_drop_table(s),
             Stmt::Explain(s) => self.explain_select(*s),
+            Stmt::Begin => self.exec_begin(),
+            Stmt::Commit => self.exec_commit(),
+            Stmt::Rollback => self.exec_rollback(),
         }
+    }
+
+    fn exec_begin(&self) -> Result<QueryResult, ExecError> {
+        let mut guard = self.txn.lock().unwrap();
+        if guard.is_some() {
+            return Err(ExecError::TxnAlreadyActive);
+        }
+        *guard = Some(HashMap::new());
+        Ok(QueryResult::TxBegin)
+    }
+
+    fn exec_commit(&self) -> Result<QueryResult, ExecError> {
+        let mut guard = self.txn.lock().unwrap();
+        let txn_map = guard.take().ok_or(ExecError::NoActiveTxn)?;
+        for (table, txn_id) in txn_map {
+            let engine = self
+                .registry
+                .get(&table)
+                .map_err(|_| ExecError::TableNotFound(table.clone()))?;
+            engine
+                .commit_txn(txn_id)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        }
+        Ok(QueryResult::TxCommit)
+    }
+
+    fn exec_rollback(&self) -> Result<QueryResult, ExecError> {
+        let mut guard = self.txn.lock().unwrap();
+        let txn_map = guard.take().ok_or(ExecError::NoActiveTxn)?;
+        for (table, txn_id) in txn_map {
+            if let Ok(engine) = self.registry.get(&table) {
+                let _ = engine.rollback_txn(txn_id);
+            }
+        }
+        Ok(QueryResult::TxRollback)
+    }
+
+    /// Return the active txn_id for `table`, creating one via `engine.begin()` if needed.
+    /// Returns `None` when not in a transaction (auto-commit mode).
+    fn txn_id_for(&self, table: &str) -> Option<TxnId> {
+        let mut guard = self.txn.lock().unwrap();
+        let map = guard.as_mut()?;
+        if let Some(&id) = map.get(table) {
+            return Some(id);
+        }
+        // Lazy begin: open a txn for this table on first DML touch.
+        let engine = self.registry.get(table).ok()?;
+        let id = engine.begin();
+        map.insert(table.to_owned(), id);
+        Some(id)
     }
 
     fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
@@ -108,7 +180,8 @@ impl SqlExecutor {
         };
 
         // Filter by WHERE (still needed for non-pushdown predicates or compound exprs)
-        let filtered = self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema)?;
+        let filtered =
+            self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
 
         // Sort by ORDER BY
         let mut sorted = filtered;
@@ -191,9 +264,29 @@ impl SqlExecutor {
         }
 
         let pk = row_vals[0];
-        engine
-            .insert(pk, row_vals)
-            .map_err(|e| ExecError::Engine(e.to_string()))?;
+        if let Some(txn_id) = self.txn_id_for(&stmt.table) {
+            engine
+                .insert_txn(txn_id, pk, row_vals)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        } else {
+            engine
+                .insert(pk, row_vals)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        }
+
+        // Persist text values for TEXT columns into the FTS sidecar.
+        for (col_name, expr) in stmt.columns.iter().zip(stmt.values.iter()) {
+            if let Some((_, col_def)) = schema.find(col_name)
+                && col_def.col_type == ColumnType::Text
+                && let Expr::Lit(LitVal::Str(text)) = expr
+            {
+                let base = self.registry.base_dir();
+                if let Ok(mut store) = TextStore::load(base, &stmt.table, col_name) {
+                    store.insert(pk, text.clone());
+                    let _ = store.save();
+                }
+            }
+        }
 
         Ok(QueryResult::Affected(1))
     }
@@ -209,13 +302,22 @@ impl SqlExecutor {
         // Get all live rows then filter
         let all_rows = self.scan_live(&engine)?;
 
-        let to_delete = self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema)?;
+        let to_delete =
+            self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
         let count = to_delete.len() as u64;
 
-        for row in to_delete {
-            engine
-                .delete(row.pk)
-                .map_err(|e| ExecError::Engine(e.to_string()))?;
+        if let Some(txn_id) = self.txn_id_for(&stmt.table) {
+            for row in to_delete {
+                engine
+                    .delete_txn(txn_id, row.pk)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+            }
+        } else {
+            for row in to_delete {
+                engine
+                    .delete(row.pk)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+            }
         }
 
         Ok(QueryResult::Affected(count))
@@ -376,12 +478,13 @@ impl SqlExecutor {
         rows: Vec<EngineRow>,
         where_clause: Option<&Expr>,
         schema: &TableSchema,
+        table: &str,
     ) -> Result<Vec<EngineRow>, ExecError> {
         match where_clause {
             None => Ok(rows),
             Some(expr) => rows
                 .into_iter()
-                .filter_map(|row| match self.eval_expr(expr, &row, schema) {
+                .filter_map(|row| match self.eval_expr(expr, &row, schema, table) {
                     Ok(true) => Some(Ok(row)),
                     Ok(false) => None,
                     Err(e) => Some(Err(e)),
@@ -395,24 +498,32 @@ impl SqlExecutor {
         expr: &Expr,
         row: &EngineRow,
         schema: &TableSchema,
+        table: &str,
     ) -> Result<bool, ExecError> {
         match expr {
             Expr::BinOp { op, left, right } => {
                 match op {
-                    BinOp::And => {
-                        Ok(self.eval_expr(left, row, schema)?
-                            && self.eval_expr(right, row, schema)?)
-                    }
-                    BinOp::Or => {
-                        Ok(self.eval_expr(left, row, schema)?
-                            || self.eval_expr(right, row, schema)?)
-                    }
+                    BinOp::And => Ok(self.eval_expr(left, row, schema, table)?
+                        && self.eval_expr(right, row, schema, table)?),
+                    BinOp::Or => Ok(self.eval_expr(left, row, schema, table)?
+                        || self.eval_expr(right, row, schema, table)?),
                     _ => {
                         // Comparison
                         let lv = self.eval_value(left, row, schema)?;
                         let rv = self.eval_value(right, row, schema)?;
                         Ok(compare_values(&lv, op, &rv))
                     }
+                }
+            }
+            Expr::Match { col, term } => {
+                let base = self.registry.base_dir();
+                match TextStore::load(base, table, col) {
+                    Ok(store) => {
+                        let index = store.build_index();
+                        let hits = index.search(term);
+                        Ok(hits.binary_search(&row.pk).is_ok())
+                    }
+                    Err(_) => Ok(false),
                 }
             }
             _ => Err(ExecError::TypeError("expected boolean expression".into())),
@@ -439,8 +550,8 @@ impl SqlExecutor {
                 LitVal::Str(s) => s.clone(),
                 LitVal::Bool(b) => b.to_string(),
             }),
-            Expr::BinOp { .. } => Err(ExecError::TypeError(
-                "nested binop in value position".into(),
+            Expr::BinOp { .. } | Expr::Match { .. } => Err(ExecError::TypeError(
+                "expected scalar value expression".into(),
             )),
         }
     }
@@ -729,6 +840,143 @@ mod tests {
             .unwrap()
         {
             QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_begin_commit() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        assert!(matches!(ex.execute("BEGIN").unwrap(), QueryResult::TxBegin));
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 100)")
+            .unwrap();
+        assert!(matches!(
+            ex.execute("COMMIT").unwrap(),
+            QueryResult::TxCommit
+        ));
+        match ex.execute("SELECT * FROM t").unwrap() {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_begin_rollback() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 100)")
+            .unwrap();
+        assert!(matches!(
+            ex.execute("ROLLBACK").unwrap(),
+            QueryResult::TxRollback
+        ));
+        match ex.execute("SELECT * FROM t").unwrap() {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_double_begin_err() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        assert!(matches!(
+            ex.execute("BEGIN"),
+            Err(ExecError::TxnAlreadyActive)
+        ));
+        ex.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn test_commit_without_begin_err() {
+        let (ex, _dir) = setup();
+        assert!(matches!(ex.execute("COMMIT"), Err(ExecError::NoActiveTxn)));
+    }
+
+    #[test]
+    fn test_abort_alias() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        ex.execute("INSERT INTO t (pk) VALUES (1)").unwrap();
+        assert!(matches!(
+            ex.execute("ABORT").unwrap(),
+            QueryResult::TxRollback
+        ));
+        match ex.execute("SELECT * FROM t").unwrap() {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_fts_match_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE docs (pk U64, body TEXT)").unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (1, 'hello world')")
+            .unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (2, 'foo bar')")
+            .unwrap();
+        match ex
+            .execute("SELECT * FROM docs WHERE MATCH(body, 'hello')")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], "1");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_fts_match_no_hit() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE docs (pk U64, body TEXT)").unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (1, 'hello world')")
+            .unwrap();
+        match ex
+            .execute("SELECT * FROM docs WHERE MATCH(body, 'rust')")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_fts_match_case_insensitive() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE docs (pk U64, body TEXT)").unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (1, 'Hello World')")
+            .unwrap();
+        match ex
+            .execute("SELECT * FROM docs WHERE MATCH(body, 'hello')")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_fts_match_multiple_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE docs (pk U64, body TEXT)").unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (1, 'rust is fast')")
+            .unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (2, 'rust and safety')")
+            .unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (3, 'python is slow')")
+            .unwrap();
+        match ex
+            .execute("SELECT * FROM docs WHERE MATCH(body, 'rust')")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
             _ => panic!(),
         }
     }

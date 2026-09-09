@@ -138,6 +138,21 @@ impl PgSession {
                     .write_all(&encode_command_complete("DROP TABLE"))
                     .await?;
             }
+            QueryResult::TxBegin => {
+                self.stream
+                    .write_all(&encode_command_complete("BEGIN"))
+                    .await?;
+            }
+            QueryResult::TxCommit => {
+                self.stream
+                    .write_all(&encode_command_complete("COMMIT"))
+                    .await?;
+            }
+            QueryResult::TxRollback => {
+                self.stream
+                    .write_all(&encode_command_complete("ROLLBACK"))
+                    .await?;
+            }
             QueryResult::ExplainPlan(lines) => {
                 let body = lines.join("\n");
                 self.stream
