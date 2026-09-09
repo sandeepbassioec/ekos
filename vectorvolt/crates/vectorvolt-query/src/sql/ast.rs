@@ -13,9 +13,22 @@ pub enum Stmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum AggFunc {
+    Count, // COUNT(*)
+    Sum,
+    Min,
+    Max,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum SelectExpr {
     Star,
     Col(String),
+    /// `COUNT(*)`, `SUM(col)`, `MIN(col)`, `MAX(col)`
+    Agg {
+        func: AggFunc,
+        col: Option<String>,
+    },
 }
 
 /// ORDER BY clause — either a plain column sort or a vector distance ranking.
@@ -32,6 +45,7 @@ pub struct SelectStmt {
     pub columns: Vec<SelectExpr>,
     pub table: String,
     pub where_clause: Option<Expr>,
+    pub group_by: Option<String>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<u64>,
     pub distinct: bool,

@@ -90,17 +90,43 @@ impl SqlParser {
         };
         let mut columns = Vec::new();
         loop {
-            match self.peek().clone() {
+            let expr = match self.peek().clone() {
                 Token::Star => {
                     self.advance();
-                    columns.push(SelectExpr::Star);
+                    SelectExpr::Star
+                }
+                Token::Count => {
+                    self.advance();
+                    self.expect(&Token::LParen)?;
+                    self.expect(&Token::Star)?;
+                    self.expect(&Token::RParen)?;
+                    SelectExpr::Agg {
+                        func: AggFunc::Count,
+                        col: None,
+                    }
+                }
+                Token::Sum | Token::Min | Token::Max => {
+                    let func = match self.advance().clone() {
+                        Token::Sum => AggFunc::Sum,
+                        Token::Min => AggFunc::Min,
+                        Token::Max => AggFunc::Max,
+                        _ => unreachable!(),
+                    };
+                    self.expect(&Token::LParen)?;
+                    let col = self.expect_ident()?;
+                    self.expect(&Token::RParen)?;
+                    SelectExpr::Agg {
+                        func,
+                        col: Some(col),
+                    }
                 }
                 Token::Ident(name) => {
                     self.advance();
-                    columns.push(SelectExpr::Col(name));
+                    SelectExpr::Col(name)
                 }
                 t => return Err(ParseError::UnexpectedToken(t)),
-            }
+            };
+            columns.push(expr);
             if self.peek() == &Token::Comma {
                 self.advance();
             } else {
@@ -113,6 +139,12 @@ impl SqlParser {
         if self.peek() == &Token::Where {
             self.advance();
             where_clause = Some(self.parse_expr()?);
+        }
+        let mut group_by = None;
+        if self.peek() == &Token::Group {
+            self.advance(); // GROUP
+            self.expect(&Token::By)?;
+            group_by = Some(self.expect_ident()?);
         }
         let mut order_by = None;
         if self.peek() == &Token::Order {
@@ -162,6 +194,7 @@ impl SqlParser {
             columns,
             table,
             where_clause,
+            group_by,
             order_by,
             limit,
             distinct,
