@@ -172,6 +172,7 @@ impl<'a> Planner<'a> {
                     .map(|cd| cd.name.clone())
                     .collect::<Vec<_>>(),
                 crate::sql::ast::SelectExpr::Col(name) => vec![name.clone()],
+                crate::sql::ast::SelectExpr::QualifiedCol { col, .. } => vec![col.clone()],
                 crate::sql::ast::SelectExpr::Agg { func, col } => {
                     use crate::sql::ast::AggFunc;
                     let label = match func {

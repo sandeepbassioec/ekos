@@ -152,6 +152,24 @@ impl SqlExecutor {
         let schema = &engine.schema;
         let col_names: Vec<String> = schema.columns().iter().map(|c| c.name.clone()).collect();
 
+        // Use the query planner to choose scan strategy.
+        let est_rows: u64 = engine
+            .partition_meta()
+            .iter()
+            .map(|p| p.row_count as u64)
+            .sum::<u64>()
+            .max(1);
+        let planner = Planner::new(schema, est_rows);
+        let plan = planner.plan(&stmt);
+        let left_rows = self.execute_scan(&plan, &engine)?;
+        let filtered_left =
+            self.filter_rows(left_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
+
+        // ── JOIN path ──────────────────────────────────────────────────────────
+        if !stmt.joins.is_empty() {
+            return self.exec_join(stmt, filtered_left, schema, &col_names);
+        }
+
         // Determine output columns (Agg variants handled separately below)
         let out_cols: Vec<(String, usize)> = stmt
             .columns
@@ -169,25 +187,18 @@ impl SqlExecutor {
                         vec![]
                     }
                 }
+                SelectExpr::QualifiedCol { col, .. } => {
+                    if let Some((idx, _)) = schema.find(col) {
+                        vec![(col.clone(), idx)]
+                    } else {
+                        vec![]
+                    }
+                }
                 SelectExpr::Agg { .. } => vec![],
             })
             .collect();
 
-        // Use the query planner to choose scan strategy.
-        // Estimate row count from partition metadata (sum of partition row counts).
-        let est_rows: u64 = engine
-            .partition_meta()
-            .iter()
-            .map(|p| p.row_count as u64)
-            .sum::<u64>()
-            .max(1);
-        let planner = Planner::new(schema, est_rows);
-        let plan = planner.plan(&stmt);
-        let all_rows = self.execute_scan(&plan, &engine)?;
-
-        // Filter by WHERE (still needed for non-pushdown predicates or compound exprs)
-        let filtered =
-            self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
+        let filtered = filtered_left;
 
         // ── Aggregate path (COUNT/SUM/MIN/MAX with optional GROUP BY) ─────────
         let has_agg = stmt
@@ -425,6 +436,164 @@ impl SqlExecutor {
             },
             _ => String::new(),
         }
+    }
+
+    /// Hash-join left rows against one or more right tables.
+    /// Produces a flat string-row result (`QueryResult::Rows`).
+    fn exec_join(
+        &self,
+        stmt: SelectStmt,
+        left_rows: Vec<EngineRow>,
+        left_schema: &TableSchema,
+        left_col_names: &[String],
+    ) -> Result<QueryResult, ExecError> {
+        // Build combined rows: each element is (left_values, right_values_per_join_table)
+        // We work in display-string space for simplicity.
+
+        // Collect left display rows
+        let left_display: Vec<Vec<String>> = left_rows
+            .iter()
+            .map(|row| {
+                left_col_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let col_type = left_schema
+                            .get(i)
+                            .map(|c| c.col_type)
+                            .unwrap_or(ColumnType::U64);
+                        TypedValue::from_bits(col_type, row.values.get(i).copied().unwrap_or(0))
+                            .display_str()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // For each JOIN, load the right table and build a HashMap<join_key → Vec<display_row>>
+        type RightMap = HashMap<String, Vec<Vec<String>>>;
+        let mut right_tables: Vec<(Vec<String>, RightMap)> = Vec::new();
+        for join in &stmt.joins {
+            let right_engine = self
+                .registry
+                .get(&join.table)
+                .map_err(|_| ExecError::TableNotFound(join.table.clone()))?;
+            let right_schema = &right_engine.schema;
+            let right_col_names: Vec<String> = right_schema
+                .columns()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            let right_rows = self.scan_live(&right_engine)?;
+            let right_col_count = right_schema.col_count();
+
+            // Find join key index in right table
+            let right_key_idx = right_schema
+                .find(&join.right_col)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+
+            let mut map: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+            for row in &right_rows {
+                let right_col_type = right_schema
+                    .get(right_key_idx)
+                    .map(|c| c.col_type)
+                    .unwrap_or(ColumnType::U64);
+                let key = TypedValue::from_bits(
+                    right_col_type,
+                    row.values.get(right_key_idx).copied().unwrap_or(0),
+                )
+                .display_str();
+                let display: Vec<String> = (0..right_col_count)
+                    .map(|i| {
+                        let ct = right_schema
+                            .get(i)
+                            .map(|c| c.col_type)
+                            .unwrap_or(ColumnType::U64);
+                        TypedValue::from_bits(ct, row.values.get(i).copied().unwrap_or(0))
+                            .display_str()
+                    })
+                    .collect();
+                map.entry(key).or_default().push(display);
+            }
+            right_tables.push((right_col_names, map));
+        }
+
+        // Find left key index for each join
+        let left_key_indices: Vec<usize> = stmt
+            .joins
+            .iter()
+            .map(|j| left_schema.find(&j.left_col).map(|(i, _)| i).unwrap_or(0))
+            .collect();
+
+        // Produce combined rows (nested-loop over joins)
+        let mut combined: Vec<Vec<String>> = left_display;
+        for (join_idx, (join, (right_col_names, right_map))) in
+            stmt.joins.iter().zip(right_tables.iter()).enumerate()
+        {
+            let left_key_idx = left_key_indices[join_idx];
+            let right_width = right_col_names.len();
+            let mut next: Vec<Vec<String>> = Vec::new();
+            for left_row in &combined {
+                let key = left_row.get(left_key_idx).cloned().unwrap_or_default();
+                if let Some(right_matches) = right_map.get(&key) {
+                    for right_row in right_matches {
+                        let mut merged = left_row.clone();
+                        merged.extend(right_row.clone());
+                        next.push(merged);
+                    }
+                } else if join.kind == JoinKind::Left {
+                    let mut merged = left_row.clone();
+                    merged.extend(vec![String::new(); right_width]);
+                    next.push(merged);
+                }
+                // INNER JOIN: drop unmatched left rows (do nothing)
+            }
+            combined = next;
+        }
+
+        // Build column headers
+        let mut all_col_names: Vec<String> = left_col_names.to_vec();
+        for (join, (right_col_names, _)) in stmt.joins.iter().zip(right_tables.iter()) {
+            for col in right_col_names {
+                all_col_names.push(format!("{}.{}", join.table, col));
+            }
+        }
+
+        // Project SELECT columns
+        let (out_headers, out_rows) = if stmt.columns.iter().any(|c| matches!(c, SelectExpr::Star))
+        {
+            (all_col_names, combined)
+        } else {
+            let mut headers = Vec::new();
+            let mut rows: Vec<Vec<String>> = combined.iter().map(|_| Vec::new()).collect();
+            for col_expr in &stmt.columns {
+                let col_name = match col_expr {
+                    SelectExpr::Col(c) | SelectExpr::QualifiedCol { col: c, .. } => c.clone(),
+                    _ => continue,
+                };
+                let col_idx = all_col_names
+                    .iter()
+                    .position(|n| n == &col_name || n.ends_with(&format!(".{col_name}")));
+                if let Some(idx) = col_idx {
+                    headers.push(col_name);
+                    for (i, row) in combined.iter().enumerate() {
+                        rows[i].push(row.get(idx).cloned().unwrap_or_default());
+                    }
+                }
+            }
+            (headers, rows)
+        };
+
+        // Apply LIMIT
+        let mut out_rows = out_rows;
+        if let Some(lim) = stmt.limit {
+            out_rows.truncate(lim as usize);
+        }
+
+        Ok(QueryResult::Rows {
+            columns: out_headers,
+            rows: out_rows,
+        })
     }
 
     fn exec_insert_select(&self, stmt: InsertSelectStmt) -> Result<QueryResult, ExecError> {
@@ -913,6 +1082,13 @@ impl SqlExecutor {
                 LitVal::Str(s) => s.clone(),
                 LitVal::Bool(b) => b.to_string(),
             }),
+            Expr::QualifiedCol { col, .. } => {
+                let (idx, col_def) = schema
+                    .find(col)
+                    .ok_or_else(|| ExecError::ColumnNotFound(col.clone()))?;
+                let bits = row.values.get(idx).copied().unwrap_or(0);
+                Ok(TypedValue::from_bits(col_def.col_type, bits).display_str())
+            }
             Expr::BinOp { .. } | Expr::Match { .. } | Expr::In { .. } | Expr::Between { .. } => {
                 Err(ExecError::TypeError(
                     "expected scalar value expression".into(),
@@ -1794,6 +1970,109 @@ mod tests {
         if let QueryResult::Rows { rows, .. } = rows {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0][1], "42");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s33_inner_join_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE orders (pk U64, user_id U64, amount U64)")
+            .unwrap();
+        ex.execute("CREATE TABLE users (pk U64, name U64)").unwrap();
+        ex.execute("INSERT INTO orders (pk, user_id, amount) VALUES (1, 10, 100)")
+            .unwrap();
+        ex.execute("INSERT INTO orders (pk, user_id, amount) VALUES (2, 20, 200)")
+            .unwrap();
+        ex.execute("INSERT INTO users (pk, name) VALUES (10, 1)")
+            .unwrap();
+        ex.execute("INSERT INTO users (pk, name) VALUES (20, 2)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT * FROM orders INNER JOIN users ON user_id = pk")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s33_inner_join_no_match() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE a (pk U64, b_id U64)").unwrap();
+        ex.execute("CREATE TABLE b (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO a (pk, b_id) VALUES (1, 99)")
+            .unwrap();
+        ex.execute("INSERT INTO b (pk, v) VALUES (1, 42)").unwrap();
+        let r = ex
+            .execute("SELECT * FROM a INNER JOIN b ON b_id = pk")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 0);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s33_left_join_keeps_unmatched() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE a (pk U64, b_id U64)").unwrap();
+        ex.execute("CREATE TABLE b (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO a (pk, b_id) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO a (pk, b_id) VALUES (2, 99)")
+            .unwrap();
+        ex.execute("INSERT INTO b (pk, v) VALUES (10, 42)").unwrap();
+        let r = ex
+            .execute("SELECT * FROM a LEFT JOIN b ON b_id = pk")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s33_join_with_where() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE o (pk U64, uid U64, amt U64)")
+            .unwrap();
+        ex.execute("CREATE TABLE u (pk U64, active U64)").unwrap();
+        ex.execute("INSERT INTO o (pk, uid, amt) VALUES (1, 1, 50)")
+            .unwrap();
+        ex.execute("INSERT INTO o (pk, uid, amt) VALUES (2, 2, 150)")
+            .unwrap();
+        ex.execute("INSERT INTO u (pk, active) VALUES (1, 1)")
+            .unwrap();
+        ex.execute("INSERT INTO u (pk, active) VALUES (2, 1)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT * FROM o INNER JOIN u ON uid = pk WHERE amt > 100")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s33_join_keyword_no_inner() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE a (pk U64, b_id U64)").unwrap();
+        ex.execute("CREATE TABLE b (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO a (pk, b_id) VALUES (1, 5)")
+            .unwrap();
+        ex.execute("INSERT INTO b (pk, v) VALUES (5, 99)").unwrap();
+        let r = ex.execute("SELECT * FROM a JOIN b ON b_id = pk").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "5");
         } else {
             panic!("expected rows");
         }
