@@ -8,8 +8,8 @@ use store::OutputFormat;
 use vvctl::commands::{
     bench, bench_net, catalog, chaos, cluster_cmd, completion, config, config_audit, connect,
     disconnect, events_cmd, graph, hal, http, install, keygen, ledger_cmd, linux, ping, profile,
-    projection_cmd, serve, server_cmd, status_cmd, store, support_bundle, table, topology, tune,
-    wal, xdp_cmd,
+    projection_cmd, query_cmd, serve, server_cmd, status_cmd, store, support_bundle, table,
+    topology, tune, wal, xdp_cmd,
 };
 use vvctl::ui;
 
@@ -174,6 +174,9 @@ enum Commands {
 
     /// Domain event schema discovery and DLQ management (list, show, diff) — S23/S24.
     Events(events_cmd::EventsArgs),
+
+    /// Execute ad-hoc SQL against a local table directory (SELECT/INSERT/DELETE/EXPLAIN) — S24-B.
+    Query(query_cmd::QueryArgs),
 
     /// Print version and build info.
     Version,
@@ -363,6 +366,8 @@ fn main() -> Result<()> {
         Commands::Cluster(args) => cluster_cmd::run(args)?,
 
         Commands::Events(args) => events_cmd::run(args)?,
+
+        Commands::Query(args) => query_cmd::run(args)?,
 
         Commands::Version => print_version(),
     }

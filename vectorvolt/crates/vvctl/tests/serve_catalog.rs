@@ -1,4 +1,4 @@
-﻿//! Integration tests for L105: vvctl serve wired to TxnManager + ShardCatalog (VV-CTL-001).
+//! Integration tests for L105: vvctl serve wired to TxnManager + ShardCatalog (VV-CTL-001).
 //!
 //! Tests use `bind()` with port 0 (OS-assigned) so they never conflict.
 //! The `run()` path (blocking event loop) is not tested here â€” CI covers that via smoke tests.
@@ -248,4 +248,3 @@ fn bind_single_table_uses_cli_flush_threshold() {
     // engine is present in single-table mode
     assert!(bound.engine.is_some());
 }
-

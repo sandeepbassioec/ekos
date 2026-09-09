@@ -25,6 +25,7 @@ pub enum Token {
     Not,
     As,
     Distinct,
+    Explain,
     // Types
     KwU64,
     KwI64,
@@ -229,6 +230,7 @@ impl<'a> Lexer<'a> {
             "NOT" => Token::Not,
             "AS" => Token::As,
             "DISTINCT" => Token::Distinct,
+            "EXPLAIN" => Token::Explain,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,

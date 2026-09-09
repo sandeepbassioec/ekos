@@ -1,4 +1,4 @@
-﻿//! Integration tests for L108: `vvctl catalog restore` + `serve --restore-catalog` (VV-CTL-004).
+//! Integration tests for L108: `vvctl catalog restore` + `serve --restore-catalog` (VV-CTL-004).
 
 use tempfile::TempDir;
 use vvctl::commands::catalog::{CatalogArgs, CatalogCommand, run};
@@ -236,4 +236,3 @@ fn serve_restore_catalog_empty_registry_is_noop() {
     let cat = bound.catalog.unwrap();
     assert_eq!(cat.table_count(), 0);
 }
-

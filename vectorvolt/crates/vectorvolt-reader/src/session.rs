@@ -138,6 +138,12 @@ impl PgSession {
                     .write_all(&encode_command_complete("DROP TABLE"))
                     .await?;
             }
+            QueryResult::ExplainPlan(lines) => {
+                let body = lines.join("\n");
+                self.stream
+                    .write_all(&encode_command_complete(&format!("EXPLAIN\n{body}")))
+                    .await?;
+            }
         }
         Ok(())
     }

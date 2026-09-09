@@ -56,6 +56,13 @@ impl SqlParser {
             Token::Delete => self.parse_delete(),
             Token::Create => self.parse_create_table(),
             Token::Drop => self.parse_drop_table(),
+            Token::Explain => {
+                self.advance(); // EXPLAIN
+                match self.parse_select()? {
+                    Stmt::Select(s) => Ok(Stmt::Explain(Box::new(s))),
+                    _ => Err(ParseError::UnexpectedToken(Token::Explain)),
+                }
+            }
             t => Err(ParseError::UnexpectedToken(t)),
         }
     }
