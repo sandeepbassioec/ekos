@@ -8,6 +8,7 @@ use vectorvolt_engine::{
 
 use crate::sql::ast::*;
 use crate::sql::fts::TextStore;
+use crate::sql::hnsw::HnswIndex;
 use crate::sql::lexer::{LexError, Lexer};
 use crate::sql::parser::{ParseError, SqlParser};
 use crate::sql::planner::{PhysicalPlan, Planner};
@@ -207,17 +208,28 @@ impl SqlExecutor {
                 }
             }
             Some(OrderBy::VecDistance { col, query }) => {
-                // Build a pk→distance map from the VectorStore sidecar.
                 let base = self.registry.base_dir();
+                // When LIMIT is set, try the HNSW index for approximate ANN.
+                // Fall back to brute-force VectorStore when the index is empty or absent.
+                let k = stmt.limit.unwrap_or(u64::MAX) as usize;
+                let hnsw_results = HnswIndex::load(base, &stmt.table, col, DistanceMetric::L2)
+                    .ok()
+                    .map(|idx| idx.search(query, k.max(1)))
+                    .filter(|r| !r.is_empty());
+
                 let dist_map: std::collections::HashMap<u64, f32> =
-                    VectorStore::load(base, &stmt.table, col)
-                        .map(|store| {
-                            store
-                                .ranked(query, DistanceMetric::L2)
-                                .into_iter()
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    if let Some(results) = hnsw_results {
+                        results.into_iter().collect()
+                    } else {
+                        VectorStore::load(base, &stmt.table, col)
+                            .map(|store| {
+                                store
+                                    .ranked(query, DistanceMetric::L2)
+                                    .into_iter()
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
                 sorted.sort_by(|a, b| {
                     let da = dist_map.get(&a.pk).copied().unwrap_or(f32::MAX);
                     let db = dist_map.get(&b.pk).copied().unwrap_or(f32::MAX);
@@ -320,10 +332,17 @@ impl SqlExecutor {
                     ColumnType::Vector(_) => {
                         if let Expr::Lit(LitVal::Str(vec_str)) = expr
                             && let Some(vec) = parse_vec_literal(vec_str)
-                            && let Ok(mut store) = VectorStore::load(base, &stmt.table, col_name)
                         {
-                            store.insert(pk, vec);
-                            let _ = store.save();
+                            if let Ok(mut store) = VectorStore::load(base, &stmt.table, col_name) {
+                                store.insert(pk, vec.clone());
+                                let _ = store.save();
+                            }
+                            if let Ok(mut idx) =
+                                HnswIndex::load(base, &stmt.table, col_name, DistanceMetric::L2)
+                            {
+                                idx.insert(pk, vec);
+                                let _ = idx.save();
+                            }
                         }
                     }
                     _ => {}

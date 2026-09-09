@@ -222,16 +222,16 @@ impl<'a> Planner<'a> {
                 if is_pk { 0.1 } else { 0.5 } // range
             };
             let range_cost = (self.stats as f64 * selectivity).max(1.0) as u64;
-            if range_cost < self.stats {
-                return PhysicalPlan::RangeScan {
-                    table: table.to_owned(),
-                    col_idx,
-                    col_name,
-                    lo,
-                    hi,
-                    est_rows: range_cost,
-                };
-            }
+            // RangeScan is always at least as good as FullScan — prefer it whenever
+            // a pushdown predicate exists (even on empty/tiny tables).
+            return PhysicalPlan::RangeScan {
+                table: table.to_owned(),
+                col_idx,
+                col_name,
+                lo,
+                hi,
+                est_rows: range_cost,
+            };
         }
         PhysicalPlan::FullScan {
             table: table.to_owned(),
