@@ -32,6 +32,7 @@ members = [
     "crates/vectorvolt-crypto",
     "crates/vectorvolt-tpm",
     "crates/vectorvolt-semantic",
+    "crates/vectorvolt-events",
 ]
 resolver = "2"
 
@@ -87,6 +88,10 @@ toml           = { version = "0.8", features = ["parse"] }
 # scripting / dynamic evaluation
 dashmap        = "6"
 rhai           = { version = "1.20", default-features = false, features = ["sync"] }
+rmp-serde      = "1"
+hmac           = "0.12"
+sha2           = "0.10"
+hex            = "0.4"
 # bitmap / probabilistic
 roaring        = "0.10"
 # compression (cold-tier storage)
@@ -115,6 +120,7 @@ vectorvolt-projection  = { path = "crates/vectorvolt-projection" }
 vectorvolt-sink        = { path = "crates/vectorvolt-sink" }
 vectorvolt-sink-sdk    = { path = "crates/vectorvolt-sink-sdk" }
 vectorvolt-semantic = { path = "crates/vectorvolt-semantic" }
+vectorvolt-events   = { path = "crates/vectorvolt-events" }
 vectorvolt-net     = { path = "crates/vectorvolt-net" }
 vectorvolt-http    = { path = "crates/vectorvolt-http" }
 vectorvolt-cluster = { path = "crates/vectorvolt-cluster" }
