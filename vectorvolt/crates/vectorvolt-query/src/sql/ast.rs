@@ -2,6 +2,7 @@
 pub enum Stmt {
     Select(SelectStmt),
     Insert(InsertStmt),
+    Update(UpdateStmt),
     Delete(DeleteStmt),
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
@@ -41,6 +42,14 @@ pub struct InsertStmt {
     pub table: String,
     pub columns: Vec<String>,
     pub values: Vec<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStmt {
+    pub table: String,
+    /// `(col_name, new_value_expr)` pairs from the SET clause.
+    pub assignments: Vec<(String, Expr)>,
+    pub where_clause: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
