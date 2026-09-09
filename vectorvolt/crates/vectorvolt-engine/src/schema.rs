@@ -34,6 +34,9 @@ pub enum ColumnType {
     Timestamp,
     /// Decimal fixed-point: value × 10⁻⁶, stored as two's-complement `u64`.
     Decimal,
+    /// UTF-8 text. Stored as a u64 hash in the columnar engine; full strings live
+    /// in a per-table sidecar managed by the SQL executor's FTS layer.
+    Text,
     /// Floating-point vector of `usize` dimensions.
     /// Vectors are stored in a sidecar HNSW index, not in the columnar layout.
     Vector(usize),
@@ -59,6 +62,7 @@ impl ColumnType {
             "bool" => Self::Bool,
             "timestamp" => Self::Timestamp,
             "decimal" => Self::Decimal,
+            "text" => Self::Text,
             _ => Self::U64,
         }
     }
@@ -72,6 +76,7 @@ impl ColumnType {
             Self::Bool => "bool",
             Self::Timestamp => "timestamp",
             Self::Decimal => "decimal",
+            Self::Text => "text",
             Self::Vector(_) => "vector",
         }
     }
@@ -323,7 +328,8 @@ impl TypedValue {
             ColumnType::Bool => Self::Bool(bits != 0),
             ColumnType::Timestamp => Self::Timestamp(bits),
             ColumnType::Decimal => Self::Decimal(bits as i64),
-            // Vectors live in the HNSW sidecar; the columnar slot is unused.
+            // Text and Vector live in sidecars; the columnar slot stores a hash/0.
+            ColumnType::Text => Self::U64(bits),
             ColumnType::Vector(_) => Self::U64(bits),
         }
     }
@@ -417,7 +423,11 @@ impl TypedValue {
                         })
                 }
             }
-            // Vectors live in the HNSW sidecar; parse returns a zero placeholder.
+            // Text and Vector live in sidecars; parse stores a hash/0 placeholder.
+            ColumnType::Text => {
+                let hash = s.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+                Ok(Self::U64(hash))
+            }
             ColumnType::Vector(_) => Ok(Self::U64(0)),
         }
     }

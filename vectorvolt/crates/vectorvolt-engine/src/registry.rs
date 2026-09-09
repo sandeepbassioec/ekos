@@ -163,6 +163,11 @@ impl TableRegistry {
         }
     }
 
+    /// Returns the registry's base directory.
+    pub fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
+    }
+
     /// Create a table with the given schema, persist it, and open it.
     ///
     /// Writes `<base_dir>/<name>/schema.txt` so the table survives a restart.
