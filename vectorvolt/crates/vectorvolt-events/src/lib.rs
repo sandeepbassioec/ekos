@@ -2,6 +2,7 @@
 //!
 //! VV-EVT-001..016
 
+pub mod cdc_bridge;
 pub mod config;
 pub mod emitter;
 pub mod envelope;
@@ -10,6 +11,7 @@ pub mod outbox;
 pub mod registry;
 pub mod sink;
 
+pub use cdc_bridge::CdcEventBridge;
 pub use config::{
     DomainEventSchema, EventFieldDef, EventRouteConfig, SinkKind, YamlEventRouteConfig,
 };
