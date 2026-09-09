@@ -53,6 +53,7 @@ impl SqlParser {
         match self.peek().clone() {
             Token::Select => self.parse_select(),
             Token::Insert => self.parse_insert(),
+            Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
             Token::Create => self.parse_create_table(),
             Token::Drop => self.parse_drop_table(),
@@ -198,6 +199,35 @@ impl SqlParser {
             table,
             columns,
             values,
+        }))
+    }
+
+    fn parse_update(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // UPDATE
+        let table = self.expect_ident()?;
+        self.expect(&Token::Set)?;
+        let mut assignments = Vec::new();
+        loop {
+            let col = self.expect_ident()?;
+            self.expect(&Token::Eq)?;
+            let val = self.parse_primary()?;
+            assignments.push((col, val));
+            if self.peek() == &Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        let where_clause = if self.peek() == &Token::Where {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Stmt::Update(UpdateStmt {
+            table,
+            assignments,
+            where_clause,
         }))
     }
 

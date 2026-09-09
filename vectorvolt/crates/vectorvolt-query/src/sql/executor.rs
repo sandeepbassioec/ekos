@@ -78,6 +78,7 @@ impl SqlExecutor {
         match stmt {
             Stmt::Select(s) => self.exec_select(s),
             Stmt::Insert(s) => self.exec_insert(s),
+            Stmt::Update(s) => self.exec_update(s),
             Stmt::Delete(s) => self.exec_delete(s),
             Stmt::CreateTable(s) => self.exec_create_table(s),
             Stmt::DropTable(s) => self.exec_drop_table(s),
@@ -351,6 +352,43 @@ impl SqlExecutor {
         }
 
         Ok(QueryResult::Affected(1))
+    }
+
+    fn exec_update(&self, stmt: UpdateStmt) -> Result<QueryResult, ExecError> {
+        let engine = self
+            .registry
+            .get(&stmt.table)
+            .map_err(|_| ExecError::TableNotFound(stmt.table.clone()))?;
+        let schema = &engine.schema;
+
+        let all_rows = self.scan_live(&engine)?;
+        let to_update =
+            self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
+        let count = to_update.len() as u64;
+
+        for row in to_update {
+            let mut new_vals = row.values.clone();
+            for (col_name, expr) in &stmt.assignments {
+                let (idx, col_def) = schema
+                    .find(col_name)
+                    .ok_or_else(|| ExecError::ColumnNotFound(col_name.clone()))?;
+                new_vals[idx] = self.expr_to_bits(expr, col_def.col_type)?;
+            }
+            if let Some(txn_id) = self.txn_id_for(&stmt.table) {
+                engine
+                    .delete_txn(txn_id, row.pk)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+                engine
+                    .insert_txn(txn_id, row.pk, new_vals)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+            } else {
+                engine
+                    .update(row.pk, new_vals)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+            }
+        }
+
+        Ok(QueryResult::Affected(count))
     }
 
     fn exec_delete(&self, stmt: DeleteStmt) -> Result<QueryResult, ExecError> {
@@ -1180,5 +1218,51 @@ mod tests {
             "expected est_rows < 10_000, got {}",
             plan.est_rows()
         );
+    }
+
+    #[test]
+    fn test_update_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        let r = ex.execute("UPDATE t SET v = 99 WHERE pk = 1");
+        assert!(matches!(r, Ok(QueryResult::Affected(1))));
+        let rows = ex.execute("SELECT * FROM t WHERE pk = 1").unwrap();
+        if let QueryResult::Rows { rows, .. } = rows {
+            assert_eq!(rows[0][1], "99");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_update_no_match_returns_zero() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        let r = ex.execute("UPDATE t SET v = 99 WHERE pk = 999");
+        assert!(matches!(r, Ok(QueryResult::Affected(0))));
+    }
+
+    #[test]
+    fn test_update_multiple_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 5)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 5)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (3, 9)").unwrap();
+        // UPDATE all rows where v = 5 — should update 2 rows
+        let r = ex.execute("UPDATE t SET v = 7 WHERE v = 5");
+        assert!(matches!(r, Ok(QueryResult::Affected(2))));
+    }
+
+    #[test]
+    fn test_update_no_where_updates_all() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 1)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 2)").unwrap();
+        let r = ex.execute("UPDATE t SET v = 0");
+        assert!(matches!(r, Ok(QueryResult::Affected(2))));
     }
 }
