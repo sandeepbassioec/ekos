@@ -29,6 +29,7 @@ pub enum Token {
     Begin,
     Commit,
     Rollback,
+    Match,
     // Types
     KwU64,
     KwI64,
@@ -237,6 +238,7 @@ impl<'a> Lexer<'a> {
             "BEGIN" => Token::Begin,
             "COMMIT" => Token::Commit,
             "ROLLBACK" | "ABORT" => Token::Rollback,
+            "MATCH" => Token::Match,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,

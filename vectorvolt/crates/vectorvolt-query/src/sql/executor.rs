@@ -7,6 +7,7 @@ use vectorvolt_engine::{
 };
 
 use crate::sql::ast::*;
+use crate::sql::fts::TextStore;
 use crate::sql::lexer::{LexError, Lexer};
 use crate::sql::parser::{ParseError, SqlParser};
 
@@ -179,7 +180,8 @@ impl SqlExecutor {
         };
 
         // Filter by WHERE (still needed for non-pushdown predicates or compound exprs)
-        let filtered = self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema)?;
+        let filtered =
+            self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
 
         // Sort by ORDER BY
         let mut sorted = filtered;
@@ -272,6 +274,20 @@ impl SqlExecutor {
                 .map_err(|e| ExecError::Engine(e.to_string()))?;
         }
 
+        // Persist text values for TEXT columns into the FTS sidecar.
+        for (col_name, expr) in stmt.columns.iter().zip(stmt.values.iter()) {
+            if let Some((_, col_def)) = schema.find(col_name)
+                && col_def.col_type == ColumnType::Text
+                && let Expr::Lit(LitVal::Str(text)) = expr
+            {
+                let base = self.registry.base_dir();
+                if let Ok(mut store) = TextStore::load(base, &stmt.table, col_name) {
+                    store.insert(pk, text.clone());
+                    let _ = store.save();
+                }
+            }
+        }
+
         Ok(QueryResult::Affected(1))
     }
 
@@ -286,7 +302,8 @@ impl SqlExecutor {
         // Get all live rows then filter
         let all_rows = self.scan_live(&engine)?;
 
-        let to_delete = self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema)?;
+        let to_delete =
+            self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
         let count = to_delete.len() as u64;
 
         if let Some(txn_id) = self.txn_id_for(&stmt.table) {
@@ -461,12 +478,13 @@ impl SqlExecutor {
         rows: Vec<EngineRow>,
         where_clause: Option<&Expr>,
         schema: &TableSchema,
+        table: &str,
     ) -> Result<Vec<EngineRow>, ExecError> {
         match where_clause {
             None => Ok(rows),
             Some(expr) => rows
                 .into_iter()
-                .filter_map(|row| match self.eval_expr(expr, &row, schema) {
+                .filter_map(|row| match self.eval_expr(expr, &row, schema, table) {
                     Ok(true) => Some(Ok(row)),
                     Ok(false) => None,
                     Err(e) => Some(Err(e)),
@@ -480,24 +498,32 @@ impl SqlExecutor {
         expr: &Expr,
         row: &EngineRow,
         schema: &TableSchema,
+        table: &str,
     ) -> Result<bool, ExecError> {
         match expr {
             Expr::BinOp { op, left, right } => {
                 match op {
-                    BinOp::And => {
-                        Ok(self.eval_expr(left, row, schema)?
-                            && self.eval_expr(right, row, schema)?)
-                    }
-                    BinOp::Or => {
-                        Ok(self.eval_expr(left, row, schema)?
-                            || self.eval_expr(right, row, schema)?)
-                    }
+                    BinOp::And => Ok(self.eval_expr(left, row, schema, table)?
+                        && self.eval_expr(right, row, schema, table)?),
+                    BinOp::Or => Ok(self.eval_expr(left, row, schema, table)?
+                        || self.eval_expr(right, row, schema, table)?),
                     _ => {
                         // Comparison
                         let lv = self.eval_value(left, row, schema)?;
                         let rv = self.eval_value(right, row, schema)?;
                         Ok(compare_values(&lv, op, &rv))
                     }
+                }
+            }
+            Expr::Match { col, term } => {
+                let base = self.registry.base_dir();
+                match TextStore::load(base, table, col) {
+                    Ok(store) => {
+                        let index = store.build_index();
+                        let hits = index.search(term);
+                        Ok(hits.binary_search(&row.pk).is_ok())
+                    }
+                    Err(_) => Ok(false),
                 }
             }
             _ => Err(ExecError::TypeError("expected boolean expression".into())),
@@ -524,8 +550,8 @@ impl SqlExecutor {
                 LitVal::Str(s) => s.clone(),
                 LitVal::Bool(b) => b.to_string(),
             }),
-            Expr::BinOp { .. } => Err(ExecError::TypeError(
-                "nested binop in value position".into(),
+            Expr::BinOp { .. } | Expr::Match { .. } => Err(ExecError::TypeError(
+                "expected scalar value expression".into(),
             )),
         }
     }
@@ -882,6 +908,75 @@ mod tests {
         ));
         match ex.execute("SELECT * FROM t").unwrap() {
             QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_fts_match_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE docs (pk U64, body TEXT)").unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (1, 'hello world')")
+            .unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (2, 'foo bar')")
+            .unwrap();
+        match ex
+            .execute("SELECT * FROM docs WHERE MATCH(body, 'hello')")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], "1");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_fts_match_no_hit() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE docs (pk U64, body TEXT)").unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (1, 'hello world')")
+            .unwrap();
+        match ex
+            .execute("SELECT * FROM docs WHERE MATCH(body, 'rust')")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_fts_match_case_insensitive() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE docs (pk U64, body TEXT)").unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (1, 'Hello World')")
+            .unwrap();
+        match ex
+            .execute("SELECT * FROM docs WHERE MATCH(body, 'hello')")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_fts_match_multiple_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE docs (pk U64, body TEXT)").unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (1, 'rust is fast')")
+            .unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (2, 'rust and safety')")
+            .unwrap();
+        ex.execute("INSERT INTO docs (pk, body) VALUES (3, 'python is slow')")
+            .unwrap();
+        match ex
+            .execute("SELECT * FROM docs WHERE MATCH(body, 'rust')")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
             _ => panic!(),
         }
     }

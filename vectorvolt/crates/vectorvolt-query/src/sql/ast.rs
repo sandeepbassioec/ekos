@@ -66,6 +66,11 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// `MATCH(col, 'term')` — full-text search predicate.
+    Match {
+        col: String,
+        term: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
