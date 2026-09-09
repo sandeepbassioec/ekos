@@ -731,9 +731,25 @@ impl SqlExecutor {
                 engine
                     .flush()
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
-                engine
+                let raw = engine
                     .scan(*col_idx, *lo, *hi)
-                    .map_err(|e| ExecError::Engine(e.to_string()))
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+                // Re-fetch each PK through get() so updates/deletes in the WAL
+                // are reflected, same as scan_live does for FullScan.
+                let mut seen = std::collections::HashSet::new();
+                let mut live = Vec::with_capacity(raw.len());
+                for row in raw {
+                    if !seen.insert(row.pk) {
+                        continue;
+                    }
+                    if let Some(current) = engine
+                        .get(row.pk)
+                        .map_err(|e| ExecError::Engine(e.to_string()))?
+                    {
+                        live.push(current);
+                    }
+                }
+                Ok(live)
             }
             _ => self.scan_live(engine),
         }
