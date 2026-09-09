@@ -17,12 +17,21 @@ pub enum SelectExpr {
     Col(String),
 }
 
+/// ORDER BY clause — either a plain column sort or a vector distance ranking.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderBy {
+    /// `ORDER BY col ASC|DESC`
+    Col { name: String, asc: bool },
+    /// `ORDER BY vec_distance(col, '[...]') [ASC]`
+    VecDistance { col: String, query: Vec<f32> },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub columns: Vec<SelectExpr>,
     pub table: String,
     pub where_clause: Option<Expr>,
-    pub order_by: Option<(String, bool)>, // (col, asc)
+    pub order_by: Option<OrderBy>,
     pub limit: Option<u64>,
     pub distinct: bool,
 }

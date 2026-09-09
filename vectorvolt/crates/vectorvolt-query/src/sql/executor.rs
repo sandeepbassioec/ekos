@@ -10,6 +10,7 @@ use crate::sql::ast::*;
 use crate::sql::fts::TextStore;
 use crate::sql::lexer::{LexError, Lexer};
 use crate::sql::parser::{ParseError, SqlParser};
+use crate::sql::vec_store::{DistanceMetric, VectorStore, parse_vec_literal};
 
 #[derive(Debug, Error)]
 pub enum ExecError {
@@ -185,17 +186,47 @@ impl SqlExecutor {
 
         // Sort by ORDER BY
         let mut sorted = filtered;
-        if let Some((col_name, asc)) = &stmt.order_by
-            && let Some((idx, col_def)) = schema.find(col_name)
-        {
-            let col_type = col_def.col_type;
-            let asc = *asc;
-            sorted.sort_by(|a, b| {
-                let va = TypedValue::from_bits(col_type, a.values.get(idx).copied().unwrap_or(0));
-                let vb = TypedValue::from_bits(col_type, b.values.get(idx).copied().unwrap_or(0));
-                let cmp = va.display_str().cmp(&vb.display_str());
-                if asc { cmp } else { cmp.reverse() }
-            });
+        match &stmt.order_by {
+            Some(OrderBy::Col {
+                name: col_name,
+                asc,
+            }) => {
+                if let Some((idx, col_def)) = schema.find(col_name) {
+                    let col_type = col_def.col_type;
+                    let asc = *asc;
+                    sorted.sort_by(|a, b| {
+                        let va = TypedValue::from_bits(
+                            col_type,
+                            a.values.get(idx).copied().unwrap_or(0),
+                        );
+                        let vb = TypedValue::from_bits(
+                            col_type,
+                            b.values.get(idx).copied().unwrap_or(0),
+                        );
+                        let cmp = va.display_str().cmp(&vb.display_str());
+                        if asc { cmp } else { cmp.reverse() }
+                    });
+                }
+            }
+            Some(OrderBy::VecDistance { col, query }) => {
+                // Build a pk→distance map from the VectorStore sidecar.
+                let base = self.registry.base_dir();
+                let dist_map: std::collections::HashMap<u64, f32> =
+                    VectorStore::load(base, &stmt.table, col)
+                        .map(|store| {
+                            store
+                                .ranked(query, DistanceMetric::L2)
+                                .into_iter()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                sorted.sort_by(|a, b| {
+                    let da = dist_map.get(&a.pk).copied().unwrap_or(f32::MAX);
+                    let db = dist_map.get(&b.pk).copied().unwrap_or(f32::MAX);
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            None => {}
         }
 
         // Apply LIMIT
@@ -275,15 +306,29 @@ impl SqlExecutor {
         }
 
         // Persist text values for TEXT columns into the FTS sidecar.
+        // Persist vector values for Vector columns into the VectorStore sidecar.
         for (col_name, expr) in stmt.columns.iter().zip(stmt.values.iter()) {
-            if let Some((_, col_def)) = schema.find(col_name)
-                && col_def.col_type == ColumnType::Text
-                && let Expr::Lit(LitVal::Str(text)) = expr
-            {
+            if let Some((_, col_def)) = schema.find(col_name) {
                 let base = self.registry.base_dir();
-                if let Ok(mut store) = TextStore::load(base, &stmt.table, col_name) {
-                    store.insert(pk, text.clone());
-                    let _ = store.save();
+                match col_def.col_type {
+                    ColumnType::Text => {
+                        if let Expr::Lit(LitVal::Str(text)) = expr
+                            && let Ok(mut store) = TextStore::load(base, &stmt.table, col_name)
+                        {
+                            store.insert(pk, text.clone());
+                            let _ = store.save();
+                        }
+                    }
+                    ColumnType::Vector(_) => {
+                        if let Expr::Lit(LitVal::Str(vec_str)) = expr
+                            && let Some(vec) = parse_vec_literal(vec_str)
+                            && let Ok(mut store) = VectorStore::load(base, &stmt.table, col_name)
+                        {
+                            store.insert(pk, vec);
+                            let _ = store.save();
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -424,12 +469,18 @@ impl SqlExecutor {
         plan.push(format!("Project    {}", cols.join(", ")));
 
         // Sort node
-        if let Some((col, asc)) = &stmt.order_by {
-            plan.push(format!(
-                "Sort       {} {}",
-                col,
-                if *asc { "ASC" } else { "DESC" }
-            ));
+        match &stmt.order_by {
+            Some(OrderBy::Col { name, asc }) => {
+                plan.push(format!(
+                    "Sort       {} {}",
+                    name,
+                    if *asc { "ASC" } else { "DESC" }
+                ));
+            }
+            Some(OrderBy::VecDistance { col, .. }) => {
+                plan.push(format!("VecSort    vec_distance({col}) ASC"));
+            }
+            None => {}
         }
 
         // Limit node
@@ -979,5 +1030,89 @@ mod tests {
             QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn test_vec_distance_order_nearest_first() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE vecs (pk U64, emb vector(2))")
+            .unwrap();
+        // pk=1: [1.0, 0.0], pk=2: [10.0, 0.0], pk=3: [2.0, 0.0]
+        ex.execute("INSERT INTO vecs (pk, emb) VALUES (1, '[1.0, 0.0]')")
+            .unwrap();
+        ex.execute("INSERT INTO vecs (pk, emb) VALUES (2, '[10.0, 0.0]')")
+            .unwrap();
+        ex.execute("INSERT INTO vecs (pk, emb) VALUES (3, '[2.0, 0.0]')")
+            .unwrap();
+        // Query [1.5, 0.0]: closest is pk=1 (dist=0.5), then pk=3 (dist=0.5... no, 0.5 vs 0.5)
+        // Actually query [0.0, 0.0]: pk=1 dist=1, pk=3 dist=2, pk=2 dist=10
+        match ex
+            .execute("SELECT pk FROM vecs ORDER BY vec_distance(emb, '[0.0, 0.0]') LIMIT 3")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0][0], "1"); // nearest
+                assert_eq!(rows[1][0], "3");
+                assert_eq!(rows[2][0], "2"); // farthest
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_vec_distance_limit_k() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE vecs (pk U64, emb vector(2))")
+            .unwrap();
+        for i in 1u64..=5 {
+            ex.execute(&format!(
+                "INSERT INTO vecs (pk, emb) VALUES ({i}, '[{}.0, 0.0]')",
+                i * 10
+            ))
+            .unwrap();
+        }
+        // Query [0,0]: top-2 should be pk=1 (dist=10) and pk=2 (dist=20)
+        match ex
+            .execute("SELECT pk FROM vecs ORDER BY vec_distance(emb, '[0.0, 0.0]') LIMIT 2")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], "1");
+                assert_eq!(rows[1][0], "2");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_vec_no_sidecar_returns_all() {
+        // Without vector sidecar file (column is u64, not vector type), ORDER BY
+        // vec_distance falls back gracefully — rows returned unsorted with dist=MAX.
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 20)")
+            .unwrap();
+        match ex
+            .execute("SELECT pk FROM t ORDER BY vec_distance(val, '[0.0]') LIMIT 10")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_vec_distance_parse_vec_literal() {
+        use crate::sql::vec_store::parse_vec_literal;
+        assert_eq!(
+            parse_vec_literal("[1.0, 2.0, 3.0]"),
+            Some(vec![1.0, 2.0, 3.0])
+        );
+        assert_eq!(parse_vec_literal("[0.5]"), Some(vec![0.5]));
+        assert!(parse_vec_literal("not a vec").is_none());
     }
 }

@@ -117,19 +117,37 @@ impl SqlParser {
         if self.peek() == &Token::Order {
             self.advance(); // ORDER
             self.expect(&Token::By)?;
-            let col = self.expect_ident()?;
-            let asc = match self.peek() {
-                Token::Desc => {
-                    self.advance();
-                    false
-                }
-                Token::Asc => {
-                    self.advance();
-                    true
-                }
-                _ => true,
-            };
-            order_by = Some((col, asc));
+            if self.peek() == &Token::VecDistance {
+                // ORDER BY vec_distance(col, '[1.0,2.0,...]')
+                self.advance(); // VEC_DISTANCE
+                self.expect(&Token::LParen)?;
+                let col = self.expect_ident()?;
+                self.expect(&Token::Comma)?;
+                let vec_str = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                self.expect(&Token::RParen)?;
+                let query =
+                    crate::sql::vec_store::parse_vec_literal(&vec_str).ok_or_else(|| {
+                        ParseError::Other(format!("invalid vector literal: '{vec_str}'"))
+                    })?;
+                order_by = Some(OrderBy::VecDistance { col, query });
+            } else {
+                let col = self.expect_ident()?;
+                let asc = match self.peek() {
+                    Token::Desc => {
+                        self.advance();
+                        false
+                    }
+                    Token::Asc => {
+                        self.advance();
+                        true
+                    }
+                    _ => true,
+                };
+                order_by = Some(OrderBy::Col { name: col, asc });
+            }
         }
         let mut limit = None;
         if self.peek() == &Token::Limit {
@@ -352,7 +370,13 @@ mod tests {
     #[test]
     fn test_select_order_desc() {
         match parse("SELECT * FROM t ORDER BY pk DESC") {
-            Stmt::Select(s) => assert_eq!(s.order_by, Some(("pk".to_owned(), false))),
+            Stmt::Select(s) => assert_eq!(
+                s.order_by,
+                Some(OrderBy::Col {
+                    name: "pk".to_owned(),
+                    asc: false
+                })
+            ),
             _ => panic!(),
         }
     }
