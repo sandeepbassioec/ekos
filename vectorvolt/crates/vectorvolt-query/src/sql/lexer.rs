@@ -30,6 +30,7 @@ pub enum Token {
     Commit,
     Rollback,
     Match,
+    VecDistance,
     // Types
     KwU64,
     KwI64,
@@ -239,6 +240,7 @@ impl<'a> Lexer<'a> {
             "COMMIT" => Token::Commit,
             "ROLLBACK" | "ABORT" => Token::Rollback,
             "MATCH" => Token::Match,
+            "VEC_DISTANCE" => Token::VecDistance,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,
