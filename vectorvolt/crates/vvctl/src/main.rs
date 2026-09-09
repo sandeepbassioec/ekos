@@ -7,8 +7,9 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use store::OutputFormat;
 use vvctl::commands::{
     bench, bench_net, catalog, chaos, cluster_cmd, completion, config, config_audit, connect,
-    disconnect, graph, hal, http, install, keygen, ledger_cmd, linux, ping, profile, projection_cmd,
-    serve, server_cmd, status_cmd, store, support_bundle, table, topology, tune, wal, xdp_cmd,
+    disconnect, events_cmd, graph, hal, http, install, keygen, ledger_cmd, linux, ping, profile,
+    projection_cmd, serve, server_cmd, status_cmd, store, support_bundle, table, topology, tune,
+    wal, xdp_cmd,
 };
 use vvctl::ui;
 
@@ -170,6 +171,9 @@ enum Commands {
 
     /// Cluster membership management (nodes, join, leave, status, ring).
     Cluster(cluster_cmd::ClusterArgs),
+
+    /// Domain event schema discovery and DLQ management (list, show, diff) — S23/S24.
+    Events(events_cmd::EventsArgs),
 
     /// Print version and build info.
     Version,
@@ -357,6 +361,8 @@ fn main() -> Result<()> {
         Commands::Install(args) => install::run(args)?,
 
         Commands::Cluster(args) => cluster_cmd::run(args)?,
+
+        Commands::Events(args) => events_cmd::run(args)?,
 
         Commands::Version => print_version(),
     }
