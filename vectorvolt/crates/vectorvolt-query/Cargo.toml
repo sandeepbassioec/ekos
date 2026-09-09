@@ -9,6 +9,7 @@ vectorvolt-hal = { workspace = true }
 vectorvolt-index = { workspace = true }
 vectorvolt-storage = { workspace = true }
 thiserror = { workspace = true }
+serde      = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
