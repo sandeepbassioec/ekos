@@ -28,11 +28,31 @@ pub enum AggFunc {
 pub enum SelectExpr {
     Star,
     Col(String),
+    /// `t.col` — table-qualified column reference
+    QualifiedCol {
+        table: String,
+        col: String,
+    },
     /// `COUNT(*)`, `SUM(col)`, `MIN(col)`, `MAX(col)`
     Agg {
         func: AggFunc,
         col: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub table: String,
+    /// `ON left_table.left_col = right_table.right_col` (equality only)
+    pub left_col: String,
+    pub right_col: String,
 }
 
 /// ORDER BY clause — either a plain column sort or a vector distance ranking.
@@ -48,6 +68,7 @@ pub enum OrderBy {
 pub struct SelectStmt {
     pub columns: Vec<SelectExpr>,
     pub table: String,
+    pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub group_by: Option<String>,
     pub having: Option<Expr>,
@@ -138,6 +159,11 @@ pub enum Expr {
     Match {
         col: String,
         term: String,
+    },
+    /// `t.col` — table-qualified column reference in expressions.
+    QualifiedCol {
+        table: String,
+        col: String,
     },
     /// `col IN (v1, v2, ...)`
     In {

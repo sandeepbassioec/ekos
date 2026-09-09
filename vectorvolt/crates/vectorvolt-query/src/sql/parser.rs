@@ -125,7 +125,13 @@ impl SqlParser {
                 }
                 Token::Ident(name) => {
                     self.advance();
-                    SelectExpr::Col(name)
+                    if self.peek() == &Token::Dot {
+                        self.advance(); // consume '.'
+                        let col = self.expect_ident()?;
+                        SelectExpr::QualifiedCol { table: name, col }
+                    } else {
+                        SelectExpr::Col(name)
+                    }
                 }
                 t => return Err(ParseError::UnexpectedToken(t)),
             };
@@ -138,6 +144,45 @@ impl SqlParser {
         }
         self.expect(&Token::From)?;
         let table = self.expect_ident()?;
+        let mut joins = Vec::new();
+        loop {
+            let kind = match self.peek().clone() {
+                Token::Inner => {
+                    self.advance();
+                    self.expect(&Token::Join)?;
+                    JoinKind::Inner
+                }
+                Token::Left => {
+                    self.advance();
+                    let _ = if self.peek() == &Token::Outer {
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    self.expect(&Token::Join)?;
+                    JoinKind::Left
+                }
+                Token::Join => {
+                    self.advance();
+                    JoinKind::Inner
+                }
+                _ => break,
+            };
+            let join_table = self.expect_ident()?;
+            self.expect(&Token::On)?;
+            // ON left_table.left_col = right_table.right_col
+            // We accept any two qualified or unqualified col refs around '='
+            let (_, left_col) = self.parse_qualified_col()?;
+            self.expect(&Token::Eq)?;
+            let (_, right_col) = self.parse_qualified_col()?;
+            joins.push(JoinClause {
+                kind,
+                table: join_table,
+                left_col,
+                right_col,
+            });
+        }
         let mut where_clause = None;
         if self.peek() == &Token::Where {
             self.advance();
@@ -201,6 +246,7 @@ impl SqlParser {
         Ok(Stmt::Select(SelectStmt {
             columns,
             table,
+            joins,
             where_clause,
             group_by,
             having,
@@ -398,6 +444,18 @@ impl SqlParser {
         Ok(Stmt::CreateTable(CreateTableStmt { table, columns }))
     }
 
+    /// Parse `table.col` or bare `col`, returning `(table_hint, col)`.
+    fn parse_qualified_col(&mut self) -> Result<(Option<String>, String), ParseError> {
+        let first = self.expect_ident()?;
+        if self.peek() == &Token::Dot {
+            self.advance();
+            let col = self.expect_ident()?;
+            Ok((Some(first), col))
+        } else {
+            Ok((None, first))
+        }
+    }
+
     fn parse_drop_table(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // DROP
         self.expect(&Token::Table)?;
@@ -512,7 +570,15 @@ impl SqlParser {
                 self.expect(&Token::RParen)?;
                 Ok(Expr::Match { col, term })
             }
-            Token::Ident(s) => Ok(Expr::Col(s)),
+            Token::Ident(s) => {
+                if self.peek() == &Token::Dot {
+                    self.advance(); // consume '.'
+                    let col = self.expect_ident()?;
+                    Ok(Expr::QualifiedCol { table: s, col })
+                } else {
+                    Ok(Expr::Col(s))
+                }
+            }
             Token::Integer(n) => Ok(Expr::Lit(LitVal::Int(n))),
             Token::Float(f) => Ok(Expr::Lit(LitVal::Float(f))),
             Token::Str(s) => Ok(Expr::Lit(LitVal::Str(s))),
