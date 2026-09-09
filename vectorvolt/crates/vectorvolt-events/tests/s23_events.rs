@@ -124,6 +124,7 @@ fn emitter_when_filter_suppresses_small_orders() {
     let schema = DomainEventSchema {
         name: "LargeOrderPlaced".into(),
         version: "1.0.0".into(),
+        entity: "orders".into(),
         trigger: TriggerKind::Insert,
         when: Some("values[1] > 100000".into()),
         fields: HashMap::new(),
@@ -168,6 +169,7 @@ fn emitter_delete_trigger() {
     let schema = DomainEventSchema {
         name: "OrderCancelled".into(),
         version: "1.0.0".into(),
+        entity: "orders".into(),
         trigger: TriggerKind::Delete,
         when: None,
         fields: {
@@ -301,14 +303,43 @@ fn registry_register_and_list_versions() {
     let schema = DomainEventSchema {
         name: "OrderPlaced".into(),
         version: "1.0.0".into(),
+        entity: "orders".into(),
         trigger: TriggerKind::Insert,
         when: None,
         fields: HashMap::new(),
         routes: vec![],
     };
     reg.register(&schema).unwrap();
-    let versions = reg.list_versions("OrderPlaced").unwrap();
+    let versions = reg.list_versions("orders", "OrderPlaced").unwrap();
     assert_eq!(versions, vec!["1.0.0"]);
+}
+
+#[test]
+fn registry_list_domains_and_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg = SchemaVersionRegistry::new(tmp.path()).unwrap();
+    for (entity, name) in [
+        ("orders", "OrderPlaced"),
+        ("orders", "OrderCancelled"),
+        ("inventory", "StockUpdated"),
+    ] {
+        reg.register(&DomainEventSchema {
+            name: name.into(),
+            version: "1.0.0".into(),
+            entity: entity.into(),
+            trigger: TriggerKind::Insert,
+            when: None,
+            fields: HashMap::new(),
+            routes: vec![],
+        })
+        .unwrap();
+    }
+    let mut domains = reg.list_domains().unwrap();
+    domains.sort();
+    assert_eq!(domains, vec!["inventory", "orders"]);
+    let mut order_events = reg.list_events("orders").unwrap();
+    order_events.sort();
+    assert_eq!(order_events, vec!["OrderCancelled", "OrderPlaced"]);
 }
 
 #[test]
@@ -318,13 +349,14 @@ fn registry_show_schema() {
     let schema = DomainEventSchema {
         name: "OrderPlaced".into(),
         version: "2.0.0".into(),
+        entity: "orders".into(),
         trigger: TriggerKind::Insert,
         when: None,
         fields: HashMap::new(),
         routes: vec![],
     };
     reg.register(&schema).unwrap();
-    let loaded = reg.show("OrderPlaced", "2.0.0").unwrap();
+    let loaded = reg.show("orders", "OrderPlaced", "2.0.0").unwrap();
     assert_eq!(loaded.version, "2.0.0");
 }
 
@@ -337,6 +369,7 @@ fn registry_diff_two_versions() {
     let v1 = DomainEventSchema {
         name: "Ev".into(),
         version: "1.0.0".into(),
+        entity: "orders".into(),
         trigger: TriggerKind::Insert,
         when: None,
         fields: fields_v1,
@@ -348,6 +381,7 @@ fn registry_diff_two_versions() {
     let v2 = DomainEventSchema {
         name: "Ev".into(),
         version: "2.0.0".into(),
+        entity: "orders".into(),
         trigger: TriggerKind::Insert,
         when: None,
         fields: fields_v2,
@@ -355,7 +389,7 @@ fn registry_diff_two_versions() {
     };
     reg.register(&v1).unwrap();
     reg.register(&v2).unwrap();
-    let diffs = reg.diff("Ev", "1.0.0", "2.0.0").unwrap();
+    let diffs = reg.diff("orders", "Ev", "1.0.0", "2.0.0").unwrap();
     assert!(
         diffs
             .iter()

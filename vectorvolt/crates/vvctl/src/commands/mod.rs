@@ -11,6 +11,7 @@ pub mod connect;
 pub mod connect_simple;
 pub mod control;
 pub mod disconnect;
+pub mod events_cmd;
 pub mod graph;
 pub mod hal;
 pub mod http;
