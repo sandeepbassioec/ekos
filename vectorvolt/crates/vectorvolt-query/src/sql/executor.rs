@@ -10,6 +10,7 @@ use crate::sql::ast::*;
 use crate::sql::fts::TextStore;
 use crate::sql::lexer::{LexError, Lexer};
 use crate::sql::parser::{ParseError, SqlParser};
+use crate::sql::planner::{PhysicalPlan, Planner};
 use crate::sql::vec_store::{DistanceMetric, VectorStore, parse_vec_literal};
 
 #[derive(Debug, Error)]
@@ -165,20 +166,17 @@ impl SqlExecutor {
             })
             .collect();
 
-        // Use range scan (pushdown) when WHERE is a simple single-column predicate;
-        // fall back to full scan otherwise.
-        let all_rows = if let Some(expr) = &stmt.where_clause
-            && let Some((col_idx, lo, hi)) = Self::try_pushdown(expr, schema)
-        {
-            engine
-                .flush()
-                .map_err(|e| ExecError::Engine(e.to_string()))?;
-            engine
-                .scan(col_idx, lo, hi)
-                .map_err(|e| ExecError::Engine(e.to_string()))?
-        } else {
-            self.scan_live(&engine)?
-        };
+        // Use the query planner to choose scan strategy.
+        // Estimate row count from partition metadata (sum of partition row counts).
+        let est_rows: u64 = engine
+            .partition_meta()
+            .iter()
+            .map(|p| p.row_count as u64)
+            .sum::<u64>()
+            .max(1);
+        let planner = Planner::new(schema, est_rows);
+        let plan = planner.plan(&stmt);
+        let all_rows = self.execute_scan(&plan, &engine)?;
 
         // Filter by WHERE (still needed for non-pushdown predicates or compound exprs)
         let filtered =
@@ -394,101 +392,55 @@ impl SqlExecutor {
     /// Try to extract a simple single-column range predicate for pushdown.
     ///
     /// Returns `(col_name, lo_inclusive, hi_inclusive)` when WHERE is:
-    ///   `col OP lit` or `col OP lit AND col OP lit` (same column, collapsible to range).
-    fn try_pushdown(expr: &Expr, schema: &TableSchema) -> Option<(usize, u64, u64)> {
-        match expr {
-            Expr::BinOp { op, left, right } => {
-                // Single comparison: col OP lit
-                if let (Expr::Col(name), Expr::Lit(LitVal::Int(n))) =
-                    (left.as_ref(), right.as_ref())
-                    && let Some((idx, _)) = schema.find(name)
-                {
-                    let v = *n as u64;
-                    return match op {
-                        BinOp::Eq => Some((idx, v, v)),
-                        BinOp::Gte => Some((idx, v, u64::MAX)),
-                        BinOp::Gt => Some((idx, v.saturating_add(1), u64::MAX)),
-                        BinOp::Lte => Some((idx, 0, v)),
-                        BinOp::Lt => Some((idx, 0, v.saturating_sub(1))),
-                        _ => None,
-                    };
-                }
-                // AND of two comparisons on the same column → range
-                if *op == BinOp::And
-                    && let (Some((i1, lo, _)), Some((i2, _, hi))) = (
-                        Self::try_pushdown(left, schema),
-                        Self::try_pushdown(right, schema),
-                    )
-                    && i1 == i2
-                {
-                    return Some((i1, lo, hi));
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
     /// Build and return an EXPLAIN plan for a SELECT without executing it.
     fn explain_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
         let engine = self
             .registry
             .get(&stmt.table)
             .map_err(|_| ExecError::TableNotFound(stmt.table.clone()))?;
-        let schema = &engine.schema;
-
-        let mut plan: Vec<String> = Vec::new();
-
-        // Scan node
-        if let Some(expr) = &stmt.where_clause
-            && let Some((col_idx, lo, hi)) = Self::try_pushdown(expr, schema)
-        {
-            let col_name = schema.get(col_idx).map(|c| c.name.as_str()).unwrap_or("?");
-            plan.push(format!(
-                "RangeScan  table={} col={} lo={} hi={}",
-                stmt.table, col_name, lo, hi
-            ));
-        } else {
-            plan.push(format!("FullScan   table={}", stmt.table));
-        }
-
-        // Filter node (always shown when WHERE exists)
-        if stmt.where_clause.is_some() {
-            plan.push("Filter     WHERE <expr>".to_string());
-        }
-
-        // Project node
-        let cols: Vec<String> = stmt
-            .columns
+        let est_rows: u64 = engine
+            .partition_meta()
             .iter()
-            .map(|c| match c {
-                SelectExpr::Star => "*".to_string(),
-                SelectExpr::Col(n) => n.clone(),
-            })
-            .collect();
-        plan.push(format!("Project    {}", cols.join(", ")));
+            .map(|p| p.row_count as u64)
+            .sum::<u64>()
+            .max(1);
+        let planner = Planner::new(&engine.schema, est_rows);
+        let plan = planner.plan(&stmt);
+        Ok(QueryResult::ExplainPlan(plan.explain(0)))
+    }
 
-        // Sort node
-        match &stmt.order_by {
-            Some(OrderBy::Col { name, asc }) => {
-                plan.push(format!(
-                    "Sort       {} {}",
-                    name,
-                    if *asc { "ASC" } else { "DESC" }
-                ));
+    /// Execute the scan portion of a physical plan (FullScan or RangeScan at root).
+    fn execute_scan(
+        &self,
+        plan: &PhysicalPlan,
+        engine: &vectorvolt_engine::TableEngine,
+    ) -> Result<Vec<EngineRow>, ExecError> {
+        // Walk to the leaf scan node (skip Project/Filter/Sort/Limit wrappers).
+        let leaf = Self::leaf_scan(plan);
+        match leaf {
+            PhysicalPlan::RangeScan {
+                col_idx, lo, hi, ..
+            } => {
+                engine
+                    .flush()
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+                engine
+                    .scan(*col_idx, *lo, *hi)
+                    .map_err(|e| ExecError::Engine(e.to_string()))
             }
-            Some(OrderBy::VecDistance { col, .. }) => {
-                plan.push(format!("VecSort    vec_distance({col}) ASC"));
-            }
-            None => {}
+            _ => self.scan_live(engine),
         }
+    }
 
-        // Limit node
-        if let Some(n) = stmt.limit {
-            plan.push(format!("Limit      {n}"));
+    fn leaf_scan(plan: &PhysicalPlan) -> &PhysicalPlan {
+        match plan {
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::VecSort { input, .. }
+            | PhysicalPlan::Limit { input, .. } => Self::leaf_scan(input),
+            other => other,
         }
-
-        Ok(QueryResult::ExplainPlan(plan))
     }
 
     /// Scan all rows and verify each is still live via `get()`.
@@ -830,8 +782,11 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         match ex.execute("EXPLAIN SELECT * FROM t").unwrap() {
             QueryResult::ExplainPlan(lines) => {
-                assert!(lines[0].contains("FullScan"));
-                assert!(lines[0].contains("table=t"));
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("FullScan") && l.contains("table=t"))
+                );
                 assert!(lines.iter().any(|l| l.contains("Project")));
             }
             _ => panic!("expected ExplainPlan"),
@@ -844,10 +799,11 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         match ex.execute("EXPLAIN SELECT * FROM t WHERE pk = 5").unwrap() {
             QueryResult::ExplainPlan(lines) => {
-                assert!(lines[0].contains("RangeScan"), "got: {}", lines[0]);
-                assert!(lines[0].contains("col=pk"));
-                assert!(lines[0].contains("lo=5"));
-                assert!(lines[0].contains("hi=5"));
+                let range = lines.iter().find(|l| l.contains("RangeScan"));
+                let range = range.expect("expected RangeScan node");
+                assert!(range.contains("col=pk"), "got: {range}");
+                assert!(range.contains("lo=5"), "got: {range}");
+                assert!(range.contains("hi=5"), "got: {range}");
             }
             _ => panic!("expected ExplainPlan"),
         }
@@ -1114,5 +1070,96 @@ mod tests {
         );
         assert_eq!(parse_vec_literal("[0.5]"), Some(vec![0.5]));
         assert!(parse_vec_literal("not a vec").is_none());
+    }
+
+    // ── Planner tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_planner_chooses_range_scan_for_eq() {
+        use crate::sql::lexer::Lexer;
+        use crate::sql::parser::SqlParser;
+        use crate::sql::planner::Planner;
+        use vectorvolt_engine::{ColumnDef, ColumnType, TableSchema};
+
+        let schema = TableSchema::new(vec![
+            ColumnDef::new("pk", ColumnType::U64),
+            ColumnDef::new("val", ColumnType::U64),
+        ])
+        .unwrap();
+        let tokens = Lexer::new("SELECT * FROM t WHERE pk = 5")
+            .tokenize()
+            .unwrap();
+        let stmt = match SqlParser::new(tokens).parse().unwrap() {
+            crate::sql::ast::Stmt::Select(s) => s,
+            _ => panic!(),
+        };
+        let plan = Planner::new(&schema, 10_000).plan(&stmt);
+        assert!(
+            plan.explain(0).iter().any(|l| l.contains("RangeScan")),
+            "expected RangeScan in plan"
+        );
+    }
+
+    #[test]
+    fn test_planner_chooses_full_scan_no_where() {
+        use crate::sql::lexer::Lexer;
+        use crate::sql::parser::SqlParser;
+        use crate::sql::planner::Planner;
+        use vectorvolt_engine::{ColumnDef, ColumnType, TableSchema};
+
+        let schema = TableSchema::new(vec![ColumnDef::new("pk", ColumnType::U64)]).unwrap();
+        let tokens = Lexer::new("SELECT * FROM t").tokenize().unwrap();
+        let stmt = match SqlParser::new(tokens).parse().unwrap() {
+            crate::sql::ast::Stmt::Select(s) => s,
+            _ => panic!(),
+        };
+        let plan = Planner::new(&schema, 500).plan(&stmt);
+        let lines = plan.explain(0);
+        assert!(lines.iter().any(|l| l.contains("FullScan")));
+        assert!(!lines.iter().any(|l| l.contains("RangeScan")));
+    }
+
+    #[test]
+    fn test_planner_explain_vec_sort_node() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE vecs (pk U64, emb vector(2))")
+            .unwrap();
+        match ex
+            .execute("EXPLAIN SELECT pk FROM vecs ORDER BY vec_distance(emb, '[1.0,0.0]') LIMIT 3")
+            .unwrap()
+        {
+            QueryResult::ExplainPlan(lines) => {
+                assert!(lines.iter().any(|l| l.contains("VecSort")));
+                assert!(lines.iter().any(|l| l.contains("Limit") && l.contains("3")));
+            }
+            _ => panic!("expected ExplainPlan"),
+        }
+    }
+
+    #[test]
+    fn test_planner_est_rows_range_less_than_full() {
+        use crate::sql::lexer::Lexer;
+        use crate::sql::parser::SqlParser;
+        use crate::sql::planner::Planner;
+        use vectorvolt_engine::{ColumnDef, ColumnType, TableSchema};
+
+        let schema = TableSchema::new(vec![
+            ColumnDef::new("pk", ColumnType::U64),
+            ColumnDef::new("v", ColumnType::U64),
+        ])
+        .unwrap();
+        let tokens = Lexer::new("SELECT * FROM t WHERE pk = 1")
+            .tokenize()
+            .unwrap();
+        let stmt = match SqlParser::new(tokens).parse().unwrap() {
+            crate::sql::ast::Stmt::Select(s) => s,
+            _ => panic!(),
+        };
+        let plan = Planner::new(&schema, 10_000).plan(&stmt);
+        assert!(
+            plan.est_rows() < 10_000,
+            "expected est_rows < 10_000, got {}",
+            plan.est_rows()
+        );
     }
 }
