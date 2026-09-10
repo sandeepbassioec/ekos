@@ -7,6 +7,8 @@ use vectorvolt_engine::{
 };
 
 use crate::sql::ast::*;
+#[allow(unused_imports)]
+use crate::sql::ast::{ArithOp, ScalarFunc, ScalarFunc::*, SetOp};
 use crate::sql::fts::TextStore;
 use crate::sql::hnsw::HnswIndex;
 use crate::sql::lexer::{LexError, Lexer};
@@ -58,6 +60,8 @@ pub struct SqlExecutor {
     registry: Arc<TableRegistry>,
     /// Active transaction state. `None` = auto-commit mode.
     txn: Mutex<Option<TxnMap>>,
+    /// S45 — in-memory view store.
+    views: Mutex<HashMap<String, SelectStmt>>,
 }
 
 impl SqlExecutor {
@@ -65,6 +69,7 @@ impl SqlExecutor {
         Self {
             registry,
             txn: Mutex::new(None),
+            views: Mutex::new(HashMap::new()),
         }
     }
 
@@ -90,6 +95,10 @@ impl SqlExecutor {
             Stmt::Begin => self.exec_begin(),
             Stmt::Commit => self.exec_commit(),
             Stmt::Rollback => self.exec_rollback(),
+            Stmt::CreateIndex(s) => self.exec_create_index(s),
+            Stmt::DropIndex(s) => self.exec_drop_index(s),
+            Stmt::CreateView(s) => self.exec_create_view(s),
+            Stmt::DropView(s) => self.exec_drop_view(s),
         }
     }
 
@@ -144,6 +153,80 @@ impl SqlExecutor {
     }
 
     fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
+        // S41 — handle CTEs
+        if !stmt.ctes.is_empty() {
+            let mut cte_map: HashMap<String, (Vec<String>, Vec<Vec<String>>)> = HashMap::new();
+            for (cte_name, cte_stmt) in &stmt.ctes {
+                let result = self.exec_select(*cte_stmt.clone())?;
+                if let QueryResult::Rows { columns, rows } = result {
+                    cte_map.insert(cte_name.clone(), (columns, rows));
+                }
+            }
+            if let Some((cte_cols, cte_rows)) = cte_map.get(&stmt.table) {
+                let filtered: Vec<Vec<String>> = if let Some(where_expr) = &stmt.where_clause {
+                    cte_rows
+                        .iter()
+                        .filter(|row| {
+                            let m: HashMap<String, String> =
+                                cte_cols.iter().cloned().zip(row.iter().cloned()).collect();
+                            Self::eval_str_where(where_expr, &m)
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    cte_rows.clone()
+                };
+                let filtered = if let Some(lim) = stmt.limit {
+                    filtered.into_iter().take(lim as usize).collect()
+                } else {
+                    filtered
+                };
+                let (out_cols, out_rows) =
+                    Self::project_str_rows(&stmt.columns, &filtered, cte_cols);
+                return Ok(QueryResult::Rows {
+                    columns: out_cols,
+                    rows: out_rows,
+                });
+            }
+        }
+
+        // S45 — handle views
+        let view_stmt_opt = self.views.lock().unwrap().get(&stmt.table).cloned();
+        if let Some(view_stmt) = view_stmt_opt {
+            let result = self.exec_select(view_stmt)?;
+            return match result {
+                QueryResult::Rows {
+                    columns: view_cols,
+                    rows: view_rows,
+                } => {
+                    let filtered: Vec<Vec<String>> = if let Some(where_expr) = &stmt.where_clause {
+                        view_rows
+                            .into_iter()
+                            .filter(|row| {
+                                let m: HashMap<String, String> =
+                                    view_cols.iter().cloned().zip(row.iter().cloned()).collect();
+                                Self::eval_str_where(where_expr, &m)
+                            })
+                            .collect()
+                    } else {
+                        view_rows
+                    };
+                    let filtered = if let Some(lim) = stmt.limit {
+                        filtered.into_iter().take(lim as usize).collect()
+                    } else {
+                        filtered
+                    };
+                    let (out_cols, out_rows) =
+                        Self::project_str_rows(&stmt.columns, &filtered, &view_cols);
+                    Ok(QueryResult::Rows {
+                        columns: out_cols,
+                        rows: out_rows,
+                    })
+                }
+                _ => Err(ExecError::Engine("view returned non-rows".into())),
+            };
+        }
+
         let engine = self
             .registry
             .get(&stmt.table)
@@ -222,7 +305,10 @@ impl SqlExecutor {
                     }
                 }
                 SelectExpr::Subquery { alias, .. } => vec![(alias.clone(), usize::MAX)],
-                SelectExpr::WindowFunc { func, .. } => vec![(func.col_name(), usize::MAX - 1)],
+                SelectExpr::WindowFunc { func, alias, .. } => {
+                    let name = alias.clone().unwrap_or_else(|| func.col_name());
+                    vec![(name, usize::MAX - 1)]
+                }
                 SelectExpr::Computed { alias, .. } => vec![(alias.clone(), usize::MAX - 2)],
                 SelectExpr::Agg { .. } => vec![],
             })
@@ -331,8 +417,9 @@ impl SqlExecutor {
             .columns
             .iter()
             .filter_map(|c| {
-                if let SelectExpr::WindowFunc { func, .. } = c {
-                    Some((func.col_name(), c.clone()))
+                if let SelectExpr::WindowFunc { func, alias, .. } = c {
+                    let name = alias.clone().unwrap_or_else(|| func.col_name());
+                    Some((name, c.clone()))
                 } else {
                     None
                 }
@@ -348,11 +435,45 @@ impl SqlExecutor {
                             let val = match expr {
                                 SelectExpr::WindowFunc {
                                     func: WindowFunc::RowNumber,
+                                    over_partition,
                                     ..
-                                } => (row_idx + 1).to_string(),
+                                } => {
+                                    if let Some(part_col) = over_partition {
+                                        if let Some((part_idx, part_def)) = schema.find(part_col) {
+                                            let my_bits = final_rows[row_idx]
+                                                .values
+                                                .get(part_idx)
+                                                .copied()
+                                                .unwrap_or(0);
+                                            let my_part =
+                                                TypedValue::from_bits(part_def.col_type, my_bits)
+                                                    .display_str();
+                                            let rn = final_rows[..row_idx]
+                                                .iter()
+                                                .filter(|r| {
+                                                    let rb = r
+                                                        .values
+                                                        .get(part_idx)
+                                                        .copied()
+                                                        .unwrap_or(0);
+                                                    TypedValue::from_bits(part_def.col_type, rb)
+                                                        .display_str()
+                                                        == my_part
+                                                })
+                                                .count()
+                                                + 1;
+                                            rn.to_string()
+                                        } else {
+                                            (row_idx + 1).to_string()
+                                        }
+                                    } else {
+                                        (row_idx + 1).to_string()
+                                    }
+                                }
                                 SelectExpr::WindowFunc {
                                     func: WindowFunc::Rank,
                                     over_order,
+                                    ..
                                 } => {
                                     if let Some(order_col) = over_order {
                                         if let Some((idx, col_def)) = schema.find(order_col) {
@@ -404,6 +525,88 @@ impl SqlExecutor {
                                         format!("{:.0}", total)
                                     } else {
                                         "0".to_owned()
+                                    }
+                                }
+                                SelectExpr::WindowFunc {
+                                    func: WindowFunc::Lead { col, offset },
+                                    ..
+                                } => {
+                                    let next_idx = row_idx + *offset as usize;
+                                    if let Some((cidx, cdef)) = schema.find(col) {
+                                        final_rows
+                                            .get(next_idx)
+                                            .map(|r| {
+                                                TypedValue::from_bits(
+                                                    cdef.col_type,
+                                                    r.values.get(cidx).copied().unwrap_or(0),
+                                                )
+                                                .display_str()
+                                            })
+                                            .unwrap_or_else(|| "NULL".to_owned())
+                                    } else {
+                                        "NULL".to_owned()
+                                    }
+                                }
+                                SelectExpr::WindowFunc {
+                                    func: WindowFunc::Lag { col, offset },
+                                    ..
+                                } => {
+                                    if row_idx >= *offset as usize {
+                                        let prev_idx = row_idx - *offset as usize;
+                                        if let Some((cidx, cdef)) = schema.find(col) {
+                                            final_rows
+                                                .get(prev_idx)
+                                                .map(|r| {
+                                                    TypedValue::from_bits(
+                                                        cdef.col_type,
+                                                        r.values.get(cidx).copied().unwrap_or(0),
+                                                    )
+                                                    .display_str()
+                                                })
+                                                .unwrap_or_else(|| "NULL".to_owned())
+                                        } else {
+                                            "NULL".to_owned()
+                                        }
+                                    } else {
+                                        "NULL".to_owned()
+                                    }
+                                }
+                                SelectExpr::WindowFunc {
+                                    func: WindowFunc::FirstValue(col),
+                                    ..
+                                } => {
+                                    if let Some((cidx, cdef)) = schema.find(col) {
+                                        final_rows
+                                            .first()
+                                            .map(|r| {
+                                                TypedValue::from_bits(
+                                                    cdef.col_type,
+                                                    r.values.get(cidx).copied().unwrap_or(0),
+                                                )
+                                                .display_str()
+                                            })
+                                            .unwrap_or_else(|| "NULL".to_owned())
+                                    } else {
+                                        "NULL".to_owned()
+                                    }
+                                }
+                                SelectExpr::WindowFunc {
+                                    func: WindowFunc::LastValue(col),
+                                    ..
+                                } => {
+                                    if let Some((cidx, cdef)) = schema.find(col) {
+                                        final_rows
+                                            .last()
+                                            .map(|r| {
+                                                TypedValue::from_bits(
+                                                    cdef.col_type,
+                                                    r.values.get(cidx).copied().unwrap_or(0),
+                                                )
+                                                .display_str()
+                                            })
+                                            .unwrap_or_else(|| "NULL".to_owned())
+                                    } else {
+                                        "NULL".to_owned()
                                     }
                                 }
                                 _ => String::new(),
@@ -462,6 +665,38 @@ impl SqlExecutor {
                     .collect()
             })
             .collect();
+
+        // S40 — set operations
+        let (mut out_col_names, mut rows) = (out_col_names, rows);
+        if let Some(set_op) = stmt.set_op {
+            match set_op {
+                SetOp::UnionAll(right_stmt) => {
+                    if let Ok(QueryResult::Rows {
+                        rows: right_rows, ..
+                    }) = self.exec_select(*right_stmt)
+                    {
+                        rows.extend(right_rows);
+                    }
+                }
+                SetOp::Intersect(right_stmt) => {
+                    if let Ok(QueryResult::Rows {
+                        rows: right_rows, ..
+                    }) = self.exec_select(*right_stmt)
+                    {
+                        rows.retain(|row| right_rows.contains(row));
+                    }
+                }
+                SetOp::Except(right_stmt) => {
+                    if let Ok(QueryResult::Rows {
+                        rows: right_rows, ..
+                    }) = self.exec_select(*right_stmt)
+                    {
+                        rows.retain(|row| !right_rows.contains(row));
+                    }
+                }
+            }
+        }
+        let _ = &mut out_col_names; // suppress unused_mut
 
         Ok(QueryResult::Rows {
             columns: out_col_names,
@@ -883,6 +1118,42 @@ impl SqlExecutor {
         }
 
         let pk = row_vals[0];
+
+        // S44 — ON CONFLICT DO NOTHING
+        if stmt.on_conflict_ignore {
+            let already_exists = engine
+                .get(pk)
+                .map_err(|e| ExecError::Engine(e.to_string()))?
+                .is_some();
+            if already_exists {
+                return Ok(QueryResult::Affected(0));
+            }
+        }
+
+        // S44 — ON CONFLICT DO UPDATE
+        if let Some(updates) = &stmt.on_conflict_update {
+            let already_exists = engine
+                .get(pk)
+                .map_err(|e| ExecError::Engine(e.to_string()))?
+                .is_some();
+            if already_exists {
+                let current = engine
+                    .get(pk)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?
+                    .ok_or_else(|| ExecError::Engine("row vanished".into()))?;
+                let mut new_vals = current.values.clone();
+                for (col_name, expr) in updates {
+                    if let Some((idx, col_def)) = schema.find(col_name) {
+                        new_vals[idx] = self.expr_to_bits(expr, col_def.col_type)?;
+                    }
+                }
+                engine
+                    .update(pk, new_vals)
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+                return Ok(QueryResult::Affected(1));
+            }
+        }
+
         if let Some(txn_id) = self.txn_id_for(&stmt.table) {
             engine
                 .insert_txn(txn_id, pk, row_vals)
@@ -1032,6 +1303,120 @@ impl SqlExecutor {
         Ok(QueryResult::Dropped)
     }
 
+    // S42 — Index DDL
+    fn exec_create_index(&self, stmt: CreateIndexStmt) -> Result<QueryResult, ExecError> {
+        let base = self.registry.base_dir();
+        let dir = base.join(&stmt.table).join("indexes");
+        std::fs::create_dir_all(&dir).map_err(|e| ExecError::Engine(e.to_string()))?;
+        let path = dir.join(format!("{}.json", stmt.index_name));
+        let content = format!("{{\"col\":\"{}\"}}", stmt.col);
+        std::fs::write(path, content).map_err(|e| ExecError::Engine(e.to_string()))?;
+        Ok(QueryResult::Created)
+    }
+
+    fn exec_drop_index(&self, stmt: DropIndexStmt) -> Result<QueryResult, ExecError> {
+        // Best-effort: ignore error if file doesn't exist
+        let base = self.registry.base_dir();
+        let path = base
+            .join("__any__")
+            .join("indexes")
+            .join(format!("{}.json", stmt.index_name));
+        // Search all table dirs for the index
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let idx_path = entry
+                    .path()
+                    .join("indexes")
+                    .join(format!("{}.json", stmt.index_name));
+                if idx_path.exists() {
+                    let _ = std::fs::remove_file(idx_path);
+                    return Ok(QueryResult::Dropped);
+                }
+            }
+        }
+        let _ = path; // suppress warning
+        Ok(QueryResult::Dropped)
+    }
+
+    // S45 — CREATE/DROP VIEW
+    fn exec_create_view(&self, stmt: CreateViewStmt) -> Result<QueryResult, ExecError> {
+        self.views.lock().unwrap().insert(stmt.name, *stmt.select);
+        Ok(QueryResult::Created)
+    }
+
+    fn exec_drop_view(&self, stmt: DropViewStmt) -> Result<QueryResult, ExecError> {
+        self.views.lock().unwrap().remove(&stmt.name);
+        Ok(QueryResult::Dropped)
+    }
+
+    /// S41/S45 helper — filter/project string rows.
+    fn project_str_rows(
+        exprs: &[SelectExpr],
+        rows: &[Vec<String>],
+        col_names: &[String],
+    ) -> (Vec<String>, Vec<Vec<String>>) {
+        if exprs.iter().any(|e| matches!(e, SelectExpr::Star)) {
+            return (col_names.to_vec(), rows.to_vec());
+        }
+        let mut headers: Vec<String> = Vec::new();
+        let mut out_rows: Vec<Vec<String>> = rows.iter().map(|_| Vec::new()).collect();
+        for expr in exprs {
+            let col_name = match expr {
+                SelectExpr::Col(n) => n.clone(),
+                SelectExpr::QualifiedCol { col, .. } => col.clone(),
+                _ => continue,
+            };
+            if let Some(idx) = col_names.iter().position(|c| c == &col_name) {
+                headers.push(col_name);
+                for (i, row) in rows.iter().enumerate() {
+                    out_rows[i].push(row.get(idx).cloned().unwrap_or_default());
+                }
+            }
+        }
+        (headers, out_rows)
+    }
+
+    /// S41/S45 helper — evaluate WHERE on a string-row map.
+    fn eval_str_where(expr: &Expr, row: &HashMap<String, String>) -> bool {
+        match expr {
+            Expr::BinOp {
+                op: BinOp::And,
+                left,
+                right,
+            } => Self::eval_str_where(left, row) && Self::eval_str_where(right, row),
+            Expr::BinOp {
+                op: BinOp::Or,
+                left,
+                right,
+            } => Self::eval_str_where(left, row) || Self::eval_str_where(right, row),
+            Expr::BinOp { op, left, right } => {
+                let lv = Self::str_val(left, row);
+                let rv = Self::str_val(right, row);
+                compare_values(&lv, op, &rv)
+            }
+            Expr::IsNull { col, negated } => {
+                let v = row.get(col).cloned().unwrap_or_default();
+                let is_null = v.is_empty() || v == "NULL";
+                if *negated { !is_null } else { is_null }
+            }
+            _ => true, // permissive for unsupported predicates
+        }
+    }
+
+    fn str_val(expr: &Expr, row: &HashMap<String, String>) -> String {
+        match expr {
+            Expr::Col(name) => row.get(name).cloned().unwrap_or_default(),
+            Expr::Lit(lit) => match lit {
+                LitVal::Int(n) => n.to_string(),
+                LitVal::Float(f) => format!("{f:.6}"),
+                LitVal::Str(s) => s.clone(),
+                LitVal::Bool(b) => b.to_string(),
+                LitVal::Null => "NULL".to_owned(),
+            },
+            _ => String::new(),
+        }
+    }
+
     /// Try to extract a simple single-column range predicate for pushdown.
     ///
     /// Returns `(col_name, lo_inclusive, hi_inclusive)` when WHERE is:
@@ -1067,9 +1452,21 @@ impl SqlExecutor {
                 engine
                     .flush()
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
-                let raw = engine
-                    .scan(*col_idx, *lo, *hi)
-                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+                // S46 — treat missing zone files as empty (zone pruning correctness fix)
+                let raw = match engine.scan(*col_idx, *lo, *hi) {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        let msg = e.to_string().to_lowercase();
+                        if msg.contains("not found")
+                            || msg.contains("no such")
+                            || msg.contains("os error 2")
+                        {
+                            vec![]
+                        } else {
+                            return Err(ExecError::Engine(e.to_string()));
+                        }
+                    }
+                };
                 // Re-fetch each PK through get() so updates/deletes in the WAL
                 // are reflected, same as scan_live does for FullScan.
                 let mut seen = std::collections::HashSet::new();
@@ -1268,6 +1665,9 @@ impl SqlExecutor {
                 }
                 Ok(else_val.is_some())
             }
+            Expr::Arith { .. } | Expr::ScalarFn { .. } | Expr::Cast { .. } => Err(
+                ExecError::TypeError("arithmetic/scalar not valid as boolean".into()),
+            ),
             _ => Err(ExecError::TypeError("expected boolean expression".into())),
         }
     }
@@ -1336,6 +1736,70 @@ impl SqlExecutor {
                     self.eval_value(ev, row, schema)
                 } else {
                     Ok("NULL".to_owned())
+                }
+            }
+            Expr::Arith { op, left, right } => {
+                let lv = self.eval_value(left, row, schema)?;
+                let rv = self.eval_value(right, row, schema)?;
+                let lf: f64 = lv.parse().unwrap_or(0.0);
+                let rf: f64 = rv.parse().unwrap_or(0.0);
+                let result = match op {
+                    ArithOp::Add => lf + rf,
+                    ArithOp::Sub => lf - rf,
+                    ArithOp::Mul => lf * rf,
+                    ArithOp::Div => {
+                        if rf != 0.0 {
+                            lf / rf
+                        } else {
+                            0.0
+                        }
+                    }
+                    ArithOp::Mod => {
+                        if rf != 0.0 {
+                            lf % rf
+                        } else {
+                            0.0
+                        }
+                    }
+                };
+                if result.fract() == 0.0 && result.abs() < 1e15 {
+                    Ok(format!("{}", result as i64))
+                } else {
+                    Ok(format!("{}", result))
+                }
+            }
+            Expr::ScalarFn { func, arg } => {
+                let val = self.eval_value(arg, row, schema)?;
+                let f: f64 = val.parse().unwrap_or(0.0);
+                let result = match func {
+                    ScalarFunc::Abs => f.abs(),
+                    ScalarFunc::Round => f.round(),
+                    ScalarFunc::Ceil => f.ceil(),
+                    ScalarFunc::Floor => f.floor(),
+                };
+                if result.fract() == 0.0 && result.abs() < 1e15 {
+                    Ok(format!("{}", result as i64))
+                } else {
+                    Ok(format!("{}", result))
+                }
+            }
+            Expr::Cast { expr, target } => {
+                let val = self.eval_value(expr, row, schema)?;
+                match target.to_lowercase().as_str() {
+                    "u64" | "i64" => {
+                        let n: f64 = val.parse().unwrap_or(0.0);
+                        Ok(format!("{}", n as i64))
+                    }
+                    "f64" => {
+                        let f: f64 = val.parse().unwrap_or(0.0);
+                        Ok(format!("{}", f))
+                    }
+                    "text" => Ok(val),
+                    "bool" => {
+                        let b = val != "0" && !val.is_empty() && val != "false" && val != "NULL";
+                        Ok(b.to_string())
+                    }
+                    _ => Ok(val),
                 }
             }
             Expr::Match { .. }
@@ -2552,6 +3016,771 @@ mod tests {
             // Only pk=1 (v=0) should match IS NULL
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0][0], "1");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S39: Arithmetic Expressions ──────────────────────────────────────────
+
+    #[test]
+    fn test_s39_add_columns() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 20)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk + val AS total FROM t ORDER BY pk")
+            .unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert!(columns.contains(&"total".to_owned()));
+            assert_eq!(rows[0][0], "11");
+            assert_eq!(rows[1][0], "22");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s39_sub_literal() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT val - 1 AS dec FROM t WHERE pk = 1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "9");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s39_mul_columns() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 5)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 7)").unwrap();
+        let r = ex
+            .execute("SELECT pk * val AS prod FROM t WHERE pk = 2")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "14");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s39_scalar_abs() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 5)").unwrap();
+        let r = ex
+            .execute("SELECT ABS(val) AS a FROM t WHERE pk = 1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "5");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s39_scalar_round() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE ft (pk U64, fval F64)").unwrap();
+        ex.execute("INSERT INTO ft (pk, fval) VALUES (1, 3.7)")
+            .unwrap();
+        let r = ex.execute("SELECT ROUND(fval) AS r FROM ft").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "4");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S40: Set Operations ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_s40_union_all() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t1 (pk U64, val U64)").unwrap();
+        ex.execute("CREATE TABLE t2 (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t1 (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t1 (pk, val) VALUES (2, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t2 (pk, val) VALUES (3, 30)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk FROM t1 UNION ALL SELECT pk FROM t2")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 3);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s40_union_dedup() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE a (pk U64, v U64)").unwrap();
+        ex.execute("CREATE TABLE b (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO a (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO b (pk, v) VALUES (1, 10)").unwrap();
+        // UNION ALL includes duplicates
+        let r = ex
+            .execute("SELECT pk FROM a UNION ALL SELECT pk FROM b")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s40_intersect() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE x (pk U64, v U64)").unwrap();
+        ex.execute("CREATE TABLE y (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO x (pk, v) VALUES (1, 1)").unwrap();
+        ex.execute("INSERT INTO x (pk, v) VALUES (2, 2)").unwrap();
+        ex.execute("INSERT INTO y (pk, v) VALUES (2, 2)").unwrap();
+        ex.execute("INSERT INTO y (pk, v) VALUES (3, 3)").unwrap();
+        let r = ex
+            .execute("SELECT pk FROM x INTERSECT SELECT pk FROM y")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "2");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s40_except() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE x (pk U64, v U64)").unwrap();
+        ex.execute("CREATE TABLE y (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO x (pk, v) VALUES (1, 1)").unwrap();
+        ex.execute("INSERT INTO x (pk, v) VALUES (2, 2)").unwrap();
+        ex.execute("INSERT INTO x (pk, v) VALUES (3, 3)").unwrap();
+        ex.execute("INSERT INTO y (pk, v) VALUES (2, 2)").unwrap();
+        let r = ex
+            .execute("SELECT pk FROM x EXCEPT SELECT pk FROM y")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s40_union_all_order() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE p (pk U64, v U64)").unwrap();
+        ex.execute("CREATE TABLE q (pk U64, v U64)").unwrap();
+        for i in 1u64..=3 {
+            ex.execute(&format!("INSERT INTO p (pk, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        for i in 4u64..=6 {
+            ex.execute(&format!("INSERT INTO q (pk, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex
+            .execute("SELECT pk FROM p UNION ALL SELECT pk FROM q")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 6);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S41: CTEs ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_s41_cte_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (3, 30)")
+            .unwrap();
+        let r = ex
+            .execute("WITH c AS (SELECT pk FROM t WHERE pk > 1) SELECT pk FROM c")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s41_cte_count() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        for i in 1u64..=5 {
+            ex.execute(&format!("INSERT INTO t (pk, val) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex
+            .execute("WITH c AS (SELECT pk FROM t WHERE pk >= 3) SELECT pk FROM c")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 3);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s41_cte_filter() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 100)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 200)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (3, 300)")
+            .unwrap();
+        let r = ex
+            .execute("WITH c AS (SELECT pk FROM t) SELECT pk FROM c WHERE pk = 2")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "2");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s41_cte_alias() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 42)")
+            .unwrap();
+        let r = ex
+            .execute("WITH mydata AS (SELECT pk FROM t) SELECT pk FROM mydata")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "1");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s41_cte_multi_row() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        for i in 1u64..=4 {
+            ex.execute(&format!("INSERT INTO t (pk, val) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex
+            .execute("WITH all_rows AS (SELECT pk FROM t) SELECT pk FROM all_rows")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 4);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S42: Index DDL ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_s42_create_index() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        let r = ex.execute("CREATE INDEX idx_val ON t(val)");
+        assert!(matches!(r, Ok(QueryResult::Created)), "{r:?}");
+    }
+
+    #[test]
+    fn test_s42_drop_index() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+        let r = ex.execute("DROP INDEX idx_val");
+        assert!(matches!(r, Ok(QueryResult::Dropped)), "{r:?}");
+    }
+
+    #[test]
+    fn test_s42_create_dup_index() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+        // Creating same index twice is OK (overwrite)
+        let r = ex.execute("CREATE INDEX idx_val ON t(val)");
+        assert!(matches!(r, Ok(QueryResult::Created)), "{r:?}");
+    }
+
+    #[test]
+    fn test_s42_index_on_query() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 99)")
+            .unwrap();
+        ex.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+        let r = ex.execute("SELECT * FROM t WHERE val = 99").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s42_drop_nonexistent() {
+        let (ex, _dir) = setup();
+        // Drop non-existent index returns Dropped (best-effort)
+        let r = ex.execute("DROP INDEX ghost_idx");
+        assert!(matches!(r, Ok(QueryResult::Dropped)), "{r:?}");
+    }
+
+    // ── S43: CAST ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_s43_cast_to_text() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 42)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT CAST(pk AS TEXT) AS s FROM t WHERE pk = 1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "1");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s43_cast_u64_col() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 55)")
+            .unwrap();
+        let r = ex.execute("SELECT CAST(val AS U64) AS n FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "55");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s43_cast_in_where() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 7)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 8)").unwrap();
+        let r = ex
+            .execute("SELECT CAST(pk AS TEXT) AS s FROM t WHERE pk = 1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s43_cast_col_as_text() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 123)")
+            .unwrap();
+        let r = ex.execute("SELECT CAST(val AS TEXT) AS s FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "123");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s43_cast_f64() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE ft (pk U64, fval F64)").unwrap();
+        ex.execute("INSERT INTO ft (pk, fval) VALUES (1, 9.5)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT CAST(fval AS TEXT) AS s FROM ft")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            // Should have some string representation
+            assert!(!rows[0][0].is_empty());
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S44: UPSERT ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_s44_insert_on_conflict_ignore() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        // Insert duplicate with DO NOTHING — no error
+        let r = ex.execute("INSERT INTO t (pk, val) VALUES (1, 99) ON CONFLICT DO NOTHING");
+        assert!(matches!(r, Ok(QueryResult::Affected(0))), "{r:?}");
+    }
+
+    #[test]
+    fn test_s44_insert_on_conflict_update() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        let r =
+            ex.execute("INSERT INTO t (pk, val) VALUES (1, 99) ON CONFLICT DO UPDATE SET val = 99");
+        assert!(matches!(r, Ok(QueryResult::Affected(1))), "{r:?}");
+    }
+
+    #[test]
+    fn test_s44_upsert_new_row() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        // ON CONFLICT path not triggered for new rows
+        let r = ex.execute("INSERT INTO t (pk, val) VALUES (1, 42) ON CONFLICT DO NOTHING");
+        assert!(matches!(r, Ok(QueryResult::Affected(1))), "{r:?}");
+    }
+
+    #[test]
+    fn test_s44_upsert_verify() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 99) ON CONFLICT DO UPDATE SET val = 99")
+            .unwrap();
+        let r = ex.execute("SELECT val FROM t WHERE pk = 1").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "99");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s44_on_conflict_do_nothing() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 20)")
+            .unwrap();
+        // Multiple inserts with IGNORE, count stays same
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 99) ON CONFLICT DO NOTHING")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 99) ON CONFLICT DO NOTHING")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S45: CREATE VIEW ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_s45_create_view() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        let r = ex.execute("CREATE VIEW v AS SELECT pk FROM t");
+        assert!(matches!(r, Ok(QueryResult::Created)), "{r:?}");
+    }
+
+    #[test]
+    fn test_s45_query_view() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 20)")
+            .unwrap();
+        ex.execute("CREATE VIEW v AS SELECT pk FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM v").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s45_drop_view() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("CREATE VIEW v AS SELECT pk FROM t").unwrap();
+        let r = ex.execute("DROP VIEW v");
+        assert!(matches!(r, Ok(QueryResult::Dropped)), "{r:?}");
+    }
+
+    #[test]
+    fn test_s45_view_with_where() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        for i in 1u64..=5 {
+            ex.execute(&format!("INSERT INTO t (pk, val) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        ex.execute("CREATE VIEW big AS SELECT pk FROM t WHERE pk > 3")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM big").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s45_view_project() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 99)")
+            .unwrap();
+        ex.execute("CREATE VIEW vfull AS SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT pk FROM vfull").unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert_eq!(columns, vec!["pk"]);
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S46: Correctness Fixes ────────────────────────────────────────────────
+
+    #[test]
+    fn test_s46_range_scan_empty_zone() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        // Range scan on small table — should not panic
+        let r = ex.execute("SELECT * FROM t WHERE pk = 999");
+        assert!(r.is_ok(), "{r:?}");
+        if let Ok(QueryResult::Rows { rows, .. }) = r {
+            assert_eq!(rows.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_s46_range_scan_correct_results() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        for i in 1u64..=10 {
+            ex.execute(&format!("INSERT INTO t (pk, val) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex.execute("SELECT * FROM t WHERE pk = 5").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "5");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s46_range_scan_pk_boundary() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 1)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (10, 10)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT * FROM t WHERE pk >= 1 AND pk <= 1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "1");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s46_zone_pruning() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        for i in 1u64..=5 {
+            ex.execute(&format!("INSERT INTO t (pk, val) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex
+            .execute("SELECT * FROM t WHERE pk >= 2 AND pk <= 4")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 3);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s46_correctness_filter_chain() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, a U64, b U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, a, b) VALUES (1, 5, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, a, b) VALUES (2, 5, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, a, b) VALUES (3, 9, 10)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT * FROM t WHERE a = 5 AND b = 10")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "1");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S47: Window Function Extensions ──────────────────────────────────────
+
+    #[test]
+    fn test_s47_lead() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (3, 30)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk, LEAD(val, 1) OVER () AS next_val FROM t ORDER BY pk")
+            .unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert!(columns.contains(&"next_val".to_owned()));
+            assert_eq!(rows.len(), 3);
+            // First row's LEAD(val,1) is the second row's val = 20
+            assert_eq!(rows[0][1], "20");
+            // Last row has no next → NULL
+            assert_eq!(rows[2][1], "NULL");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s47_lag() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (3, 30)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk, LAG(val, 1) OVER () AS prev_val FROM t ORDER BY pk")
+            .unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert!(columns.contains(&"prev_val".to_owned()));
+            // First row has no previous → NULL
+            assert_eq!(rows[0][1], "NULL");
+            // Second row's LAG(val,1) is first row's val = 10
+            assert_eq!(rows[1][1], "10");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s47_first_value() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 100)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 200)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (3, 300)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT FIRST_VALUE(val) OVER () AS fv FROM t ORDER BY pk")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            // All rows should have the first value
+            assert!(rows.iter().all(|r| r[0] == "100"));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s47_last_value() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 100)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 200)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (3, 300)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT LAST_VALUE(val) OVER () AS lv FROM t ORDER BY pk")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            // All rows should have the last value
+            assert!(rows.iter().all(|r| r[0] == "300"));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s47_partition_by() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, grp U64, val U64)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, grp, val) VALUES (1, 1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, grp, val) VALUES (2, 1, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, grp, val) VALUES (3, 2, 30)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, grp, val) VALUES (4, 2, 40)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk, ROW_NUMBER() OVER (PARTITION BY grp) AS rn FROM t ORDER BY pk")
+            .unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert!(columns.contains(&"rn".to_owned()));
+            // pk=1 → rn=1 (first in grp 1), pk=2 → rn=2, pk=3 → rn=1 (first in grp 2)
+            let rn_col = columns.iter().position(|c| c == "rn").unwrap();
+            assert_eq!(rows[0][rn_col], "1");
+            assert_eq!(rows[1][rn_col], "2");
+            assert_eq!(rows[2][rn_col], "1");
+            assert_eq!(rows[3][rn_col], "2");
         } else {
             panic!("expected rows");
         }

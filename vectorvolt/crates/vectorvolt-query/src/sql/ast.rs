@@ -1,3 +1,4 @@
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Select(SelectStmt),
@@ -14,6 +15,12 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+    // S42
+    CreateIndex(CreateIndexStmt),
+    DropIndex(DropIndexStmt),
+    // S45
+    CreateView(CreateViewStmt),
+    DropView(DropViewStmt),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +38,17 @@ pub enum WindowFunc {
     Rank,
     /// `SUM(col) OVER ()`
     WinSum(String),
+    // S47
+    Lead {
+        col: String,
+        offset: u64,
+    },
+    Lag {
+        col: String,
+        offset: u64,
+    },
+    FirstValue(String),
+    LastValue(String),
 }
 
 impl WindowFunc {
@@ -39,8 +57,39 @@ impl WindowFunc {
             WindowFunc::RowNumber => "row_number".to_owned(),
             WindowFunc::Rank => "rank".to_owned(),
             WindowFunc::WinSum(col) => format!("win_sum({})", col),
+            WindowFunc::Lead { col, offset } => format!("lead({},{})", col, offset),
+            WindowFunc::Lag { col, offset } => format!("lag({},{})", col, offset),
+            WindowFunc::FirstValue(col) => format!("first_value({})", col),
+            WindowFunc::LastValue(col) => format!("last_value({})", col),
         }
     }
+}
+
+/// S39 arithmetic operator
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+/// S39 scalar function
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarFunc {
+    Abs,
+    Round,
+    Ceil,
+    Floor,
+}
+
+/// S40 set operation
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetOp {
+    UnionAll(Box<SelectStmt>),
+    Intersect(Box<SelectStmt>),
+    Except(Box<SelectStmt>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +115,8 @@ pub enum SelectExpr {
     WindowFunc {
         func: WindowFunc,
         over_order: Option<String>,
+        over_partition: Option<String>,
+        alias: Option<String>,
     },
     /// `CASE WHEN ... END AS alias`, `COALESCE(...) AS alias` — per-row computed expression
     Computed {
@@ -109,6 +160,10 @@ pub struct SelectStmt {
     pub order_by: Option<OrderBy>,
     pub limit: Option<u64>,
     pub distinct: bool,
+    // S40 — set operations
+    pub set_op: Option<SetOp>,
+    // S41 — CTEs
+    pub ctes: Vec<(String, Box<SelectStmt>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,6 +172,9 @@ pub struct InsertStmt {
     pub columns: Vec<String>,
     pub values: Vec<Expr>,
     pub or_replace: bool,
+    // S44 — UPSERT
+    pub on_conflict_update: Option<Vec<(String, Expr)>>,
+    pub on_conflict_ignore: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,6 +238,31 @@ pub struct RenameTableStmt {
     pub new_name: String,
 }
 
+// S42
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStmt {
+    pub index_name: String,
+    pub table: String,
+    pub col: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStmt {
+    pub index_name: String,
+}
+
+// S45
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewStmt {
+    pub name: String,
+    pub select: Box<SelectStmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropViewStmt {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Col(String),
@@ -232,6 +315,22 @@ pub enum Expr {
     Case {
         branches: Vec<(Expr, Expr)>,
         else_val: Option<Box<Expr>>,
+    },
+    // S39 — arithmetic
+    Arith {
+        op: ArithOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    // S39 — scalar functions
+    ScalarFn {
+        func: ScalarFunc,
+        arg: Box<Expr>,
+    },
+    // S43 — CAST
+    Cast {
+        expr: Box<Expr>,
+        target: String,
     },
 }
 
