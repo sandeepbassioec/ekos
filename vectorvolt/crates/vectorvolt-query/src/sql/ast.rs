@@ -21,6 +21,15 @@ pub enum Stmt {
     // S45
     CreateView(CreateViewStmt),
     DropView(DropViewStmt),
+    // S53 — savepoints
+    Savepoint(String),
+    ReleaseSavepoint(String),
+    RollbackTo(String),
+    // S56 — EXPLAIN ANALYZE
+    ExplainAnalyze(Box<SelectStmt>),
+    // S57 — prepared statements
+    Prepare { name: String, stmt: Box<Stmt> },
+    ExecuteStmt { name: String, params: Vec<Expr> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +50,8 @@ pub enum ScalarFunc {
     Round,
     Ceil,
     Floor,
+    Trim,
+    Now,
 }
 
 /// Window function kind for `func() OVER (...)` expressions.
@@ -61,6 +72,10 @@ pub enum WindowFunc {
     },
     FirstValue(String),
     LastValue(String),
+    // S52
+    DenseRank,
+    Ntile(u64),
+    PercentRank,
 }
 
 impl WindowFunc {
@@ -73,6 +88,9 @@ impl WindowFunc {
             WindowFunc::Lag { col, offset } => format!("lag({},{})", col, offset),
             WindowFunc::FirstValue(col) => format!("first_value({})", col),
             WindowFunc::LastValue(col) => format!("last_value({})", col),
+            WindowFunc::DenseRank => "dense_rank".to_owned(),
+            WindowFunc::Ntile(n) => format!("ntile({})", n),
+            WindowFunc::PercentRank => "percent_rank".to_owned(),
         }
     }
 }
@@ -160,7 +178,7 @@ pub struct SelectStmt {
     pub table: String,
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
-    pub group_by: Option<String>,
+    pub group_by: Vec<String>,
     pub having: Option<Expr>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<u64>,
@@ -344,6 +362,22 @@ pub enum Expr {
         expr: Box<Expr>,
         target: String,
     },
+    // S49 — string functions
+    StrFunc {
+        name: String,
+        args: Vec<Expr>,
+    },
+    // S50 — date/time
+    DateExtract {
+        part: String,
+        expr: Box<Expr>,
+    },
+    // S54 — scalar subquery in expression context
+    ScalarSubquery {
+        subquery: Box<SelectStmt>,
+    },
+    // S57 — prepared statement placeholder
+    Placeholder(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]

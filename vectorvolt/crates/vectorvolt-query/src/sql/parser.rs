@@ -65,9 +65,17 @@ impl SqlParser {
             Token::Rename => self.parse_rename_table(),
             Token::Explain => {
                 self.advance(); // EXPLAIN
-                match self.parse_select()? {
-                    Stmt::Select(s) => Ok(Stmt::Explain(Box::new(s))),
-                    _ => Err(ParseError::UnexpectedToken(Token::Explain)),
+                if self.peek() == &Token::Analyze {
+                    self.advance(); // ANALYZE
+                    match self.parse_select()? {
+                        Stmt::Select(s) => Ok(Stmt::ExplainAnalyze(Box::new(s))),
+                        _ => Err(ParseError::UnexpectedToken(Token::Explain)),
+                    }
+                } else {
+                    match self.parse_select()? {
+                        Stmt::Select(s) => Ok(Stmt::Explain(Box::new(s))),
+                        _ => Err(ParseError::UnexpectedToken(Token::Explain)),
+                    }
                 }
             }
             Token::Begin => {
@@ -80,7 +88,59 @@ impl SqlParser {
             }
             Token::Rollback => {
                 self.advance();
-                Ok(Stmt::Rollback)
+                if self.peek() == &Token::To {
+                    self.advance(); // TO
+                    if self.peek() == &Token::Savepoint {
+                        self.advance(); // SAVEPOINT (optional keyword)
+                    }
+                    let name = self.expect_ident()?;
+                    Ok(Stmt::RollbackTo(name))
+                } else {
+                    Ok(Stmt::Rollback)
+                }
+            }
+            Token::Savepoint => {
+                self.advance();
+                let name = self.expect_ident()?;
+                Ok(Stmt::Savepoint(name))
+            }
+            Token::Release => {
+                self.advance();
+                if self.peek() == &Token::Savepoint {
+                    self.advance();
+                }
+                let name = self.expect_ident()?;
+                Ok(Stmt::ReleaseSavepoint(name))
+            }
+            Token::Prepare => {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&Token::As)?;
+                let inner = self.parse()?;
+                Ok(Stmt::Prepare {
+                    name,
+                    stmt: Box::new(inner),
+                })
+            }
+            Token::Execute => {
+                self.advance();
+                let name = self.expect_ident()?;
+                let mut params = Vec::new();
+                if self.peek() == &Token::LParen {
+                    self.advance();
+                    if self.peek() != &Token::RParen {
+                        loop {
+                            params.push(self.parse_primary()?);
+                            if self.peek() == &Token::Comma {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&Token::RParen)?;
+                }
+                Ok(Stmt::ExecuteStmt { name, params })
             }
             t => Err(ParseError::UnexpectedToken(t)),
         }
@@ -304,7 +364,16 @@ impl SqlParser {
                 | Token::Round
                 | Token::Ceil
                 | Token::Floor
-                | Token::Cast => {
+                | Token::Cast
+                | Token::Trim
+                | Token::Now
+                | Token::Substr
+                | Token::Concat
+                | Token::Instr
+                | Token::Replace
+                | Token::DateAdd
+                | Token::DateDiff
+                | Token::Extract => {
                     // Computed expression in SELECT list — peek stays, parse_primary advances.
                     let expr = self.parse_primary()?;
                     let alias = if self.peek() == &Token::As {
@@ -314,6 +383,84 @@ impl SqlParser {
                         "expr".to_owned()
                     };
                     SelectExpr::Computed { expr, alias }
+                }
+                Token::DenseRank => {
+                    self.advance();
+                    self.expect(&Token::LParen)?;
+                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::Over)?;
+                    self.expect(&Token::LParen)?;
+                    let over_order = if self.peek() == &Token::Order {
+                        self.advance();
+                        self.expect(&Token::By)?;
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+                    self.expect(&Token::RParen)?;
+                    let alias = if self.peek() == &Token::As {
+                        self.advance();
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+                    SelectExpr::WindowFunc {
+                        func: crate::sql::ast::WindowFunc::DenseRank,
+                        over_order,
+                        over_partition: None,
+                        alias,
+                    }
+                }
+                Token::Ntile => {
+                    self.advance();
+                    self.expect(&Token::LParen)?;
+                    let n = match self.advance().clone() {
+                        Token::Integer(n) => n as u64,
+                        t => return Err(ParseError::UnexpectedToken(t)),
+                    };
+                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::Over)?;
+                    self.expect(&Token::LParen)?;
+                    self.expect(&Token::RParen)?;
+                    let alias = if self.peek() == &Token::As {
+                        self.advance();
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+                    SelectExpr::WindowFunc {
+                        func: crate::sql::ast::WindowFunc::Ntile(n),
+                        over_order: None,
+                        over_partition: None,
+                        alias,
+                    }
+                }
+                Token::PercentRank => {
+                    self.advance();
+                    self.expect(&Token::LParen)?;
+                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::Over)?;
+                    self.expect(&Token::LParen)?;
+                    let over_order = if self.peek() == &Token::Order {
+                        self.advance();
+                        self.expect(&Token::By)?;
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+                    self.expect(&Token::RParen)?;
+                    let alias = if self.peek() == &Token::As {
+                        self.advance();
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+                    SelectExpr::WindowFunc {
+                        func: crate::sql::ast::WindowFunc::PercentRank,
+                        over_order,
+                        over_partition: None,
+                        alias,
+                    }
                 }
                 Token::Lead | Token::Lag => {
                     let func_tok = self.advance().clone();
@@ -427,11 +574,18 @@ impl SqlParser {
             self.advance();
             where_clause = Some(self.parse_expr()?);
         }
-        let mut group_by = None;
+        let mut group_by: Vec<String> = Vec::new();
         if self.peek() == &Token::Group {
             self.advance(); // GROUP
             self.expect(&Token::By)?;
-            group_by = Some(self.expect_ident()?);
+            loop {
+                group_by.push(self.expect_ident()?);
+                if self.peek() == &Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
         }
         let mut having = None;
         if self.peek() == &Token::Having {
@@ -1150,6 +1304,114 @@ impl SqlParser {
                 self.expect(&Token::End)?;
                 Ok(Expr::Case { branches, else_val })
             }
+            Token::Trim => {
+                self.expect(&Token::LParen)?;
+                let arg = self.parse_primary()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::ScalarFn {
+                    func: ScalarFunc::Trim,
+                    arg: Box::new(arg),
+                })
+            }
+            Token::Now => {
+                self.expect(&Token::LParen)?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::ScalarFn {
+                    func: ScalarFunc::Now,
+                    arg: Box::new(Expr::Lit(LitVal::Null)),
+                })
+            }
+            Token::Substr => {
+                self.expect(&Token::LParen)?;
+                let s = self.parse_primary()?;
+                self.expect(&Token::Comma)?;
+                let start = self.parse_primary()?;
+                let mut args = vec![s, start];
+                if self.peek() == &Token::Comma {
+                    self.advance();
+                    args.push(self.parse_primary()?);
+                }
+                self.expect(&Token::RParen)?;
+                Ok(Expr::StrFunc {
+                    name: "SUBSTR".to_owned(),
+                    args,
+                })
+            }
+            Token::Concat => {
+                self.expect(&Token::LParen)?;
+                let mut args = Vec::new();
+                loop {
+                    args.push(self.parse_primary()?);
+                    if self.peek() == &Token::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&Token::RParen)?;
+                Ok(Expr::StrFunc {
+                    name: "CONCAT".to_owned(),
+                    args,
+                })
+            }
+            Token::Instr => {
+                self.expect(&Token::LParen)?;
+                let s = self.parse_primary()?;
+                self.expect(&Token::Comma)?;
+                let sub = self.parse_primary()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::StrFunc {
+                    name: "INSTR".to_owned(),
+                    args: vec![s, sub],
+                })
+            }
+            Token::Replace => {
+                self.expect(&Token::LParen)?;
+                let s = self.parse_primary()?;
+                self.expect(&Token::Comma)?;
+                let from = self.parse_primary()?;
+                self.expect(&Token::Comma)?;
+                let to = self.parse_primary()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::StrFunc {
+                    name: "REPLACE".to_owned(),
+                    args: vec![s, from, to],
+                })
+            }
+            Token::DateAdd => {
+                self.expect(&Token::LParen)?;
+                let date = self.parse_primary()?;
+                self.expect(&Token::Comma)?;
+                let n = self.parse_primary()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::StrFunc {
+                    name: "DATE_ADD".to_owned(),
+                    args: vec![date, n],
+                })
+            }
+            Token::DateDiff => {
+                self.expect(&Token::LParen)?;
+                let d1 = self.parse_primary()?;
+                self.expect(&Token::Comma)?;
+                let d2 = self.parse_primary()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::StrFunc {
+                    name: "DATE_DIFF".to_owned(),
+                    args: vec![d1, d2],
+                })
+            }
+            Token::Extract => {
+                self.expect(&Token::LParen)?;
+                let part = self.expect_ident()?;
+                self.expect(&Token::From)?;
+                let expr = self.parse_primary()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::DateExtract {
+                    part,
+                    expr: Box::new(expr),
+                })
+            }
+            Token::Placeholder(n) => Ok(Expr::Placeholder(n)),
             t => Err(ParseError::UnexpectedToken(t)),
         }
     }
