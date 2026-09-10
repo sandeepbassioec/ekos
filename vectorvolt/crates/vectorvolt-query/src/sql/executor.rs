@@ -170,6 +170,20 @@ impl SqlExecutor {
             return self.exec_join(stmt, filtered_left, schema, &col_names);
         }
 
+        // Collect scalar subqueries from SELECT list for later evaluation.
+        // usize::MAX is a sentinel meaning "subquery column — filled separately".
+        let subquery_cols: Vec<(String, SelectStmt)> = stmt
+            .columns
+            .iter()
+            .filter_map(|expr| {
+                if let SelectExpr::Subquery { subquery, alias } = expr {
+                    Some((alias.clone(), *subquery.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // Determine output columns (Agg variants handled separately below)
         let out_cols: Vec<(String, usize)> = stmt
             .columns
@@ -194,6 +208,7 @@ impl SqlExecutor {
                         vec![]
                     }
                 }
+                SelectExpr::Subquery { alias, .. } => vec![(alias.clone(), usize::MAX)],
                 SelectExpr::Agg { .. } => vec![],
             })
             .collect();
@@ -278,6 +293,24 @@ impl SqlExecutor {
             sorted
         };
 
+        // Pre-evaluate scalar subqueries (each returns a single value shared across all rows).
+        let subquery_values: Vec<(String, String)> = subquery_cols
+            .into_iter()
+            .map(|(alias, sq)| {
+                let val = self
+                    .exec_select(sq)
+                    .ok()
+                    .and_then(|r| match r {
+                        QueryResult::Rows { rows, .. } => {
+                            rows.into_iter().next().and_then(|r| r.into_iter().next())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                (alias, val)
+            })
+            .collect();
+
         // Build output
         let out_col_names: Vec<String> = out_cols.iter().map(|(n, _)| n.clone()).collect();
         let rows: Vec<Vec<String>> = final_rows
@@ -285,13 +318,22 @@ impl SqlExecutor {
             .map(|row| {
                 out_cols
                     .iter()
-                    .map(|(_, idx)| {
-                        let bits = row.values.get(*idx).copied().unwrap_or(0);
-                        let col_type = schema
-                            .get(*idx)
-                            .map(|c| c.col_type)
-                            .unwrap_or(ColumnType::U64);
-                        TypedValue::from_bits(col_type, bits).display_str()
+                    .map(|(col_name, idx)| {
+                        if *idx == usize::MAX {
+                            // Subquery column — look up pre-evaluated value by alias.
+                            subquery_values
+                                .iter()
+                                .find(|(a, _)| a == col_name)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_default()
+                        } else {
+                            let bits = row.values.get(*idx).copied().unwrap_or(0);
+                            let col_type = schema
+                                .get(*idx)
+                                .map(|c| c.col_type)
+                                .unwrap_or(ColumnType::U64);
+                            TypedValue::from_bits(col_type, bits).display_str()
+                        }
                     })
                     .collect()
             })
@@ -1058,6 +1100,29 @@ impl SqlExecutor {
                 Ok(compare_values(&cell, &BinOp::Gte, &lo_s)
                     && compare_values(&cell, &BinOp::Lte, &hi_s))
             }
+            Expr::InSubquery { col, subquery } => {
+                let (idx, col_def) = schema
+                    .find(col)
+                    .ok_or_else(|| ExecError::ColumnNotFound(col.clone()))?;
+                let bits = row.values.get(idx).copied().unwrap_or(0);
+                let cell = TypedValue::from_bits(col_def.col_type, bits).display_str();
+                let result = self.exec_select(*subquery.clone())?;
+                let vals: Vec<String> = match result {
+                    QueryResult::Rows { rows, .. } => rows
+                        .into_iter()
+                        .filter_map(|r| r.into_iter().next())
+                        .collect(),
+                    _ => vec![],
+                };
+                Ok(vals.iter().any(|v| compare_values(&cell, &BinOp::Eq, v)))
+            }
+            Expr::Exists { subquery } => {
+                let result = self.exec_select(*subquery.clone())?;
+                Ok(match result {
+                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
+                    _ => false,
+                })
+            }
             _ => Err(ExecError::TypeError("expected boolean expression".into())),
         }
     }
@@ -1089,11 +1154,14 @@ impl SqlExecutor {
                 let bits = row.values.get(idx).copied().unwrap_or(0);
                 Ok(TypedValue::from_bits(col_def.col_type, bits).display_str())
             }
-            Expr::BinOp { .. } | Expr::Match { .. } | Expr::In { .. } | Expr::Between { .. } => {
-                Err(ExecError::TypeError(
-                    "expected scalar value expression".into(),
-                ))
-            }
+            Expr::BinOp { .. }
+            | Expr::Match { .. }
+            | Expr::In { .. }
+            | Expr::Between { .. }
+            | Expr::InSubquery { .. }
+            | Expr::Exists { .. } => Err(ExecError::TypeError(
+                "expected scalar value expression".into(),
+            )),
         }
     }
 
@@ -2073,6 +2141,130 @@ mod tests {
         if let QueryResult::Rows { rows, .. } = r {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0][1], "5");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S34: SQL Subqueries ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_s34_in_subquery_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE orders (pk U64, amount U64)")
+            .unwrap();
+        ex.execute("CREATE TABLE vip (pk U64, order_id U64)")
+            .unwrap();
+        ex.execute("INSERT INTO orders (pk, amount) VALUES (1, 100)")
+            .unwrap();
+        ex.execute("INSERT INTO orders (pk, amount) VALUES (2, 200)")
+            .unwrap();
+        ex.execute("INSERT INTO orders (pk, amount) VALUES (3, 300)")
+            .unwrap();
+        ex.execute("INSERT INTO vip (pk, order_id) VALUES (10, 1)")
+            .unwrap();
+        ex.execute("INSERT INTO vip (pk, order_id) VALUES (11, 3)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk FROM orders WHERE pk IN (SELECT order_id FROM vip)")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            let pks: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+            assert!(pks.contains(&"1"), "pk 1 should match");
+            assert!(pks.contains(&"3"), "pk 3 should match");
+            assert!(!pks.contains(&"2"), "pk 2 should not match");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s34_in_subquery_with_where() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE items (pk U64, price U64)")
+            .unwrap();
+        ex.execute("CREATE TABLE featured (pk U64, item_pk U64, active U64)")
+            .unwrap();
+        ex.execute("INSERT INTO items (pk, price) VALUES (1, 50)")
+            .unwrap();
+        ex.execute("INSERT INTO items (pk, price) VALUES (2, 80)")
+            .unwrap();
+        ex.execute("INSERT INTO items (pk, price) VALUES (3, 120)")
+            .unwrap();
+        ex.execute("INSERT INTO featured (pk, item_pk, active) VALUES (1, 2, 1)")
+            .unwrap();
+        ex.execute("INSERT INTO featured (pk, item_pk, active) VALUES (2, 3, 0)")
+            .unwrap();
+        let r = ex
+            .execute(
+                "SELECT pk FROM items WHERE pk IN (SELECT item_pk FROM featured WHERE active = 1)",
+            )
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "2");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s34_exists_true() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE users (pk U64, role U64)").unwrap();
+        ex.execute("CREATE TABLE admins (pk U64, user_id U64)")
+            .unwrap();
+        ex.execute("INSERT INTO users (pk, role) VALUES (1, 1)")
+            .unwrap();
+        ex.execute("INSERT INTO admins (pk, user_id) VALUES (1, 1)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk FROM users WHERE EXISTS (SELECT pk FROM admins WHERE user_id = 1)")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s34_exists_false() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE users (pk U64, role U64)").unwrap();
+        ex.execute("CREATE TABLE admins (pk U64, user_id U64)")
+            .unwrap();
+        ex.execute("INSERT INTO users (pk, role) VALUES (1, 1)")
+            .unwrap();
+        // No admin rows — EXISTS should return false, filtering out all users
+        let r = ex
+            .execute("SELECT pk FROM users WHERE EXISTS (SELECT pk FROM admins WHERE user_id = 1)")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 0);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s34_scalar_subquery_in_select() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE products (pk U64, price U64)")
+            .unwrap();
+        ex.execute("CREATE TABLE counts (pk U64, total U64)")
+            .unwrap();
+        ex.execute("INSERT INTO products (pk, price) VALUES (1, 42)")
+            .unwrap();
+        ex.execute("INSERT INTO counts (pk, total) VALUES (1, 99)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk, (SELECT total FROM counts WHERE pk = 1) AS cnt FROM products")
+            .unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert!(columns.contains(&"cnt".to_owned()));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "99");
         } else {
             panic!("expected rows");
         }
