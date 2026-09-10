@@ -108,19 +108,63 @@ impl SqlParser {
                         col: None,
                     }
                 }
-                Token::Sum | Token::Min | Token::Max => {
-                    let func = match self.advance().clone() {
-                        Token::Sum => AggFunc::Sum,
-                        Token::Min => AggFunc::Min,
-                        Token::Max => AggFunc::Max,
-                        _ => unreachable!(),
+                Token::RowNumber => {
+                    self.advance();
+                    self.expect(&Token::LParen)?;
+                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::Over)?;
+                    self.expect(&Token::LParen)?;
+                    self.expect(&Token::RParen)?;
+                    SelectExpr::WindowFunc {
+                        func: crate::sql::ast::WindowFunc::RowNumber,
+                        over_order: None,
+                    }
+                }
+                Token::Rank => {
+                    self.advance();
+                    self.expect(&Token::LParen)?;
+                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::Over)?;
+                    self.expect(&Token::LParen)?;
+                    // Optional ORDER BY inside OVER
+                    let over_order = if self.peek() == &Token::Order {
+                        self.advance(); // ORDER
+                        self.expect(&Token::By)?;
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
                     };
+                    self.expect(&Token::RParen)?;
+                    SelectExpr::WindowFunc {
+                        func: crate::sql::ast::WindowFunc::Rank,
+                        over_order,
+                    }
+                }
+                Token::Sum | Token::Min | Token::Max => {
+                    let func_tok = self.advance().clone();
                     self.expect(&Token::LParen)?;
                     let col = self.expect_ident()?;
                     self.expect(&Token::RParen)?;
-                    SelectExpr::Agg {
-                        func,
-                        col: Some(col),
+                    // Check for OVER — window function variant of SUM
+                    if self.peek() == &Token::Over && matches!(func_tok, Token::Sum) {
+                        self.advance(); // OVER
+                        self.expect(&Token::LParen)?;
+                        self.expect(&Token::RParen)?;
+                        SelectExpr::WindowFunc {
+                            func: crate::sql::ast::WindowFunc::WinSum(col),
+                            over_order: None,
+                        }
+                    } else {
+                        let func = match func_tok {
+                            Token::Sum => AggFunc::Sum,
+                            Token::Min => AggFunc::Min,
+                            Token::Max => AggFunc::Max,
+                            _ => unreachable!(),
+                        };
+                        SelectExpr::Agg {
+                            func,
+                            col: Some(col),
+                        }
                     }
                 }
                 Token::LParen => {
@@ -148,6 +192,17 @@ impl SqlParser {
                     } else {
                         SelectExpr::Col(name)
                     }
+                }
+                Token::Case | Token::Coalesce | Token::Null => {
+                    // Computed expression in SELECT list — peek stays, parse_primary advances.
+                    let expr = self.parse_primary()?;
+                    let alias = if self.peek() == &Token::As {
+                        self.advance();
+                        self.expect_ident()?
+                    } else {
+                        "expr".to_owned()
+                    };
+                    SelectExpr::Computed { expr, alias }
                 }
                 t => return Err(ParseError::UnexpectedToken(t)),
             };
@@ -518,6 +573,22 @@ impl SqlParser {
             });
         }
         let left = self.parse_primary()?;
+        // IS NULL / IS NOT NULL
+        if self.peek() == &Token::Is {
+            self.advance(); // IS
+            let negated = if self.peek() == &Token::Not {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            self.expect(&Token::Null)?;
+            let col = match left {
+                Expr::Col(c) => c,
+                _ => return Err(ParseError::Other("IS NULL requires a column".to_owned())),
+            };
+            return Ok(Expr::IsNull { col, negated });
+        }
         if self.peek() == &Token::In {
             self.advance();
             self.expect(&Token::LParen)?;
@@ -639,6 +710,39 @@ impl SqlParser {
             Token::Sum => Ok(Expr::Col("sum".to_owned())),
             Token::Min => Ok(Expr::Col("min".to_owned())),
             Token::Max => Ok(Expr::Col("max".to_owned())),
+            Token::Null => Ok(Expr::Lit(LitVal::Null)),
+            Token::Coalesce => {
+                self.expect(&Token::LParen)?;
+                let mut args = Vec::new();
+                loop {
+                    args.push(self.parse_primary()?);
+                    if self.peek() == &Token::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&Token::RParen)?;
+                Ok(Expr::Coalesce { args })
+            }
+            Token::Case => {
+                let mut branches = Vec::new();
+                while self.peek() == &Token::When {
+                    self.advance(); // WHEN
+                    let cond = self.parse_comparison()?;
+                    self.expect(&Token::Then)?;
+                    let then_val = self.parse_primary()?;
+                    branches.push((cond, then_val));
+                }
+                let else_val = if self.peek() == &Token::Else {
+                    self.advance();
+                    Some(Box::new(self.parse_primary()?))
+                } else {
+                    None
+                };
+                self.expect(&Token::End)?;
+                Ok(Expr::Case { branches, else_val })
+            }
             t => Err(ParseError::UnexpectedToken(t)),
         }
     }

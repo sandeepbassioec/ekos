@@ -24,6 +24,25 @@ pub enum AggFunc {
     Max,
 }
 
+/// Window function kind for `func() OVER (...)` expressions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    /// `SUM(col) OVER ()`
+    WinSum(String),
+}
+
+impl WindowFunc {
+    pub fn col_name(&self) -> String {
+        match self {
+            WindowFunc::RowNumber => "row_number".to_owned(),
+            WindowFunc::Rank => "rank".to_owned(),
+            WindowFunc::WinSum(col) => format!("win_sum({})", col),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectExpr {
     Star,
@@ -41,6 +60,16 @@ pub enum SelectExpr {
     /// `(SELECT ...) AS alias` — scalar subquery in SELECT list
     Subquery {
         subquery: Box<SelectStmt>,
+        alias: String,
+    },
+    /// `ROW_NUMBER() OVER ()`, `RANK() OVER (ORDER BY col)`, `SUM(col) OVER ()`
+    WindowFunc {
+        func: WindowFunc,
+        over_order: Option<String>,
+    },
+    /// `CASE WHEN ... END AS alias`, `COALESCE(...) AS alias` — per-row computed expression
+    Computed {
+        expr: Expr,
         alias: String,
     },
 }
@@ -190,6 +219,20 @@ pub enum Expr {
     Exists {
         subquery: Box<SelectStmt>,
     },
+    /// `col IS NULL` / `col IS NOT NULL`
+    IsNull {
+        col: String,
+        negated: bool,
+    },
+    /// `COALESCE(expr, expr, ...)`
+    Coalesce {
+        args: Vec<Expr>,
+    },
+    /// `CASE WHEN cond THEN val ... ELSE val END`
+    Case {
+        branches: Vec<(Expr, Expr)>,
+        else_val: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,6 +241,7 @@ pub enum LitVal {
     Float(f64),
     Str(String),
     Bool(bool),
+    Null,
 }
 
 #[derive(Debug, Clone, PartialEq)]
