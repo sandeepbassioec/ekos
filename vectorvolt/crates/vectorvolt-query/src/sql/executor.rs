@@ -263,6 +263,28 @@ impl SqlExecutor {
                     });
                 }
             }
+            Some(OrderBy::Multi(cols)) => {
+                sorted.sort_by(|a, b| {
+                    for (col_name, asc) in cols {
+                        if let Some((idx, col_def)) = schema.find(col_name) {
+                            let va = TypedValue::from_bits(
+                                col_def.col_type,
+                                a.values.get(idx).copied().unwrap_or(0),
+                            );
+                            let vb = TypedValue::from_bits(
+                                col_def.col_type,
+                                b.values.get(idx).copied().unwrap_or(0),
+                            );
+                            let cmp = va.display_str().cmp(&vb.display_str());
+                            let cmp = if *asc { cmp } else { cmp.reverse() };
+                            if cmp != std::cmp::Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
             Some(OrderBy::VecDistance { col, query }) => {
                 let base = self.registry.base_dir();
                 // When LIMIT is set, try the HNSW index for approximate ANN.
@@ -295,7 +317,15 @@ impl SqlExecutor {
             None => {}
         }
 
-        // Apply LIMIT
+        // Apply OFFSET then LIMIT
+        if let Some(off) = stmt.offset {
+            let skip = off as usize;
+            if skip >= sorted.len() {
+                sorted.clear();
+            } else {
+                sorted.drain(0..skip);
+            }
+        }
         if let Some(lim) = stmt.limit {
             sorted.truncate(lim as usize);
         }
@@ -1268,6 +1298,19 @@ impl SqlExecutor {
                 }
                 Ok(else_val.is_some())
             }
+            Expr::Like {
+                col,
+                pattern,
+                negated,
+            } => {
+                let (idx, col_def) = schema
+                    .find(col)
+                    .ok_or_else(|| ExecError::ColumnNotFound(col.clone()))?;
+                let bits = row.values.get(idx).copied().unwrap_or(0);
+                let val = TypedValue::from_bits(col_def.col_type, bits).display_str();
+                let matched = like_match(&val, pattern);
+                Ok(if *negated { !matched } else { matched })
+            }
             _ => Err(ExecError::TypeError("expected boolean expression".into())),
         }
     }
@@ -1338,12 +1381,25 @@ impl SqlExecutor {
                     Ok("NULL".to_owned())
                 }
             }
+            Expr::ScalarFn { func, col } => {
+                let (idx, col_def) = schema
+                    .find(col)
+                    .ok_or_else(|| ExecError::ColumnNotFound(col.clone()))?;
+                let bits = row.values.get(idx).copied().unwrap_or(0);
+                let val = TypedValue::from_bits(col_def.col_type, bits).display_str();
+                Ok(match func {
+                    crate::sql::ast::ScalarFunc::Upper => val.to_uppercase(),
+                    crate::sql::ast::ScalarFunc::Lower => val.to_lowercase(),
+                    crate::sql::ast::ScalarFunc::Length => val.len().to_string(),
+                })
+            }
             Expr::Match { .. }
             | Expr::In { .. }
             | Expr::Between { .. }
             | Expr::InSubquery { .. }
             | Expr::Exists { .. }
-            | Expr::IsNull { .. } => Err(ExecError::TypeError(
+            | Expr::IsNull { .. }
+            | Expr::Like { .. } => Err(ExecError::TypeError(
                 "expected scalar value expression".into(),
             )),
         }
@@ -1364,6 +1420,23 @@ impl SqlExecutor {
             .map(|v| v.to_bits())
             .map_err(|e| ExecError::TypeError(e.to_string()))
     }
+}
+
+fn like_match(val: &str, pattern: &str) -> bool {
+    if pattern == "%" {
+        return true;
+    }
+    if pattern.starts_with('%') && pattern.ends_with('%') && pattern.len() > 2 {
+        let inner = &pattern[1..pattern.len() - 1];
+        return val.contains(inner);
+    }
+    if let Some(suffix) = pattern.strip_prefix('%') {
+        return val.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('%') {
+        return val.starts_with(prefix);
+    }
+    val == pattern
 }
 
 fn compare_values(left: &str, op: &BinOp, right: &str) -> bool {
@@ -2552,6 +2625,117 @@ mod tests {
             // Only pk=1 (v=0) should match IS NULL
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0][0], "1");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s38_limit_offset() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE pg (pk U64, v U64)").unwrap();
+        for i in 1u64..=5 {
+            ex.execute(&format!("INSERT INTO pg (pk, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex
+            .execute("SELECT pk FROM pg ORDER BY pk ASC LIMIT 2 OFFSET 2")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], "3");
+            assert_eq!(rows[1][0], "4");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s38_like_prefix() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE lk (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO lk (pk, val) VALUES (1, 100)")
+            .unwrap();
+        ex.execute("INSERT INTO lk (pk, val) VALUES (2, 200)")
+            .unwrap();
+        ex.execute("INSERT INTO lk (pk, val) VALUES (3, 150)")
+            .unwrap();
+        let r = ex.execute("SELECT pk FROM lk WHERE val LIKE '1%'").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+            let pks: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+            assert!(pks.contains(&"1"));
+            assert!(pks.contains(&"3"));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s38_like_contains() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE lk2 (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO lk2 (pk, val) VALUES (1, 100)")
+            .unwrap();
+        ex.execute("INSERT INTO lk2 (pk, val) VALUES (2, 999)")
+            .unwrap();
+        ex.execute("INSERT INTO lk2 (pk, val) VALUES (3, 200)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk FROM lk2 WHERE val LIKE '%0%'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+            let pks: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+            assert!(pks.contains(&"1"));
+            assert!(pks.contains(&"3"));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s38_scalar_fn_length() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE sf (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO sf (pk, val) VALUES (1, 12345)")
+            .unwrap();
+        ex.execute("INSERT INTO sf (pk, val) VALUES (2, 7)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT LENGTH(val) AS len FROM sf WHERE pk = 1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "5");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s38_multi_order_by() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE mo (pk U64, grp U64, score U64)")
+            .unwrap();
+        ex.execute("INSERT INTO mo (pk, grp, score) VALUES (1, 2, 30)")
+            .unwrap();
+        ex.execute("INSERT INTO mo (pk, grp, score) VALUES (2, 1, 40)")
+            .unwrap();
+        ex.execute("INSERT INTO mo (pk, grp, score) VALUES (3, 1, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO mo (pk, grp, score) VALUES (4, 2, 10)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk FROM mo ORDER BY grp ASC, score DESC")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 4);
+            // grp=1 rows first: score DESC → pk=2(40), pk=3(20). grp=2 rows: score DESC → pk=1(30), pk=4(10)
+            assert_eq!(rows[0][0], "2");
+            assert_eq!(rows[1][0], "3");
+            assert_eq!(rows[2][0], "1");
+            assert_eq!(rows[3][0], "4");
         } else {
             panic!("expected rows");
         }
