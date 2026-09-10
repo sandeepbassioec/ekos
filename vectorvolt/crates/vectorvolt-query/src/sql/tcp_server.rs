@@ -1,6 +1,6 @@
-//! SQL-over-TCP server (S35, VV-NET-SQL-001..005).
+//! SQL-over-TCP server (S35/S36, VV-NET-SQL-001..010).
 //!
-//! Protocol: newline-delimited JSON frames on a plain TCP stream.
+//! Protocol: newline-delimited JSON frames on a plain TCP *or* TLS stream.
 //!
 //! Request frame  (client → server):
 //!   `{"sql":"SELECT * FROM t"}\n`
@@ -26,7 +26,7 @@ use crate::sql::executor::{QueryResult, SqlExecutor};
 
 // ── SqlTcpServer ─────────────────────────────────────────────────────────────
 
-/// A multi-threaded SQL-over-TCP server.
+/// A multi-threaded SQL-over-TCP server (plain and TLS).
 ///
 /// Each accepted connection runs on its own OS thread with a dedicated
 /// [`SqlExecutor`] (no shared per-connection state).  The underlying
@@ -41,11 +41,10 @@ impl SqlTcpServer {
         Self { registry }
     }
 
-    /// Bind to `addr` and start accepting connections.
+    /// Bind to `addr` and start accepting plain-TCP connections.
     ///
     /// Returns the [`TcpListener`] so the caller can read `.local_addr()`
-    /// (useful for ephemeral-port tests).  Spawns a background thread that
-    /// loops forever; drop the listener to stop accepting new connections.
+    /// (useful for ephemeral-port tests).
     pub fn listen<A: ToSocketAddrs>(&self, addr: A) -> std::io::Result<TcpListener> {
         let listener = TcpListener::bind(addr)?;
         let registry = Arc::clone(&self.registry);
@@ -55,7 +54,31 @@ impl SqlTcpServer {
                 match stream {
                     Ok(s) => {
                         let reg = Arc::clone(&registry);
-                        thread::spawn(move || handle_connection(s, reg));
+                        thread::spawn(move || handle_plain(s, reg));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(listener)
+    }
+
+    /// Bind to `addr` and start accepting TLS connections using `tls_config`.
+    pub fn listen_tls<A: ToSocketAddrs>(
+        &self,
+        addr: A,
+        tls_config: Arc<rustls::ServerConfig>,
+    ) -> std::io::Result<TcpListener> {
+        let listener = TcpListener::bind(addr)?;
+        let registry = Arc::clone(&self.registry);
+        let listener_clone = listener.try_clone()?;
+        thread::spawn(move || {
+            for stream in listener_clone.incoming() {
+                match stream {
+                    Ok(s) => {
+                        let reg = Arc::clone(&registry);
+                        let cfg = Arc::clone(&tls_config);
+                        thread::spawn(move || handle_tls(s, reg, cfg));
                     }
                     Err(_) => break,
                 }
@@ -65,26 +88,58 @@ impl SqlTcpServer {
     }
 }
 
-// ── Connection handler ────────────────────────────────────────────────────────
+// ── Connection handlers ───────────────────────────────────────────────────────
 
-fn handle_connection(stream: TcpStream, registry: Arc<TableRegistry>) {
-    let mut writer = match stream.try_clone() {
-        Ok(w) => w,
-        Err(_) => return,
-    };
-    let reader = BufReader::new(stream);
+fn handle_plain(stream: TcpStream, registry: Arc<TableRegistry>) {
     let executor = SqlExecutor::new(registry);
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) if l.is_empty() => continue,
-            Ok(l) => l,
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
             Err(_) => break,
-        };
-        let response = handle_request(&executor, &line);
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let response = handle_request(&executor, trimmed);
         let mut out = response.to_string();
         out.push('\n');
-        if writer.write_all(out.as_bytes()).is_err() {
+        if reader.get_mut().write_all(out.as_bytes()).is_err() {
+            break;
+        }
+    }
+}
+
+fn handle_tls(
+    stream: TcpStream,
+    registry: Arc<TableRegistry>,
+    tls_config: Arc<rustls::ServerConfig>,
+) {
+    let conn = match rustls::ServerConnection::new(tls_config) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let executor = SqlExecutor::new(registry);
+    let tls_stream = rustls::StreamOwned::new(conn, stream);
+    let mut reader = BufReader::new(tls_stream);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let response = handle_request(&executor, trimmed);
+        let mut out = response.to_string();
+        out.push('\n');
+        if reader.get_mut().write_all(out.as_bytes()).is_err() {
             break;
         }
     }
@@ -128,9 +183,9 @@ fn encode_result(result: QueryResult) -> Value {
     }
 }
 
-// ── SqlSession (convenience client wrapper for tests) ─────────────────────────
+// ── SqlSession (plain-TCP client for tests) ───────────────────────────────────
 
-/// Thin synchronous client for talking to a [`SqlTcpServer`].
+/// Thin synchronous client for talking to a plain-TCP [`SqlTcpServer`].
 pub struct SqlSession {
     writer: TcpStream,
     reader: BufReader<TcpStream>,
@@ -165,6 +220,8 @@ mod tests {
     use tempfile::TempDir;
     use vectorvolt_engine::EngineOptions;
 
+    // ── plain-TCP helpers (S35) ───────────────────────────────────────────────
+
     fn start_server() -> (SqlTcpServer, TcpListener, TempDir) {
         let dir = TempDir::new().unwrap();
         let registry = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
@@ -175,7 +232,6 @@ mod tests {
 
     fn session(listener: &TcpListener) -> SqlSession {
         let addr = listener.local_addr().unwrap();
-        // Small retry loop — the accept thread may not be ready immediately.
         for _ in 0..20 {
             if let Ok(s) = SqlSession::connect(addr) {
                 return s;
@@ -219,7 +275,6 @@ mod tests {
             .unwrap();
         let commit_r = s.query("COMMIT").unwrap();
         assert_eq!(commit_r["op"], "commit");
-        // After commit, a new query (same connection) sees the row.
         let r = s.query("SELECT pk FROM acct WHERE pk = 1").unwrap();
         assert_eq!(r["rows"].as_array().unwrap().len(), 1);
     }
@@ -234,7 +289,6 @@ mod tests {
             .unwrap();
         let rb_r = s.query("ROLLBACK").unwrap();
         assert_eq!(rb_r["op"], "rollback");
-        // After rollback the row must not exist.
         let r = s.query("SELECT pk FROM ledger WHERE pk = 42").unwrap();
         assert_eq!(r["rows"].as_array().unwrap().len(), 0);
     }
@@ -245,17 +299,190 @@ mod tests {
         let mut s1 = session(&listener);
         let mut s2 = session(&listener);
         s1.query("CREATE TABLE shared (pk U64, v U64)").unwrap();
-        // s1 begins a transaction and inserts — s2 must not see uncommitted data.
         s1.query("BEGIN").unwrap();
         s1.query("INSERT INTO shared (pk, v) VALUES (7, 77)")
             .unwrap();
         let r2 = s2.query("SELECT pk FROM shared WHERE pk = 7").unwrap();
-        // s2 sees 0 rows (transaction not committed yet).
         assert_eq!(r2["rows"].as_array().unwrap().len(), 0);
-        // Commit on s1.
         s1.query("COMMIT").unwrap();
-        // Now s2 should see the row.
         let r2_after = s2.query("SELECT pk FROM shared WHERE pk = 7").unwrap();
         assert_eq!(r2_after["rows"].as_array().unwrap().len(), 1);
+    }
+
+    // ── TLS helpers (S36) ─────────────────────────────────────────────────────
+
+    use rcgen::generate_simple_self_signed;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    fn make_tls_server_config() -> Arc<rustls::ServerConfig> {
+        let cert = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        Arc::new(cfg)
+    }
+
+    struct TlsSession {
+        inner: BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
+    }
+
+    impl TlsSession {
+        fn connect<A: ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
+            let tls_cfg = Arc::new(
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                    .with_no_client_auth(),
+            );
+            let server_name = rustls::pki_types::ServerName::try_from("localhost")
+                .unwrap()
+                .to_owned();
+            let conn = rustls::ClientConnection::new(tls_cfg, server_name).unwrap();
+            let stream = TcpStream::connect(addr)?;
+            let tls = rustls::StreamOwned::new(conn, stream);
+            Ok(Self {
+                inner: BufReader::new(tls),
+            })
+        }
+
+        fn query(&mut self, sql: &str) -> serde_json::Result<Value> {
+            let req = format!("{}\n", json!({"sql": sql}));
+            self.inner.get_mut().write_all(req.as_bytes()).unwrap();
+            let mut line = String::new();
+            self.inner.read_line(&mut line).unwrap();
+            serde_json::from_str(line.trim())
+        }
+    }
+
+    // Certificate verifier that accepts everything (tests only).
+    #[derive(Debug)]
+    struct NoVerifier;
+
+    impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    fn start_tls_server() -> (
+        SqlTcpServer,
+        TcpListener,
+        TempDir,
+        Arc<rustls::ServerConfig>,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let registry = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
+        let server = SqlTcpServer::new(Arc::clone(&registry));
+        let tls_cfg = make_tls_server_config();
+        let listener = server
+            .listen_tls("127.0.0.1:0", Arc::clone(&tls_cfg))
+            .unwrap();
+        (server, listener, dir, tls_cfg)
+    }
+
+    fn tls_session(listener: &TcpListener) -> TlsSession {
+        let addr = listener.local_addr().unwrap();
+        for _ in 0..20 {
+            if let Ok(s) = TlsSession::connect(addr) {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        TlsSession::connect(addr).unwrap()
+    }
+
+    #[test]
+    fn test_s36_tls_ddl() {
+        let (_srv, listener, _dir, _cfg) = start_tls_server();
+        let mut s = tls_session(&listener);
+        let r = s.query("CREATE TABLE tls_t (pk U64, v U64)").unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["op"], "created");
+    }
+
+    #[test]
+    fn test_s36_tls_insert_select() {
+        let (_srv, listener, _dir, _cfg) = start_tls_server();
+        let mut s = tls_session(&listener);
+        s.query("CREATE TABLE tls_items (pk U64, price U64)")
+            .unwrap();
+        s.query("INSERT INTO tls_items (pk, price) VALUES (1, 999)")
+            .unwrap();
+        let r = s
+            .query("SELECT pk, price FROM tls_items WHERE pk = 1")
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["rows"][0][1], "999");
+    }
+
+    #[test]
+    fn test_s36_tls_txn_commit() {
+        let (_srv, listener, _dir, _cfg) = start_tls_server();
+        let mut s = tls_session(&listener);
+        s.query("CREATE TABLE tls_acct (pk U64, bal U64)").unwrap();
+        s.query("BEGIN").unwrap();
+        s.query("INSERT INTO tls_acct (pk, bal) VALUES (5, 2000)")
+            .unwrap();
+        let r = s.query("COMMIT").unwrap();
+        assert_eq!(r["op"], "commit");
+        let r2 = s.query("SELECT pk FROM tls_acct WHERE pk = 5").unwrap();
+        assert_eq!(r2["rows"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_s36_tls_txn_rollback() {
+        let (_srv, listener, _dir, _cfg) = start_tls_server();
+        let mut s = tls_session(&listener);
+        s.query("CREATE TABLE tls_rb (pk U64, v U64)").unwrap();
+        s.query("BEGIN").unwrap();
+        s.query("INSERT INTO tls_rb (pk, v) VALUES (99, 1)")
+            .unwrap();
+        let r = s.query("ROLLBACK").unwrap();
+        assert_eq!(r["op"], "rollback");
+        let r2 = s.query("SELECT pk FROM tls_rb WHERE pk = 99").unwrap();
+        assert_eq!(r2["rows"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_s36_tls_error_response() {
+        let (_srv, listener, _dir, _cfg) = start_tls_server();
+        let mut s = tls_session(&listener);
+        let r = s.query("SELECT * FROM nonexistent_table").unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().is_some());
     }
 }
