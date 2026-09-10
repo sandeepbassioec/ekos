@@ -5,4 +5,5 @@ pub mod hnsw;
 pub mod lexer;
 pub mod parser;
 pub mod planner;
+pub mod tcp_server;
 pub mod vec_store;
