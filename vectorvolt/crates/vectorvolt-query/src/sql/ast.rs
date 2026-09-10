@@ -1,3 +1,4 @@
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Select(SelectStmt),
@@ -22,6 +23,14 @@ pub enum AggFunc {
     Sum,
     Min,
     Max,
+}
+
+/// Scalar function applied to a column value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarFunc {
+    Upper,
+    Lower,
+    Length,
 }
 
 /// Window function kind for `func() OVER (...)` expressions.
@@ -94,6 +103,8 @@ pub struct JoinClause {
 pub enum OrderBy {
     /// `ORDER BY col ASC|DESC`
     Col { name: String, asc: bool },
+    /// `ORDER BY col1 ASC, col2 DESC, ...`
+    Multi(Vec<(String, bool)>),
     /// `ORDER BY vec_distance(col, '[...]') [ASC]`
     VecDistance { col: String, query: Vec<f32> },
 }
@@ -108,6 +119,7 @@ pub struct SelectStmt {
     pub having: Option<Expr>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<u64>,
+    pub offset: Option<u64>,
     pub distinct: bool,
 }
 
@@ -232,6 +244,17 @@ pub enum Expr {
     Case {
         branches: Vec<(Expr, Expr)>,
         else_val: Option<Box<Expr>>,
+    },
+    /// `col LIKE 'pattern'` / `col NOT LIKE 'pattern'`
+    Like {
+        col: String,
+        pattern: String,
+        negated: bool,
+    },
+    /// `UPPER(col)`, `LOWER(col)`, `LENGTH(col)`
+    ScalarFn {
+        func: ScalarFunc,
+        col: String,
     },
 }
 

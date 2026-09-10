@@ -200,6 +200,18 @@ impl<'a> Planner<'a> {
                 col: name.clone(),
                 asc: *asc,
             },
+            Some(OrderBy::Multi(cols)) => {
+                // Use first column for the planner estimate; executor handles the full multi-sort.
+                if let Some((name, asc)) = cols.first() {
+                    PhysicalPlan::Sort {
+                        input: Box::new(after_project),
+                        col: name.clone(),
+                        asc: *asc,
+                    }
+                } else {
+                    after_project
+                }
+            }
             Some(OrderBy::VecDistance { col, query }) => PhysicalPlan::VecSort {
                 input: Box::new(after_project),
                 col: col.clone(),
