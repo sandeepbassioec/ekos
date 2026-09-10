@@ -194,6 +194,7 @@ pub struct SqlSession {
 impl SqlSession {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
         let stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
         let reader = BufReader::new(stream.try_clone()?);
         Ok(Self {
             writer: stream,
@@ -342,6 +343,7 @@ mod tests {
                 .to_owned();
             let conn = rustls::ClientConnection::new(tls_cfg, server_name).unwrap();
             let stream = TcpStream::connect(addr)?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
             let tls = rustls::StreamOwned::new(conn, stream);
             Ok(Self {
                 inner: BufReader::new(tls),
