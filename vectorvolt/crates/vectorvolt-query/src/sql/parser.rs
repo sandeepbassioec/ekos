@@ -80,6 +80,25 @@ impl SqlParser {
             }
             Token::Begin => {
                 self.advance();
+                // S61 — BEGIN ISOLATION LEVEL ...
+                if self.peek() == &Token::Isolation {
+                    self.advance(); // ISOLATION
+                    self.expect(&Token::Level)?;
+                    let level = match self.advance().clone() {
+                        Token::KwRead => match self.advance().clone() {
+                            Token::Committed => IsolationLevel::ReadCommitted,
+                            Token::Uncommitted => IsolationLevel::ReadUncommitted,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        },
+                        Token::Repeatable => {
+                            self.advance(); // READ
+                            IsolationLevel::RepeatableRead
+                        }
+                        Token::Serializable => IsolationLevel::Serializable,
+                        t => return Err(ParseError::UnexpectedToken(t)),
+                    };
+                    return Ok(Stmt::BeginIsolation { level });
+                }
                 Ok(Stmt::Begin)
             }
             Token::Commit => {
@@ -320,7 +339,19 @@ impl SqlParser {
                 }
                 Token::Ident(name) => {
                     self.advance();
-                    if self.peek() == &Token::Dot {
+                    // S64 / UDF — function call in SELECT list: NAME(...) AS alias
+                    if self.peek() == &Token::LParen {
+                        // Back up the token position to let parse_primary re-read it
+                        self.pos -= 1;
+                        let expr = self.parse_primary()?;
+                        let alias = if self.peek() == &Token::As {
+                            self.advance();
+                            self.expect_ident()?
+                        } else {
+                            "expr".to_owned()
+                        };
+                        SelectExpr::Computed { expr, alias }
+                    } else if self.peek() == &Token::Dot {
                         self.advance(); // consume '.'
                         let col = self.expect_ident()?;
                         SelectExpr::QualifiedCol { table: name, col }
@@ -373,7 +404,8 @@ impl SqlParser {
                 | Token::Replace
                 | Token::DateAdd
                 | Token::DateDiff
-                | Token::Extract => {
+                | Token::Extract
+                | Token::MatchScore => {
                     // Computed expression in SELECT list — peek stays, parse_primary advances.
                     let expr = self.parse_primary()?;
                     let alias = if self.peek() == &Token::As {
@@ -530,6 +562,16 @@ impl SqlParser {
         }
         self.expect(&Token::From)?;
         let table = self.expect_ident()?;
+        // S67 — USE INDEX(name) hint
+        let mut index_hint = None;
+        if self.peek() == &Token::Use {
+            self.advance(); // USE
+            self.expect(&Token::Index)?;
+            self.expect(&Token::LParen)?;
+            let hint = self.expect_ident()?;
+            self.expect(&Token::RParen)?;
+            index_hint = Some(hint);
+        }
         let mut joins = Vec::new();
         loop {
             let kind = match self.peek().clone() {
@@ -679,6 +721,7 @@ impl SqlParser {
             distinct,
             set_op: None,
             ctes: vec![],
+            index_hint,
         };
 
         // S40 — check for UNION ALL / INTERSECT / EXCEPT
@@ -822,13 +865,50 @@ impl SqlParser {
                     Token::Ident(s) => s,
                     t => return Err(ParseError::UnexpectedToken(t)),
                 };
-                AlterOp::AddColumn(ColTypeDef { name, col_type })
+                AlterOp::AddColumn(ColTypeDef {
+                    name,
+                    col_type,
+                    default: None,
+                    check: None,
+                })
             }
             Token::Drop => {
                 self.advance();
                 self.expect(&Token::Column)?;
                 let name = self.expect_ident()?;
                 AlterOp::DropColumn(name)
+            }
+            // S58 — RENAME COLUMN old TO new
+            Token::Rename => {
+                self.advance();
+                self.expect(&Token::Column)?;
+                let from = self.expect_ident()?;
+                self.expect(&Token::To)?;
+                let to = self.expect_ident()?;
+                AlterOp::RenameColumn { from, to }
+            }
+            // S58 — ALTER COLUMN col TYPE new_type
+            Token::Alter => {
+                self.advance();
+                self.expect(&Token::Column)?;
+                let col = self.expect_ident()?;
+                // Expect TYPE keyword (stored as KwType or as Ident "TYPE")
+                match self.advance().clone() {
+                    Token::KwType => {}
+                    Token::Ident(s) if s.eq_ignore_ascii_case("TYPE") => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                let new_type = match self.advance().clone() {
+                    Token::KwU64 => "u64".to_owned(),
+                    Token::KwI64 => "i64".to_owned(),
+                    Token::KwF64 => "f64".to_owned(),
+                    Token::KwBool => "bool".to_owned(),
+                    Token::KwText => "text".to_owned(),
+                    Token::KwTimestamp => "timestamp".to_owned(),
+                    Token::Ident(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                AlterOp::ChangeType { col, new_type }
             }
             t => return Err(ParseError::UnexpectedToken(t)),
         };
@@ -899,6 +979,64 @@ impl SqlParser {
     fn parse_create(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // CREATE
         match self.peek().clone() {
+            // S65 — CREATE FUNCTION
+            Token::Function => {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&Token::LParen)?;
+                // param may be any identifier-like token
+                let param = match self.advance().clone() {
+                    Token::Ident(s) => s,
+                    Token::Row => "row".to_owned(),
+                    Token::Rows => "rows".to_owned(),
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                self.expect(&Token::RParen)?;
+                self.expect(&Token::Returns)?;
+                self.advance(); // skip return type token
+                self.expect(&Token::As)?;
+                let body = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                return Ok(Stmt::CreateFunction { name, param, body });
+            }
+            // S66 — CREATE TRIGGER
+            Token::Trigger => {
+                self.advance();
+                let name = self.expect_ident()?;
+                let timing = match self.advance().clone() {
+                    Token::Before => TriggerTiming::Before,
+                    Token::After => TriggerTiming::After,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                let event = match self.advance().clone() {
+                    Token::Insert => TriggerEvent::Insert,
+                    Token::Update => TriggerEvent::Update,
+                    Token::Delete => TriggerEvent::Delete,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                self.expect(&Token::On)?;
+                let table = self.expect_ident()?;
+                // FOR keyword — consume as ident or skip if not present
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("FOR")) {
+                    self.advance();
+                }
+                self.expect(&Token::Each)?;
+                self.expect(&Token::Row)?;
+                self.expect(&Token::Execute)?;
+                self.expect(&Token::Function)?;
+                let func = self.expect_ident()?;
+                self.expect(&Token::LParen)?;
+                self.expect(&Token::RParen)?;
+                return Ok(Stmt::CreateTrigger(TriggerDef {
+                    name,
+                    timing,
+                    event,
+                    table,
+                    func,
+                }));
+            }
             Token::Index => {
                 self.advance(); // INDEX
                 let index_name = self.expect_ident()?;
@@ -933,7 +1071,32 @@ impl SqlParser {
         let table = self.expect_ident()?;
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
+        let mut foreign_keys = Vec::new();
         loop {
+            // S60 — FOREIGN KEY clause
+            if self.peek() == &Token::Foreign {
+                self.advance(); // FOREIGN
+                self.expect(&Token::Key)?;
+                self.expect(&Token::LParen)?;
+                let col = self.expect_ident()?;
+                self.expect(&Token::RParen)?;
+                self.expect(&Token::References)?;
+                let ref_table = self.expect_ident()?;
+                self.expect(&Token::LParen)?;
+                let ref_col = self.expect_ident()?;
+                self.expect(&Token::RParen)?;
+                foreign_keys.push(ForeignKey {
+                    col,
+                    ref_table,
+                    ref_col,
+                });
+                if self.peek() == &Token::Comma {
+                    self.advance();
+                    continue;
+                } else {
+                    break;
+                }
+            }
             let name = self.expect_ident()?;
             let col_type = match self.advance().clone() {
                 Token::KwU64 => "u64".to_owned(),
@@ -958,7 +1121,81 @@ impl SqlParser {
                 }
                 t => return Err(ParseError::UnexpectedToken(t)),
             };
-            columns.push(ColTypeDef { name, col_type });
+            // S59 — DEFAULT and CHECK
+            let mut default = None;
+            let mut check = None;
+            loop {
+                match self.peek().clone() {
+                    Token::Default => {
+                        self.advance();
+                        let lit = match self.advance().clone() {
+                            Token::Integer(n) => LitVal::Int(n),
+                            Token::Float(f) => LitVal::Float(f),
+                            Token::Str(s) => LitVal::Str(s),
+                            Token::Boolean(b) => LitVal::Bool(b),
+                            Token::Null => LitVal::Null,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        default = Some(lit);
+                    }
+                    Token::Check => {
+                        self.advance();
+                        self.expect(&Token::LParen)?;
+                        // Collect tokens until matching RParen as a string
+                        let mut depth = 1usize;
+                        let mut check_str = String::new();
+                        loop {
+                            match self.advance().clone() {
+                                Token::LParen => {
+                                    depth += 1;
+                                    check_str.push('(');
+                                }
+                                Token::RParen => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                    check_str.push(')');
+                                }
+                                Token::Ident(s) => {
+                                    check_str.push_str(&s);
+                                    check_str.push(' ');
+                                }
+                                Token::Integer(n) => {
+                                    check_str.push_str(&n.to_string());
+                                    check_str.push(' ');
+                                }
+                                Token::Float(f) => {
+                                    check_str.push_str(&f.to_string());
+                                    check_str.push(' ');
+                                }
+                                Token::Str(s) => {
+                                    check_str.push('\'');
+                                    check_str.push_str(&s);
+                                    check_str.push('\'');
+                                    check_str.push(' ');
+                                }
+                                Token::Gt => check_str.push_str("> "),
+                                Token::Lt => check_str.push_str("< "),
+                                Token::Gte => check_str.push_str(">= "),
+                                Token::Lte => check_str.push_str("<= "),
+                                Token::Eq => check_str.push_str("= "),
+                                Token::Neq => check_str.push_str("<> "),
+                                Token::Eof => break,
+                                _ => {}
+                            }
+                        }
+                        check = Some(check_str.trim().to_owned());
+                    }
+                    _ => break,
+                }
+            }
+            columns.push(ColTypeDef {
+                name,
+                col_type,
+                default,
+                check,
+            });
             if self.peek() == &Token::Comma {
                 self.advance();
             } else {
@@ -966,7 +1203,11 @@ impl SqlParser {
             }
         }
         self.expect(&Token::RParen)?;
-        Ok(Stmt::CreateTable(CreateTableStmt { table, columns }))
+        Ok(Stmt::CreateTable(CreateTableStmt {
+            table,
+            columns,
+            foreign_keys,
+        }))
     }
 
     /// Parse `table.col` or bare `col`, returning `(table_hint, col)`.
@@ -993,6 +1234,16 @@ impl SqlParser {
                 self.advance();
                 let name = self.expect_ident()?;
                 return Ok(Stmt::DropView(DropViewStmt { name }));
+            }
+            Token::Function => {
+                self.advance();
+                let name = self.expect_ident()?;
+                return Ok(Stmt::DropFunction { name });
+            }
+            Token::Trigger => {
+                self.advance();
+                let name = self.expect_ident()?;
+                return Ok(Stmt::DropTrigger { name });
             }
             _ => {}
         }
@@ -1238,13 +1489,99 @@ impl SqlParser {
                 self.expect(&Token::RParen)?;
                 Ok(Expr::Match { col, term })
             }
+            // S62 — MATCH_SCORE(col, 'term')
+            Token::MatchScore => {
+                self.expect(&Token::LParen)?;
+                let col = self.expect_ident()?;
+                self.expect(&Token::Comma)?;
+                let term = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                self.expect(&Token::RParen)?;
+                Ok(Expr::MatchScore { col, term })
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("DATE_TRUNC") => {
+                self.expect(&Token::LParen)?;
+                let part = match self.advance().clone() {
+                    Token::Str(s2) => s2,
+                    Token::Ident(s2) => s2,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                self.expect(&Token::Comma)?;
+                let col = self.parse_primary()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::StrFunc {
+                    name: "DATE_TRUNC".to_owned(),
+                    args: vec![Expr::Lit(LitVal::Str(part)), col],
+                })
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("TIME_BUCKET") => {
+                self.expect(&Token::LParen)?;
+                let interval = self.parse_primary()?;
+                self.expect(&Token::Comma)?;
+                let col = self.parse_primary()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::StrFunc {
+                    name: "TIME_BUCKET".to_owned(),
+                    args: vec![interval, col],
+                })
+            }
             Token::Ident(s) => {
-                if self.peek() == &Token::Dot {
+                // S65 — UDF/generic function call: ident(args...)
+                if self.peek() == &Token::LParen {
+                    self.advance(); // consume '('
+                    let mut args = Vec::new();
+                    if self.peek() != &Token::RParen {
+                        loop {
+                            args.push(self.parse_primary()?);
+                            if self.peek() == &Token::Comma {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&Token::RParen)?;
+                    return Ok(Expr::StrFunc {
+                        name: s.to_ascii_uppercase(),
+                        args,
+                    });
+                }
+                // S63 — JSON operators col->'key' and col->>'key'
+                let base = if self.peek() == &Token::Dot {
                     self.advance(); // consume '.'
                     let col = self.expect_ident()?;
-                    Ok(Expr::QualifiedCol { table: s, col })
+                    Expr::QualifiedCol { table: s, col }
                 } else {
-                    Ok(Expr::Col(s))
+                    Expr::Col(s)
+                };
+                match self.peek().clone() {
+                    Token::Arrow => {
+                        self.advance();
+                        let key = match self.advance().clone() {
+                            Token::Str(k) => k,
+                            Token::Ident(k) => k,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        Ok(Expr::JsonGet {
+                            expr: Box::new(base),
+                            key,
+                        })
+                    }
+                    Token::ArrowText => {
+                        self.advance();
+                        let key = match self.advance().clone() {
+                            Token::Str(k) => k,
+                            Token::Ident(k) => k,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        Ok(Expr::JsonGetText {
+                            expr: Box::new(base),
+                            key,
+                        })
+                    }
+                    _ => Ok(base),
                 }
             }
             Token::Integer(n) => Ok(Expr::Lit(LitVal::Int(n))),
