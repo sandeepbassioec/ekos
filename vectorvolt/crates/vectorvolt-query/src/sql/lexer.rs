@@ -68,6 +68,12 @@ pub enum Token {
     // S38 — string + pagination
     Offset,
     Like,
+    // S68 — ILIKE
+    ILike,
+    // S71 — CROSS JOIN
+    Cross,
+    // S73 — RETURNING
+    Returning,
     Upper,
     Lower,
     Length,
@@ -160,6 +166,22 @@ pub enum Token {
     Row,
     // S67
     Use,
+    // S68
+    Recursive,
+    // S69
+    Lateral,
+    // S71
+    Reset,
+    // S74
+    Copy,
+    Header,
+    Format,
+    Csv,
+    // S75
+    Materialized,
+    Refresh,
+    // S77
+    Range,
     // Types
     KwU64,
     KwI64,
@@ -427,6 +449,9 @@ impl<'a> Lexer<'a> {
             "COALESCE" => Token::Coalesce,
             "OFFSET" => Token::Offset,
             "LIKE" => Token::Like,
+            "ILIKE" => Token::ILike,
+            "CROSS" => Token::Cross,
+            "RETURNING" => Token::Returning,
             "UPPER" => Token::Upper,
             "LOWER" => Token::Lower,
             "LENGTH" => Token::Length,
@@ -493,6 +518,16 @@ impl<'a> Lexer<'a> {
             "EACH" => Token::Each,
             "ROW" => Token::Row,
             "USE" => Token::Use,
+            "RECURSIVE" => Token::Recursive,
+            "LATERAL" => Token::Lateral,
+            "RESET" => Token::Reset,
+            "COPY" => Token::Copy,
+            "HEADER" => Token::Header,
+            "FORMAT" => Token::Format,
+            "CSV" => Token::Csv,
+            "MATERIALIZED" => Token::Materialized,
+            "REFRESH" => Token::Refresh,
+            "RANGE" => Token::Range,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,
