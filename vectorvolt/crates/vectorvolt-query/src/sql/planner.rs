@@ -174,7 +174,9 @@ impl<'a> Planner<'a> {
                 crate::sql::ast::SelectExpr::Col(name) => vec![name.clone()],
                 crate::sql::ast::SelectExpr::QualifiedCol { col, .. } => vec![col.clone()],
                 crate::sql::ast::SelectExpr::Subquery { alias, .. } => vec![alias.clone()],
-                crate::sql::ast::SelectExpr::WindowFunc { func, .. } => vec![func.col_name()],
+                crate::sql::ast::SelectExpr::WindowFunc { func, alias, .. } => {
+                    vec![alias.clone().unwrap_or_else(|| func.col_name())]
+                }
                 crate::sql::ast::SelectExpr::Computed { alias, .. } => vec![alias.clone()],
                 crate::sql::ast::SelectExpr::Agg { func, col } => {
                     use crate::sql::ast::AggFunc;
