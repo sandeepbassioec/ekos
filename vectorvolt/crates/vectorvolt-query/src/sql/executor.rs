@@ -170,6 +170,19 @@ impl SqlExecutor {
             return self.exec_join(stmt, filtered_left, schema, &col_names);
         }
 
+        // Collect computed (CASE/COALESCE/etc.) expressions — evaluated per row.
+        let computed_cols: Vec<(String, Expr)> = stmt
+            .columns
+            .iter()
+            .filter_map(|expr| {
+                if let SelectExpr::Computed { alias, expr } = expr {
+                    Some((alias.clone(), expr.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // Collect scalar subqueries from SELECT list for later evaluation.
         // usize::MAX is a sentinel meaning "subquery column — filled separately".
         let subquery_cols: Vec<(String, SelectStmt)> = stmt
@@ -209,6 +222,8 @@ impl SqlExecutor {
                     }
                 }
                 SelectExpr::Subquery { alias, .. } => vec![(alias.clone(), usize::MAX)],
+                SelectExpr::WindowFunc { func, .. } => vec![(func.col_name(), usize::MAX - 1)],
+                SelectExpr::Computed { alias, .. } => vec![(alias.clone(), usize::MAX - 2)],
                 SelectExpr::Agg { .. } => vec![],
             })
             .collect();
@@ -311,11 +326,103 @@ impl SqlExecutor {
             })
             .collect();
 
+        // Collect window function columns (if any) and pre-compute per-row values.
+        let window_funcs: Vec<(String, SelectExpr)> = stmt
+            .columns
+            .iter()
+            .filter_map(|c| {
+                if let SelectExpr::WindowFunc { func, .. } = c {
+                    Some((func.col_name(), c.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Each element = Vec of (col_name, value) pairs for that row index.
+        let window_row_vals: Vec<Vec<(String, String)>> = if !window_funcs.is_empty() {
+            (0..final_rows.len())
+                .map(|row_idx| {
+                    window_funcs
+                        .iter()
+                        .map(|(col_name, expr)| {
+                            let val = match expr {
+                                SelectExpr::WindowFunc {
+                                    func: WindowFunc::RowNumber,
+                                    ..
+                                } => (row_idx + 1).to_string(),
+                                SelectExpr::WindowFunc {
+                                    func: WindowFunc::Rank,
+                                    over_order,
+                                } => {
+                                    if let Some(order_col) = over_order {
+                                        if let Some((idx, col_def)) = schema.find(order_col) {
+                                            let my_bits = final_rows[row_idx]
+                                                .values
+                                                .get(idx)
+                                                .copied()
+                                                .unwrap_or(0);
+                                            let my_s =
+                                                TypedValue::from_bits(col_def.col_type, my_bits)
+                                                    .display_str();
+                                            let rank = final_rows
+                                                .iter()
+                                                .filter(|r| {
+                                                    let rb =
+                                                        r.values.get(idx).copied().unwrap_or(0);
+                                                    let rs =
+                                                        TypedValue::from_bits(col_def.col_type, rb)
+                                                            .display_str();
+                                                    compare_values(&rs, &BinOp::Lt, &my_s)
+                                                })
+                                                .count()
+                                                + 1;
+                                            rank.to_string()
+                                        } else {
+                                            (row_idx + 1).to_string()
+                                        }
+                                    } else {
+                                        (row_idx + 1).to_string()
+                                    }
+                                }
+                                SelectExpr::WindowFunc {
+                                    func: WindowFunc::WinSum(sum_col),
+                                    ..
+                                } => {
+                                    if let Some((idx, col_def)) = schema.find(sum_col) {
+                                        let total: f64 = final_rows
+                                            .iter()
+                                            .map(|r| {
+                                                TypedValue::from_bits(
+                                                    col_def.col_type,
+                                                    r.values.get(idx).copied().unwrap_or(0),
+                                                )
+                                                .display_str()
+                                                .parse::<f64>()
+                                                .unwrap_or(0.0)
+                                            })
+                                            .sum();
+                                        format!("{:.0}", total)
+                                    } else {
+                                        "0".to_owned()
+                                    }
+                                }
+                                _ => String::new(),
+                            };
+                            (col_name.clone(), val)
+                        })
+                        .collect()
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
         // Build output
         let out_col_names: Vec<String> = out_cols.iter().map(|(n, _)| n.clone()).collect();
         let rows: Vec<Vec<String>> = final_rows
             .iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(row_idx, row)| {
                 out_cols
                     .iter()
                     .map(|(col_name, idx)| {
@@ -325,6 +432,23 @@ impl SqlExecutor {
                                 .iter()
                                 .find(|(a, _)| a == col_name)
                                 .map(|(_, v)| v.clone())
+                                .unwrap_or_default()
+                        } else if *idx == usize::MAX - 1 {
+                            // Window function column — look up pre-computed value.
+                            window_row_vals
+                                .get(row_idx)
+                                .and_then(|wrow| {
+                                    wrow.iter()
+                                        .find(|(n, _)| n == col_name)
+                                        .map(|(_, v)| v.clone())
+                                })
+                                .unwrap_or_default()
+                        } else if *idx == usize::MAX - 2 {
+                            // Computed expression (CASE WHEN, COALESCE, etc.) — evaluate per row.
+                            computed_cols
+                                .iter()
+                                .find(|(n, _)| n == col_name)
+                                .and_then(|(_, expr)| self.eval_value(expr, row, schema).ok())
                                 .unwrap_or_default()
                         } else {
                             let bits = row.values.get(*idx).copied().unwrap_or(0);
@@ -475,6 +599,7 @@ impl SqlExecutor {
                 LitVal::Float(f) => format!("{f:.6}"),
                 LitVal::Str(s) => s.clone(),
                 LitVal::Bool(b) => b.to_string(),
+                LitVal::Null => "NULL".to_owned(),
             },
             _ => String::new(),
         }
@@ -1075,6 +1200,7 @@ impl SqlExecutor {
                         LitVal::Float(f) => format!("{f:.6}"),
                         LitVal::Str(s) => s.clone(),
                         LitVal::Bool(b) => b.to_string(),
+                        LitVal::Null => "NULL".to_owned(),
                     };
                     compare_values(&cell, &BinOp::Eq, &vs)
                 }))
@@ -1090,12 +1216,14 @@ impl SqlExecutor {
                     LitVal::Float(f) => format!("{f:.6}"),
                     LitVal::Str(s) => s.clone(),
                     LitVal::Bool(b) => b.to_string(),
+                    LitVal::Null => "NULL".to_owned(),
                 };
                 let hi_s = match hi {
                     LitVal::Int(n) => n.to_string(),
                     LitVal::Float(f) => format!("{f:.6}"),
                     LitVal::Str(s) => s.clone(),
                     LitVal::Bool(b) => b.to_string(),
+                    LitVal::Null => "NULL".to_owned(),
                 };
                 Ok(compare_values(&cell, &BinOp::Gte, &lo_s)
                     && compare_values(&cell, &BinOp::Lte, &hi_s))
@@ -1123,6 +1251,23 @@ impl SqlExecutor {
                     _ => false,
                 })
             }
+            Expr::IsNull { col, negated } => {
+                let (idx, col_def) = schema
+                    .find(col)
+                    .ok_or_else(|| ExecError::ColumnNotFound(col.clone()))?;
+                let bits = row.values.get(idx).copied().unwrap_or(0);
+                let cell = TypedValue::from_bits(col_def.col_type, bits).display_str();
+                let is_null = bits == 0 || cell.is_empty() || cell == "NULL";
+                Ok(if *negated { !is_null } else { is_null })
+            }
+            Expr::Case { branches, else_val } => {
+                for (when_expr, _) in branches {
+                    if self.eval_expr(when_expr, row, schema, table)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(else_val.is_some())
+            }
             _ => Err(ExecError::TypeError("expected boolean expression".into())),
         }
     }
@@ -1146,6 +1291,7 @@ impl SqlExecutor {
                 LitVal::Float(f) => format!("{f:.6}"),
                 LitVal::Str(s) => s.clone(),
                 LitVal::Bool(b) => b.to_string(),
+                LitVal::Null => "NULL".to_owned(),
             }),
             Expr::QualifiedCol { col, .. } => {
                 let (idx, col_def) = schema
@@ -1154,12 +1300,50 @@ impl SqlExecutor {
                 let bits = row.values.get(idx).copied().unwrap_or(0);
                 Ok(TypedValue::from_bits(col_def.col_type, bits).display_str())
             }
-            Expr::BinOp { .. }
-            | Expr::Match { .. }
+            Expr::BinOp { op, left, right } => match op {
+                BinOp::And | BinOp::Or => Err(ExecError::TypeError(
+                    "AND/OR not valid in scalar context".into(),
+                )),
+                _ => {
+                    let lv = self.eval_value(left, row, schema)?;
+                    let rv = self.eval_value(right, row, schema)?;
+                    Ok(if compare_values(&lv, op, &rv) {
+                        "true".to_owned()
+                    } else {
+                        "false".to_owned()
+                    })
+                }
+            },
+            Expr::Coalesce { args } => {
+                for arg in args {
+                    let val = self.eval_value(arg, row, schema)?;
+                    if !val.is_empty() && val != "NULL" {
+                        return Ok(val);
+                    }
+                }
+                Ok("NULL".to_owned())
+            }
+            Expr::Case { branches, else_val } => {
+                for (when_expr, then_expr) in branches {
+                    let cond = self.eval_value(when_expr, row, schema)?;
+                    let truthy =
+                        !cond.is_empty() && cond != "0" && cond != "false" && cond != "NULL";
+                    if truthy {
+                        return self.eval_value(then_expr, row, schema);
+                    }
+                }
+                if let Some(ev) = else_val {
+                    self.eval_value(ev, row, schema)
+                } else {
+                    Ok("NULL".to_owned())
+                }
+            }
+            Expr::Match { .. }
             | Expr::In { .. }
             | Expr::Between { .. }
             | Expr::InSubquery { .. }
-            | Expr::Exists { .. } => Err(ExecError::TypeError(
+            | Expr::Exists { .. }
+            | Expr::IsNull { .. } => Err(ExecError::TypeError(
                 "expected scalar value expression".into(),
             )),
         }
@@ -1172,6 +1356,7 @@ impl SqlExecutor {
                 LitVal::Float(f) => format!("{f:.6}"),
                 LitVal::Str(s) => s.clone(),
                 LitVal::Bool(b) => b.to_string(),
+                LitVal::Null => "0".to_owned(),
             },
             _ => return Err(ExecError::TypeError("expected literal in INSERT".into())),
         };
@@ -2265,6 +2450,108 @@ mod tests {
             assert!(columns.contains(&"cnt".to_owned()));
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0][1], "99");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S37: Window functions ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_s37_row_number() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE wt (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO wt (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO wt (pk, v) VALUES (2, 20)").unwrap();
+        ex.execute("INSERT INTO wt (pk, v) VALUES (3, 30)").unwrap();
+        let r = ex
+            .execute("SELECT pk, ROW_NUMBER() OVER () FROM wt")
+            .unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert!(columns.contains(&"row_number".to_owned()));
+            assert_eq!(rows.len(), 3);
+            // ROW_NUMBER values should be 1, 2, 3
+            let rns: Vec<&str> = rows.iter().map(|r| r[1].as_str()).collect();
+            assert!(rns.contains(&"1") && rns.contains(&"2") && rns.contains(&"3"));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s37_rank_over_order() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE rt (pk U64, score U64)").unwrap();
+        ex.execute("INSERT INTO rt (pk, score) VALUES (1, 100)")
+            .unwrap();
+        ex.execute("INSERT INTO rt (pk, score) VALUES (2, 200)")
+            .unwrap();
+        ex.execute("INSERT INTO rt (pk, score) VALUES (3, 150)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT pk, RANK() OVER (ORDER BY score) FROM rt ORDER BY pk")
+            .unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert!(columns.contains(&"rank".to_owned()));
+            // pk=1 has score=100 (lowest) → rank 1
+            let pk1_rank = &rows.iter().find(|r| r[0] == "1").unwrap()[1];
+            assert_eq!(pk1_rank, "1");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s37_win_sum_over() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE st (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO st (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO st (pk, v) VALUES (2, 20)").unwrap();
+        ex.execute("INSERT INTO st (pk, v) VALUES (3, 30)").unwrap();
+        let r = ex.execute("SELECT pk, SUM(v) OVER () FROM st").unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert!(columns.contains(&"win_sum(v)".to_owned()));
+            // All rows should have the same total: 10+20+30=60
+            assert!(rows.iter().all(|r| r[1] == "60"));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S37: CASE WHEN ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_s37_case_when() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE ct (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO ct (pk, v) VALUES (1, 5)").unwrap();
+        ex.execute("INSERT INTO ct (pk, v) VALUES (2, 15)").unwrap();
+        let r = ex
+            .execute("SELECT pk, CASE WHEN v = 5 THEN 100 ELSE 200 END FROM ct ORDER BY pk")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][1], "100"); // pk=1, v=5 → 100
+            assert_eq!(rows[1][1], "200"); // pk=2, v=15 → 200
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S37: NULL handling ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_s37_is_null() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE nt (pk U64, v U64)").unwrap();
+        // Insert row with v=0 (treated as NULL in our u64 system)
+        ex.execute("INSERT INTO nt (pk, v) VALUES (1, 0)").unwrap();
+        ex.execute("INSERT INTO nt (pk, v) VALUES (2, 99)").unwrap();
+        let r = ex.execute("SELECT pk FROM nt WHERE v IS NULL").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            // Only pk=1 (v=0) should match IS NULL
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "1");
         } else {
             panic!("expected rows");
         }
