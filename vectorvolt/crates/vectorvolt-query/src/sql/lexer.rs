@@ -104,6 +104,29 @@ pub enum Token {
     Unbounded,
     Current,
     Rows,
+    // S49
+    Substr,
+    Trim,
+    Concat,
+    Instr,
+    // S50
+    Now,
+    DateAdd,
+    DateDiff,
+    Extract,
+    // S52
+    DenseRank,
+    Ntile,
+    PercentRank,
+    // S53
+    Savepoint,
+    Release,
+    // S56
+    Analyze,
+    // S57
+    Prepare,
+    Execute,
+    Placeholder(usize),
     // Types
     KwU64,
     KwI64,
@@ -233,6 +256,16 @@ impl<'a> Lexer<'a> {
             if ch == '!' && self.pos + 1 < bytes.len() && bytes[self.pos + 1] == b'=' {
                 tokens.push(Token::Neq);
                 self.pos += 2;
+                continue;
+            }
+            if ch == '$' {
+                self.pos += 1;
+                let start = self.pos;
+                while self.pos < bytes.len() && (bytes[self.pos] as char).is_ascii_digit() {
+                    self.pos += 1;
+                }
+                let n: usize = self.input[start..self.pos].parse().unwrap_or(0);
+                tokens.push(Token::Placeholder(n));
                 continue;
             }
             let tok = match ch {
@@ -379,6 +412,22 @@ impl<'a> Lexer<'a> {
             "UNBOUNDED" => Token::Unbounded,
             "CURRENT" => Token::Current,
             "ROWS" => Token::Rows,
+            "SUBSTR" => Token::Substr,
+            "TRIM" => Token::Trim,
+            "CONCAT" => Token::Concat,
+            "INSTR" => Token::Instr,
+            "NOW" => Token::Now,
+            "DATE_ADD" => Token::DateAdd,
+            "DATE_DIFF" => Token::DateDiff,
+            "EXTRACT" => Token::Extract,
+            "DENSE_RANK" => Token::DenseRank,
+            "NTILE" => Token::Ntile,
+            "PERCENT_RANK" => Token::PercentRank,
+            "SAVEPOINT" => Token::Savepoint,
+            "RELEASE" => Token::Release,
+            "ANALYZE" => Token::Analyze,
+            "PREPARE" => Token::Prepare,
+            "EXECUTE" => Token::Execute,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,
