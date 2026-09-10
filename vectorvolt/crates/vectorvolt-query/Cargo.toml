@@ -11,9 +11,11 @@ vectorvolt-storage = { workspace = true }
 thiserror = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
+rustls     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rcgen    = { workspace = true }
 
 [dev-dependencies.criterion]
 workspace = true
