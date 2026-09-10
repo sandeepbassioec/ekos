@@ -146,7 +146,11 @@ impl<'a> Planner<'a> {
 
     pub fn plan(&self, stmt: &SelectStmt) -> PhysicalPlan {
         // ── Choose scan ────────────────────────────────────────────────────
-        let scan = self.choose_scan(&stmt.table, stmt.where_clause.as_ref());
+        let scan = self.choose_scan_with_hint(
+            &stmt.table,
+            stmt.where_clause.as_ref(),
+            stmt.index_hint.as_deref(),
+        );
 
         // ── Filter (only when WHERE isn't fully covered by the scan) ───────
         let after_filter = if let Some(expr) = &stmt.where_clause {
@@ -234,7 +238,31 @@ impl<'a> Planner<'a> {
     }
 
     /// Choose between FullScan and RangeScan using a cost heuristic.
+    #[allow(dead_code)]
     fn choose_scan(&self, table: &str, where_clause: Option<&Expr>) -> PhysicalPlan {
+        self.choose_scan_with_hint(table, where_clause, None)
+    }
+
+    /// Choose scan, preferring hint column if provided (S67).
+    fn choose_scan_with_hint(
+        &self,
+        table: &str,
+        where_clause: Option<&Expr>,
+        hint: Option<&str>,
+    ) -> PhysicalPlan {
+        // If a hint column is specified and we can find it, force a RangeScan on it
+        if let Some(hint_col) = hint
+            && let Some((col_idx, _)) = self.schema.find(hint_col)
+        {
+            return PhysicalPlan::RangeScan {
+                table: table.to_owned(),
+                col_idx,
+                col_name: hint_col.to_owned(),
+                lo: 0,
+                hi: u64::MAX,
+                est_rows: self.stats,
+            };
+        }
         if let Some(expr) = where_clause
             && let Some((col_idx, lo, hi)) = self.try_pushdown(expr)
         {

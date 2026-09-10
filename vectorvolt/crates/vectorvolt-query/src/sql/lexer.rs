@@ -127,6 +127,39 @@ pub enum Token {
     Prepare,
     Execute,
     Placeholder(usize),
+    // S58
+    KwType,
+    // S59
+    Default,
+    Check,
+    // S60
+    Foreign,
+    Key,
+    References,
+    // S61
+    KwRead,
+    Committed,
+    Uncommitted,
+    Repeatable,
+    Serializable,
+    Isolation,
+    Level,
+    // S62
+    MatchScore,
+    // S63
+    Arrow,
+    ArrowText,
+    // S65
+    Function,
+    Returns,
+    // S66
+    Trigger,
+    Before,
+    After,
+    Each,
+    Row,
+    // S67
+    Use,
     // Types
     KwU64,
     KwI64,
@@ -198,6 +231,16 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 tokens.push(Token::Str(s));
+                continue;
+            }
+            if ch == '-' && self.pos + 1 < bytes.len() && bytes[self.pos + 1] == b'>' {
+                if self.pos + 2 < bytes.len() && bytes[self.pos + 2] == b'>' {
+                    tokens.push(Token::ArrowText);
+                    self.pos += 3;
+                } else {
+                    tokens.push(Token::Arrow);
+                    self.pos += 2;
+                }
                 continue;
             }
             if ch == '-'
@@ -428,6 +471,28 @@ impl<'a> Lexer<'a> {
             "ANALYZE" => Token::Analyze,
             "PREPARE" => Token::Prepare,
             "EXECUTE" => Token::Execute,
+            "TYPE" => Token::KwType,
+            "DEFAULT" => Token::Default,
+            "CHECK" => Token::Check,
+            "FOREIGN" => Token::Foreign,
+            "KEY" => Token::Key,
+            "REFERENCES" => Token::References,
+            "READ" => Token::KwRead,
+            "COMMITTED" => Token::Committed,
+            "UNCOMMITTED" => Token::Uncommitted,
+            "REPEATABLE" => Token::Repeatable,
+            "SERIALIZABLE" => Token::Serializable,
+            "ISOLATION" => Token::Isolation,
+            "LEVEL" => Token::Level,
+            "MATCH_SCORE" => Token::MatchScore,
+            "FUNCTION" => Token::Function,
+            "RETURNS" => Token::Returns,
+            "TRIGGER" => Token::Trigger,
+            "BEFORE" => Token::Before,
+            "AFTER" => Token::After,
+            "EACH" => Token::Each,
+            "ROW" => Token::Row,
+            "USE" => Token::Use,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,

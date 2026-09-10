@@ -28,8 +28,32 @@ pub enum Stmt {
     // S56 — EXPLAIN ANALYZE
     ExplainAnalyze(Box<SelectStmt>),
     // S57 — prepared statements
-    Prepare { name: String, stmt: Box<Stmt> },
-    ExecuteStmt { name: String, params: Vec<Expr> },
+    Prepare {
+        name: String,
+        stmt: Box<Stmt>,
+    },
+    ExecuteStmt {
+        name: String,
+        params: Vec<Expr>,
+    },
+    // S61 — isolation levels
+    BeginIsolation {
+        level: IsolationLevel,
+    },
+    // S65 — UDFs
+    CreateFunction {
+        name: String,
+        param: String,
+        body: String,
+    },
+    DropFunction {
+        name: String,
+    },
+    // S66 — triggers
+    CreateTrigger(TriggerDef),
+    DropTrigger {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +212,8 @@ pub struct SelectStmt {
     pub set_op: Option<SetOp>,
     // S41 — CTEs
     pub ctes: Vec<(String, Box<SelectStmt>)>,
+    // S67 — index hint
+    pub index_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -226,12 +252,25 @@ pub struct DeleteStmt {
 pub struct ColTypeDef {
     pub name: String,
     pub col_type: String,
+    // S59
+    pub default: Option<LitVal>,
+    pub check: Option<String>,
+}
+
+// S60 — foreign key
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    pub col: String,
+    pub ref_table: String,
+    pub ref_col: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableStmt {
     pub table: String,
     pub columns: Vec<ColTypeDef>,
+    // S60
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,6 +282,9 @@ pub struct DropTableStmt {
 pub enum AlterOp {
     AddColumn(ColTypeDef),
     DropColumn(String),
+    // S58
+    RenameColumn { from: String, to: String },
+    ChangeType { col: String, new_type: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -285,6 +327,38 @@ pub struct CreateViewStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropViewStmt {
     pub name: String,
+}
+
+// S61 — isolation levels
+#[derive(Debug, Clone, PartialEq)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+// S66 — triggers
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerDef {
+    pub name: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub table: String,
+    pub func: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -378,6 +452,20 @@ pub enum Expr {
     },
     // S57 — prepared statement placeholder
     Placeholder(usize),
+    // S62 — match score
+    MatchScore {
+        col: String,
+        term: String,
+    },
+    // S63 — JSON operators
+    JsonGet {
+        expr: Box<Expr>,
+        key: String,
+    },
+    JsonGetText {
+        expr: Box<Expr>,
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
