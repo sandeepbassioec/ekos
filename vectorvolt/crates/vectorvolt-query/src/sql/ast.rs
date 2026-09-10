@@ -31,6 +31,18 @@ pub enum AggFunc {
     Max,
 }
 
+/// Scalar function applied to a column or expression value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarFunc {
+    Upper,
+    Lower,
+    Length,
+    Abs,
+    Round,
+    Ceil,
+    Floor,
+}
+
 /// Window function kind for `func() OVER (...)` expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WindowFunc {
@@ -73,15 +85,6 @@ pub enum ArithOp {
     Mul,
     Div,
     Mod,
-}
-
-/// S39 scalar function
-#[derive(Debug, Clone, PartialEq)]
-pub enum ScalarFunc {
-    Abs,
-    Round,
-    Ceil,
-    Floor,
 }
 
 /// S40 set operation
@@ -145,6 +148,8 @@ pub struct JoinClause {
 pub enum OrderBy {
     /// `ORDER BY col ASC|DESC`
     Col { name: String, asc: bool },
+    /// `ORDER BY col1 ASC, col2 DESC, ...`
+    Multi(Vec<(String, bool)>),
     /// `ORDER BY vec_distance(col, '[...]') [ASC]`
     VecDistance { col: String, query: Vec<f32> },
 }
@@ -159,6 +164,7 @@ pub struct SelectStmt {
     pub having: Option<Expr>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<u64>,
+    pub offset: Option<u64>,
     pub distinct: bool,
     // S40 — set operations
     pub set_op: Option<SetOp>,
@@ -316,13 +322,19 @@ pub enum Expr {
         branches: Vec<(Expr, Expr)>,
         else_val: Option<Box<Expr>>,
     },
+    /// `col LIKE 'pattern'` / `col NOT LIKE 'pattern'`
+    Like {
+        col: String,
+        pattern: String,
+        negated: bool,
+    },
     // S39 — arithmetic
     Arith {
         op: ArithOp,
         left: Box<Expr>,
         right: Box<Expr>,
     },
-    // S39 — scalar functions
+    /// `UPPER(col)`, `LOWER(col)`, `LENGTH(col)`, `ABS(expr)`, `ROUND(expr)`, etc.
     ScalarFn {
         func: ScalarFunc,
         arg: Box<Expr>,

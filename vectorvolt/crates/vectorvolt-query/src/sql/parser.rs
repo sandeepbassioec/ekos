@@ -297,6 +297,9 @@ impl SqlParser {
                 Token::Case
                 | Token::Coalesce
                 | Token::Null
+                | Token::Upper
+                | Token::Lower
+                | Token::Length
                 | Token::Abs
                 | Token::Round
                 | Token::Ceil
@@ -468,7 +471,29 @@ impl SqlParser {
                     }
                     _ => true,
                 };
-                order_by = Some(OrderBy::Col { name: col, asc });
+                if self.peek() == &Token::Comma {
+                    // Multi-column ORDER BY
+                    let mut cols = vec![(col, asc)];
+                    while self.peek() == &Token::Comma {
+                        self.advance();
+                        let c = self.expect_ident()?;
+                        let a = match self.peek() {
+                            Token::Desc => {
+                                self.advance();
+                                false
+                            }
+                            Token::Asc => {
+                                self.advance();
+                                true
+                            }
+                            _ => true,
+                        };
+                        cols.push((c, a));
+                    }
+                    order_by = Some(OrderBy::Multi(cols));
+                } else {
+                    order_by = Some(OrderBy::Col { name: col, asc });
+                }
             }
         }
         let mut limit = None;
@@ -476,6 +501,14 @@ impl SqlParser {
             self.advance();
             match self.advance().clone() {
                 Token::Integer(n) => limit = Some(n as u64),
+                t => return Err(ParseError::UnexpectedToken(t)),
+            }
+        }
+        let mut offset = None;
+        if self.peek() == &Token::Offset {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => offset = Some(n as u64),
                 t => return Err(ParseError::UnexpectedToken(t)),
             }
         }
@@ -488,6 +521,7 @@ impl SqlParser {
             having,
             order_by,
             limit,
+            offset,
             distinct,
             set_op: None,
             ctes: vec![],
@@ -852,6 +886,48 @@ impl SqlParser {
             });
         }
         let left = self.parse_primary()?;
+        // col LIKE 'pattern' / col NOT LIKE 'pattern'
+        if self.peek() == &Token::Not {
+            self.advance(); // consume NOT
+            self.expect(&Token::Like)?;
+            let pattern = match self.advance().clone() {
+                Token::Str(s) => s,
+                t => return Err(ParseError::UnexpectedToken(t)),
+            };
+            let col = match left {
+                Expr::Col(c) => c,
+                _ => {
+                    return Err(ParseError::Other(
+                        "NOT LIKE left side must be a column".to_owned(),
+                    ));
+                }
+            };
+            return Ok(Expr::Like {
+                col,
+                pattern,
+                negated: true,
+            });
+        }
+        if self.peek() == &Token::Like {
+            self.advance();
+            let pattern = match self.advance().clone() {
+                Token::Str(s) => s,
+                t => return Err(ParseError::UnexpectedToken(t)),
+            };
+            let col = match left {
+                Expr::Col(c) => c,
+                _ => {
+                    return Err(ParseError::Other(
+                        "LIKE left side must be a column".to_owned(),
+                    ));
+                }
+            };
+            return Ok(Expr::Like {
+                col,
+                pattern,
+                negated: false,
+            });
+        }
         // IS NULL / IS NOT NULL
         if self.peek() == &Token::Is {
             self.advance(); // IS
@@ -1040,6 +1116,21 @@ impl SqlParser {
                 }
                 self.expect(&Token::RParen)?;
                 Ok(Expr::Coalesce { args })
+            }
+            tok @ (Token::Upper | Token::Lower | Token::Length) => {
+                let func = match tok {
+                    Token::Upper => crate::sql::ast::ScalarFunc::Upper,
+                    Token::Lower => crate::sql::ast::ScalarFunc::Lower,
+                    Token::Length => crate::sql::ast::ScalarFunc::Length,
+                    _ => unreachable!(),
+                };
+                self.expect(&Token::LParen)?;
+                let col = self.expect_ident()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::ScalarFn {
+                    func,
+                    arg: Box::new(Expr::Col(col)),
+                })
             }
             Token::Case => {
                 let mut branches = Vec::new();
