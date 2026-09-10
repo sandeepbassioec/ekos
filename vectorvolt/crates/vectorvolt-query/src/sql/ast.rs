@@ -38,6 +38,11 @@ pub enum SelectExpr {
         func: AggFunc,
         col: Option<String>,
     },
+    /// `(SELECT ...) AS alias` — scalar subquery in SELECT list
+    Subquery {
+        subquery: Box<SelectStmt>,
+        alias: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -175,6 +180,15 @@ pub enum Expr {
         col: String,
         lo: LitVal,
         hi: LitVal,
+    },
+    /// `col IN (SELECT col FROM table WHERE ...)`
+    InSubquery {
+        col: String,
+        subquery: Box<SelectStmt>,
+    },
+    /// `EXISTS (SELECT 1 FROM table WHERE ...)`
+    Exists {
+        subquery: Box<SelectStmt>,
     },
 }
 

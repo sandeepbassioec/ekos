@@ -51,6 +51,7 @@ pub enum Token {
     Left,
     Outer,
     On,
+    Exists,
     // Types
     KwU64,
     KwI64,
@@ -281,6 +282,7 @@ impl<'a> Lexer<'a> {
             "LEFT" => Token::Left,
             "OUTER" => Token::Outer,
             "ON" => Token::On,
+            "EXISTS" => Token::Exists,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,

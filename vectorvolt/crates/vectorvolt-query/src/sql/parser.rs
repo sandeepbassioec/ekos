@@ -123,6 +123,22 @@ impl SqlParser {
                         col: Some(col),
                     }
                 }
+                Token::LParen => {
+                    // (SELECT ...) AS alias — scalar subquery in SELECT list
+                    self.advance();
+                    let inner = self.parse_select()?;
+                    let subquery = match inner {
+                        Stmt::Select(s) => s,
+                        _ => return Err(ParseError::Other("subquery must be SELECT".to_owned())),
+                    };
+                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::As)?;
+                    let alias = self.expect_ident()?;
+                    SelectExpr::Subquery {
+                        subquery: Box::new(subquery),
+                        alias,
+                    }
+                }
                 Token::Ident(name) => {
                     self.advance();
                     if self.peek() == &Token::Dot {
@@ -487,10 +503,45 @@ impl SqlParser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        // EXISTS (SELECT ...)
+        if self.peek() == &Token::Exists {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            let inner = self.parse_select()?;
+            let subquery = match inner {
+                Stmt::Select(s) => s,
+                _ => return Err(ParseError::Other("EXISTS requires SELECT".to_owned())),
+            };
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::Exists {
+                subquery: Box::new(subquery),
+            });
+        }
         let left = self.parse_primary()?;
         if self.peek() == &Token::In {
             self.advance();
             self.expect(&Token::LParen)?;
+            // Check if this is IN (SELECT ...) or IN (literal, ...)
+            if self.peek() == &Token::Select {
+                let inner = self.parse_select()?;
+                let subquery = match inner {
+                    Stmt::Select(s) => s,
+                    _ => return Err(ParseError::Other("IN subquery must be SELECT".to_owned())),
+                };
+                self.expect(&Token::RParen)?;
+                let col = match left {
+                    Expr::Col(c) => c,
+                    _ => {
+                        return Err(ParseError::Other(
+                            "IN left side must be a column".to_owned(),
+                        ));
+                    }
+                };
+                return Ok(Expr::InSubquery {
+                    col,
+                    subquery: Box::new(subquery),
+                });
+            }
             let mut values = Vec::new();
             loop {
                 let expr = self.parse_primary()?;
