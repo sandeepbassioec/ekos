@@ -180,6 +180,13 @@ fn encode_result(result: QueryResult) -> Value {
         QueryResult::TxBegin => json!({"ok": true, "type": "ok", "op": "begin"}),
         QueryResult::TxCommit => json!({"ok": true, "type": "ok", "op": "commit"}),
         QueryResult::TxRollback => json!({"ok": true, "type": "ok", "op": "rollback"}),
+        QueryResult::Error(msg) => json!({"ok": false, "error": msg}),
+        QueryResult::Notice(msg) => json!({"ok": true, "notice": msg}),
+        QueryResult::WithNotice { result, notice } => {
+            let inner = encode_result(*result);
+            json!({"ok": true, "notice": notice, "result": inner})
+        }
+        QueryResult::Ok(msg) => json!({"ok": true, "message": msg}),
     }
 }
 

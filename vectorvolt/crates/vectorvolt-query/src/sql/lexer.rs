@@ -182,6 +182,28 @@ pub enum Token {
     Refresh,
     // S77
     Range,
+    // S78 — RLS
+    Policy,
+    Using,
+    // S79 — column masking
+    Mask,
+    // S81 — token auth
+    Session,
+    KwToken,
+    Require,
+    // S82 — rate limiting
+    Rate,
+    Per,
+    KwSecond,
+    // S83 — IP allowlist
+    Allowed,
+    Ip,
+    // S84 — TLS cert rotation
+    Rotate,
+    Cert,
+    // S87 — warnings
+    Warnings,
+    Off,
     // Types
     KwU64,
     KwI64,
@@ -528,6 +550,21 @@ impl<'a> Lexer<'a> {
             "MATERIALIZED" => Token::Materialized,
             "REFRESH" => Token::Refresh,
             "RANGE" => Token::Range,
+            "POLICY" => Token::Policy,
+            "USING" => Token::Using,
+            "MASK" => Token::Mask,
+            "SESSION" => Token::Session,
+            "TOKEN" => Token::KwToken,
+            "REQUIRE" => Token::Require,
+            "RATE" => Token::Rate,
+            "PER" => Token::Per,
+            "SECOND" => Token::KwSecond,
+            "ALLOWED" => Token::Allowed,
+            "IP" => Token::Ip,
+            "ROTATE" => Token::Rotate,
+            "CERT" => Token::Cert,
+            "WARNINGS" => Token::Warnings,
+            "OFF" => Token::Off,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,
