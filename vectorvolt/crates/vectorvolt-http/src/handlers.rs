@@ -1656,6 +1656,24 @@ pub async fn sql_handler(
                     ok: true,
                     message: "transaction rolled back".into(),
                 }),
+                SqlQueryResult::Error(msg) => SqlResp::Ok(crate::types::SqlOkResp {
+                    ok: false,
+                    message: msg,
+                }),
+                SqlQueryResult::Notice(msg) | SqlQueryResult::Ok(msg) => {
+                    SqlResp::Ok(crate::types::SqlOkResp { ok: true, message: msg })
+                }
+                SqlQueryResult::WithNotice { result, notice: _ } => {
+                    match *result {
+                        SqlQueryResult::Rows { columns, rows } => {
+                            SqlResp::Rows(crate::types::SqlRowsResp { columns, rows })
+                        }
+                        other => SqlResp::Ok(crate::types::SqlOkResp {
+                            ok: true,
+                            message: format!("{other:?}"),
+                        }),
+                    }
+                }
             };
             Json(resp).into_response()
         }
