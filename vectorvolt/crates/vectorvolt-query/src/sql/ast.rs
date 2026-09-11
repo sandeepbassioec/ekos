@@ -164,6 +164,31 @@ pub enum Stmt {
     },
     // S97 — wait events
     ResetWaitEvents,
+    // S98 — flamegraph export
+    ExplainFlamegraph(Box<SelectStmt>),
+    // S100 — EXPLAIN BUFFERS
+    ExplainBuffers(Box<SelectStmt>),
+    // S101/S102 — psql/pgcli meta-commands
+    MetaCmd {
+        cmd: String,
+        arg: Option<String>,
+    },
+    // S103 — cursor protocol
+    DeclareCursor {
+        name: String,
+        select: Box<SelectStmt>,
+    },
+    FetchCursor {
+        name: String,
+        count: u64,
+    },
+    CloseCursor {
+        name: String,
+    },
+    // S106 — statement timeout
+    SetStatementTimeout {
+        ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

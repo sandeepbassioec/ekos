@@ -49,6 +49,13 @@ impl SqlParser {
             Token::Ident(s) => Ok(s),
             // Allow soft keywords as identifiers (table/column names)
             Token::Events => Ok("events".to_owned()),
+            Token::Flamegraph => Ok("flamegraph".to_owned()),
+            Token::Buffers => Ok("buffers".to_owned()),
+            Token::Declare => Ok("declare".to_owned()),
+            Token::Cursor => Ok("cursor".to_owned()),
+            Token::Fetch => Ok("fetch".to_owned()),
+            Token::Close => Ok("close".to_owned()),
+            Token::Stdin => Ok("stdin".to_owned()),
             Token::Slow => Ok("slow".to_owned()),
             Token::Standby => Ok("standby".to_owned()),
             Token::Primary => Ok("primary".to_owned()),
@@ -83,6 +90,55 @@ impl SqlParser {
                     self.advance(); // ANALYZE
                     match self.parse_select()? {
                         Stmt::Select(s) => Ok(Stmt::ExplainAnalyze(Box::new(s))),
+                        _ => Err(ParseError::UnexpectedToken(Token::Explain)),
+                    }
+                } else if self.peek() == &Token::Flamegraph {
+                    // S98 — EXPLAIN FLAMEGRAPH SELECT ...
+                    self.advance(); // FLAMEGRAPH
+                    match self.parse_select()? {
+                        Stmt::Select(s) => Ok(Stmt::ExplainFlamegraph(Box::new(s))),
+                        _ => Err(ParseError::UnexpectedToken(Token::Explain)),
+                    }
+                } else if self.peek() == &Token::LParen {
+                    // S100 — EXPLAIN (BUFFERS, ANALYZE) SELECT ... or EXPLAIN (ANALYZE) SELECT ...
+                    self.advance(); // (
+                    let mut has_buffers = false;
+                    loop {
+                        match self.peek().clone() {
+                            Token::RParen => break,
+                            Token::Buffers => {
+                                self.advance();
+                                has_buffers = true;
+                            }
+                            Token::Analyze => {
+                                self.advance();
+                            }
+                            _ => {
+                                self.advance();
+                            }
+                        }
+                        if self.peek() == &Token::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&Token::RParen)?;
+                    match self.parse_select()? {
+                        Stmt::Select(s) => {
+                            if has_buffers {
+                                Ok(Stmt::ExplainBuffers(Box::new(s)))
+                            } else {
+                                Ok(Stmt::ExplainAnalyze(Box::new(s)))
+                            }
+                        }
+                        _ => Err(ParseError::UnexpectedToken(Token::Explain)),
+                    }
+                } else if self.peek() == &Token::Buffers {
+                    // S100 — EXPLAIN BUFFERS SELECT ...
+                    self.advance(); // BUFFERS
+                    match self.parse_select()? {
+                        Stmt::Select(s) => Ok(Stmt::ExplainBuffers(Box::new(s))),
                         _ => Err(ParseError::UnexpectedToken(Token::Explain)),
                     }
                 } else {
@@ -210,7 +266,15 @@ impl SqlParser {
                 self.advance(); // COPY
                 let table = self.expect_ident()?;
                 self.expect(&Token::From)?;
+                // S104 — detect STDIN keyword
                 let path = match self.advance().clone() {
+                    Token::Stdin => {
+                        // Inline data follows as a string literal
+                        match self.advance().clone() {
+                            Token::Str(s) => format!("__STDIN__:{s}"),
+                            _ => "__STDIN__:".to_owned(),
+                        }
+                    }
                     Token::Str(s) => s,
                     t => return Err(ParseError::UnexpectedToken(t)),
                 };
@@ -379,6 +443,15 @@ impl SqlParser {
                         };
                         return Ok(Stmt::SetAutoExplainThreshold { ms });
                     }
+                    // S106 — SET STATEMENT_TIMEOUT n
+                    Token::Ident(ref s) if s.eq_ignore_ascii_case("STATEMENT_TIMEOUT") => {
+                        self.advance(); // STATEMENT_TIMEOUT
+                        let ms = match self.advance().clone() {
+                            Token::Integer(n) => n as u64,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        return Ok(Stmt::SetStatementTimeout { ms });
+                    }
                     _ => {
                         return Err(ParseError::UnexpectedToken(self.peek().clone()));
                     }
@@ -533,6 +606,57 @@ impl SqlParser {
                     cert_path,
                     key_path,
                 });
+            }
+            // S101/S102 — meta-commands
+            Token::MetaCmd(cmd) => {
+                let cmd = cmd.clone();
+                self.advance();
+                // Optional argument (e.g. \d tablename, \c dbname)
+                let arg = match self.peek().clone() {
+                    Token::Ident(s) => {
+                        self.advance();
+                        Some(s)
+                    }
+                    _ => None,
+                };
+                Ok(Stmt::MetaCmd { cmd, arg })
+            }
+            // S103 — DECLARE name CURSOR FOR SELECT ...
+            Token::Declare => {
+                self.advance(); // DECLARE
+                let name = self.expect_ident()?;
+                self.expect(&Token::Cursor)?;
+                // consume optional FOR keyword
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("FOR")) {
+                    self.advance();
+                }
+                match self.parse_select()? {
+                    Stmt::Select(s) => Ok(Stmt::DeclareCursor {
+                        name,
+                        select: Box::new(s),
+                    }),
+                    _ => Err(ParseError::Other(
+                        "DECLARE CURSOR requires SELECT".to_owned(),
+                    )),
+                }
+            }
+            // S103 — FETCH n FROM name
+            Token::Fetch => {
+                self.advance(); // FETCH
+                let count = match self.advance().clone() {
+                    Token::Integer(n) => n as u64,
+                    Token::All => 0, // FETCH ALL = no limit
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                self.expect(&Token::From)?;
+                let name = self.expect_ident()?;
+                Ok(Stmt::FetchCursor { name, count })
+            }
+            // S103 — CLOSE name
+            Token::Close => {
+                self.advance(); // CLOSE
+                let name = self.expect_ident()?;
+                Ok(Stmt::CloseCursor { name })
             }
             t => Err(ParseError::UnexpectedToken(t)),
         }
