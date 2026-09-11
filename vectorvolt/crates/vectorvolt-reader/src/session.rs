@@ -173,7 +173,7 @@ impl PgSession {
                 self.stream
                     .write_all(&encode_command_complete(&format!("NOTICE: {notice}")))
                     .await?;
-                self.send_result(*result).await?;
+                Box::pin(self.send_result(*result)).await?;
             }
             QueryResult::Ok(msg) => {
                 self.stream
