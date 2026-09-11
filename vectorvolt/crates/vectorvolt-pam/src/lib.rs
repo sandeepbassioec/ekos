@@ -63,14 +63,64 @@ pub fn register_user(username: &str, password: &str) {
         .insert(username.to_owned(), password.to_owned());
 }
 
-/// Write directly to /dev/tty so output appears over SSH/PAM session.
-fn write_to_tty(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-        let _ = tty.write_all(msg.as_bytes());
-    } else {
-        // fallback if /dev/tty not available
-        print!("{}", msg);
+/// PAM conversation struct
+#[repr(C)]
+struct PamMessage {
+    msg_style: c_int,
+    msg: *const c_char,
+}
+
+#[repr(C)]
+struct PamResponse {
+    resp: *mut c_char,
+    resp_retcode: c_int,
+}
+
+type PamConvFn = unsafe extern "C" fn(
+    num_msg: c_int,
+    msg: *mut *const PamMessage,
+    resp: *mut *mut PamResponse,
+    appdata_ptr: *mut c_void,
+) -> c_int;
+
+#[repr(C)]
+struct PamConv {
+    conv: PamConvFn,
+    appdata_ptr: *mut c_void,
+}
+
+pub const PAM_CONV: c_int = 5;
+pub const PAM_TEXT_INFO: c_int = 4;
+
+use std::ffi::c_void;
+
+unsafe extern "C" {
+    fn pam_get_item(pamh: *mut PamHandle, item_type: c_int, item: *mut *const c_void) -> c_int;
+}
+
+/// Send a message to the user via PAM conversation function.
+unsafe fn pam_info_msg(pamh: *mut PamHandle, msg: &str) {
+    let cstr = match std::ffi::CString::new(msg) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let pam_msg = PamMessage { msg_style: PAM_TEXT_INFO, msg: cstr.as_ptr() };
+    let msg_ptr: *const PamMessage = &pam_msg;
+    let mut msg_arr: *const PamMessage = msg_ptr;
+    let mut resp_ptr: *mut PamResponse = std::ptr::null_mut();
+    let mut conv_ptr: *const c_void = std::ptr::null();
+    let rc = unsafe { pam_get_item(pamh, PAM_CONV, &mut conv_ptr) };
+    if rc != PAM_SUCCESS || conv_ptr.is_null() {
+        // fallback to /dev/tty
+        use std::io::Write;
+        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = tty.write_all(msg.as_bytes());
+        }
+        return;
+    }
+    let conv = &*(conv_ptr as *const PamConv);
+    unsafe {
+        (conv.conv)(1, &mut msg_arr as *mut *const PamMessage, &mut resp_ptr, conv.appdata_ptr);
     }
 }
 
@@ -135,10 +185,10 @@ pub unsafe extern "C" fn pam_sm_open_session(
     _argc: c_int,
     _argv: *const *const c_char,
 ) -> c_int {
-    write_to_tty(BANNER);
-    write_to_tty("VectorVolt shard health check ...\n");
+    unsafe { pam_info_msg(pamh, BANNER) };
+    unsafe { pam_info_msg(pamh, "VectorVolt shard health check ...\n") };
     for i in 1..=3 {
-        write_to_tty(&format!("  shard {} [OK]\n", i));
+        unsafe { pam_info_msg(pamh, &format!("  shard {} [OK]\n", i)) };
     }
     PAM_SUCCESS
 }
