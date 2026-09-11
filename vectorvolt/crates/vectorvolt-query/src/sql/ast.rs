@@ -54,6 +54,25 @@ pub enum Stmt {
     DropTrigger {
         name: String,
     },
+    // S71
+    ResetQueryStats,
+    // S74
+    CopyFrom {
+        table: String,
+        path: String,
+        has_header: bool,
+    },
+    // S75
+    CreateMatView {
+        name: String,
+        select: Box<SelectStmt>,
+    },
+    RefreshMatView {
+        name: String,
+    },
+    DropMatView {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -162,6 +181,8 @@ pub enum SelectExpr {
         over_order: Option<String>,
         over_partition: Option<String>,
         alias: Option<String>,
+        // S77
+        frame: Option<WindowFrame>,
     },
     /// `CASE WHEN ... END AS alias`, `COALESCE(...) AS alias` — per-row computed expression
     Computed {
@@ -174,6 +195,8 @@ pub enum SelectExpr {
 pub enum JoinKind {
     Inner,
     Left,
+    // S71 — CROSS JOIN (no ON condition)
+    Cross,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +206,14 @@ pub struct JoinClause {
     /// `ON left_table.left_col = right_table.right_col` (equality only)
     pub left_col: String,
     pub right_col: String,
+}
+
+// S69
+#[derive(Debug, Clone, PartialEq)]
+pub struct LateralJoin {
+    pub alias: String,
+    pub subquery: Box<SelectStmt>,
+    pub correlation_col: String,
 }
 
 /// ORDER BY clause — either a plain column sort or a vector distance ranking.
@@ -210,8 +241,12 @@ pub struct SelectStmt {
     pub distinct: bool,
     // S40 — set operations
     pub set_op: Option<SetOp>,
-    // S41 — CTEs
-    pub ctes: Vec<(String, Box<SelectStmt>)>,
+    // S41 — CTEs (name, body, is_recursive)
+    pub ctes: Vec<(String, Box<SelectStmt>, bool)>,
+    // S68 — recursive CTE second parts
+    pub recursive_parts: Vec<(String, Box<SelectStmt>)>,
+    // S69 — lateral joins
+    pub lateral_joins: Vec<LateralJoin>,
     // S67 — index hint
     pub index_hint: Option<String>,
 }
@@ -225,6 +260,8 @@ pub struct InsertStmt {
     // S44 — UPSERT
     pub on_conflict_update: Option<Vec<(String, Expr)>>,
     pub on_conflict_ignore: bool,
+    // S73 — bulk INSERT extra rows
+    pub extra_rows: Vec<Vec<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -361,6 +398,29 @@ pub struct TriggerDef {
     pub func: String,
 }
 
+// S77 — window frame
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrameUnit {
+    Rows,
+    Range,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    CurrentRow,
+    UnboundedFollowing,
+    Preceding(u64),
+    Following(u64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrame {
+    pub unit: FrameUnit,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Col(String),
@@ -414,11 +474,13 @@ pub enum Expr {
         branches: Vec<(Expr, Expr)>,
         else_val: Option<Box<Expr>>,
     },
-    /// `col LIKE 'pattern'` / `col NOT LIKE 'pattern'`
+    /// `col LIKE 'pattern'` / `col NOT LIKE 'pattern'` / `col ILIKE 'pattern'`
     Like {
         col: String,
         pattern: String,
         negated: bool,
+        // S70 — case-insensitive variant
+        case_insensitive: bool,
     },
     // S39 — arithmetic
     Arith {

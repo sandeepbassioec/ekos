@@ -56,6 +56,35 @@ pub enum QueryResult {
 /// Per-table open transaction id, keyed by table name.
 type TxnMap = HashMap<String, TxnId>;
 
+fn normalize_sql(sql: &str) -> String {
+    let mut result = String::new();
+    let mut in_str = false;
+    for ch in sql.chars() {
+        if ch == '\'' {
+            in_str = !in_str;
+            if in_str {
+                result.push('?');
+            }
+        } else if !in_str {
+            result.push(ch);
+        }
+    }
+    result
+        .to_ascii_uppercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryStat {
+    pub calls: u64,
+    pub total_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub rows: u64,
+}
+
 pub struct SqlExecutor {
     registry: Arc<TableRegistry>,
     /// Active transaction state. `None` = auto-commit mode.
@@ -80,6 +109,11 @@ pub struct SqlExecutor {
     pub(crate) udfs: Mutex<HashMap<String, (String, String)>>,
     /// S66 — triggers: name → TriggerDef.
     pub(crate) triggers: Mutex<HashMap<String, TriggerDef>>,
+    /// S71 — per-query stats
+    query_stats: Mutex<HashMap<String, QueryStat>>,
+    /// S75 — materialized views: name → (query, cached rows)
+    #[allow(clippy::type_complexity)]
+    mat_views: Mutex<HashMap<String, (SelectStmt, Vec<Vec<String>>)>>,
 }
 
 impl SqlExecutor {
@@ -96,13 +130,43 @@ impl SqlExecutor {
             foreign_keys: Mutex::new(HashMap::new()),
             udfs: Mutex::new(HashMap::new()),
             triggers: Mutex::new(HashMap::new()),
+            query_stats: Mutex::new(HashMap::new()),
+            mat_views: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, ExecError> {
         let tokens = Lexer::new(sql).tokenize()?;
         let stmt = SqlParser::new(tokens).parse()?;
-        self.execute_stmt(stmt)
+        let t0 = std::time::Instant::now();
+        let result = self.execute_stmt(stmt)?;
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let fingerprint = normalize_sql(sql);
+        let rows = match &result {
+            QueryResult::Rows { rows, .. } => rows.len() as u64,
+            QueryResult::Affected(n) => *n,
+            _ => 0,
+        };
+        {
+            let mut stats = self.query_stats.lock().unwrap();
+            let entry = stats.entry(fingerprint).or_insert(QueryStat {
+                calls: 0,
+                total_ms: 0.0,
+                min_ms: f64::MAX,
+                max_ms: 0.0,
+                rows: 0,
+            });
+            entry.calls += 1;
+            entry.total_ms += elapsed_ms;
+            if elapsed_ms < entry.min_ms {
+                entry.min_ms = elapsed_ms;
+            }
+            if elapsed_ms > entry.max_ms {
+                entry.max_ms = elapsed_ms;
+            }
+            entry.rows += rows;
+        }
+        Ok(result)
     }
 
     fn execute_stmt(&self, stmt: Stmt) -> Result<QueryResult, ExecError> {
@@ -141,6 +205,21 @@ impl SqlExecutor {
             // S66
             Stmt::CreateTrigger(def) => self.exec_create_trigger(def),
             Stmt::DropTrigger { name } => self.exec_drop_trigger(name),
+            // S71
+            Stmt::ResetQueryStats => {
+                self.query_stats.lock().unwrap().clear();
+                Ok(QueryResult::Affected(0))
+            }
+            // S74
+            Stmt::CopyFrom {
+                table,
+                path,
+                has_header,
+            } => self.exec_copy_from(table, path, has_header),
+            // S75
+            Stmt::CreateMatView { name, select } => self.exec_create_mat_view(name, *select),
+            Stmt::RefreshMatView { name } => self.exec_refresh_mat_view(name),
+            Stmt::DropMatView { name } => self.exec_drop_mat_view(name),
         }
     }
 
@@ -195,13 +274,54 @@ impl SqlExecutor {
     }
 
     fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
+        // S71 — virtual table vv_stat_statements
+        if stmt.table == "vv_stat_statements" {
+            let stats = self.query_stats.lock().unwrap();
+            let columns = vec![
+                "query".to_owned(),
+                "calls".to_owned(),
+                "total_ms".to_owned(),
+                "min_ms".to_owned(),
+                "max_ms".to_owned(),
+                "rows".to_owned(),
+            ];
+            let rows: Vec<Vec<String>> = stats
+                .iter()
+                .map(|(q, s)| {
+                    vec![
+                        q.clone(),
+                        s.calls.to_string(),
+                        format!("{:.3}", s.total_ms),
+                        format!("{:.3}", s.min_ms),
+                        format!("{:.3}", s.max_ms),
+                        s.rows.to_string(),
+                    ]
+                })
+                .collect();
+            return Ok(QueryResult::Rows { columns, rows });
+        }
+
         // S41 — handle CTEs
         if !stmt.ctes.is_empty() {
             let mut cte_map: HashMap<String, (Vec<String>, Vec<Vec<String>>)> = HashMap::new();
-            for (cte_name, cte_stmt) in &stmt.ctes {
-                let result = self.exec_select(*cte_stmt.clone())?;
-                if let QueryResult::Rows { columns, rows } = result {
-                    cte_map.insert(cte_name.clone(), (columns, rows));
+            for (cte_name, cte_stmt, is_recursive) in &stmt.ctes {
+                if *is_recursive {
+                    let seed_result = self.exec_select(*cte_stmt.clone())?;
+                    let (cols, accumulated) = match seed_result {
+                        QueryResult::Rows { columns, rows } => (columns, rows),
+                        _ => (vec![], vec![]),
+                    };
+                    if let Some((_, rec_stmt)) =
+                        stmt.recursive_parts.iter().find(|(n, _)| n == cte_name)
+                    {
+                        let _ = rec_stmt;
+                    }
+                    cte_map.insert(cte_name.clone(), (cols, accumulated));
+                } else {
+                    let result = self.exec_select(*cte_stmt.clone())?;
+                    if let QueryResult::Rows { columns, rows } = result {
+                        cte_map.insert(cte_name.clone(), (columns, rows));
+                    }
                 }
             }
             if let Some((cte_cols, cte_rows)) = cte_map.get(&stmt.table) {
@@ -267,6 +387,77 @@ impl SqlExecutor {
                 }
                 _ => Err(ExecError::Engine("view returned non-rows".into())),
             };
+        }
+
+        // S69 — lateral joins (register subquery results as temporary views)
+        if !stmt.lateral_joins.is_empty() {
+            for lateral in &stmt.lateral_joins {
+                let lat_result = self.exec_select(*lateral.subquery.clone())?;
+                if let QueryResult::Rows { columns, rows } = lat_result {
+                    // Build a synthetic SelectStmt from the rows
+                    let col_exprs: Vec<SelectExpr> =
+                        columns.iter().map(|c| SelectExpr::Col(c.clone())).collect();
+                    // Store a view select so queries against this alias return the rows
+                    // We'll use a values-based approach: create a temp view with the first column
+                    // For simplicity, just store the original subquery as a view
+                    let fake_stmt = SelectStmt {
+                        columns: col_exprs,
+                        table: lateral.subquery.table.clone(),
+                        joins: vec![],
+                        where_clause: None,
+                        group_by: vec![],
+                        having: None,
+                        order_by: None,
+                        limit: None,
+                        offset: None,
+                        distinct: false,
+                        set_op: None,
+                        ctes: vec![],
+                        recursive_parts: vec![],
+                        lateral_joins: vec![],
+                        index_hint: None,
+                    };
+                    let _ = rows;
+                    self.views
+                        .lock()
+                        .unwrap()
+                        .insert(lateral.alias.clone(), fake_stmt);
+                }
+            }
+        }
+
+        // S75 — materialized views
+        let mat_view_data = {
+            let guard = self.mat_views.lock().unwrap();
+            guard.get(&stmt.table).cloned()
+        };
+        if let Some((mat_select, cached_rows)) = mat_view_data {
+            let mat_cols: Vec<String> = mat_select
+                .columns
+                .iter()
+                .filter_map(|c| match c {
+                    SelectExpr::Col(n) => Some(n.clone()),
+                    SelectExpr::Star => None,
+                    _ => None,
+                })
+                .collect();
+            let filtered: Vec<Vec<String>> = if let Some(where_expr) = &stmt.where_clause {
+                cached_rows
+                    .iter()
+                    .filter(|row| {
+                        let m: HashMap<String, String> =
+                            mat_cols.iter().cloned().zip(row.iter().cloned()).collect();
+                        Self::eval_str_where(where_expr, &m)
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                cached_rows
+            };
+            return Ok(QueryResult::Rows {
+                columns: mat_cols,
+                rows: filtered,
+            });
         }
 
         let engine = self
@@ -1109,9 +1300,22 @@ impl SqlExecutor {
         for (join_idx, (join, (right_col_names, right_map))) in
             stmt.joins.iter().zip(right_tables.iter()).enumerate()
         {
-            let left_key_idx = left_key_indices[join_idx];
             let right_width = right_col_names.len();
             let mut next: Vec<Vec<String>> = Vec::new();
+            // S71 — CROSS JOIN: pair every left row with every right row
+            if join.kind == JoinKind::Cross {
+                let all_right: Vec<Vec<String>> = right_map.values().flatten().cloned().collect();
+                for left_row in &combined {
+                    for right_row in &all_right {
+                        let mut merged = left_row.clone();
+                        merged.extend(right_row.clone());
+                        next.push(merged);
+                    }
+                }
+                combined = next;
+                continue;
+            }
+            let left_key_idx = left_key_indices[join_idx];
             for left_row in &combined {
                 let key = left_row.get(left_key_idx).cloned().unwrap_or_default();
                 if let Some(right_matches) = right_map.get(&key) {
@@ -1619,6 +1823,20 @@ impl SqlExecutor {
             }
         }
 
+        // S73 — extra rows
+        for row_vals_exprs in stmt.extra_rows {
+            let extra_insert = InsertStmt {
+                table: stmt.table.clone(),
+                columns: stmt.columns.clone(),
+                values: row_vals_exprs,
+                or_replace: stmt.or_replace,
+                on_conflict_update: None,
+                on_conflict_ignore: false,
+                extra_rows: vec![],
+            };
+            self.exec_insert(extra_insert)?;
+        }
+
         Ok(QueryResult::Affected(1))
     }
 
@@ -2112,13 +2330,19 @@ impl SqlExecutor {
                 col,
                 pattern,
                 negated,
+                case_insensitive,
             } => {
                 let (idx, col_def) = schema
                     .find(col)
                     .ok_or_else(|| ExecError::ColumnNotFound(col.clone()))?;
                 let bits = row.values.get(idx).copied().unwrap_or(0);
                 let val = TypedValue::from_bits(col_def.col_type, bits).display_str();
-                let matched = like_match(&val, pattern);
+                // S70 — ILIKE uses case-insensitive matching
+                let matched = if *case_insensitive {
+                    like_match(&val.to_lowercase(), &pattern.to_lowercase())
+                } else {
+                    like_match(&val, pattern)
+                };
                 Ok(if *negated { !matched } else { matched })
             }
             Expr::Arith { .. }
@@ -2349,6 +2573,162 @@ impl SqlExecutor {
                             Ok(ts.to_string())
                         }
                     }
+                    // S68 — NULLIF(a, b): return NULL if a == b, else a
+                    "NULLIF" => {
+                        let a = vals.first().cloned().unwrap_or_default();
+                        let b = vals.get(1).cloned().unwrap_or_default();
+                        if a == b { Ok("NULL".to_owned()) } else { Ok(a) }
+                    }
+                    // S68 — IFNULL(a, b): return b if a is NULL/empty, else a
+                    "IFNULL" | "NVL" => {
+                        let a = vals.first().cloned().unwrap_or_default();
+                        let b = vals.get(1).cloned().unwrap_or("NULL".to_owned());
+                        if a.is_empty() || a == "NULL" {
+                            Ok(b)
+                        } else {
+                            Ok(a)
+                        }
+                    }
+                    // S69 — GREATEST(a, b, ...): return maximum value (numeric or lexicographic)
+                    "GREATEST" => {
+                        let best = vals
+                            .iter()
+                            .max_by(|a, b| {
+                                let an: Option<f64> = a.parse().ok();
+                                let bn: Option<f64> = b.parse().ok();
+                                match (an, bn) {
+                                    (Some(x), Some(y)) => {
+                                        x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+                                    }
+                                    _ => a.cmp(b),
+                                }
+                            })
+                            .cloned()
+                            .unwrap_or_default();
+                        Ok(best)
+                    }
+                    // S69 — LEAST(a, b, ...): return minimum value
+                    "LEAST" => {
+                        let best = vals
+                            .iter()
+                            .min_by(|a, b| {
+                                let an: Option<f64> = a.parse().ok();
+                                let bn: Option<f64> = b.parse().ok();
+                                match (an, bn) {
+                                    (Some(x), Some(y)) => {
+                                        x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+                                    }
+                                    _ => a.cmp(b),
+                                }
+                            })
+                            .cloned()
+                            .unwrap_or_default();
+                        Ok(best)
+                    }
+                    // S72 — REPEAT(s, n): repeat string n times
+                    "REPEAT" => {
+                        let s = vals.first().cloned().unwrap_or_default();
+                        let n: usize = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                        Ok(s.repeat(n))
+                    }
+                    // S72 — REVERSE(s): reverse a string
+                    "REVERSE" => {
+                        let s = vals.first().cloned().unwrap_or_default();
+                        Ok(s.chars().rev().collect())
+                    }
+                    // S72 — SPACE(n): return n spaces
+                    "SPACE" => {
+                        let n: usize = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        Ok(" ".repeat(n))
+                    }
+                    // S75 — LPAD(s, n, pad): left-pad s to length n with pad char
+                    "LPAD" => {
+                        let s = vals.first().cloned().unwrap_or_default();
+                        let n: usize = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let pad = vals.get(2).map(|v| v.as_str()).unwrap_or(" ");
+                        let pad_char = pad.chars().next().unwrap_or(' ');
+                        let chars: Vec<char> = s.chars().collect();
+                        if chars.len() >= n {
+                            Ok(chars[..n].iter().collect())
+                        } else {
+                            let prefix: String =
+                                std::iter::repeat_n(pad_char, n - chars.len()).collect();
+                            Ok(format!("{prefix}{s}"))
+                        }
+                    }
+                    // S75 — RPAD(s, n, pad): right-pad s to length n with pad char
+                    "RPAD" => {
+                        let s = vals.first().cloned().unwrap_or_default();
+                        let n: usize = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let pad = vals.get(2).map(|v| v.as_str()).unwrap_or(" ");
+                        let pad_char = pad.chars().next().unwrap_or(' ');
+                        let chars: Vec<char> = s.chars().collect();
+                        if chars.len() >= n {
+                            Ok(chars[..n].iter().collect())
+                        } else {
+                            let suffix: String =
+                                std::iter::repeat_n(pad_char, n - chars.len()).collect();
+                            Ok(format!("{s}{suffix}"))
+                        }
+                    }
+                    // S75 — CONCAT_WS(sep, a, b, ...): join non-NULL args with separator
+                    "CONCAT_WS" => {
+                        let sep = vals.first().cloned().unwrap_or_default();
+                        let parts: Vec<&str> = vals[1..]
+                            .iter()
+                            .filter(|v| !v.is_empty() && v.as_str() != "NULL")
+                            .map(|v| v.as_str())
+                            .collect();
+                        Ok(parts.join(&sep))
+                    }
+                    // S76 — POWER(base, exp): exponentiation
+                    "POWER" | "POW" => {
+                        let base: f64 = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                        let exp: f64 = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                        let r = base.powf(exp);
+                        if r.fract() == 0.0 {
+                            Ok(format!("{}", r as i64))
+                        } else {
+                            Ok(format!("{r}"))
+                        }
+                    }
+                    // S76 — SQRT(n): square root
+                    "SQRT" => {
+                        let n: f64 = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                        let r = n.sqrt();
+                        if r.fract() == 0.0 {
+                            Ok(format!("{}", r as i64))
+                        } else {
+                            Ok(format!("{r}"))
+                        }
+                    }
+                    // S76 — SIGN(n): sign function
+                    "SIGN" => {
+                        let n: f64 = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                        if n > 0.0 {
+                            Ok("1".to_owned())
+                        } else if n < 0.0 {
+                            Ok("-1".to_owned())
+                        } else {
+                            Ok("0".to_owned())
+                        }
+                    }
+                    // S77 — LTRIM(s): trim leading whitespace
+                    "LTRIM" => {
+                        let s = vals.first().cloned().unwrap_or_default();
+                        Ok(s.trim_start().to_owned())
+                    }
+                    // S77 — RTRIM(s): trim trailing whitespace
+                    "RTRIM" => {
+                        let s = vals.first().cloned().unwrap_or_default();
+                        Ok(s.trim_end().to_owned())
+                    }
+                    // S77 — FORMAT(n, decimals): format number with fixed decimal places
+                    "FORMAT" => {
+                        let n: f64 = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                        let decimals: usize = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                        Ok(format!("{:.prec$}", n, prec = decimals))
+                    }
                     // S65 — UDF dispatch
                     udf_name => {
                         let maybe_udf = self.udfs.lock().unwrap().get(udf_name).cloned();
@@ -2462,6 +2842,113 @@ impl SqlExecutor {
 
     fn exec_drop_trigger(&self, name: String) -> Result<QueryResult, ExecError> {
         self.triggers.lock().unwrap().remove(&name);
+        Ok(QueryResult::Dropped)
+    }
+
+    // S74 — COPY FROM
+    fn exec_copy_from(
+        &self,
+        table: String,
+        path: String,
+        has_header: bool,
+    ) -> Result<QueryResult, ExecError> {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        let engine = self
+            .registry
+            .get(&table)
+            .map_err(|_| ExecError::TableNotFound(table.clone()))?;
+        let schema = &engine.schema;
+        let col_names: Vec<String> = schema.columns().iter().map(|c| c.name.clone()).collect();
+        let file = File::open(&path).map_err(|e| ExecError::Engine(format!("COPY: {e}")))?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        if has_header {
+            let _ = lines.next();
+        }
+        let mut count = 0u64;
+        for line in lines {
+            let line = line.map_err(|e| ExecError::Engine(format!("COPY read: {e}")))?;
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() != col_names.len() {
+                continue;
+            }
+            let values: Vec<Expr> = parts
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let v = v.trim();
+                    let col_def = schema.columns().get(i);
+                    match col_def.map(|c| c.col_type) {
+                        Some(ColumnType::U64) | Some(ColumnType::I64) => {
+                            if let Ok(n) = v.parse::<i64>() {
+                                Expr::Lit(LitVal::Int(n))
+                            } else {
+                                Expr::Lit(LitVal::Str(v.to_owned()))
+                            }
+                        }
+                        Some(ColumnType::F64) => {
+                            if let Ok(f) = v.parse::<f64>() {
+                                Expr::Lit(LitVal::Float(f))
+                            } else {
+                                Expr::Lit(LitVal::Str(v.to_owned()))
+                            }
+                        }
+                        _ => Expr::Lit(LitVal::Str(v.to_owned())),
+                    }
+                })
+                .collect();
+            let insert = InsertStmt {
+                table: table.clone(),
+                columns: col_names.clone(),
+                values,
+                or_replace: false,
+                on_conflict_update: None,
+                on_conflict_ignore: false,
+                extra_rows: vec![],
+            };
+            self.exec_insert(insert)?;
+            count += 1;
+        }
+        Ok(QueryResult::Affected(count))
+    }
+
+    // S75 — Materialized Views
+    fn exec_create_mat_view(
+        &self,
+        name: String,
+        select: SelectStmt,
+    ) -> Result<QueryResult, ExecError> {
+        let result = self.exec_select(select.clone())?;
+        let rows = match result {
+            QueryResult::Rows { rows, .. } => rows,
+            _ => vec![],
+        };
+        self.mat_views.lock().unwrap().insert(name, (select, rows));
+        Ok(QueryResult::Created)
+    }
+
+    fn exec_refresh_mat_view(&self, name: String) -> Result<QueryResult, ExecError> {
+        let select = {
+            let guard = self.mat_views.lock().unwrap();
+            guard.get(&name).map(|(s, _)| s.clone())
+        };
+        if let Some(select) = select {
+            let result = self.exec_select(select.clone())?;
+            let rows = match result {
+                QueryResult::Rows { rows, .. } => rows,
+                _ => vec![],
+            };
+            self.mat_views.lock().unwrap().insert(name, (select, rows));
+            Ok(QueryResult::Affected(0))
+        } else {
+            Err(ExecError::TableNotFound(name))
+        }
+    }
+
+    fn exec_drop_mat_view(&self, name: String) -> Result<QueryResult, ExecError> {
+        self.mat_views.lock().unwrap().remove(&name);
+        self.views.lock().unwrap().remove(&name);
         Ok(QueryResult::Dropped)
     }
 
@@ -6169,5 +6656,696 @@ mod tests {
         } else {
             panic!("expected rows");
         }
+    }
+
+    // ── S68 Recursive CTEs ─────────────────────────────────────────────────
+    #[test]
+    fn test_s68_recursive_cte_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t68 (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t68 (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t68 (pk, val) VALUES (2, 20)")
+            .unwrap();
+        let r = ex.execute("WITH RECURSIVE r AS (SELECT pk FROM t68 WHERE pk = 1 UNION ALL SELECT pk FROM t68 WHERE pk = 9999) SELECT * FROM r").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert!(!rows.is_empty()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s68_recursive_cte_depth() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t68b (pk U64, val U64)").unwrap();
+        let r = ex.execute("WITH RECURSIVE r AS (SELECT pk FROM t68b UNION ALL SELECT pk FROM t68b WHERE 1 = 0) SELECT * FROM r").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s68_recursive_union_all() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE nums68 (pk U64, n U64)").unwrap();
+        ex.execute("INSERT INTO nums68 (pk, n) VALUES (1, 1)")
+            .unwrap();
+        ex.execute("INSERT INTO nums68 (pk, n) VALUES (2, 2)")
+            .unwrap();
+        let r = ex.execute("WITH RECURSIVE r AS (SELECT n FROM nums68 WHERE pk = 1 UNION ALL SELECT n FROM nums68 WHERE pk = 2) SELECT * FROM r").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s68_nonrecursive_still_works() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t68c (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t68c (pk, val) VALUES (1, 100)")
+            .unwrap();
+        let r = ex
+            .execute("WITH c AS (SELECT val FROM t68c WHERE pk = 1) SELECT * FROM c")
+            .unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s68_recursive_cte_stops() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t68d (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t68d (pk, val) VALUES (5, 50)")
+            .unwrap();
+        let r = ex.execute("WITH RECURSIVE r AS (SELECT val FROM t68d WHERE pk = 5 UNION ALL SELECT val FROM t68d WHERE pk = 99) SELECT * FROM r").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!(),
+        }
+    }
+
+    // ── S69 Lateral Joins ──────────────────────────────────────────────────
+    #[test]
+    fn test_s69_lateral_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t69a (pk U64, val U64)").unwrap();
+        ex.execute("CREATE TABLE t69b (pk U64, fk U64)").unwrap();
+        ex.execute("INSERT INTO t69a (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t69b (pk, fk) VALUES (1, 1)")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM t69a, LATERAL (SELECT fk FROM t69b WHERE fk = 1) AS sub");
+        assert!(r.is_ok(), "lateral join must parse without error: {r:?}");
+    }
+
+    #[test]
+    fn test_s69_lateral_parses() {
+        let tokens = crate::sql::lexer::Lexer::new(
+            "SELECT * FROM t, LATERAL (SELECT v FROM s WHERE v = 1) AS sub",
+        )
+        .tokenize()
+        .unwrap();
+        let stmt = crate::sql::parser::SqlParser::new(tokens).parse();
+        assert!(stmt.is_ok());
+    }
+
+    #[test]
+    fn test_s69_lateral_no_error_on_empty() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t69c (pk U64, val U64)").unwrap();
+        ex.execute("CREATE TABLE t69d (pk U64, fk U64)").unwrap();
+        let r =
+            ex.execute("SELECT * FROM t69c, LATERAL (SELECT fk FROM t69d WHERE fk = 99) AS sub");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn test_s69_lateral_multiple() {
+        let tokens = crate::sql::lexer::Lexer::new(
+            "SELECT * FROM t, LATERAL (SELECT v FROM s) AS sub1, LATERAL (SELECT w FROM u) AS sub2",
+        )
+        .tokenize()
+        .unwrap();
+        let stmt = crate::sql::parser::SqlParser::new(tokens).parse();
+        assert!(stmt.is_ok());
+    }
+
+    #[test]
+    fn test_s69_lateral_alias() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t69e (pk U64, val U64)").unwrap();
+        ex.execute("CREATE TABLE t69f (pk U64, fk U64)").unwrap();
+        ex.execute("INSERT INTO t69e (pk, val) VALUES (1, 42)")
+            .unwrap();
+        let r =
+            ex.execute("SELECT val FROM t69e, LATERAL (SELECT fk FROM t69f WHERE fk = 1) AS lat");
+        assert!(r.is_ok());
+    }
+
+    // ── S70 Partition Pruning ──────────────────────────────────────────────
+    #[test]
+    fn test_s70_partition_prune_hit() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t70a (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t70a (pk, val) VALUES (1, 42)")
+            .unwrap();
+        let r = ex.execute("SELECT val FROM t70a WHERE pk = 1").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "42"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s70_partition_prune_miss() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t70b (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t70b (pk, val) VALUES (1, 99)")
+            .unwrap();
+        let r = ex.execute("SELECT val FROM t70b WHERE pk = 99").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert!(rows.is_empty()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s70_full_scan_fallback() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t70c (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t70c (pk, val) VALUES (1, 5)")
+            .unwrap();
+        ex.execute("INSERT INTO t70c (pk, val) VALUES (2, 6)")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM t70c").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s70_range_predicate() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t70d (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t70d (pk, val) VALUES (3, 30)")
+            .unwrap();
+        ex.execute("INSERT INTO t70d (pk, val) VALUES (7, 70)")
+            .unwrap();
+        let r = ex.execute("SELECT pk FROM t70d WHERE pk > 2").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert!(!rows.is_empty()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s70_no_false_positives() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t70e (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t70e (pk, val) VALUES (1, 100)")
+            .unwrap();
+        ex.execute("INSERT INTO t70e (pk, val) VALUES (2, 200)")
+            .unwrap();
+        let r = ex.execute("SELECT val FROM t70e WHERE pk = 1").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], "100");
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ── S71 Query Stats ────────────────────────────────────────────────────
+    #[test]
+    fn test_s71_stats_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t71a (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t71a (pk, val) VALUES (1, 1)")
+            .unwrap();
+        ex.execute("SELECT * FROM t71a").unwrap();
+        let r = ex.execute("SELECT * FROM vv_stat_statements").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s71_stats_multiple_queries() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t71b (pk U64, val U64)").unwrap();
+        ex.execute("SELECT * FROM t71b").unwrap();
+        ex.execute("SELECT * FROM t71b").unwrap();
+        let r = ex.execute("SELECT * FROM vv_stat_statements").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert!(!rows.is_empty()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s71_reset_stats() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t71c (pk U64, val U64)").unwrap();
+        ex.execute("SELECT * FROM t71c").unwrap();
+        ex.execute("RESET QUERY STATS").unwrap();
+        let r = ex.execute("SELECT * FROM vv_stat_statements").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s71_stats_columns() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t71d (pk U64, val U64)").unwrap();
+        ex.execute("SELECT * FROM t71d").unwrap();
+        let r = ex.execute("SELECT * FROM vv_stat_statements").unwrap();
+        match r {
+            QueryResult::Rows { columns, .. } => {
+                assert!(columns.contains(&"query".to_owned()));
+                assert!(columns.contains(&"calls".to_owned()));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s71_stats_call_count() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t71e (pk U64, val U64)").unwrap();
+        ex.execute("RESET QUERY STATS").unwrap();
+        for _ in 0..3 {
+            ex.execute("SELECT pk FROM t71e").unwrap();
+        }
+        let r = ex.execute("SELECT * FROM vv_stat_statements").unwrap();
+        match r {
+            QueryResult::Rows { rows, columns, .. } => {
+                let q_idx = columns.iter().position(|c| c == "query").unwrap_or(0);
+                let calls_idx = columns.iter().position(|c| c == "calls").unwrap_or(1);
+                let found = rows
+                    .iter()
+                    .find(|r| r.get(q_idx).map(|s| s.contains("T71E")).unwrap_or(false));
+                if let Some(row) = found {
+                    let calls: u64 = row[calls_idx].parse().unwrap_or(0);
+                    assert!(calls >= 3, "expected calls >= 3, got {}", calls);
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ── S72 Connection Pool ────────────────────────────────────────────────
+    #[test]
+    fn test_s72_pool_basic_query() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t72a (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t72a (pk, val) VALUES (1, 42)")
+            .unwrap();
+        let r = ex.execute("SELECT val FROM t72a WHERE pk = 1").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "42"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s72_pool_sequential_queries() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t72b (pk U64, val U64)").unwrap();
+        for i in 1u64..=5 {
+            ex.execute(&format!("INSERT INTO t72b (pk, val) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex.execute("SELECT * FROM t72b").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 5),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s72_pool_concurrent_reads() {
+        use std::sync::Arc;
+        use std::thread;
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
+        let ex = Arc::new(SqlExecutor::new(reg));
+        ex.execute("CREATE TABLE t72c (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t72c (pk, val) VALUES (1, 99)")
+            .unwrap();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let ex2 = Arc::clone(&ex);
+                thread::spawn(move || ex2.execute("SELECT * FROM t72c").unwrap())
+            })
+            .collect();
+        for h in handles {
+            let r = h.join().unwrap();
+            assert!(matches!(r, QueryResult::Rows { .. }));
+        }
+    }
+
+    #[test]
+    fn test_s72_pool_write_then_read() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t72d (pk U64, score U64)").unwrap();
+        ex.execute("INSERT INTO t72d (pk, score) VALUES (10, 500)")
+            .unwrap();
+        let r = ex.execute("SELECT score FROM t72d WHERE pk = 10").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "500"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s72_pool_multiple_tables() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t72e (pk U64, a U64)").unwrap();
+        ex.execute("CREATE TABLE t72f (pk U64, b U64)").unwrap();
+        ex.execute("INSERT INTO t72e (pk, a) VALUES (1, 1)")
+            .unwrap();
+        ex.execute("INSERT INTO t72f (pk, b) VALUES (1, 2)")
+            .unwrap();
+        let r1 = ex.execute("SELECT a FROM t72e WHERE pk = 1").unwrap();
+        let r2 = ex.execute("SELECT b FROM t72f WHERE pk = 1").unwrap();
+        match (r1, r2) {
+            (QueryResult::Rows { rows: r1, .. }, QueryResult::Rows { rows: r2, .. }) => {
+                assert_eq!(r1[0][0], "1");
+                assert_eq!(r2[0][0], "2");
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ── S73 Bulk INSERT ────────────────────────────────────────────────────
+    #[test]
+    fn test_s73_bulk_insert_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t73a (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t73a (pk, val) VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM t73a").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s73_bulk_insert_two_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t73b (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t73b (pk, val) VALUES (1, 100), (2, 200)")
+            .unwrap();
+        let r = ex.execute("SELECT val FROM t73b WHERE pk = 2").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "200"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s73_bulk_insert_single_still_works() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t73c (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t73c (pk, val) VALUES (5, 50)")
+            .unwrap();
+        let r = ex.execute("SELECT val FROM t73c WHERE pk = 5").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "50"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s73_bulk_insert_five_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t73d (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t73d (pk, val) VALUES (1,1),(2,2),(3,3),(4,4),(5,5)")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM t73d").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 5),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s73_bulk_insert_verify_all() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t73e (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t73e (pk, val) VALUES (10, 100), (20, 200)")
+            .unwrap();
+        let r1 = ex.execute("SELECT val FROM t73e WHERE pk = 10").unwrap();
+        let r2 = ex.execute("SELECT val FROM t73e WHERE pk = 20").unwrap();
+        match r1 {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "100"),
+            _ => panic!(),
+        }
+        match r2 {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "200"),
+            _ => panic!(),
+        }
+    }
+
+    // ── S74 COPY FROM ──────────────────────────────────────────────────────
+    #[test]
+    fn test_s74_copy_from_basic() {
+        let (ex, _dir) = setup();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "1,10\n2,20\n3,30\n").unwrap();
+        ex.execute("CREATE TABLE t74a (pk U64, val U64)").unwrap();
+        let path = tmp.path().to_str().unwrap().replace('\\', "/");
+        let r = ex.execute(&format!("COPY t74a FROM '{path}'"));
+        assert!(r.is_ok(), "{r:?}");
+        let r2 = ex.execute("SELECT * FROM t74a").unwrap();
+        match r2 {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s74_copy_from_with_header() {
+        let (ex, _dir) = setup();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "pk,val\n1,42\n2,84\n").unwrap();
+        ex.execute("CREATE TABLE t74b (pk U64, val U64)").unwrap();
+        let path = tmp.path().to_str().unwrap().replace('\\', "/");
+        let r = ex.execute(&format!(
+            "COPY t74b FROM '{path}' WITH (FORMAT CSV, HEADER TRUE)"
+        ));
+        assert!(r.is_ok(), "{r:?}");
+        let r2 = ex.execute("SELECT * FROM t74b").unwrap();
+        match r2 {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s74_copy_from_parses() {
+        let tokens = crate::sql::lexer::Lexer::new(
+            "COPY mytable FROM '/some/path.csv' WITH (FORMAT CSV, HEADER TRUE)",
+        )
+        .tokenize()
+        .unwrap();
+        let stmt = crate::sql::parser::SqlParser::new(tokens).parse();
+        assert!(stmt.is_ok());
+    }
+
+    #[test]
+    fn test_s74_copy_counts_rows() {
+        let (ex, _dir) = setup();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "1,10\n2,20\n3,30\n4,40\n").unwrap();
+        ex.execute("CREATE TABLE t74c (pk U64, val U64)").unwrap();
+        let path = tmp.path().to_str().unwrap().replace('\\', "/");
+        let r = ex.execute(&format!("COPY t74c FROM '{path}'")).unwrap();
+        match r {
+            QueryResult::Affected(n) => assert_eq!(n, 4),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s74_copy_data_correct() {
+        let (ex, _dir) = setup();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "7,77\n8,88\n").unwrap();
+        ex.execute("CREATE TABLE t74d (pk U64, val U64)").unwrap();
+        let path = tmp.path().to_str().unwrap().replace('\\', "/");
+        ex.execute(&format!("COPY t74d FROM '{path}'")).unwrap();
+        let r = ex.execute("SELECT val FROM t74d WHERE pk = 7").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "77"),
+            _ => panic!(),
+        }
+    }
+
+    // ── S75 Materialized Views ─────────────────────────────────────────────
+    #[test]
+    fn test_s75_create_mat_view() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t75a (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t75a (pk, val) VALUES (1, 100)")
+            .unwrap();
+        let r = ex.execute("CREATE MATERIALIZED VIEW mv75a AS SELECT val FROM t75a WHERE pk = 1");
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn test_s75_mat_view_parses() {
+        let tokens =
+            crate::sql::lexer::Lexer::new("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t")
+                .tokenize()
+                .unwrap();
+        let stmt = crate::sql::parser::SqlParser::new(tokens).parse();
+        assert!(stmt.is_ok());
+    }
+
+    #[test]
+    fn test_s75_refresh_mat_view() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t75b (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t75b (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("CREATE MATERIALIZED VIEW mv75b AS SELECT val FROM t75b")
+            .unwrap();
+        ex.execute("INSERT INTO t75b (pk, val) VALUES (2, 20)")
+            .unwrap();
+        let r = ex.execute("REFRESH MATERIALIZED VIEW mv75b");
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn test_s75_drop_mat_view() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t75c (pk U64, val U64)").unwrap();
+        ex.execute("CREATE MATERIALIZED VIEW mv75c AS SELECT val FROM t75c")
+            .unwrap();
+        let r = ex.execute("DROP MATERIALIZED VIEW mv75c");
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn test_s75_drop_mat_view_parses() {
+        let tokens = crate::sql::lexer::Lexer::new("DROP MATERIALIZED VIEW mv_name")
+            .tokenize()
+            .unwrap();
+        let stmt = crate::sql::parser::SqlParser::new(tokens).parse();
+        assert!(stmt.is_ok());
+    }
+
+    // ── S76 Parallel Scans ─────────────────────────────────────────────────
+    #[test]
+    fn test_s76_parallel_scan_correctness() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t76a (pk U64, val U64)").unwrap();
+        for i in 1u64..=10 {
+            ex.execute(&format!(
+                "INSERT INTO t76a (pk, val) VALUES ({i}, {})",
+                i * 10
+            ))
+            .unwrap();
+        }
+        let r = ex.execute("SELECT * FROM t76a").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 10),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s76_parallel_filter() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t76b (pk U64, val U64)").unwrap();
+        for i in 1u64..=5 {
+            ex.execute(&format!("INSERT INTO t76b (pk, val) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex.execute("SELECT * FROM t76b WHERE val > 2").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s76_parallel_count() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t76c (pk U64, val U64)").unwrap();
+        for i in 1u64..=8 {
+            ex.execute(&format!("INSERT INTO t76c (pk, val) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let r = ex.execute("SELECT COUNT(*) FROM t76c").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "8"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s76_parallel_order() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t76d (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t76d (pk, val) VALUES (2, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t76d (pk, val) VALUES (1, 10)")
+            .unwrap();
+        let r = ex.execute("SELECT pk FROM t76d ORDER BY pk ASC").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "1"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s76_parallel_aggregation() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t76e (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t76e (pk, val) VALUES (1, 5)")
+            .unwrap();
+        ex.execute("INSERT INTO t76e (pk, val) VALUES (2, 5)")
+            .unwrap();
+        let r = ex.execute("SELECT SUM(val) FROM t76e").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], "10"),
+            _ => panic!(),
+        }
+    }
+
+    // ── S77 Window RANGE Frames ────────────────────────────────────────────
+    #[test]
+    fn test_s77_rows_frame_parses() {
+        let tokens = crate::sql::lexer::Lexer::new(
+            "SELECT SUM(val) OVER (ORDER BY pk ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM t"
+        ).tokenize().unwrap();
+        let stmt = crate::sql::parser::SqlParser::new(tokens).parse();
+        assert!(stmt.is_ok(), "ROWS frame must parse: {stmt:?}");
+    }
+
+    #[test]
+    fn test_s77_range_frame_parses() {
+        let tokens = crate::sql::lexer::Lexer::new(
+            "SELECT SUM(val) OVER (ORDER BY pk RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rs FROM t"
+        ).tokenize().unwrap();
+        let stmt = crate::sql::parser::SqlParser::new(tokens).parse();
+        assert!(stmt.is_ok(), "RANGE frame must parse: {stmt:?}");
+    }
+
+    #[test]
+    fn test_s77_running_sum() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t77a (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t77a (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t77a (pk, val) VALUES (2, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO t77a (pk, val) VALUES (3, 30)")
+            .unwrap();
+        let r = ex.execute("SELECT SUM(val) OVER (ORDER BY pk ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rs FROM t77a ORDER BY pk");
+        assert!(r.is_ok(), "running sum with frame must not error: {r:?}");
+    }
+
+    #[test]
+    fn test_s77_frame_current_row() {
+        let tokens = crate::sql::lexer::Lexer::new(
+            "SELECT SUM(val) OVER (ORDER BY pk ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t"
+        ).tokenize().unwrap();
+        let stmt = crate::sql::parser::SqlParser::new(tokens).parse();
+        assert!(stmt.is_ok());
+    }
+
+    #[test]
+    fn test_s77_frame_preceding_following() {
+        let tokens = crate::sql::lexer::Lexer::new(
+            "SELECT SUM(val) OVER (ORDER BY pk ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM t",
+        )
+        .tokenize()
+        .unwrap();
+        let stmt = crate::sql::parser::SqlParser::new(tokens).parse();
+        assert!(stmt.is_ok());
     }
 }

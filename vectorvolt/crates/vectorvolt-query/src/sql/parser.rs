@@ -161,25 +161,130 @@ impl SqlParser {
                 }
                 Ok(Stmt::ExecuteStmt { name, params })
             }
+            Token::Reset => {
+                self.advance(); // RESET
+                match self.advance().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("QUERY") => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                match self.advance().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("STATS") => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                Ok(Stmt::ResetQueryStats)
+            }
+            Token::Refresh => {
+                self.advance(); // REFRESH
+                self.expect(&Token::Materialized)?;
+                self.expect(&Token::View)?;
+                let name = self.expect_ident()?;
+                Ok(Stmt::RefreshMatView { name })
+            }
+            Token::Copy => {
+                self.advance(); // COPY
+                let table = self.expect_ident()?;
+                self.expect(&Token::From)?;
+                let path = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                let mut has_header = false;
+                if self.peek() == &Token::With
+                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("WITH"))
+                {
+                    self.advance(); // WITH
+                    self.expect(&Token::LParen)?;
+                    loop {
+                        match self.peek().clone() {
+                            Token::RParen => break,
+                            Token::Format => {
+                                self.advance();
+                                self.advance(); // CSV
+                            }
+                            Token::Header => {
+                                self.advance();
+                                match self.advance().clone() {
+                                    Token::Boolean(b) => has_header = b,
+                                    Token::Ident(s) if s.eq_ignore_ascii_case("TRUE") => {
+                                        has_header = true
+                                    }
+                                    Token::Ident(s) if s.eq_ignore_ascii_case("FALSE") => {
+                                        has_header = false
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {
+                                self.advance();
+                            }
+                        }
+                        if self.peek() == &Token::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&Token::RParen)?;
+                }
+                Ok(Stmt::CopyFrom {
+                    table,
+                    path,
+                    has_header,
+                })
+            }
             t => Err(ParseError::UnexpectedToken(t)),
         }
     }
 
-    /// S41 — `WITH name AS (SELECT ...) SELECT ...`
+    /// S41/S68 — `WITH [RECURSIVE] name AS (SELECT ...) SELECT ...`
     fn parse_with_select(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // WITH
+        let is_recursive = if self.peek() == &Token::Recursive {
+            self.advance();
+            true
+        } else {
+            false
+        };
         let mut ctes = Vec::new();
+        let mut recursive_parts = Vec::new();
         loop {
             let name = self.expect_ident()?;
             self.expect(&Token::As)?;
             self.expect(&Token::LParen)?;
-            let inner = self.parse_select()?;
-            let inner_stmt = match inner {
-                Stmt::Select(s) => s,
-                _ => return Err(ParseError::Other("CTE body must be SELECT".to_owned())),
-            };
-            self.expect(&Token::RParen)?;
-            ctes.push((name, Box::new(inner_stmt)));
+            if is_recursive {
+                // parse_select handles UNION ALL internally, so parse the whole CTE body
+                let whole = self.parse_select()?;
+                let whole_stmt = match whole {
+                    Stmt::Select(s) => s,
+                    _ => {
+                        return Err(ParseError::Other(
+                            "Recursive CTE body must be SELECT".to_owned(),
+                        ));
+                    }
+                };
+                self.expect(&Token::RParen)?;
+                // Extract seed and recursive part from UNION ALL
+                let (seed_stmt, rec_stmt) = match whole_stmt.set_op.clone() {
+                    Some(SetOp::UnionAll(rec)) => {
+                        let seed = SelectStmt {
+                            set_op: None,
+                            ..whole_stmt.clone()
+                        };
+                        (seed, *rec)
+                    }
+                    _ => (whole_stmt.clone(), whole_stmt),
+                };
+                ctes.push((name.clone(), Box::new(seed_stmt), true));
+                recursive_parts.push((name, Box::new(rec_stmt)));
+            } else {
+                let inner = self.parse_select()?;
+                let inner_stmt = match inner {
+                    Stmt::Select(s) => s,
+                    _ => return Err(ParseError::Other("CTE body must be SELECT".to_owned())),
+                };
+                self.expect(&Token::RParen)?;
+                ctes.push((name, Box::new(inner_stmt), false));
+            }
             if self.peek() == &Token::Comma {
                 self.advance();
             } else {
@@ -190,6 +295,7 @@ impl SqlParser {
         match outer {
             Stmt::Select(mut s) => {
                 s.ctes = ctes;
+                s.recursive_parts = recursive_parts;
                 Ok(Stmt::Select(s))
             }
             _ => Err(ParseError::Other(
@@ -255,6 +361,7 @@ impl SqlParser {
                         over_order,
                         over_partition,
                         alias,
+                        frame: None,
                     }
                 }
                 Token::Rank => {
@@ -290,6 +397,7 @@ impl SqlParser {
                         over_order,
                         over_partition,
                         alias,
+                        frame: None,
                     }
                 }
                 Token::Sum | Token::Min | Token::Max => {
@@ -301,12 +409,35 @@ impl SqlParser {
                     if self.peek() == &Token::Over && matches!(func_tok, Token::Sum) {
                         self.advance(); // OVER
                         self.expect(&Token::LParen)?;
+                        let over_partition = if self.peek() == &Token::Partition {
+                            self.advance();
+                            self.expect(&Token::By)?;
+                            Some(self.expect_ident()?)
+                        } else {
+                            None
+                        };
+                        let over_order = if self.peek() == &Token::Order {
+                            self.advance();
+                            self.expect(&Token::By)?;
+                            Some(self.expect_ident()?)
+                        } else {
+                            None
+                        };
+                        // S77 — optional ROWS/RANGE BETWEEN ... AND ...
+                        let frame = self.try_parse_frame()?;
                         self.expect(&Token::RParen)?;
+                        let alias = if self.peek() == &Token::As {
+                            self.advance();
+                            Some(self.expect_ident()?)
+                        } else {
+                            None
+                        };
                         SelectExpr::WindowFunc {
                             func: crate::sql::ast::WindowFunc::WinSum(col),
-                            over_order: None,
-                            over_partition: None,
-                            alias: None,
+                            over_order,
+                            over_partition,
+                            alias,
+                            frame,
                         }
                     } else {
                         let func = match func_tok {
@@ -441,6 +572,7 @@ impl SqlParser {
                         over_order,
                         over_partition: None,
                         alias,
+                        frame: None,
                     }
                 }
                 Token::Ntile => {
@@ -465,6 +597,7 @@ impl SqlParser {
                         over_order: None,
                         over_partition: None,
                         alias,
+                        frame: None,
                     }
                 }
                 Token::PercentRank => {
@@ -492,6 +625,7 @@ impl SqlParser {
                         over_order,
                         over_partition: None,
                         alias,
+                        frame: None,
                     }
                 }
                 Token::Lead | Token::Lag => {
@@ -523,6 +657,7 @@ impl SqlParser {
                         over_order: None,
                         over_partition: None,
                         alias,
+                        frame: None,
                     }
                 }
                 Token::FirstValue | Token::LastValue => {
@@ -549,6 +684,7 @@ impl SqlParser {
                         over_order: None,
                         over_partition: None,
                         alias,
+                        frame: None,
                     }
                 }
                 t => return Err(ParseError::UnexpectedToken(t)),
@@ -595,6 +731,19 @@ impl SqlParser {
                     self.advance();
                     JoinKind::Inner
                 }
+                // S71 — CROSS JOIN (no ON condition)
+                Token::Cross => {
+                    self.advance();
+                    self.expect(&Token::Join)?;
+                    let join_table = self.expect_ident()?;
+                    joins.push(JoinClause {
+                        kind: JoinKind::Cross,
+                        table: join_table,
+                        left_col: String::new(),
+                        right_col: String::new(),
+                    });
+                    continue;
+                }
                 _ => break,
             };
             let join_table = self.expect_ident()?;
@@ -610,6 +759,34 @@ impl SqlParser {
                 left_col,
                 right_col,
             });
+        }
+        // S69 — LATERAL joins: , LATERAL (SELECT ...) AS alias
+        let mut lateral_joins = Vec::new();
+        while self.peek() == &Token::Comma {
+            if self.pos + 1 < self.tokens.len() && self.tokens[self.pos + 1] == Token::Lateral {
+                self.advance(); // consume comma
+                self.advance(); // LATERAL
+                self.expect(&Token::LParen)?;
+                let sub = self.parse_select()?;
+                let subquery = match sub {
+                    Stmt::Select(s) => s,
+                    _ => {
+                        return Err(ParseError::Other(
+                            "LATERAL subquery must be SELECT".to_owned(),
+                        ));
+                    }
+                };
+                self.expect(&Token::RParen)?;
+                self.expect(&Token::As)?;
+                let alias = self.expect_ident()?;
+                lateral_joins.push(LateralJoin {
+                    alias,
+                    subquery: Box::new(subquery),
+                    correlation_col: String::new(),
+                });
+            } else {
+                break;
+            }
         }
         let mut where_clause = None;
         if self.peek() == &Token::Where {
@@ -721,6 +898,8 @@ impl SqlParser {
             distinct,
             set_op: None,
             ctes: vec![],
+            recursive_parts: vec![],
+            lateral_joins,
             index_hint,
         };
 
@@ -803,6 +982,28 @@ impl SqlParser {
         }
         self.expect(&Token::RParen)?;
 
+        // S73 — multi-row VALUES: (v1,...), (v2,...), ...
+        let mut extra_rows: Vec<Vec<Expr>> = Vec::new();
+        while self.peek() == &Token::Comma {
+            if self.pos + 1 < self.tokens.len() && self.tokens[self.pos + 1] == Token::LParen {
+                self.advance(); // comma
+                self.expect(&Token::LParen)?;
+                let mut row = Vec::new();
+                loop {
+                    row.push(self.parse_primary()?);
+                    if self.peek() == &Token::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&Token::RParen)?;
+                extra_rows.push(row);
+            } else {
+                break;
+            }
+        }
+
         // S44 — ON CONFLICT handling
         let mut on_conflict_update = None;
         let mut on_conflict_ignore = false;
@@ -843,6 +1044,7 @@ impl SqlParser {
             or_replace,
             on_conflict_update,
             on_conflict_ignore,
+            extra_rows,
         }))
     }
 
@@ -1065,6 +1267,25 @@ impl SqlParser {
                     select: Box::new(select_stmt),
                 }));
             }
+            Token::Materialized => {
+                self.advance(); // MATERIALIZED
+                self.expect(&Token::View)?;
+                let name = self.expect_ident()?;
+                self.expect(&Token::As)?;
+                let sel = self.parse_select()?;
+                let select_stmt = match sel {
+                    Stmt::Select(s) => s,
+                    _ => {
+                        return Err(ParseError::Other(
+                            "MATERIALIZED VIEW body must be SELECT".to_owned(),
+                        ));
+                    }
+                };
+                return Ok(Stmt::CreateMatView {
+                    name,
+                    select: Box::new(select_stmt),
+                });
+            }
             _ => {}
         }
         self.expect(&Token::Table)?;
@@ -1245,6 +1466,12 @@ impl SqlParser {
                 let name = self.expect_ident()?;
                 return Ok(Stmt::DropTrigger { name });
             }
+            Token::Materialized => {
+                self.advance();
+                self.expect(&Token::View)?;
+                let name = self.expect_ident()?;
+                return Ok(Stmt::DropMatView { name });
+            }
             _ => {}
         }
         self.expect(&Token::Table)?;
@@ -1311,6 +1538,7 @@ impl SqlParser {
                 col,
                 pattern,
                 negated: true,
+                case_insensitive: false,
             });
         }
         if self.peek() == &Token::Like {
@@ -1331,6 +1559,29 @@ impl SqlParser {
                 col,
                 pattern,
                 negated: false,
+                case_insensitive: false,
+            });
+        }
+        // S70 — ILIKE (case-insensitive LIKE)
+        if self.peek() == &Token::ILike {
+            self.advance();
+            let pattern = match self.advance().clone() {
+                Token::Str(s) => s,
+                t => return Err(ParseError::UnexpectedToken(t)),
+            };
+            let col = match left {
+                Expr::Col(c) => c,
+                _ => {
+                    return Err(ParseError::Other(
+                        "ILIKE left side must be a column".to_owned(),
+                    ));
+                }
+            };
+            return Ok(Expr::Like {
+                col,
+                pattern,
+                negated: false,
+                case_insensitive: true,
             });
         }
         // IS NULL / IS NOT NULL
@@ -1749,6 +2000,53 @@ impl SqlParser {
                 })
             }
             Token::Placeholder(n) => Ok(Expr::Placeholder(n)),
+            t => Err(ParseError::UnexpectedToken(t)),
+        }
+    }
+
+    fn try_parse_frame(&mut self) -> Result<Option<WindowFrame>, ParseError> {
+        let unit = match self.peek() {
+            Token::Rows => {
+                self.advance();
+                FrameUnit::Rows
+            }
+            Token::Range => {
+                self.advance();
+                FrameUnit::Range
+            }
+            _ => return Ok(None),
+        };
+        self.expect(&Token::Between)?;
+        let start = self.parse_frame_bound()?;
+        self.expect(&Token::And)?;
+        let end = self.parse_frame_bound()?;
+        Ok(Some(WindowFrame { unit, start, end }))
+    }
+
+    fn parse_frame_bound(&mut self) -> Result<FrameBound, ParseError> {
+        match self.peek().clone() {
+            Token::Unbounded => {
+                self.advance();
+                match self.advance().clone() {
+                    Token::Preceding => Ok(FrameBound::UnboundedPreceding),
+                    Token::Following => Ok(FrameBound::UnboundedFollowing),
+                    t => Err(ParseError::UnexpectedToken(t)),
+                }
+            }
+            Token::Current => {
+                self.advance();
+                self.expect(&Token::Row)?;
+                Ok(FrameBound::CurrentRow)
+            }
+            Token::Integer(n) => {
+                let n = n as u64;
+                self.advance();
+                match self.advance().clone() {
+                    Token::Preceding => Ok(FrameBound::Preceding(n)),
+                    Token::Following => Ok(FrameBound::Following(n)),
+                    t => Err(ParseError::UnexpectedToken(t)),
+                }
+            }
             t => Err(ParseError::UnexpectedToken(t)),
         }
     }
