@@ -3668,6 +3668,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectorvolt-pam"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "vectorvolt-projection"
 version = "0.1.0"
 dependencies = [

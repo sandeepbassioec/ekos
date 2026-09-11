@@ -33,6 +33,7 @@ members = [
     "crates/vectorvolt-tpm",
     "crates/vectorvolt-semantic",
     "crates/vectorvolt-events",
+    "crates/vectorvolt-pam",
 ]
 resolver = "2"
 

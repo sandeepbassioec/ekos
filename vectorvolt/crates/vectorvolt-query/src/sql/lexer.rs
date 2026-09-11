@@ -223,6 +223,19 @@ pub enum Token {
     Slow,
     // S97 — wait events
     Events,
+    // S98 — flamegraph export
+    Flamegraph,
+    // S100 — EXPLAIN BUFFERS
+    Buffers,
+    // S101/S102 — psql/pgcli meta-commands (e.g. \dt, \d, \l)
+    MetaCmd(String),
+    // S103 — cursor protocol
+    Declare,
+    Cursor,
+    Fetch,
+    Close,
+    // S104 — COPY STDIN
+    Stdin,
     // Types
     KwU64,
     KwI64,
@@ -320,6 +333,17 @@ impl<'a> Lexer<'a> {
                 let (tok, adv) = Self::lex_number(self.input, self.pos, false)?;
                 self.pos += adv;
                 tokens.push(tok);
+                continue;
+            }
+            // S101/S102 — meta-commands starting with backslash (\dt, \d, \l, etc.)
+            if ch == '\\' {
+                let start = self.pos;
+                self.pos += 1;
+                while self.pos < bytes.len() && !(bytes[self.pos] as char).is_whitespace() {
+                    self.pos += 1;
+                }
+                let word = self.input[start..self.pos].to_owned();
+                tokens.push(Token::MetaCmd(word));
                 continue;
             }
             if ch.is_ascii_alphabetic() || ch == '_' {
@@ -597,6 +621,13 @@ impl<'a> Lexer<'a> {
             "PATH" => Token::KwPath,
             "SLOW" => Token::Slow,
             "EVENTS" => Token::Events,
+            "FLAMEGRAPH" => Token::Flamegraph,
+            "BUFFERS" => Token::Buffers,
+            "DECLARE" => Token::Declare,
+            "CURSOR" => Token::Cursor,
+            "FETCH" => Token::Fetch,
+            "CLOSE" => Token::Close,
+            "STDIN" => Token::Stdin,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,

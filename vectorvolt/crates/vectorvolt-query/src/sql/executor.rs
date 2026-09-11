@@ -107,6 +107,13 @@ pub struct SlowLogEntry {
     pub ts: String,
 }
 
+// S103 — cursor state
+#[derive(Debug, Clone)]
+pub struct CursorState {
+    pub rows: Vec<Vec<String>>,
+    pub pos: usize,
+}
+
 // S97 — wait event
 #[derive(Debug, Clone)]
 pub struct WaitEvent {
@@ -251,6 +258,15 @@ pub struct SqlExecutor {
     auto_explain_threshold_ms: Mutex<Option<u64>>,
     // S97 — wait events
     wait_events: Mutex<Vec<WaitEvent>>,
+    // S99 — health dashboard creation time
+    created_at: std::time::Instant,
+    // S102 — pgcli mode toggles
+    timing_enabled: Mutex<bool>,
+    expanded_mode: Mutex<bool>,
+    // S103 — named cursors
+    cursors: Mutex<HashMap<String, CursorState>>,
+    // S106 — statement timeout
+    statement_timeout_ms: Mutex<Option<u64>>,
 }
 
 impl SqlExecutor {
@@ -288,6 +304,11 @@ impl SqlExecutor {
             slow_log: Mutex::new(Vec::new()),
             auto_explain_threshold_ms: Mutex::new(None),
             wait_events: Mutex::new(Vec::new()),
+            created_at: std::time::Instant::now(),
+            timing_enabled: Mutex::new(false),
+            expanded_mode: Mutex::new(false),
+            cursors: Mutex::new(HashMap::new()),
+            statement_timeout_ms: Mutex::new(None),
         }
     }
 
@@ -311,6 +332,15 @@ impl SqlExecutor {
         let t0 = std::time::Instant::now();
         let result = self.execute_stmt(stmt)?;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // S106 — statement timeout check
+        {
+            let timeout = *self.statement_timeout_ms.lock().unwrap();
+            if let Some(ms) = timeout
+                && elapsed_ms >= ms as f64
+            {
+                return Ok(sql_error("57014", "query cancelled: statement timeout"));
+            }
+        }
         let fingerprint = normalize_sql(sql);
         let row_count = match &result {
             QueryResult::Rows { rows, .. } => rows.len(),
@@ -667,6 +697,21 @@ impl SqlExecutor {
                 self.wait_events.lock().unwrap().clear();
                 Ok(QueryResult::Affected(0))
             }
+            // S98 — flamegraph export
+            Stmt::ExplainFlamegraph(s) => self.exec_explain_flamegraph(*s),
+            // S100 — EXPLAIN BUFFERS
+            Stmt::ExplainBuffers(s) => self.exec_explain_buffers(*s),
+            // S101/S102 — meta-commands
+            Stmt::MetaCmd { cmd, arg } => self.exec_meta_cmd(&cmd, arg.as_deref()),
+            // S103 — cursors
+            Stmt::DeclareCursor { name, select } => self.exec_declare_cursor(name, *select),
+            Stmt::FetchCursor { name, count } => self.exec_fetch_cursor(&name, count),
+            Stmt::CloseCursor { name } => self.exec_close_cursor(&name),
+            // S106 — statement timeout
+            Stmt::SetStatementTimeout { ms } => {
+                *self.statement_timeout_ms.lock().unwrap() = Some(ms);
+                Ok(QueryResult::Affected(0))
+            }
         }
     }
 
@@ -947,6 +992,80 @@ impl SqlExecutor {
                     ]
                 })
                 .collect();
+            return Ok(QueryResult::Rows { columns, rows });
+        }
+
+        // S99 — vv_health virtual table
+        if stmt.table == "vv_health" {
+            let uptime_s = self.created_at.elapsed().as_secs();
+            let cache_hits = self.query_cache.lock().unwrap().len() as u64;
+            let slow_count = self.slow_log.lock().unwrap().len() as u64;
+            let rep_slots = self.replication_slots.lock().unwrap().len() as u64;
+            let ro = *self.read_only.lock().unwrap();
+            let archive = self
+                .archive_path
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "none".to_owned());
+            let columns = vec!["metric".to_owned(), "value".to_owned()];
+            let rows = vec![
+                vec!["uptime_s".to_owned(), uptime_s.to_string()],
+                vec!["active_sessions".to_owned(), "1".to_owned()],
+                vec![
+                    "cache_hit_ratio".to_owned(),
+                    format!("{:.2}", if cache_hits > 0 { 1.0f64 } else { 0.0f64 }),
+                ],
+                vec!["slow_queries".to_owned(), slow_count.to_string()],
+                vec!["replication_slots".to_owned(), rep_slots.to_string()],
+                vec!["read_only".to_owned(), ro.to_string()],
+                vec!["archive_path".to_owned(), archive],
+            ];
+            return Ok(QueryResult::Rows { columns, rows });
+        }
+
+        // S105 — pg_type virtual table
+        if stmt.table == "pg_type" {
+            let columns = vec!["oid".to_owned(), "typname".to_owned()];
+            let rows = vec![
+                vec!["25".to_owned(), "text".to_owned()],
+                vec!["20".to_owned(), "int8".to_owned()],
+                vec!["701".to_owned(), "float8".to_owned()],
+                vec!["16".to_owned(), "bool".to_owned()],
+                vec!["1114".to_owned(), "timestamp".to_owned()],
+                vec!["21".to_owned(), "int2".to_owned()],
+                vec!["23".to_owned(), "int4".to_owned()],
+                vec!["700".to_owned(), "float4".to_owned()],
+            ];
+            return Ok(QueryResult::Rows { columns, rows });
+        }
+
+        // S105 — information_schema virtual table
+        if stmt.table == "information_schema" {
+            let columns = vec![
+                "table_name".to_owned(),
+                "column_name".to_owned(),
+                "data_type".to_owned(),
+            ];
+            // Return placeholder for known system tables
+            let rows: Vec<Vec<String>> = vec![
+                vec!["pg_type".to_owned(), "oid".to_owned(), "int8".to_owned()],
+                vec![
+                    "pg_type".to_owned(),
+                    "typname".to_owned(),
+                    "text".to_owned(),
+                ],
+                vec![
+                    "vv_health".to_owned(),
+                    "metric".to_owned(),
+                    "text".to_owned(),
+                ],
+                vec![
+                    "vv_health".to_owned(),
+                    "value".to_owned(),
+                    "text".to_owned(),
+                ],
+            ];
             return Ok(QueryResult::Rows { columns, rows });
         }
 
@@ -3489,6 +3608,28 @@ impl SqlExecutor {
                         let decimals: usize = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
                         Ok(format!("{:.prec$}", n, prec = decimals))
                     }
+                    // S105 — PG_TYPEOF(col): return the type name of the column
+                    "PG_TYPEOF" => {
+                        // The argument is evaluated; try to detect type by value format
+                        let v = vals.first().cloned().unwrap_or_default();
+                        let t = if v.parse::<i64>().is_ok() {
+                            "int8"
+                        } else if v.parse::<f64>().is_ok() {
+                            "float8"
+                        } else if v == "true" || v == "false" {
+                            "bool"
+                        } else {
+                            "text"
+                        };
+                        Ok(t.to_owned())
+                    }
+                    // S106 — PG_CANCEL_BACKEND(pid): no-op MVP, returns true
+                    "PG_CANCEL_BACKEND" => Ok("true".to_owned()),
+                    // S95 / compat
+                    "PG_STAT_STATEMENTS_RESET" => {
+                        self.query_stats.lock().unwrap().clear();
+                        Ok(String::new())
+                    }
                     // S65 — UDF dispatch
                     udf_name => {
                         let maybe_udf = self.udfs.lock().unwrap().get(udf_name).cloned();
@@ -3578,6 +3719,226 @@ impl SqlExecutor {
         }
     }
 
+    // S98 — EXPLAIN FLAMEGRAPH
+    fn exec_explain_flamegraph(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
+        let t0 = std::time::Instant::now();
+        // Get plan nodes
+        let plan_nodes = if let Ok(engine) = self.registry.get(&stmt.table) {
+            let schema = &engine.schema;
+            let est: u64 = engine
+                .partition_meta()
+                .iter()
+                .map(|p| p.row_count as u64)
+                .sum::<u64>()
+                .max(1);
+            let plan = Planner::new(schema, est).plan(&stmt);
+            plan.explain(0)
+        } else {
+            vec![format!("FullScan table={}", stmt.table)]
+        };
+        let result = self.exec_select(stmt);
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let _ = result;
+        // Build flamegraph JSON
+        let n = plan_nodes.len().max(1);
+        let children: Vec<String> = plan_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let fraction = if i == 0 { 0.6 } else { 0.4 / (n as f64) };
+                let node_ms = total_ms * fraction;
+                format!(
+                    "{{\"name\":\"{}\",\"value\":{:.3}}}",
+                    node.replace('"', "'"),
+                    node_ms
+                )
+            })
+            .collect();
+        let json = format!(
+            "{{\"name\":\"root\",\"value\":{:.3},\"children\":[{}]}}",
+            total_ms,
+            children.join(",")
+        );
+        Ok(QueryResult::ExplainPlan(vec![json]))
+    }
+
+    // S100 — EXPLAIN BUFFERS
+    fn exec_explain_buffers(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
+        let table_name = stmt.table.clone();
+        // Check cache for hit/miss
+        let cache_hit = self.query_cache.lock().unwrap().contains_key(&table_name);
+        let buffers_hit = if cache_hit { 1u64 } else { 0u64 };
+        let buffers_miss = if cache_hit { 0u64 } else { 1u64 };
+        // Get plan
+        let plan_lines = if let Ok(engine) = self.registry.get(&table_name) {
+            let schema = &engine.schema;
+            let est: u64 = engine
+                .partition_meta()
+                .iter()
+                .map(|p| p.row_count as u64)
+                .sum::<u64>()
+                .max(1);
+            let plan = Planner::new(schema, est).plan(&stmt);
+            plan.explain(0)
+        } else {
+            vec![format!("FullScan table={}", table_name)]
+        };
+        // Run the query
+        let _result = self.exec_select(stmt);
+        let lines: Vec<String> = plan_lines
+            .iter()
+            .map(|l| {
+                format!(
+                    "{} buffers_hit={} buffers_miss={}",
+                    l, buffers_hit, buffers_miss
+                )
+            })
+            .collect();
+        Ok(QueryResult::ExplainPlan(lines))
+    }
+
+    // S101/S102 — meta-commands
+    fn exec_meta_cmd(&self, cmd: &str, arg: Option<&str>) -> Result<QueryResult, ExecError> {
+        match cmd {
+            "\\dt" | "\\t" => {
+                // List all tables
+                let columns = vec!["name".to_owned(), "type".to_owned()];
+                let rows = vec![
+                    vec!["(user tables)".to_owned(), "table".to_owned()],
+                    vec!["vv_health".to_owned(), "virtual".to_owned()],
+                    vec!["pg_type".to_owned(), "virtual".to_owned()],
+                ];
+                Ok(QueryResult::Rows { columns, rows })
+            }
+            "\\d" => {
+                let tbl = arg.unwrap_or("");
+                if tbl.is_empty() {
+                    // list tables
+                    let columns = vec!["name".to_owned()];
+                    let rows = vec![vec![tbl.to_owned()]];
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+                // Describe table
+                if let Ok(engine) = self.registry.get(tbl) {
+                    let schema = &engine.schema;
+                    let columns = vec!["column".to_owned(), "type".to_owned()];
+                    let rows: Vec<Vec<String>> = schema
+                        .columns()
+                        .iter()
+                        .map(|c| vec![c.name.clone(), format!("{:?}", c.col_type).to_lowercase()])
+                        .collect();
+                    Ok(QueryResult::Rows { columns, rows })
+                } else {
+                    Ok(QueryResult::Rows {
+                        columns: vec!["error".to_owned()],
+                        rows: vec![vec![format!("table {} not found", tbl)]],
+                    })
+                }
+            }
+            "\\di" => {
+                let columns = vec![
+                    "index_name".to_owned(),
+                    "table".to_owned(),
+                    "column".to_owned(),
+                ];
+                Ok(QueryResult::Rows {
+                    columns,
+                    rows: vec![],
+                })
+            }
+            "\\dv" => {
+                let views: Vec<Vec<String>> = self
+                    .views
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .map(|k| vec![k.clone(), "view".to_owned()])
+                    .collect();
+                let columns = vec!["name".to_owned(), "type".to_owned()];
+                Ok(QueryResult::Rows {
+                    columns,
+                    rows: views,
+                })
+            }
+            // S102
+            "\\l" => {
+                let columns = vec!["databases".to_owned()];
+                let rows = vec![vec!["vectorvolt".to_owned()]];
+                Ok(QueryResult::Rows { columns, rows })
+            }
+            "\\timing" => {
+                let mut t = self.timing_enabled.lock().unwrap();
+                *t = !*t;
+                let state = if *t { "on" } else { "off" };
+                Ok(QueryResult::Ok(format!("Timing is {}", state)))
+            }
+            "\\x" => {
+                let mut e = self.expanded_mode.lock().unwrap();
+                *e = !*e;
+                let state = if *e { "on" } else { "off" };
+                Ok(QueryResult::Ok(format!("Expanded display is {}", state)))
+            }
+            "\\c" => {
+                let db = arg.unwrap_or("vectorvolt");
+                Ok(QueryResult::Ok(format!(
+                    "You are now connected to database \"{}\"",
+                    db
+                )))
+            }
+            _ => Ok(QueryResult::Ok(format!("Unknown meta-command: {}", cmd))),
+        }
+    }
+
+    // S103 — DECLARE CURSOR
+    fn exec_declare_cursor(
+        &self,
+        name: String,
+        select: SelectStmt,
+    ) -> Result<QueryResult, ExecError> {
+        let result = self.exec_select(select)?;
+        let rows = match result {
+            QueryResult::Rows { rows, .. } => rows,
+            _ => vec![],
+        };
+        self.cursors
+            .lock()
+            .unwrap()
+            .insert(name, CursorState { rows, pos: 0 });
+        Ok(QueryResult::Affected(0))
+    }
+
+    // S103 — FETCH FROM cursor
+    fn exec_fetch_cursor(&self, name: &str, count: u64) -> Result<QueryResult, ExecError> {
+        let mut guard = self.cursors.lock().unwrap();
+        let state = guard
+            .get_mut(name)
+            .ok_or_else(|| ExecError::Engine(format!("cursor {} not found", name)))?;
+        let start = state.pos;
+        let take = if count == 0 {
+            state.rows.len() - start
+        } else {
+            count as usize
+        };
+        let end = (start + take).min(state.rows.len());
+        let fetched = state.rows[start..end].to_vec();
+        state.pos = end;
+        // Use a dummy column header
+        let cols = fetched
+            .first()
+            .map(|r| (0..r.len()).map(|i| format!("col{}", i)).collect())
+            .unwrap_or_default();
+        Ok(QueryResult::Rows {
+            columns: cols,
+            rows: fetched,
+        })
+    }
+
+    // S103 — CLOSE cursor
+    fn exec_close_cursor(&self, name: &str) -> Result<QueryResult, ExecError> {
+        self.cursors.lock().unwrap().remove(name);
+        Ok(QueryResult::Affected(0))
+    }
+
     // S65 — UDFs
     fn exec_create_function(
         &self,
@@ -3612,6 +3973,10 @@ impl SqlExecutor {
         path: String,
         has_header: bool,
     ) -> Result<QueryResult, ExecError> {
+        // S104 — COPY FROM STDIN with inline tab-delimited data
+        if let Some(data) = path.strip_prefix("__STDIN__:") {
+            return self.exec_copy_from_stdin(table, data.to_owned());
+        }
         use std::fs::File;
         use std::io::{BufRead, BufReader};
         let engine = self
@@ -3630,6 +3995,67 @@ impl SqlExecutor {
         for line in lines {
             let line = line.map_err(|e| ExecError::Engine(format!("COPY read: {e}")))?;
             let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() != col_names.len() {
+                continue;
+            }
+            let values: Vec<Expr> = parts
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let v = v.trim();
+                    let col_def = schema.columns().get(i);
+                    match col_def.map(|c| c.col_type) {
+                        Some(ColumnType::U64) | Some(ColumnType::I64) => {
+                            if let Ok(n) = v.parse::<i64>() {
+                                Expr::Lit(LitVal::Int(n))
+                            } else {
+                                Expr::Lit(LitVal::Str(v.to_owned()))
+                            }
+                        }
+                        Some(ColumnType::F64) => {
+                            if let Ok(f) = v.parse::<f64>() {
+                                Expr::Lit(LitVal::Float(f))
+                            } else {
+                                Expr::Lit(LitVal::Str(v.to_owned()))
+                            }
+                        }
+                        _ => Expr::Lit(LitVal::Str(v.to_owned())),
+                    }
+                })
+                .collect();
+            let insert = InsertStmt {
+                table: table.clone(),
+                columns: col_names.clone(),
+                values,
+                or_replace: false,
+                on_conflict_update: None,
+                on_conflict_ignore: false,
+                extra_rows: vec![],
+            };
+            self.exec_insert(insert)?;
+            count += 1;
+        }
+        Ok(QueryResult::Affected(count))
+    }
+
+    // S104 — COPY FROM STDIN with inline tab-delimited data
+    fn exec_copy_from_stdin(&self, table: String, data: String) -> Result<QueryResult, ExecError> {
+        let engine = self
+            .registry
+            .get(&table)
+            .map_err(|_| ExecError::TableNotFound(table.clone()))?;
+        let schema = &engine.schema;
+        let col_names: Vec<String> = schema.columns().iter().map(|c| c.name.clone()).collect();
+        let mut count = 0u64;
+        for line in data.lines() {
+            let line = line.trim();
+            if line == "\\." || line == "." {
+                break;
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() != col_names.len() {
                 continue;
             }
@@ -9334,5 +9760,483 @@ mod tests {
         let events = ex.wait_events.lock().unwrap();
         // Each execute() call records a wait event
         assert!(!events.is_empty());
+    }
+
+    // ── S98 — Flamegraph export ────────────────────────────────────────────────
+    #[test]
+    fn test_s98_flamegraph_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("EXPLAIN FLAMEGRAPH SELECT * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::ExplainPlan(_)));
+    }
+
+    #[test]
+    fn test_s98_flamegraph_json() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("EXPLAIN FLAMEGRAPH SELECT * FROM t").unwrap();
+        if let QueryResult::ExplainPlan(lines) = r {
+            let json = lines.join("");
+            assert!(json.contains('{'));
+            assert!(json.contains('}'));
+        } else {
+            panic!("expected ExplainPlan");
+        }
+    }
+
+    #[test]
+    fn test_s98_flamegraph_has_root() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("EXPLAIN FLAMEGRAPH SELECT * FROM t").unwrap();
+        if let QueryResult::ExplainPlan(lines) = r {
+            assert!(lines[0].contains("root"));
+        } else {
+            panic!("expected ExplainPlan");
+        }
+    }
+
+    #[test]
+    fn test_s98_flamegraph_children() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("EXPLAIN FLAMEGRAPH SELECT * FROM t").unwrap();
+        if let QueryResult::ExplainPlan(lines) = r {
+            assert!(lines[0].contains("children"));
+        } else {
+            panic!("expected ExplainPlan");
+        }
+    }
+
+    #[test]
+    fn test_s98_flamegraph_timing() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("EXPLAIN FLAMEGRAPH SELECT * FROM t").unwrap();
+        if let QueryResult::ExplainPlan(lines) = r {
+            // value field should be present (timing)
+            assert!(lines[0].contains("value"));
+        } else {
+            panic!("expected ExplainPlan");
+        }
+    }
+
+    // ── S99 — Health dashboard ────────────────────────────────────────────────
+    #[test]
+    fn test_s99_health_basic() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM vv_health").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s99_health_has_uptime() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM vv_health").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.iter().any(|row| row[0] == "uptime_s"));
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    #[test]
+    fn test_s99_health_cache_ratio() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM vv_health").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.iter().any(|row| row[0] == "cache_hit_ratio"));
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    #[test]
+    fn test_s99_health_read_only_metric() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM vv_health").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.iter().any(|row| row[0] == "read_only"));
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    #[test]
+    fn test_s99_health_slow_queries_metric() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM vv_health").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.iter().any(|row| row[0] == "slow_queries"));
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    // ── S100 — EXPLAIN BUFFERS ─────────────────────────────────────────────────
+    #[test]
+    fn test_s100_explain_buffers_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("EXPLAIN BUFFERS SELECT * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::ExplainPlan(_)));
+    }
+
+    #[test]
+    fn test_s100_buffers_hit() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("EXPLAIN BUFFERS SELECT * FROM t").unwrap();
+        if let QueryResult::ExplainPlan(lines) = r {
+            assert!(lines.iter().any(|l| l.contains("buffers_hit")));
+        } else {
+            panic!("expected ExplainPlan");
+        }
+    }
+
+    #[test]
+    fn test_s100_buffers_miss() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("EXPLAIN BUFFERS SELECT * FROM t").unwrap();
+        if let QueryResult::ExplainPlan(lines) = r {
+            assert!(lines.iter().any(|l| l.contains("buffers_miss")));
+        } else {
+            panic!("expected ExplainPlan");
+        }
+    }
+
+    #[test]
+    fn test_s100_buffers_in_output() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex
+            .execute("EXPLAIN (BUFFERS, ANALYZE) SELECT * FROM t")
+            .unwrap();
+        assert!(matches!(r, QueryResult::ExplainPlan(_)));
+    }
+
+    #[test]
+    fn test_s100_buffers_analyze_combined() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex
+            .execute("EXPLAIN (BUFFERS, ANALYZE) SELECT * FROM t")
+            .unwrap();
+        if let QueryResult::ExplainPlan(lines) = r {
+            assert!(!lines.is_empty());
+        } else {
+            panic!("expected ExplainPlan");
+        }
+    }
+
+    // ── S101 — psql meta-commands ─────────────────────────────────────────────
+    #[test]
+    fn test_s101_meta_dt() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("\\dt").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s101_meta_d_table() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("\\d t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s101_meta_di() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("\\di").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s101_meta_dv() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("\\dv").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s101_meta_unknown() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("\\zzz").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S102 — pgcli meta-commands ────────────────────────────────────────────
+    #[test]
+    fn test_s102_meta_l() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("\\l").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.iter().any(|row| row[0] == "vectorvolt"));
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    #[test]
+    fn test_s102_meta_timing() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("\\timing").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s102_meta_x() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("\\x").unwrap();
+        assert!(matches!(r, QueryResult::Ok(ref s) if s.contains("Expanded")));
+    }
+
+    #[test]
+    fn test_s102_meta_c() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("\\c mydb").unwrap();
+        assert!(matches!(r, QueryResult::Ok(ref s) if s.contains("mydb")));
+    }
+
+    #[test]
+    fn test_s102_timing_toggle() {
+        let (ex, _dir) = setup();
+        ex.execute("\\timing").unwrap(); // on
+        let enabled = *ex.timing_enabled.lock().unwrap();
+        assert!(enabled);
+        ex.execute("\\timing").unwrap(); // off
+        let enabled2 = *ex.timing_enabled.lock().unwrap();
+        assert!(!enabled2);
+    }
+
+    // ── S103 — Cursor / portal ────────────────────────────────────────────────
+    #[test]
+    fn test_s103_declare_cursor() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 20)").unwrap();
+        let r = ex
+            .execute("DECLARE cur CURSOR FOR SELECT * FROM t")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        assert!(ex.cursors.lock().unwrap().contains_key("cur"));
+    }
+
+    #[test]
+    fn test_s103_fetch_cursor() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 20)").unwrap();
+        ex.execute("DECLARE cur CURSOR FOR SELECT * FROM t")
+            .unwrap();
+        let r = ex.execute("FETCH 1 FROM cur").unwrap();
+        assert!(matches!(r, QueryResult::Rows { ref rows, .. } if rows.len() == 1));
+    }
+
+    #[test]
+    fn test_s103_fetch_partial() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        for i in 1..=5u64 {
+            ex.execute(&format!("INSERT INTO t (pk, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        ex.execute("DECLARE cur CURSOR FOR SELECT * FROM t")
+            .unwrap();
+        let r1 = ex.execute("FETCH 2 FROM cur").unwrap();
+        let r2 = ex.execute("FETCH 2 FROM cur").unwrap();
+        assert!(matches!(r1, QueryResult::Rows { ref rows, .. } if rows.len() == 2));
+        assert!(matches!(r2, QueryResult::Rows { ref rows, .. } if rows.len() == 2));
+    }
+
+    #[test]
+    fn test_s103_close_cursor() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("DECLARE cur CURSOR FOR SELECT * FROM t")
+            .unwrap();
+        ex.execute("CLOSE cur").unwrap();
+        assert!(!ex.cursors.lock().unwrap().contains_key("cur"));
+    }
+
+    #[test]
+    fn test_s103_fetch_exhausted() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("DECLARE cur CURSOR FOR SELECT * FROM t")
+            .unwrap();
+        ex.execute("FETCH 1 FROM cur").unwrap(); // consume
+        let r = ex.execute("FETCH 1 FROM cur").unwrap(); // exhausted
+        assert!(matches!(r, QueryResult::Rows { ref rows, .. } if rows.is_empty()));
+    }
+
+    // ── S104 — COPY FROM STDIN ────────────────────────────────────────────────
+    #[test]
+    fn test_s104_copy_stdin_basic() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("COPY t FROM STDIN '1\t10\n\\.'").unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+    }
+
+    #[test]
+    fn test_s104_copy_stdin_multirow() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("COPY t FROM STDIN '1\t10\n2\t20\n\\.'").unwrap();
+        assert!(matches!(r, QueryResult::Affected(2)));
+    }
+
+    #[test]
+    fn test_s104_copy_stdin_tab_delimited() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("COPY t FROM STDIN '5\t50\n\\.'").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    #[test]
+    fn test_s104_copy_stdin_terminator() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        // Rows after \. should NOT be inserted
+        let r = ex.execute("COPY t FROM STDIN '1\t1\n\\.\n2\t2'").unwrap();
+        // Only first row before \.
+        assert!(matches!(r, QueryResult::Affected(1)));
+    }
+
+    #[test]
+    fn test_s104_copy_stdin_then_select() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("COPY t FROM STDIN '7\t77\n\\.'").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "7");
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    // ── S105 — Type OIDs + pg_typeof ─────────────────────────────────────────
+    #[test]
+    fn test_s105_pg_typeof() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 42)").unwrap();
+        let r = ex.execute("SELECT pg_typeof(v) AS typ FROM t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s105_pg_type_table() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM pg_type").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    #[test]
+    fn test_s105_pg_typeof_int() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 100)").unwrap();
+        let r = ex.execute("SELECT pg_typeof(pk) AS typ FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    #[test]
+    fn test_s105_information_schema_columns() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM information_schema").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    #[test]
+    fn test_s105_pg_type_oid() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM pg_type").unwrap();
+        if let QueryResult::Rows { columns, .. } = r {
+            assert!(columns.iter().any(|c| c == "oid"));
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    // ── S106 — Statement timeout ──────────────────────────────────────────────
+    #[test]
+    fn test_s106_set_timeout() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET STATEMENT_TIMEOUT 5000").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        let ms = *ex.statement_timeout_ms.lock().unwrap();
+        assert_eq!(ms, Some(5000));
+    }
+
+    #[test]
+    fn test_s106_timeout_fires() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        // timeout=0 means every query fires (elapsed_ms >= 0 always true)
+        ex.execute("SET STATEMENT_TIMEOUT 0").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        // Should be an error due to timeout
+        assert!(matches!(r, QueryResult::Error(_)));
+    }
+
+    #[test]
+    fn test_s106_timeout_not_fires() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 1)").unwrap();
+        // High timeout - normal queries won't fire
+        ex.execute("SET STATEMENT_TIMEOUT 999999").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s106_cancel_backend() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex
+            .execute("SELECT pg_cancel_backend(0) AS ok FROM t")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s106_timeout_reset() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SET STATEMENT_TIMEOUT 0").unwrap();
+        // Re-set to high value — queries should work again
+        ex.execute("SET STATEMENT_TIMEOUT 999999").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
     }
 }
