@@ -118,7 +118,7 @@ unsafe fn pam_info_msg(pamh: *mut PamHandle, msg: &str) {
         }
         return;
     }
-    let conv = &*(conv_ptr as *const PamConv);
+    let conv = unsafe { &*(conv_ptr as *const PamConv) };
     unsafe {
         (conv.conv)(1, &mut msg_arr as *mut *const PamMessage, &mut resp_ptr, conv.appdata_ptr);
     }
@@ -180,7 +180,7 @@ pub unsafe extern "C" fn pam_sm_setcred(
 /// PAM open session — print banner + shard health check.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pam_sm_open_session(
-    _pamh: *mut PamHandle,
+    pamh: *mut PamHandle,
     _flags: c_int,
     _argc: c_int,
     _argv: *const *const c_char,
