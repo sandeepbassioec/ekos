@@ -63,7 +63,18 @@ pub fn register_user(username: &str, password: &str) {
         .insert(username.to_owned(), password.to_owned());
 }
 
-/// VectorVolt ASCII banner — printed to stderr on session open.
+/// Write directly to /dev/tty so output appears over SSH/PAM session.
+fn write_to_tty(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(msg.as_bytes());
+    } else {
+        // fallback if /dev/tty not available
+        print!("{}", msg);
+    }
+}
+
+/// VectorVolt ASCII banner — printed to terminal on session open.
 pub const BANNER: &str = r#"
 ╔══════════════════════════════════════════════════════════════╗
 ║  ██╗   ██╗███████╗ ██████╗████████╗ ██████╗ ██████╗        ║
@@ -124,10 +135,10 @@ pub unsafe extern "C" fn pam_sm_open_session(
     _argc: c_int,
     _argv: *const *const c_char,
 ) -> c_int {
-    println!("{}", BANNER);
-    println!("VectorVolt shard health check ...");
+    write_to_tty(BANNER);
+    write_to_tty("VectorVolt shard health check ...\n");
     for i in 1..=3 {
-        println!("  shard {} [OK]", i);
+        write_to_tty(&format!("  shard {} [OK]\n", i));
     }
     PAM_SUCCESS
 }
