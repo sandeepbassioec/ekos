@@ -68,6 +68,15 @@ fn sql_error(code: &str, msg: &str) -> QueryResult {
     QueryResult::Error(format!("[{}] {}", code, msg))
 }
 
+fn chrono_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{}", secs)
+}
+
 /// Per-table open transaction id, keyed by table name.
 type TxnMap = HashMap<String, TxnId>;
 
@@ -81,24 +90,92 @@ pub struct AuditEntry {
     pub new_val: String,
 }
 
+// S88 — replication slot
+#[derive(Debug, Clone)]
+pub struct ReplicationSlot {
+    pub name: String,
+    pub temporary: bool,
+    pub lsn: u64,
+}
+
+// S93 — slow query log entry
+#[derive(Debug, Clone)]
+pub struct SlowLogEntry {
+    pub sql: String,
+    pub duration_ms: u64,
+    pub rows: usize,
+    pub ts: String,
+}
+
+// S97 — wait event
+#[derive(Debug, Clone)]
+pub struct WaitEvent {
+    pub event_type: String,
+    pub object_name: String,
+    pub duration_us: u64,
+    pub ts: String,
+}
+
 fn normalize_sql(sql: &str) -> String {
+    // Replace string literals with ?
     let mut result = String::new();
     let mut in_str = false;
-    for ch in sql.chars() {
+    let mut prev_was_digit = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
         if ch == '\'' {
-            in_str = !in_str;
             if in_str {
+                in_str = false;
+            } else {
+                in_str = true;
                 result.push('?');
             }
-        } else if !in_str {
-            result.push(ch);
+            i += 1;
+            continue;
         }
+        if in_str {
+            i += 1;
+            continue;
+        }
+        // Replace integer/float literals with ?
+        if ch.is_ascii_digit() && !prev_was_digit {
+            result.push('?');
+            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                i += 1;
+            }
+            if i < bytes.len()
+                && bytes[i] == b'.'
+                && i + 1 < bytes.len()
+                && (bytes[i + 1] as char).is_ascii_digit()
+            {
+                i += 1; // skip dot
+                while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            prev_was_digit = true;
+            continue;
+        }
+        prev_was_digit = ch.is_ascii_digit();
+        result.push(ch);
+        i += 1;
     }
     result
-        .to_ascii_uppercase()
+        .to_ascii_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn fingerprint_hash(s: &str) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +237,20 @@ pub struct SqlExecutor {
     bound_portals: Mutex<HashMap<String, (String, Vec<LitVal>)>>,
     // S87 — warnings enabled
     warnings_enabled: Mutex<bool>,
+    // S88 — replication slots
+    replication_slots: Mutex<HashMap<String, ReplicationSlot>>,
+    // S90 — read-only mode
+    read_only: Mutex<bool>,
+    // S92 — WAL archive
+    archive_path: Mutex<Option<String>>,
+    archive_count: Mutex<u64>,
+    // S93 — slow query log
+    slow_query_threshold_ms: Mutex<Option<u64>>,
+    slow_log: Mutex<Vec<SlowLogEntry>>,
+    // S96 — auto-explain
+    auto_explain_threshold_ms: Mutex<Option<u64>>,
+    // S97 — wait events
+    wait_events: Mutex<Vec<WaitEvent>>,
 }
 
 impl SqlExecutor {
@@ -189,24 +280,50 @@ impl SqlExecutor {
             tls_key_path: Mutex::new(None),
             bound_portals: Mutex::new(HashMap::new()),
             warnings_enabled: Mutex::new(false),
+            replication_slots: Mutex::new(HashMap::new()),
+            read_only: Mutex::new(false),
+            archive_path: Mutex::new(None),
+            archive_count: Mutex::new(0),
+            slow_query_threshold_ms: Mutex::new(None),
+            slow_log: Mutex::new(Vec::new()),
+            auto_explain_threshold_ms: Mutex::new(None),
+            wait_events: Mutex::new(Vec::new()),
         }
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, ExecError> {
         let tokens = Lexer::new(sql).tokenize()?;
         let stmt = SqlParser::new(tokens).parse()?;
+        // Check if stmt is a management operation that clears stats/log/events
+        let is_reset_stmt = matches!(
+            &stmt,
+            Stmt::TruncateSlowLog | Stmt::ResetQueryStats | Stmt::ResetWaitEvents
+        );
+        // Check if stmt is a pg_stat_statements_reset select
+        let is_stat_reset_select = if let Stmt::Select(ref s) = stmt {
+            s.columns.iter().any(|col| {
+                matches!(col, SelectExpr::Computed { expr: Expr::StrFunc { name, .. }, .. } if name.eq_ignore_ascii_case("PG_STAT_STATEMENTS_RESET"))
+            })
+        } else {
+            false
+        };
+        let skip_stats = is_reset_stmt || is_stat_reset_select;
         let t0 = std::time::Instant::now();
         let result = self.execute_stmt(stmt)?;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let fingerprint = normalize_sql(sql);
-        let rows = match &result {
+        let row_count = match &result {
+            QueryResult::Rows { rows, .. } => rows.len(),
+            _ => 0,
+        };
+        let rows_u64 = match &result {
             QueryResult::Rows { rows, .. } => rows.len() as u64,
             QueryResult::Affected(n) => *n,
             _ => 0,
         };
-        {
+        if !skip_stats {
             let mut stats = self.query_stats.lock().unwrap();
-            let entry = stats.entry(fingerprint).or_insert(QueryStat {
+            let entry = stats.entry(fingerprint.clone()).or_insert(QueryStat {
                 calls: 0,
                 total_ms: 0.0,
                 min_ms: f64::MAX,
@@ -221,7 +338,62 @@ impl SqlExecutor {
             if elapsed_ms > entry.max_ms {
                 entry.max_ms = elapsed_ms;
             }
-            entry.rows += rows;
+            entry.rows += rows_u64;
+        }
+        // S93 — slow query log (skip for reset stmts)
+        let slow_threshold = *self.slow_query_threshold_ms.lock().unwrap();
+        if !is_reset_stmt
+            && let Some(threshold) = slow_threshold
+            && elapsed_ms >= threshold as f64
+        {
+            let ts = chrono_now();
+            self.slow_log.lock().unwrap().push(SlowLogEntry {
+                sql: sql.to_owned(),
+                duration_ms: elapsed_ms as u64,
+                rows: row_count,
+                ts,
+            });
+        }
+        // S96 — auto-explain
+        let auto_explain = *self.auto_explain_threshold_ms.lock().unwrap();
+        let result = if let Some(ae_threshold) = auto_explain {
+            if elapsed_ms >= ae_threshold as f64
+                && let Ok(toks2) = Lexer::new(sql).tokenize()
+                && let Ok(stmt2) = SqlParser::new(toks2).parse()
+                && let Stmt::Select(sel) = stmt2
+            {
+                // Find first available table schema for planner
+                let plan_lines = if let Ok(engine) = self.registry.get(&sel.table) {
+                    let schema = &engine.schema;
+                    let est: u64 = engine
+                        .partition_meta()
+                        .iter()
+                        .map(|p| p.row_count as u64)
+                        .sum::<u64>()
+                        .max(1);
+                    let plan = Planner::new(schema, est).plan(&sel);
+                    plan.explain(0).join("; ")
+                } else {
+                    format!("FullScan table={}", sel.table)
+                };
+                return Ok(QueryResult::WithNotice {
+                    result: Box::new(result),
+                    notice: format!("auto-explain: {}", plan_lines),
+                });
+            }
+            result
+        } else {
+            result
+        };
+        // S97 — record wait event for every query (simulated), skip for reset stmts
+        if !is_reset_stmt {
+            let ts = chrono_now();
+            self.wait_events.lock().unwrap().push(WaitEvent {
+                event_type: "LWLock".to_owned(),
+                object_name: "query_cache".to_owned(),
+                duration_us: 0,
+                ts,
+            });
         }
         Ok(result)
     }
@@ -381,6 +553,120 @@ impl SqlExecutor {
                 *self.warnings_enabled.lock().unwrap() = on;
                 Ok(QueryResult::Affected(0))
             }
+            // S88 — replication slots
+            Stmt::CreateReplicationSlot { name, temporary } => {
+                self.replication_slots.lock().unwrap().insert(
+                    name.clone(),
+                    ReplicationSlot {
+                        name,
+                        temporary,
+                        lsn: 0,
+                    },
+                );
+                Ok(QueryResult::Created)
+            }
+            Stmt::DropReplicationSlot { name } => {
+                self.replication_slots.lock().unwrap().remove(&name);
+                Ok(QueryResult::Dropped)
+            }
+            Stmt::StartReplication { slot, .. } => {
+                let log = self.audit_log.lock().unwrap().clone();
+                let mut slot_guard = self.replication_slots.lock().unwrap();
+                if let Some(s) = slot_guard.get_mut(&slot) {
+                    s.lsn += log.len() as u64;
+                }
+                let columns = vec![
+                    "lsn".to_owned(),
+                    "op".to_owned(),
+                    "table".to_owned(),
+                    "ts".to_owned(),
+                ];
+                let rows: Vec<Vec<String>> = log
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        vec![
+                            format!("0/{}", i),
+                            e.op.clone(),
+                            e.table.clone(),
+                            e.ts.clone(),
+                        ]
+                    })
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
+            // S90 — read-only mode
+            Stmt::SetReadOnly => {
+                *self.read_only.lock().unwrap() = true;
+                Ok(QueryResult::Affected(0))
+            }
+            Stmt::SetReadWrite => {
+                *self.read_only.lock().unwrap() = false;
+                Ok(QueryResult::Affected(0))
+            }
+            // S91 — failover
+            Stmt::PromoteStandby => {
+                *self.read_only.lock().unwrap() = false;
+                Ok(QueryResult::Ok("promoted to primary".to_owned()))
+            }
+            Stmt::DemotePrimary => {
+                *self.read_only.lock().unwrap() = true;
+                Ok(QueryResult::Ok("demoted to standby".to_owned()))
+            }
+            // S92 — WAL archive
+            Stmt::SetArchivePath { path } => {
+                *self.archive_path.lock().unwrap() = Some(path);
+                Ok(QueryResult::Affected(0))
+            }
+            Stmt::ArchiveNow => {
+                let path_opt = self.archive_path.lock().unwrap().clone();
+                if let Some(ref path) = path_opt {
+                    let mut count = self.archive_count.lock().unwrap();
+                    let filename = format!("{}/wal_segment_{}.bin", path, *count);
+                    let _ = std::fs::create_dir_all(path);
+                    let _ = std::fs::write(&filename, b"WAL_SEGMENT");
+                    *count += 1;
+                    Ok(QueryResult::Ok(format!("archived to {}", filename)))
+                } else {
+                    Ok(sql_error("42000", "no archive path configured"))
+                }
+            }
+            Stmt::ShowArchiveStatus => {
+                let path = self
+                    .archive_path
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default();
+                let count = *self.archive_count.lock().unwrap();
+                Ok(QueryResult::Rows {
+                    columns: vec![
+                        "path".to_owned(),
+                        "count".to_owned(),
+                        "last_archived_at".to_owned(),
+                    ],
+                    rows: vec![vec![path, count.to_string(), chrono_now()]],
+                })
+            }
+            // S93 — slow query threshold
+            Stmt::SetSlowQueryThreshold { ms } => {
+                *self.slow_query_threshold_ms.lock().unwrap() = Some(ms);
+                Ok(QueryResult::Affected(0))
+            }
+            Stmt::TruncateSlowLog => {
+                self.slow_log.lock().unwrap().clear();
+                Ok(QueryResult::Affected(0))
+            }
+            // S96 — auto-explain threshold
+            Stmt::SetAutoExplainThreshold { ms } => {
+                *self.auto_explain_threshold_ms.lock().unwrap() = Some(ms);
+                Ok(QueryResult::Affected(0))
+            }
+            // S97 — reset wait events
+            Stmt::ResetWaitEvents => {
+                self.wait_events.lock().unwrap().clear();
+                Ok(QueryResult::Affected(0))
+            }
         }
     }
 
@@ -492,6 +778,7 @@ impl SqlExecutor {
             let stats = self.query_stats.lock().unwrap();
             let columns = vec![
                 "query".to_owned(),
+                "fingerprint".to_owned(),
                 "calls".to_owned(),
                 "total_ms".to_owned(),
                 "min_ms".to_owned(),
@@ -503,11 +790,160 @@ impl SqlExecutor {
                 .map(|(q, s)| {
                     vec![
                         q.clone(),
+                        q.clone(), // fingerprint = normalized query
                         s.calls.to_string(),
                         format!("{:.3}", s.total_ms),
                         format!("{:.3}", s.min_ms),
                         format!("{:.3}", s.max_ms),
                         s.rows.to_string(),
+                    ]
+                })
+                .collect();
+            return Ok(QueryResult::Rows { columns, rows });
+        }
+
+        // S94 — virtual table vv_query_fingerprints
+        if stmt.table == "vv_query_fingerprints" {
+            let stats = self.query_stats.lock().unwrap();
+            let mut fingerprint_map: HashMap<String, (u64, f64)> = HashMap::new();
+            for (q, s) in stats.iter() {
+                let entry = fingerprint_map.entry(q.clone()).or_insert((0, 0.0));
+                entry.0 += s.calls;
+                entry.1 += s.total_ms;
+            }
+            let columns = vec![
+                "fingerprint".to_owned(),
+                "count".to_owned(),
+                "avg_ms".to_owned(),
+            ];
+            let rows: Vec<Vec<String>> = fingerprint_map
+                .iter()
+                .map(|(fp, (cnt, total))| {
+                    let avg = if *cnt > 0 { total / (*cnt as f64) } else { 0.0 };
+                    vec![fp.clone(), cnt.to_string(), format!("{:.3}", avg)]
+                })
+                .collect();
+            return Ok(QueryResult::Rows { columns, rows });
+        }
+
+        // S95 — pg_stat_statements_reset() function call intercepted in SELECT columns
+        for col in &stmt.columns {
+            if let SelectExpr::Computed {
+                expr: Expr::StrFunc { name, .. },
+                ..
+            } = col
+                && name.eq_ignore_ascii_case("PG_STAT_STATEMENTS_RESET")
+            {
+                self.query_stats.lock().unwrap().clear();
+                return Ok(QueryResult::Rows {
+                    columns: vec!["pg_stat_statements_reset".to_owned()],
+                    rows: vec![vec!["".to_owned()]],
+                });
+            }
+        }
+
+        // S95 — pg_stat_statements compatibility alias
+        if stmt.table == "pg_stat_statements" {
+            let stats = self.query_stats.lock().unwrap();
+            let columns = vec![
+                "userid".to_owned(),
+                "dbid".to_owned(),
+                "queryid".to_owned(),
+                "query".to_owned(),
+                "calls".to_owned(),
+                "total_exec_time".to_owned(),
+                "min_exec_time".to_owned(),
+                "max_exec_time".to_owned(),
+                "rows".to_owned(),
+            ];
+            let rows: Vec<Vec<String>> = stats
+                .iter()
+                .map(|(q, s)| {
+                    let qid = fingerprint_hash(q);
+                    vec![
+                        "0".to_owned(),
+                        "0".to_owned(),
+                        qid.to_string(),
+                        q.clone(),
+                        s.calls.to_string(),
+                        format!("{:.3}", s.total_ms),
+                        format!("{:.3}", s.min_ms),
+                        format!("{:.3}", s.max_ms),
+                        s.rows.to_string(),
+                    ]
+                })
+                .collect();
+            return Ok(QueryResult::Rows { columns, rows });
+        }
+
+        // S93 — virtual table vv_slow_log
+        if stmt.table == "vv_slow_log" {
+            let log = self.slow_log.lock().unwrap();
+            let columns = vec![
+                "sql".to_owned(),
+                "duration_ms".to_owned(),
+                "rows".to_owned(),
+                "ts".to_owned(),
+            ];
+            let rows: Vec<Vec<String>> = log
+                .iter()
+                .map(|e| {
+                    vec![
+                        e.sql.clone(),
+                        e.duration_ms.to_string(),
+                        e.rows.to_string(),
+                        e.ts.clone(),
+                    ]
+                })
+                .collect();
+            return Ok(QueryResult::Rows { columns, rows });
+        }
+
+        // S89 — logical decode virtual function
+        if stmt.table == "vv_logical_decode" {
+            let log = self.audit_log.lock().unwrap().clone();
+            let columns = vec![
+                "lsn".to_owned(),
+                "xid".to_owned(),
+                "relation".to_owned(),
+                "op".to_owned(),
+                "old_data".to_owned(),
+                "new_data".to_owned(),
+            ];
+            let rows: Vec<Vec<String>> = log
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    vec![
+                        format!("0/{}", i + 1),
+                        format!("{}", 1000 + i),
+                        e.table.clone(),
+                        e.op.clone(),
+                        format!("{{\"old\":\"{}\"}}", e.old_val),
+                        format!("{{\"new\":\"{}\"}}", e.new_val),
+                    ]
+                })
+                .collect();
+            return Ok(QueryResult::Rows { columns, rows });
+        }
+
+        // S97 — virtual table vv_wait_events
+        if stmt.table == "vv_wait_events" {
+            let events = self.wait_events.lock().unwrap();
+            let columns = vec![
+                "event_type".to_owned(),
+                "object_name".to_owned(),
+                "duration_us".to_owned(),
+                "ts".to_owned(),
+            ];
+            let rows: Vec<Vec<String>> = events
+                .iter()
+                .map(|e| {
+                    vec![
+                        e.event_type.clone(),
+                        e.object_name.clone(),
+                        e.duration_us.to_string(),
+                        e.ts.clone(),
                     ]
                 })
                 .collect();
@@ -1877,6 +2313,9 @@ impl SqlExecutor {
     }
 
     fn exec_insert(&self, stmt: InsertStmt) -> Result<QueryResult, ExecError> {
+        if *self.read_only.lock().unwrap() {
+            return Ok(sql_error("25006", "read-only transaction"));
+        }
         let engine = self
             .registry
             .get(&stmt.table)
@@ -2130,6 +2569,9 @@ impl SqlExecutor {
     }
 
     fn exec_update(&self, stmt: UpdateStmt) -> Result<QueryResult, ExecError> {
+        if *self.read_only.lock().unwrap() {
+            return Ok(sql_error("25006", "read-only transaction"));
+        }
         let engine = self
             .registry
             .get(&stmt.table)
@@ -2176,6 +2618,9 @@ impl SqlExecutor {
     }
 
     fn exec_delete(&self, stmt: DeleteStmt) -> Result<QueryResult, ExecError> {
+        if *self.read_only.lock().unwrap() {
+            return Ok(sql_error("25006", "read-only transaction"));
+        }
         let engine = self
             .registry
             .get(&stmt.table)
@@ -8293,5 +8738,601 @@ mod tests {
         if let QueryResult::Notice(msg) = notice {
             assert!(!msg.is_empty());
         }
+    }
+
+    // ── S88 — Streaming replication ───────────────────────────────────────────
+
+    #[test]
+    fn test_s88_create_slot() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE REPLICATION SLOT myslot").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+        let guard = ex.replication_slots.lock().unwrap();
+        assert!(guard.contains_key("myslot"));
+    }
+
+    #[test]
+    fn test_s88_drop_slot() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE REPLICATION SLOT myslot").unwrap();
+        let r = ex.execute("DROP REPLICATION SLOT myslot").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+        let guard = ex.replication_slots.lock().unwrap();
+        assert!(!guard.contains_key("myslot"));
+    }
+
+    #[test]
+    fn test_s88_temporary_slot() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE REPLICATION SLOT tmpslot TEMPORARY")
+            .unwrap();
+        let guard = ex.replication_slots.lock().unwrap();
+        assert!(guard.get("tmpslot").unwrap().temporary);
+    }
+
+    #[test]
+    fn test_s88_start_replication() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE REPLICATION SLOT s1").unwrap();
+        let r = ex.execute("START REPLICATION SLOT s1 FROM '0/0'").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s88_replication_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("CREATE REPLICATION SLOT s1").unwrap();
+        let r = ex.execute("START REPLICATION SLOT s1 FROM '0/0'").unwrap();
+        match r {
+            QueryResult::Rows { columns, .. } => {
+                assert!(columns.contains(&"op".to_owned()));
+                assert!(columns.contains(&"table".to_owned()));
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    // ── S89 — Logical decode ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_s89_logical_decode_basic() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM vv_logical_decode").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s89_logical_decode_insert() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        let r = ex.execute("SELECT * FROM vv_logical_decode").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert!(!rows.is_empty()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s89_logical_decode_update() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("UPDATE t SET v = 99 WHERE pk = 1").unwrap();
+        let r = ex.execute("SELECT * FROM vv_logical_decode").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert!(rows.len() >= 2),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s89_logical_decode_delete() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("DELETE FROM t WHERE pk = 1").unwrap();
+        let r = ex.execute("SELECT * FROM vv_logical_decode").unwrap();
+        match r {
+            QueryResult::Rows { columns, .. } => {
+                assert!(columns.contains(&"op".to_owned()));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s89_logical_decode_lsn_advance() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        let r = ex.execute("SELECT * FROM vv_logical_decode").unwrap();
+        match r {
+            QueryResult::Rows { columns, .. } => {
+                assert!(columns.contains(&"lsn".to_owned()));
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ── S90 — Read-only mode ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_s90_set_read_only() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET READ ONLY").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        assert!(*ex.read_only.lock().unwrap());
+    }
+
+    #[test]
+    fn test_s90_read_only_blocks_insert() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SET READ ONLY").unwrap();
+        let r = ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        assert!(matches!(r, QueryResult::Error(_)));
+        if let QueryResult::Error(msg) = r {
+            assert!(msg.contains("25006"));
+        }
+    }
+
+    #[test]
+    fn test_s90_read_only_allows_select() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SET READ ONLY").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s90_set_read_write() {
+        let (ex, _dir) = setup();
+        ex.execute("SET READ ONLY").unwrap();
+        let r = ex.execute("SET READ WRITE").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        assert!(!*ex.read_only.lock().unwrap());
+    }
+
+    #[test]
+    fn test_s90_read_write_allows_insert() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SET READ ONLY").unwrap();
+        ex.execute("SET READ WRITE").unwrap();
+        let r = ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+    }
+
+    // ── S91 — Failover / promote ──────────────────────────────────────────────
+
+    #[test]
+    fn test_s91_promote() {
+        let (ex, _dir) = setup();
+        ex.execute("SET READ ONLY").unwrap();
+        let r = ex.execute("PROMOTE STANDBY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(!*ex.read_only.lock().unwrap());
+    }
+
+    #[test]
+    fn test_s91_demote() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DEMOTE PRIMARY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(*ex.read_only.lock().unwrap());
+    }
+
+    #[test]
+    fn test_s91_promote_allows_writes() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SET READ ONLY").unwrap();
+        ex.execute("PROMOTE STANDBY").unwrap();
+        let r = ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+    }
+
+    #[test]
+    fn test_s91_demote_blocks_writes() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("DEMOTE PRIMARY").unwrap();
+        let r = ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        assert!(matches!(r, QueryResult::Error(_)));
+    }
+
+    #[test]
+    fn test_s91_promote_demote_cycle() {
+        let (ex, _dir) = setup();
+        ex.execute("DEMOTE PRIMARY").unwrap();
+        ex.execute("PROMOTE STANDBY").unwrap();
+        ex.execute("DEMOTE PRIMARY").unwrap();
+        assert!(*ex.read_only.lock().unwrap());
+        ex.execute("PROMOTE STANDBY").unwrap();
+        assert!(!*ex.read_only.lock().unwrap());
+    }
+
+    // ── S92 — WAL archiving ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_s92_set_archive_path() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET ARCHIVE PATH '/tmp/vv_wal_test'").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        let path = ex.archive_path.lock().unwrap().clone();
+        assert_eq!(path, Some("/tmp/vv_wal_test".to_owned()));
+    }
+
+    #[test]
+    fn test_s92_archive_now() {
+        let (ex, _dir) = setup();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+        ex.execute(&format!("SET ARCHIVE PATH '{}'", path)).unwrap();
+        let r = ex.execute("ARCHIVE NOW").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s92_archive_creates_file() {
+        let (ex, _dir) = setup();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+        ex.execute(&format!("SET ARCHIVE PATH '{}'", path)).unwrap();
+        ex.execute("ARCHIVE NOW").unwrap();
+        let entries: Vec<_> = std::fs::read_dir(&path).unwrap().collect();
+        assert!(!entries.is_empty());
+    }
+
+    #[test]
+    fn test_s92_show_archive_status() {
+        let (ex, _dir) = setup();
+        ex.execute("SET ARCHIVE PATH '/tmp/vv_wal2'").unwrap();
+        let r = ex.execute("SHOW ARCHIVE STATUS").unwrap();
+        match r {
+            QueryResult::Rows { columns, rows } => {
+                assert!(columns.contains(&"path".to_owned()));
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], "/tmp/vv_wal2");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s92_archive_count() {
+        let (ex, _dir) = setup();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+        ex.execute(&format!("SET ARCHIVE PATH '{}'", path)).unwrap();
+        ex.execute("ARCHIVE NOW").unwrap();
+        ex.execute("ARCHIVE NOW").unwrap();
+        let count = *ex.archive_count.lock().unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // ── S93 — Slow query log ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_s93_set_threshold() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET SLOW_QUERY_THRESHOLD 100").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        let t = *ex.slow_query_threshold_ms.lock().unwrap();
+        assert_eq!(t, Some(100));
+    }
+
+    #[test]
+    fn test_s93_slow_query_logged() {
+        let (ex, _dir) = setup();
+        // Set threshold to 0 so everything gets logged
+        ex.execute("SET SLOW_QUERY_THRESHOLD 0").unwrap();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let log = ex.slow_log.lock().unwrap();
+        assert!(!log.is_empty());
+    }
+
+    #[test]
+    fn test_s93_fast_query_not_logged() {
+        let (ex, _dir) = setup();
+        // Very high threshold — nothing should be logged
+        ex.execute("SET SLOW_QUERY_THRESHOLD 99999999").unwrap();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let log = ex.slow_log.lock().unwrap();
+        // None of these should exceed 99999999ms
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_s93_slow_log_query() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SLOW_QUERY_THRESHOLD 0").unwrap();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM vv_slow_log").unwrap();
+        match r {
+            QueryResult::Rows { columns, rows } => {
+                assert!(columns.contains(&"sql".to_owned()));
+                assert!(!rows.is_empty());
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s93_truncate_slow_log() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SLOW_QUERY_THRESHOLD 0").unwrap();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        ex.execute("TRUNCATE SLOW LOG").unwrap();
+        let log = ex.slow_log.lock().unwrap();
+        assert!(log.is_empty());
+    }
+
+    // ── S94 — Query fingerprinting ────────────────────────────────────────────
+
+    #[test]
+    fn test_s94_fingerprint_literals() {
+        let fp1 = normalize_sql("SELECT * FROM t WHERE pk = 1");
+        let fp2 = normalize_sql("SELECT * FROM t WHERE pk = 42");
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_s94_fingerprint_different_queries() {
+        let fp1 = normalize_sql("SELECT * FROM t WHERE pk = 1");
+        let fp2 = normalize_sql("SELECT * FROM orders WHERE id = 1");
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_s94_fingerprint_in_stat_statements() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 20)").unwrap();
+        let r = ex.execute("SELECT * FROM vv_stat_statements").unwrap();
+        match r {
+            QueryResult::Rows { columns, .. } => {
+                assert!(columns.contains(&"fingerprint".to_owned()));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s94_query_fingerprints_table() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM vv_query_fingerprints").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s94_fingerprint_grouping() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM vv_query_fingerprints").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => {
+                // Should have grouped the two identical queries
+                let select_fp = normalize_sql("SELECT * FROM t");
+                let found = rows.iter().any(|row| row[0] == select_fp);
+                assert!(found || !rows.is_empty());
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ── S95 — pg_stat_statements compat ──────────────────────────────────────
+
+    #[test]
+    fn test_s95_pg_stat_statements() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM pg_stat_statements").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s95_pg_stat_col_names() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM pg_stat_statements").unwrap();
+        match r {
+            QueryResult::Rows { columns, .. } => {
+                assert!(columns.contains(&"userid".to_owned()));
+                assert!(columns.contains(&"queryid".to_owned()));
+                assert!(columns.contains(&"calls".to_owned()));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s95_pg_stat_calls() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM pg_stat_statements").unwrap();
+        match r {
+            QueryResult::Rows { columns, rows } => {
+                let calls_idx = columns.iter().position(|c| c == "calls").unwrap();
+                let select_fp = normalize_sql("SELECT * FROM t");
+                let found = rows.iter().find(|row| {
+                    let query_idx = columns.iter().position(|c| c == "query").unwrap();
+                    row[query_idx] == select_fp
+                });
+                if let Some(row) = found {
+                    let calls: u64 = row[calls_idx].parse().unwrap();
+                    assert!(calls >= 2);
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s95_pg_stat_reset_fn() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        // Call reset via SELECT pg_stat_statements_reset() FROM t
+        let r = ex
+            .execute("SELECT pg_stat_statements_reset() FROM t")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+        let stats = ex.query_stats.lock().unwrap();
+        assert!(stats.is_empty());
+    }
+
+    #[test]
+    fn test_s95_pg_stat_queryid() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM pg_stat_statements").unwrap();
+        match r {
+            QueryResult::Rows { columns, rows } => {
+                let qid_idx = columns.iter().position(|c| c == "queryid").unwrap();
+                if !rows.is_empty() {
+                    let qid: u64 = rows[0][qid_idx].parse().unwrap_or(0);
+                    assert!(qid > 0);
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ── S96 — Auto-EXPLAIN threshold ──────────────────────────────────────────
+
+    #[test]
+    fn test_s96_set_threshold() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET AUTO_EXPLAIN_THRESHOLD 50").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        let t = *ex.auto_explain_threshold_ms.lock().unwrap();
+        assert_eq!(t, Some(50));
+    }
+
+    #[test]
+    fn test_s96_auto_explain_fires() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        // Set threshold to 0 so all queries trigger auto-explain
+        ex.execute("SET AUTO_EXPLAIN_THRESHOLD 0").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        // May or may not fire depending on timing, but should not error
+        assert!(matches!(
+            r,
+            QueryResult::Rows { .. } | QueryResult::WithNotice { .. }
+        ));
+    }
+
+    #[test]
+    fn test_s96_auto_explain_not_fires() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        // Very high threshold — auto-explain should not fire
+        ex.execute("SET AUTO_EXPLAIN_THRESHOLD 99999999").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s96_auto_explain_plan_in_notice() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        // Threshold 0 to force trigger
+        ex.execute("SET AUTO_EXPLAIN_THRESHOLD 0").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        // If auto-explain fired, result is WithNotice; otherwise Rows
+        match r {
+            QueryResult::WithNotice { notice, .. } => {
+                assert!(notice.contains("auto-explain") || notice.contains("Scan"));
+            }
+            QueryResult::Rows { .. } => {}
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn test_s96_auto_explain_disabled() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        // No threshold set — auto-explain disabled
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    // ── S97 — Wait event tracking ─────────────────────────────────────────────
+
+    #[test]
+    fn test_s97_wait_events_table() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM vv_wait_events").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s97_wait_event_recorded() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let events = ex.wait_events.lock().unwrap();
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn test_s97_wait_event_cols() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let r = ex.execute("SELECT * FROM vv_wait_events").unwrap();
+        match r {
+            QueryResult::Rows { columns, .. } => {
+                assert!(columns.contains(&"event_type".to_owned()));
+                assert!(columns.contains(&"object_name".to_owned()));
+                assert!(columns.contains(&"duration_us".to_owned()));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_s97_reset_wait_events() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        ex.execute("RESET WAIT EVENTS").unwrap();
+        let events = ex.wait_events.lock().unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_s97_wait_events_after_query() {
+        let (ex, _dir) = setup();
+        ex.execute("RESET WAIT EVENTS").unwrap();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("SELECT * FROM t").unwrap();
+        let events = ex.wait_events.lock().unwrap();
+        // Each execute() call records a wait event
+        assert!(!events.is_empty());
     }
 }

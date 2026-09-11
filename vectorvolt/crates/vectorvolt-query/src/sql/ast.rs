@@ -129,6 +129,41 @@ pub enum Stmt {
     },
     // S87 — Warnings toggle
     SetWarnings(bool),
+    // S88 — replication slots
+    CreateReplicationSlot {
+        name: String,
+        temporary: bool,
+    },
+    DropReplicationSlot {
+        name: String,
+    },
+    StartReplication {
+        slot: String,
+        from_lsn: String,
+    },
+    // S90 — read-only mode
+    SetReadOnly,
+    SetReadWrite,
+    // S91 — failover
+    PromoteStandby,
+    DemotePrimary,
+    // S92 — WAL archiving
+    SetArchivePath {
+        path: String,
+    },
+    ArchiveNow,
+    ShowArchiveStatus,
+    // S93 — slow query log
+    SetSlowQueryThreshold {
+        ms: u64,
+    },
+    TruncateSlowLog,
+    // S96 — auto-explain
+    SetAutoExplainThreshold {
+        ms: u64,
+    },
+    // S97 — wait events
+    ResetWaitEvents,
 }
 
 #[derive(Debug, Clone, PartialEq)]

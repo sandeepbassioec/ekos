@@ -204,6 +204,25 @@ pub enum Token {
     // S87 — warnings
     Warnings,
     Off,
+    // S88 — replication slots
+    Replication,
+    Slot,
+    Temporary,
+    Start,
+    // S90 — read-only mode
+    KwWrite,
+    // S91 — failover
+    Promote,
+    Standby,
+    Demote,
+    Primary,
+    // S92 — WAL archiving
+    Archive,
+    KwPath,
+    // S93 — slow query log
+    Slow,
+    // S97 — wait events
+    Events,
     // Types
     KwU64,
     KwI64,
@@ -565,6 +584,19 @@ impl<'a> Lexer<'a> {
             "CERT" => Token::Cert,
             "WARNINGS" => Token::Warnings,
             "OFF" => Token::Off,
+            "REPLICATION" => Token::Replication,
+            "SLOT" => Token::Slot,
+            "TEMPORARY" => Token::Temporary,
+            "START" => Token::Start,
+            "WRITE" => Token::KwWrite,
+            "PROMOTE" => Token::Promote,
+            "STANDBY" => Token::Standby,
+            "DEMOTE" => Token::Demote,
+            "PRIMARY" => Token::Primary,
+            "ARCHIVE" => Token::Archive,
+            "PATH" => Token::KwPath,
+            "SLOW" => Token::Slow,
+            "EVENTS" => Token::Events,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,
