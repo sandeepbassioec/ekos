@@ -159,6 +159,27 @@ impl PgSession {
                     .write_all(&encode_command_complete(&format!("EXPLAIN\n{body}")))
                     .await?;
             }
+            QueryResult::Error(msg) => {
+                self.stream
+                    .write_all(&encode_command_complete(&format!("ERROR: {msg}")))
+                    .await?;
+            }
+            QueryResult::Notice(msg) => {
+                self.stream
+                    .write_all(&encode_command_complete(&format!("NOTICE: {msg}")))
+                    .await?;
+            }
+            QueryResult::WithNotice { result, notice } => {
+                self.stream
+                    .write_all(&encode_command_complete(&format!("NOTICE: {notice}")))
+                    .await?;
+                self.send_result(*result).await?;
+            }
+            QueryResult::Ok(msg) => {
+                self.stream
+                    .write_all(&encode_command_complete(&msg))
+                    .await?;
+            }
         }
         Ok(())
     }
