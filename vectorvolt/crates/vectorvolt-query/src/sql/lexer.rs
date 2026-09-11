@@ -236,6 +236,28 @@ pub enum Token {
     Close,
     // S104 — COPY STDIN
     Stdin,
+    // S108 — systemd integration
+    SdNotify,
+    // S109 — graceful shutdown
+    Shutdown,
+    Graceful,
+    Immediate,
+    // S110 — multi-database
+    Database,
+    // S111 — schema namespacing
+    Schema,
+    // S112 — table partitioning
+    Of,
+    For,
+    // S113 — online schema change
+    Online,
+    // S114 — vacuum
+    Vacuum,
+    // S117 — resource groups
+    Resource,
+    Assign,
+    Cpu,
+    Memory,
     // Types
     KwU64,
     KwI64,
@@ -628,6 +650,20 @@ impl<'a> Lexer<'a> {
             "FETCH" => Token::Fetch,
             "CLOSE" => Token::Close,
             "STDIN" => Token::Stdin,
+            "SD_NOTIFY" => Token::SdNotify,
+            "SHUTDOWN" => Token::Shutdown,
+            "GRACEFUL" => Token::Graceful,
+            "IMMEDIATE" => Token::Immediate,
+            "DATABASE" => Token::Database,
+            "SCHEMA" => Token::Schema,
+            "OF" => Token::Of,
+            "FOR" => Token::For,
+            "ONLINE" => Token::Online,
+            "VACUUM" => Token::Vacuum,
+            "RESOURCE" => Token::Resource,
+            "ASSIGN" => Token::Assign,
+            "CPU" => Token::Cpu,
+            "MEMORY" => Token::Memory,
             "U64" => Token::KwU64,
             "I64" => Token::KwI64,
             "F64" => Token::KwF64,

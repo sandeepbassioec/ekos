@@ -189,6 +189,77 @@ pub enum Stmt {
     SetStatementTimeout {
         ms: u64,
     },
+    // S108 — systemd integration
+    SdNotify {
+        state: String,
+    },
+    SystemdReady,
+    SystemdStopping,
+    // S109 — graceful/immediate shutdown
+    ShutdownGraceful,
+    ShutdownImmediate,
+    // S110 — multi-database
+    CreateDatabase {
+        name: String,
+    },
+    DropDatabase {
+        name: String,
+    },
+    UseDatabase {
+        name: String,
+    },
+    ShowDatabases,
+    // S111 — schema namespacing
+    CreateSchema {
+        name: String,
+    },
+    DropSchema {
+        name: String,
+    },
+    SetSearchPath {
+        schema: String,
+    },
+    ShowSchemas,
+    // S112 — table partitioning
+    CreatePartition {
+        name: String,
+        parent: String,
+        range_from: String,
+        range_to: String,
+    },
+    // S113 — online schema change (AlterTable with ONLINE is handled via AlterOp)
+    // S114 — vacuum
+    Vacuum {
+        table: String,
+        analyze: bool,
+    },
+    // S115 — ANALYZE (standalone)
+    Analyze {
+        table: String,
+    },
+    // S116 — connection limits
+    SetMaxConnections {
+        n: u64,
+    },
+    ShowMaxConnections,
+    // S117 — resource groups
+    CreateResourceGroup {
+        name: String,
+        cpu_pct: u64,
+        memory_mb: u64,
+    },
+    DropResourceGroup {
+        name: String,
+    },
+    AlterResourceGroup {
+        name: String,
+        cpu_pct: Option<u64>,
+        memory_mb: Option<u64>,
+    },
+    AssignUserToGroup {
+        user: String,
+        group: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -418,12 +489,28 @@ pub struct ForeignKey {
     pub ref_col: String,
 }
 
+// S112 — partition definition
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionStrategy {
+    Range,
+    List,
+    Hash,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionDef {
+    pub strategy: PartitionStrategy,
+    pub col: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableStmt {
     pub table: String,
     pub columns: Vec<ColTypeDef>,
     // S60
     pub foreign_keys: Vec<ForeignKey>,
+    // S112
+    pub partition_by: Option<PartitionDef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -434,6 +521,8 @@ pub struct DropTableStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterOp {
     AddColumn(ColTypeDef),
+    // S113 — ONLINE flag for add column
+    AddColumnOnline(ColTypeDef),
     DropColumn(String),
     // S58
     RenameColumn { from: String, to: String },
