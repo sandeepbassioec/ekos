@@ -89,6 +89,23 @@ pub fn run(args: QueryArgs) -> Result<()> {
                 println!("{prefix} {line}");
             }
         }
+        QueryResult::Error(msg) => eprintln!("ERROR  {msg}"),
+        QueryResult::Notice(msg) => println!("NOTICE {msg}"),
+        QueryResult::Ok(msg) => println!("{msg}"),
+        QueryResult::WithNotice { result, notice } => {
+            println!("NOTICE {notice}");
+            match *result {
+                QueryResult::Rows { columns, rows } => {
+                    println!("{}", columns.join(" | "));
+                    for row in &rows {
+                        println!("{}", row.join(" | "));
+                    }
+                    println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+                }
+                QueryResult::Affected(n) => println!("Affected {n} row(s)."),
+                other => println!("{other:?}"),
+            }
+        }
     }
     Ok(())
 }

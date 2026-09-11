@@ -88,6 +88,26 @@ fn exec_and_print(executor: &SqlExecutor, sql: &str, csv: bool) {
                 println!("{line}");
             }
         }
+        Ok(QueryResult::Error(msg)) => eprintln!("ERROR  {msg}"),
+        Ok(QueryResult::Notice(msg)) => println!("NOTICE {msg}"),
+        Ok(QueryResult::Ok(msg)) => println!("{msg}"),
+        Ok(QueryResult::WithNotice { result, notice }) => {
+            println!("NOTICE {notice}");
+            match *result {
+                QueryResult::Rows { columns, rows } => {
+                    if csv {
+                        println!("{}", columns.join(","));
+                        for row in &rows {
+                            println!("{}", row.join(","));
+                        }
+                    } else {
+                        print_table(&columns, &rows);
+                    }
+                }
+                QueryResult::Affected(n) => println!("OK  {n} row(s) affected"),
+                other => println!("{other:?}"),
+            }
+        }
         Err(e) => eprintln!("ERROR  {e}"),
     }
 }
