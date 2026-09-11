@@ -5,7 +5,7 @@
 //! We get the username via pam_get_user() from the handle.
 
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, CStr};
 use std::sync::{Mutex, OnceLock};
 
 /// Opaque PAM handle type
@@ -22,7 +22,7 @@ pub const PAM_SUCCESS: c_int = 0;
 pub const PAM_AUTH_ERR: c_int = 7;
 pub const PAM_SERVICE_ERR: c_int = 3;
 
-extern "C" {
+unsafe extern "C" {
     fn pam_get_user(
         pamh: *mut PamHandle,
         user: *mut *const c_char,
