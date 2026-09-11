@@ -47,6 +47,20 @@ impl SqlParser {
     fn expect_ident(&mut self) -> Result<String, ParseError> {
         match self.advance().clone() {
             Token::Ident(s) => Ok(s),
+            // Allow soft keywords as identifiers (table/column names)
+            Token::Events => Ok("events".to_owned()),
+            Token::Slow => Ok("slow".to_owned()),
+            Token::Standby => Ok("standby".to_owned()),
+            Token::Primary => Ok("primary".to_owned()),
+            Token::Archive => Ok("archive".to_owned()),
+            Token::KwPath => Ok("path".to_owned()),
+            Token::Slot => Ok("slot".to_owned()),
+            Token::Replication => Ok("replication".to_owned()),
+            Token::Start => Ok("start".to_owned()),
+            Token::KwWrite => Ok("write".to_owned()),
+            Token::Promote => Ok("promote".to_owned()),
+            Token::Demote => Ok("demote".to_owned()),
+            Token::Temporary => Ok("temporary".to_owned()),
             t => Err(ParseError::UnexpectedToken(t)),
         }
     }
@@ -163,6 +177,18 @@ impl SqlParser {
             }
             Token::Reset => {
                 self.advance(); // RESET
+                // peek ahead: RESET WAIT EVENTS vs RESET QUERY STATS
+                match self.peek().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("WAIT") => {
+                        self.advance(); // WAIT
+                        match self.advance().clone() {
+                            Token::Events => {}
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                        return Ok(Stmt::ResetWaitEvents);
+                    }
+                    _ => {}
+                }
                 match self.advance().clone() {
                     Token::Ident(s) if s.eq_ignore_ascii_case("QUERY") => {}
                     t => return Err(ParseError::UnexpectedToken(t)),
@@ -232,7 +258,7 @@ impl SqlParser {
                     has_header,
                 })
             }
-            // S80 — TRUNCATE AUDIT LOG
+            // S80/S93 — TRUNCATE AUDIT LOG / TRUNCATE SLOW LOG / TRUNCATE TABLE
             Token::Truncate => {
                 self.advance(); // TRUNCATE
                 match self.peek().clone() {
@@ -243,6 +269,14 @@ impl SqlParser {
                             t => return Err(ParseError::UnexpectedToken(t)),
                         }
                         return Ok(Stmt::TruncateAuditLog);
+                    }
+                    Token::Slow => {
+                        self.advance(); // SLOW
+                        match self.advance().clone() {
+                            Token::Ident(s2) if s2.eq_ignore_ascii_case("LOG") => {}
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                        return Ok(Stmt::TruncateSlowLog);
                     }
                     _ => {
                         // normal TRUNCATE TABLE
@@ -302,6 +336,49 @@ impl SqlParser {
                         };
                         return Ok(Stmt::SetWarnings(on));
                     }
+                    // S90 — SET READ ONLY / SET READ WRITE
+                    Token::KwRead => {
+                        self.advance(); // READ
+                        match self.advance().clone() {
+                            Token::Ident(s) if s.eq_ignore_ascii_case("ONLY") => {
+                                return Ok(Stmt::SetReadOnly);
+                            }
+                            Token::KwWrite => {
+                                return Ok(Stmt::SetReadWrite);
+                            }
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                    }
+                    // S92 — SET ARCHIVE PATH 'path'
+                    Token::Archive => {
+                        self.advance(); // ARCHIVE
+                        match self.advance().clone() {
+                            Token::KwPath => {}
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                        let path = match self.advance().clone() {
+                            Token::Str(s) => s,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        return Ok(Stmt::SetArchivePath { path });
+                    }
+                    // S93 — SET SLOW_QUERY_THRESHOLD n / S96 SET AUTO_EXPLAIN_THRESHOLD n
+                    Token::Ident(ref s) if s.eq_ignore_ascii_case("SLOW_QUERY_THRESHOLD") => {
+                        self.advance(); // SLOW_QUERY_THRESHOLD
+                        let ms = match self.advance().clone() {
+                            Token::Integer(n) => n as u64,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        return Ok(Stmt::SetSlowQueryThreshold { ms });
+                    }
+                    Token::Ident(ref s) if s.eq_ignore_ascii_case("AUTO_EXPLAIN_THRESHOLD") => {
+                        self.advance(); // AUTO_EXPLAIN_THRESHOLD
+                        let ms = match self.advance().clone() {
+                            Token::Integer(n) => n as u64,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        return Ok(Stmt::SetAutoExplainThreshold { ms });
+                    }
                     _ => {
                         return Err(ParseError::UnexpectedToken(self.peek().clone()));
                     }
@@ -358,18 +435,76 @@ impl SqlParser {
                 };
                 return Ok(Stmt::RemoveAllowedIp { ip });
             }
-            // S83 — SHOW ALLOWED IPS
+            // S83/S92 — SHOW ALLOWED IPS / SHOW ARCHIVE STATUS
             Token::Ident(ref s) if s.eq_ignore_ascii_case("SHOW") => {
                 self.advance(); // SHOW
+                match self.peek().clone() {
+                    Token::Allowed => {
+                        self.advance(); // ALLOWED
+                        match self.advance().clone() {
+                            Token::Ident(s) if s.eq_ignore_ascii_case("IPS") => {}
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                        return Ok(Stmt::ShowAllowedIps);
+                    }
+                    Token::Archive => {
+                        self.advance(); // ARCHIVE
+                        match self.advance().clone() {
+                            Token::Ident(s) if s.eq_ignore_ascii_case("STATUS") => {}
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                        return Ok(Stmt::ShowArchiveStatus);
+                    }
+                    t => return Err(ParseError::UnexpectedToken(t.clone())),
+                }
+            }
+            // S88 — START REPLICATION SLOT name FROM 'lsn'
+            Token::Start => {
+                self.advance(); // START
                 match self.advance().clone() {
-                    Token::Allowed => {}
+                    Token::Replication => {}
                     t => return Err(ParseError::UnexpectedToken(t)),
                 }
                 match self.advance().clone() {
-                    Token::Ident(s) if s.eq_ignore_ascii_case("IPS") => {}
+                    Token::Slot => {}
                     t => return Err(ParseError::UnexpectedToken(t)),
                 }
-                return Ok(Stmt::ShowAllowedIps);
+                let slot = self.expect_ident()?;
+                match self.advance().clone() {
+                    Token::From => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                let from_lsn = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    Token::Integer(n) => n.to_string(),
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                return Ok(Stmt::StartReplication { slot, from_lsn });
+            }
+            // S91 — PROMOTE STANDBY
+            Token::Promote => {
+                self.advance(); // PROMOTE
+                match self.advance().clone() {
+                    Token::Standby => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                return Ok(Stmt::PromoteStandby);
+            }
+            // S91 — DEMOTE PRIMARY
+            Token::Demote => {
+                self.advance(); // DEMOTE
+                match self.advance().clone() {
+                    Token::Primary => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                return Ok(Stmt::DemotePrimary);
+            }
+            // S92 — ARCHIVE NOW
+            Token::Archive => {
+                self.advance(); // ARCHIVE
+                // NOW is lexed as Token::Now
+                let _next = self.advance();
+                return Ok(Stmt::ArchiveNow);
             }
             // S84 — ROTATE TLS CERT 'path' KEY 'path'
             Token::Rotate => {
@@ -1341,6 +1476,22 @@ impl SqlParser {
     fn parse_create(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // CREATE
         match self.peek().clone() {
+            // S88 — CREATE REPLICATION SLOT name [TEMPORARY]
+            Token::Replication => {
+                self.advance(); // REPLICATION
+                match self.advance().clone() {
+                    Token::Slot => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                let name = self.expect_ident()?;
+                let temporary = if self.peek() == &Token::Temporary {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                return Ok(Stmt::CreateReplicationSlot { name, temporary });
+            }
             // S65 — CREATE FUNCTION
             Token::Function => {
                 self.advance();
@@ -1648,6 +1799,16 @@ impl SqlParser {
     fn parse_drop(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // DROP
         match self.peek().clone() {
+            // S88 — DROP REPLICATION SLOT name
+            Token::Replication => {
+                self.advance(); // REPLICATION
+                match self.advance().clone() {
+                    Token::Slot => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                let name = self.expect_ident()?;
+                return Ok(Stmt::DropReplicationSlot { name });
+            }
             Token::Index => {
                 self.advance();
                 let index_name = self.expect_ident()?;
