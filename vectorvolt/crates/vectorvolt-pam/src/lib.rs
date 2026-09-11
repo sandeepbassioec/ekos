@@ -124,10 +124,10 @@ pub unsafe extern "C" fn pam_sm_open_session(
     _argc: c_int,
     _argv: *const *const c_char,
 ) -> c_int {
-    eprintln!("{}", BANNER);
-    eprintln!("VectorVolt shard health check ...");
+    println!("{}", BANNER);
+    println!("VectorVolt shard health check ...");
     for i in 1..=3 {
-        eprintln!("  shard {} [OK]", i);
+        println!("  shard {} [OK]", i);
     }
     PAM_SUCCESS
 }
