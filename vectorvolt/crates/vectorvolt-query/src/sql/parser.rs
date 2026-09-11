@@ -51,6 +51,7 @@ impl SqlParser {
         }
     }
 
+    #[allow(clippy::needless_return)]
     pub fn parse(&mut self) -> Result<Stmt, ParseError> {
         match self.peek().clone() {
             Token::Select => self.parse_select(),
@@ -61,7 +62,6 @@ impl SqlParser {
             Token::Create => self.parse_create(),
             Token::Drop => self.parse_drop(),
             Token::Alter => self.parse_alter_table(),
-            Token::Truncate => self.parse_truncate(),
             Token::Rename => self.parse_rename_table(),
             Token::Explain => {
                 self.advance(); // EXPLAIN
@@ -231,6 +231,173 @@ impl SqlParser {
                     path,
                     has_header,
                 })
+            }
+            // S80 — TRUNCATE AUDIT LOG
+            Token::Truncate => {
+                self.advance(); // TRUNCATE
+                match self.peek().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("AUDIT") => {
+                        self.advance(); // AUDIT
+                        match self.advance().clone() {
+                            Token::Ident(s2) if s2.eq_ignore_ascii_case("LOG") => {}
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                        return Ok(Stmt::TruncateAuditLog);
+                    }
+                    _ => {
+                        // normal TRUNCATE TABLE
+                        self.expect(&Token::Table)?;
+                        let table = self.expect_ident()?;
+                        return Ok(Stmt::Truncate(TruncateStmt { table }));
+                    }
+                }
+            }
+            // S81 — SET SESSION TOKEN 'val'
+            Token::Set => {
+                self.advance(); // SET
+                match self.peek().clone() {
+                    Token::Session => {
+                        self.advance(); // SESSION
+                        match self.advance().clone() {
+                            Token::KwToken => {}
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                        let token = match self.advance().clone() {
+                            Token::Str(s) => s,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        return Ok(Stmt::SetSessionToken { token });
+                    }
+                    Token::Rate => {
+                        // SET RATE LIMIT ON table TO n PER SECOND
+                        self.advance(); // RATE
+                        match self.advance().clone() {
+                            Token::Limit | Token::Ident(_) => {}
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                        self.expect(&Token::On)?;
+                        let table = self.expect_ident()?;
+                        self.expect(&Token::To)?;
+                        let n = match self.advance().clone() {
+                            Token::Integer(n) => n as u64,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        // consume optional PER SECOND
+                        if self.peek() == &Token::Per {
+                            self.advance();
+                            if self.peek() == &Token::KwSecond {
+                                self.advance();
+                            }
+                        }
+                        return Ok(Stmt::SetRateLimit { table, n });
+                    }
+                    Token::Warnings => {
+                        self.advance(); // WARNINGS
+                        let on = match self.advance().clone() {
+                            Token::On => true,
+                            Token::Off => false,
+                            Token::Ident(s) if s.eq_ignore_ascii_case("ON") => true,
+                            Token::Ident(s) if s.eq_ignore_ascii_case("OFF") => false,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        return Ok(Stmt::SetWarnings(on));
+                    }
+                    _ => {
+                        return Err(ParseError::UnexpectedToken(self.peek().clone()));
+                    }
+                }
+            }
+            // S81 — REQUIRE TOKEN 'val' ON table
+            Token::Require => {
+                self.advance(); // REQUIRE
+                match self.advance().clone() {
+                    Token::KwToken => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                let token = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                self.expect(&Token::On)?;
+                let table = self.expect_ident()?;
+                return Ok(Stmt::RequireToken { table, token });
+            }
+            // S83 — ADD ALLOWED IP 'x.x.x.x'
+            Token::Add => {
+                self.advance(); // ADD
+                match self.peek().clone() {
+                    Token::Allowed => {
+                        self.advance(); // ALLOWED
+                        match self.advance().clone() {
+                            Token::Ip => {}
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        }
+                        let ip = match self.advance().clone() {
+                            Token::Str(s) => s,
+                            t => return Err(ParseError::UnexpectedToken(t)),
+                        };
+                        return Ok(Stmt::AddAllowedIp { ip });
+                    }
+                    _ => return Err(ParseError::UnexpectedToken(self.peek().clone())),
+                }
+            }
+            // S83 — REMOVE ALLOWED IP 'x.x.x.x'
+            Token::Ident(ref s) if s.eq_ignore_ascii_case("REMOVE") => {
+                self.advance(); // REMOVE
+                match self.advance().clone() {
+                    Token::Allowed => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                match self.advance().clone() {
+                    Token::Ip => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                let ip = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                return Ok(Stmt::RemoveAllowedIp { ip });
+            }
+            // S83 — SHOW ALLOWED IPS
+            Token::Ident(ref s) if s.eq_ignore_ascii_case("SHOW") => {
+                self.advance(); // SHOW
+                match self.advance().clone() {
+                    Token::Allowed => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                match self.advance().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("IPS") => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                return Ok(Stmt::ShowAllowedIps);
+            }
+            // S84 — ROTATE TLS CERT 'path' KEY 'path'
+            Token::Rotate => {
+                self.advance(); // ROTATE
+                match self.advance().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("TLS") => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                match self.advance().clone() {
+                    Token::Cert => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                let cert_path = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                match self.advance().clone() {
+                    Token::Key => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                let key_path = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                return Ok(Stmt::RotateTlsCert {
+                    cert_path,
+                    key_path,
+                });
             }
             t => Err(ParseError::UnexpectedToken(t)),
         }
@@ -1117,13 +1284,6 @@ impl SqlParser {
         Ok(Stmt::AlterTable(AlterTableStmt { table, op }))
     }
 
-    fn parse_truncate(&mut self) -> Result<Stmt, ParseError> {
-        self.advance(); // TRUNCATE
-        self.expect(&Token::Table)?;
-        let table = self.expect_ident()?;
-        Ok(Stmt::Truncate(TruncateStmt { table }))
-    }
-
     fn parse_rename_table(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // RENAME
         self.expect(&Token::Table)?;
@@ -1266,6 +1426,48 @@ impl SqlParser {
                     name,
                     select: Box::new(select_stmt),
                 }));
+            }
+            // S78 — CREATE POLICY name ON table USING (expr)
+            Token::Policy => {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&Token::On)?;
+                let table = self.expect_ident()?;
+                match self.advance().clone() {
+                    Token::Using => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                self.expect(&Token::LParen)?;
+                let using_expr = self.parse_expr()?;
+                self.expect(&Token::RParen)?;
+                return Ok(Stmt::CreatePolicy {
+                    name,
+                    table,
+                    using_expr,
+                });
+            }
+            // S79 — CREATE MASK name ON table.col USING 'mask_value'
+            Token::Mask => {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&Token::On)?;
+                let table = self.expect_ident()?;
+                self.expect(&Token::Dot)?;
+                let col = self.expect_ident()?;
+                match self.advance().clone() {
+                    Token::Using => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                let mask_val = match self.advance().clone() {
+                    Token::Str(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                };
+                return Ok(Stmt::CreateMask {
+                    name,
+                    table,
+                    col,
+                    mask_val,
+                });
             }
             Token::Materialized => {
                 self.advance(); // MATERIALIZED
@@ -1471,6 +1673,42 @@ impl SqlParser {
                 self.expect(&Token::View)?;
                 let name = self.expect_ident()?;
                 return Ok(Stmt::DropMatView { name });
+            }
+            // S78 — DROP POLICY name ON table
+            Token::Policy => {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&Token::On)?;
+                let table = self.expect_ident()?;
+                return Ok(Stmt::DropPolicy { name, table });
+            }
+            // S79 — DROP MASK name
+            Token::Mask => {
+                self.advance();
+                let name = self.expect_ident()?;
+                return Ok(Stmt::DropMask { name });
+            }
+            // S81 — DROP REQUIRE TOKEN ON table
+            Token::Require => {
+                self.advance(); // REQUIRE
+                match self.advance().clone() {
+                    Token::KwToken => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                self.expect(&Token::On)?;
+                let table = self.expect_ident()?;
+                return Ok(Stmt::DropRequireToken { table });
+            }
+            // S82 — DROP RATE LIMIT ON table
+            Token::Rate => {
+                self.advance(); // RATE
+                match self.advance().clone() {
+                    Token::Limit | Token::Ident(_) => {}
+                    t => return Err(ParseError::UnexpectedToken(t)),
+                }
+                self.expect(&Token::On)?;
+                let table = self.expect_ident()?;
+                return Ok(Stmt::DropRateLimit { table });
             }
             _ => {}
         }

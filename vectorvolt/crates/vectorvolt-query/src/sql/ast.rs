@@ -73,6 +73,62 @@ pub enum Stmt {
     DropMatView {
         name: String,
     },
+    // S78 — Row-level security
+    CreatePolicy {
+        name: String,
+        table: String,
+        using_expr: Expr,
+    },
+    DropPolicy {
+        name: String,
+        table: String,
+    },
+    // S79 — Column masking
+    CreateMask {
+        name: String,
+        table: String,
+        col: String,
+        mask_val: String,
+    },
+    DropMask {
+        name: String,
+    },
+    // S80 — Audit log truncate
+    TruncateAuditLog,
+    // S81 — Token-based auth
+    SetSessionToken {
+        token: String,
+    },
+    RequireToken {
+        table: String,
+        token: String,
+    },
+    DropRequireToken {
+        table: String,
+    },
+    // S82 — Rate limiting
+    SetRateLimit {
+        table: String,
+        n: u64,
+    },
+    DropRateLimit {
+        table: String,
+    },
+    // S83 — IP allowlist
+    AddAllowedIp {
+        ip: String,
+    },
+    RemoveAllowedIp {
+        ip: String,
+    },
+    ShowAllowedIps,
+    // S84 — TLS cert rotation
+    RotateTlsCert {
+        cert_path: String,
+        key_path: String,
+    },
+    // S87 — Warnings toggle
+    SetWarnings(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]
