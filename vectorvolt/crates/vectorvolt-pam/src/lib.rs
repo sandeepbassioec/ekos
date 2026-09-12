@@ -93,44 +93,30 @@ pub fn enroll_totp(username: &str) -> (String, String) {
     (b32, uri)
 }
 
-/// Render a QR code for `data` as a Unicode block-character string.
-/// Uses half-block characters (▀▄█ ) so each pair of rows = 1 terminal line.
+/// Render a QR code for `data` as a scannable Unicode string.
+/// Each module = "██" (dark) or "  " (light) so pixels are roughly square.
+/// QR spec requires 4-module quiet zone; we use 4 for reliable phone scanning.
 pub fn render_qr_text(data: &str) -> String {
     let qr = match QrCode::encode_text(data, QrCodeEcc::Medium) {
         Ok(q) => q,
         Err(_) => return String::from("  [QR code unavailable]\n"),
     };
     let size = qr.size();
-    let border = 2;
+    let border = 4;
     let mut out = String::new();
-    let total = size + border * 2;
-    let mut row = border * -1;
-    while row < size + border {
-        let mut line = String::from("  ");
+    for row in -border..size + border {
+        let mut line = String::new();
         for col in -border..size + border {
-            let top = if row >= 0 && row < size && col >= 0 && col < size {
-                qr.get_module(col, row)
+            let dark = row >= 0 && row < size && col >= 0 && col < size && qr.get_module(col, row);
+            if dark {
+                line.push_str("██");
             } else {
-                false
-            };
-            let bot = if row + 1 >= 0 && row + 1 < size && col >= 0 && col < size {
-                qr.get_module(col, row + 1)
-            } else {
-                false
-            };
-            let ch = match (top, bot) {
-                (true, true) => '█',
-                (true, false) => '▀',
-                (false, true) => '▄',
-                (false, false) => ' ',
-            };
-            line.push(ch);
+                line.push_str("  ");
+            }
         }
         out.push_str(&line);
         out.push('\n');
-        row += 2;
     }
-    let _ = total; // suppress unused warning
     out
 }
 
