@@ -194,6 +194,118 @@ fn normalize_sql(sql: &str) -> String {
         .join(" ")
 }
 
+// ── S118–S127 free helpers ───────────────────────────────────────────────────
+
+fn parse_single_quoted(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.starts_with('\'') && s.len() >= 2 {
+        if let Some(end) = s[1..].find('\'') {
+            return Some(s[1..end + 1].to_owned());
+        }
+    }
+    None
+}
+
+fn parse_event_type_filter(cond: &str) -> Option<String> {
+    if let Some(eq_pos) = cond.find('=') {
+        let val_str = cond[eq_pos + 1..].trim();
+        return parse_single_quoted(val_str);
+    }
+    None
+}
+
+fn split_table_col(s: &str) -> (String, String) {
+    if let Some(dot) = s.find('.') {
+        (
+            s[..dot].trim().to_ascii_lowercase(),
+            s[dot + 1..].trim().to_ascii_lowercase(),
+        )
+    } else {
+        (s.trim().to_ascii_lowercase(), String::new())
+    }
+}
+
+fn parse_edge(s: &str) -> Option<(String, String, String)> {
+    // (from)-[:REL]->(to) or (from)-[r:REL]->(to)
+    let from_end = s.find(')')?;
+    let from = s[1..from_end].trim().to_owned();
+    let rest = s[from_end + 1..]
+        .trim_start_matches('-')
+        .trim_start_matches('>');
+    // expect [...]
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let rel_end = rest.find(']')?;
+    let rel_inner = &rest[1..rel_end];
+    let rel_type = if let Some(colon) = rel_inner.find(':') {
+        rel_inner[colon + 1..].trim().to_owned()
+    } else {
+        rel_inner.trim().to_owned()
+    };
+    let after_rel = &rest[rel_end + 1..];
+    let to_start = after_rel.find('(')?;
+    let to_end = after_rel.find(')')?;
+    let to = after_rel[to_start + 1..to_end].trim().to_owned();
+    Some((from, rel_type, to))
+}
+
+fn parse_match_rel_type(sql: &str) -> Option<String> {
+    if let Some(bracket_start) = sql.find('[') {
+        if let Some(bracket_end) = sql[bracket_start..].find(']') {
+            let inner = &sql[bracket_start + 1..bracket_start + bracket_end];
+            if let Some(colon) = inner.find(':') {
+                return Some(inner[colon + 1..].trim().to_owned());
+            }
+            // bare [r] — wildcard
+            return None;
+        }
+    }
+    None
+}
+
+fn parse_match_where(sql: &str) -> Option<String> {
+    let up = sql.to_ascii_uppercase();
+    if let Some(where_pos) = up.find(" WHERE ") {
+        // find before RETURN
+        let cond_end = up[where_pos..]
+            .find(" RETURN ")
+            .map_or(sql.len(), |p| where_pos + p);
+        let cond = &sql[where_pos + " WHERE ".len()..cond_end];
+        if let Some(eq_pos) = cond.find('=') {
+            let val_str = cond[eq_pos + 1..].trim();
+            return parse_single_quoted(val_str);
+        }
+    }
+    None
+}
+
+fn extract_dml_table(sql: &str, op: &str) -> Option<String> {
+    let up = sql.to_ascii_uppercase();
+    let keyword = match op {
+        "INSERT" => " INTO ",
+        "UPDATE" => "UPDATE ",
+        "DELETE" => " FROM ",
+        _ => return None,
+    };
+    let start = if op == "UPDATE" { 0 } else { 0 };
+    let pos = if op == "UPDATE" {
+        up.find(keyword).map(|p| p + keyword.len())
+    } else {
+        up.find(keyword).map(|p| p + keyword.len())
+    };
+    let _ = start;
+    if let Some(p) = pos {
+        let rest = sql[p..].trim();
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(rest.len());
+        Some(rest[..end].trim().to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 fn fingerprint_hash(s: &str) -> u64 {
     let mut h: u64 = 14695981039346656037;
     for b in s.bytes() {
@@ -303,6 +415,29 @@ pub struct SqlExecutor {
     connection_count: std::sync::atomic::AtomicU64,
     // S117 — resource groups
     resource_groups: Mutex<HashMap<String, ResourceGroup>>,
+    // S118 — event log: table → [(ts_ms, event_type, payload_json)]
+    event_log: Mutex<HashMap<String, Vec<(u64, String, String)>>>,
+    // S119 — read models: model_name → (source_table, event_type_filter)
+    read_models: Mutex<HashMap<String, (String, String)>>,
+    // S120 — time-travel snapshots: table → [(ts_ms, rows)]
+    #[allow(clippy::type_complexity)]
+    time_travel_log: Mutex<HashMap<String, Vec<(u64, Vec<Vec<String>>)>>>,
+    // S121 — change feed: table → [(op, row_json, ts)]
+    change_feed: Mutex<HashMap<String, Vec<(String, String, String)>>>,
+    change_feed_enabled: Mutex<HashSet<String>>,
+    // S122 — bloom indexes: index_name → (table, col, values)
+    bloom_indexes: Mutex<HashMap<String, (String, String, HashSet<String>)>>,
+    // S123 — columnar storage hint
+    columnar_tables: Mutex<HashSet<String>>,
+    // S124 — adaptive query execution
+    aqe_enabled: Mutex<bool>,
+    aqe_stats: Mutex<HashMap<String, u64>>,
+    // S125 — query result streaming
+    stream_chunk_size: Mutex<usize>,
+    // S126 — geospatial: table → col → (lat, lng)
+    geo_columns: Mutex<HashMap<String, HashMap<String, (f64, f64)>>>,
+    // S127 — graph edges: (from_node, rel_type, to_node)
+    graph_edges: Mutex<Vec<(String, String, String)>>,
 }
 
 impl SqlExecutor {
@@ -363,10 +498,26 @@ impl SqlExecutor {
             max_connections: Mutex::new(100),
             connection_count: std::sync::atomic::AtomicU64::new(0),
             resource_groups: Mutex::new(HashMap::new()),
+            event_log: Mutex::new(HashMap::new()),
+            read_models: Mutex::new(HashMap::new()),
+            time_travel_log: Mutex::new(HashMap::new()),
+            change_feed: Mutex::new(HashMap::new()),
+            change_feed_enabled: Mutex::new(HashSet::new()),
+            bloom_indexes: Mutex::new(HashMap::new()),
+            columnar_tables: Mutex::new(HashSet::new()),
+            aqe_enabled: Mutex::new(true),
+            aqe_stats: Mutex::new(HashMap::new()),
+            stream_chunk_size: Mutex::new(100),
+            geo_columns: Mutex::new(HashMap::new()),
+            graph_edges: Mutex::new(Vec::new()),
         }
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, ExecError> {
+        // S118–S127 — raw SQL pattern matching (before parser)
+        if let Some(raw_result) = self.execute_raw(sql) {
+            return raw_result;
+        }
         let tokens = Lexer::new(sql).tokenize()?;
         let stmt = SqlParser::new(tokens).parse()?;
         // Check if stmt is a management operation that clears stats/log/events
@@ -385,6 +536,38 @@ impl SqlExecutor {
         let skip_stats = is_reset_stmt || is_stat_reset_select;
         let t0 = std::time::Instant::now();
         let result = self.execute_stmt(stmt)?;
+        // S121 — change feed auto-capture for INSERT/UPDATE/DELETE
+        {
+            let up_trim = sql.trim_start().to_ascii_uppercase();
+            let op_opt = if up_trim.starts_with("INSERT ") {
+                Some("INSERT")
+            } else if up_trim.starts_with("UPDATE ") {
+                Some("UPDATE")
+            } else if up_trim.starts_with("DELETE ") {
+                Some("DELETE")
+            } else {
+                None
+            };
+            if let Some(op_str) = op_opt {
+                let tbl_opt = extract_dml_table(sql, op_str);
+                if let Some(tbl) = tbl_opt {
+                    let enabled = self.change_feed_enabled.lock().unwrap().contains(&tbl);
+                    if enabled {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                            .to_string();
+                        self.change_feed
+                            .lock()
+                            .unwrap()
+                            .entry(tbl)
+                            .or_default()
+                            .push((op_str.to_owned(), sql.to_owned(), ts));
+                    }
+                }
+            }
+        }
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         // S106 — statement timeout check
         {
@@ -919,6 +1102,618 @@ impl SqlExecutor {
                 }
             }
         }
+    }
+
+    // ── S118–S127 raw SQL handler ────────────────────────────────────────────
+    fn execute_raw(&self, sql: &str) -> Option<Result<QueryResult, ExecError>> {
+        let s = sql.trim();
+        let up = s.to_ascii_uppercase();
+
+        // S118 — APPEND EVENT TO table_name TYPE 'evt_type' PAYLOAD 'json'
+        if up.starts_with("APPEND EVENT TO ") {
+            let rest = &s["APPEND EVENT TO ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(type_pos) = up_rest.find(" TYPE ") {
+                let table_name = rest[..type_pos].trim().to_ascii_lowercase();
+                let after_type = &rest[type_pos + " TYPE ".len()..];
+                if let Some(evt_type) = parse_single_quoted(after_type) {
+                    let skip = 1 + evt_type.len() + 1;
+                    if skip <= after_type.len() {
+                        let after_evt = after_type[skip..].trim();
+                        let up_after = after_evt.to_ascii_uppercase();
+                        if let Some(payload_pos) = up_after.find("PAYLOAD ") {
+                            let payload_str = after_evt[payload_pos + "PAYLOAD ".len()..].trim();
+                            if let Some(payload) = parse_single_quoted(payload_str) {
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64;
+                                self.event_log
+                                    .lock()
+                                    .unwrap()
+                                    .entry(table_name)
+                                    .or_default()
+                                    .push((ts, evt_type, payload));
+                                return Some(Ok(QueryResult::Affected(1)));
+                            }
+                        }
+                    }
+                }
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid APPEND EVENT syntax".to_owned(),
+            )));
+        }
+
+        // S118 — SELECT * FROM EVENTS OF table_name [WHERE event_type = 'x']
+        if up.starts_with("SELECT * FROM EVENTS OF ") {
+            let rest = &s["SELECT * FROM EVENTS OF ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            let (table_name, type_filter) = if let Some(wp) = up_rest.find(" WHERE ") {
+                let tbl = rest[..wp].trim().to_ascii_lowercase();
+                let cond = rest[wp + " WHERE ".len()..].trim();
+                (tbl, parse_event_type_filter(cond))
+            } else {
+                (rest.trim().to_ascii_lowercase(), None)
+            };
+            let log = self.event_log.lock().unwrap();
+            let events = log.get(&table_name).cloned().unwrap_or_default();
+            drop(log);
+            let rows: Vec<Vec<String>> = events
+                .iter()
+                .filter(|(_, et, _)| type_filter.as_ref().map_or(true, |f| et == f))
+                .map(|(ts, et, payload)| vec![ts.to_string(), et.clone(), payload.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "ts_ms".to_owned(),
+                    "event_type".to_owned(),
+                    "payload".to_owned(),
+                ],
+                rows,
+            }));
+        }
+
+        // S119 — CREATE READ MODEL model_name FROM EVENTS OF table_name WHERE event_type = 'X'
+        if up.starts_with("CREATE READ MODEL ") {
+            let rest = &s["CREATE READ MODEL ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(from_pos) = up_rest.find(" FROM EVENTS OF ") {
+                let model_name = rest[..from_pos].trim().to_ascii_lowercase();
+                let after_from = &rest[from_pos + " FROM EVENTS OF ".len()..];
+                let up_after = after_from.to_ascii_uppercase();
+                let (table_name, event_type) = if let Some(wp) = up_after.find(" WHERE ") {
+                    let tbl = after_from[..wp].trim().to_ascii_lowercase();
+                    let cond = after_from[wp + " WHERE ".len()..].trim();
+                    (tbl, parse_event_type_filter(cond).unwrap_or_default())
+                } else {
+                    (after_from.trim().to_ascii_lowercase(), String::new())
+                };
+                self.read_models
+                    .lock()
+                    .unwrap()
+                    .insert(model_name, (table_name, event_type));
+                return Some(Ok(QueryResult::Created));
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid CREATE READ MODEL syntax".to_owned(),
+            )));
+        }
+
+        // S119 — SELECT * FROM READ MODEL model_name
+        if up.starts_with("SELECT * FROM READ MODEL ") {
+            let model_name = s["SELECT * FROM READ MODEL ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let models = self.read_models.lock().unwrap();
+            let entry = models.get(&model_name).cloned();
+            drop(models);
+            let columns = vec![
+                "ts_ms".to_owned(),
+                "event_type".to_owned(),
+                "payload".to_owned(),
+            ];
+            if let Some((table_name, event_type_filter)) = entry {
+                let log = self.event_log.lock().unwrap();
+                let events = log.get(&table_name).cloned().unwrap_or_default();
+                drop(log);
+                let rows = events
+                    .iter()
+                    .filter(|(_, et, _)| event_type_filter.is_empty() || et == &event_type_filter)
+                    .map(|(ts, et, p)| vec![ts.to_string(), et.clone(), p.clone()])
+                    .collect();
+                return Some(Ok(QueryResult::Rows { columns, rows }));
+            }
+            return Some(Ok(QueryResult::Rows {
+                columns,
+                rows: vec![],
+            }));
+        }
+
+        // S119 — DROP READ MODEL model_name
+        if up.starts_with("DROP READ MODEL ") {
+            let model_name = s["DROP READ MODEL ".len()..].trim().to_ascii_lowercase();
+            self.read_models.lock().unwrap().remove(&model_name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // S120 — SNAPSHOT TABLE table_name
+        if up.starts_with("SNAPSHOT TABLE ") {
+            let table_name = s["SNAPSHOT TABLE ".len()..].trim().to_ascii_lowercase();
+            let rows = self.scan_table_as_strings(&table_name);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.time_travel_log
+                .lock()
+                .unwrap()
+                .entry(table_name)
+                .or_default()
+                .push((ts, rows));
+            return Some(Ok(QueryResult::Affected(1)));
+        }
+
+        // S120 — SELECT * FROM table_name AS OF TIMESTAMP ts_ms
+        if let Some(as_of_pos) = up.find(" AS OF TIMESTAMP ") {
+            let prefix_up = &up[..as_of_pos];
+            if prefix_up.starts_with("SELECT * FROM ") {
+                let table_name = s["SELECT * FROM ".len()..as_of_pos]
+                    .trim()
+                    .to_ascii_lowercase();
+                let ts_str = s[as_of_pos + " AS OF TIMESTAMP ".len()..].trim();
+                let target_ts: u64 = ts_str.parse().unwrap_or(0);
+                let log = self.time_travel_log.lock().unwrap();
+                let columns = vec!["row_data".to_owned()];
+                if let Some(snapshots) = log.get(&table_name) {
+                    let closest = snapshots.iter().min_by_key(|(ts, _)| {
+                        if *ts > target_ts {
+                            ts - target_ts
+                        } else {
+                            target_ts - ts
+                        }
+                    });
+                    if let Some((_, rows)) = closest {
+                        return Some(Ok(QueryResult::Rows {
+                            columns,
+                            rows: rows.clone(),
+                        }));
+                    }
+                }
+                return Some(Ok(QueryResult::Rows {
+                    columns,
+                    rows: vec![],
+                }));
+            }
+        }
+
+        // S121 — ENABLE CHANGE FEED ON table_name
+        if up.starts_with("ENABLE CHANGE FEED ON ") {
+            let table_name = s["ENABLE CHANGE FEED ON ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.change_feed_enabled.lock().unwrap().insert(table_name);
+            return Some(Ok(QueryResult::Affected(0)));
+        }
+
+        // S121 — DISABLE CHANGE FEED ON table_name
+        if up.starts_with("DISABLE CHANGE FEED ON ") {
+            let table_name = s["DISABLE CHANGE FEED ON ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.change_feed_enabled.lock().unwrap().remove(&table_name);
+            return Some(Ok(QueryResult::Affected(0)));
+        }
+
+        // S121 — SELECT * FROM CHANGES OF table_name
+        if up.starts_with("SELECT * FROM CHANGES OF ") {
+            let table_name = s["SELECT * FROM CHANGES OF ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let feed = self.change_feed.lock().unwrap();
+            let entries = feed.get(&table_name).cloned().unwrap_or_default();
+            drop(feed);
+            let rows = entries
+                .into_iter()
+                .map(|(op, rj, ts)| vec![op, rj, ts])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["op".to_owned(), "row_json".to_owned(), "ts".to_owned()],
+                rows,
+            }));
+        }
+
+        // S122 — CREATE BLOOM INDEX idx_name ON table_name(col_name)
+        if up.starts_with("CREATE BLOOM INDEX ") {
+            let rest = &s["CREATE BLOOM INDEX ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(on_pos) = up_rest.find(" ON ") {
+                let idx_name = rest[..on_pos].trim().to_ascii_lowercase();
+                let table_col = rest[on_pos + " ON ".len()..].trim();
+                if let Some(paren_pos) = table_col.find('(') {
+                    let table_name = table_col[..paren_pos].trim().to_ascii_lowercase();
+                    let col_part = &table_col[paren_pos + 1..];
+                    let col_name = col_part.trim_end_matches(')').trim().to_ascii_lowercase();
+                    let values = self.collect_col_values(&table_name, &col_name);
+                    self.bloom_indexes.lock().unwrap().insert(
+                        idx_name,
+                        (table_name, col_name, values.into_iter().collect()),
+                    );
+                    return Some(Ok(QueryResult::Created));
+                }
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid CREATE BLOOM INDEX syntax".to_owned(),
+            )));
+        }
+
+        // S122 — DROP BLOOM INDEX idx_name
+        if up.starts_with("DROP BLOOM INDEX ") {
+            let idx_name = s["DROP BLOOM INDEX ".len()..].trim().to_ascii_lowercase();
+            self.bloom_indexes.lock().unwrap().remove(&idx_name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // S122 — SELECT * FROM table WHERE col BLOOM_MATCH 'value'
+        if up.contains(" BLOOM_MATCH ") {
+            let bm_pos = up.find(" BLOOM_MATCH ").unwrap();
+            let from_pos = up.find(" FROM ");
+            let where_pos = up.find(" WHERE ");
+            if let (Some(fp), Some(wp)) = (from_pos, where_pos) {
+                let table_name = s[fp + " FROM ".len()..wp].trim().to_ascii_lowercase();
+                let col_name = s[wp + " WHERE ".len()..bm_pos].trim().to_ascii_lowercase();
+                let after_bm = s[bm_pos + " BLOOM_MATCH ".len()..].trim();
+                if let Some(value) = parse_single_quoted(after_bm) {
+                    let indexes = self.bloom_indexes.lock().unwrap();
+                    let bloom_hit = indexes.values().any(|(tbl, col, vals)| {
+                        tbl == &table_name && col == &col_name && vals.contains(&value)
+                    });
+                    drop(indexes);
+                    if !bloom_hit {
+                        return Some(Ok(QueryResult::Rows {
+                            columns: vec![],
+                            rows: vec![],
+                        }));
+                    }
+                    let rows = self.scan_col_filtered(&table_name, &col_name, &value);
+                    return Some(Ok(QueryResult::Rows {
+                        columns: vec![col_name, "bloom_match".to_owned()],
+                        rows,
+                    }));
+                }
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid BLOOM_MATCH syntax".to_owned(),
+            )));
+        }
+
+        // S123 — ALTER TABLE table_name STORE COLUMNAR
+        if up.starts_with("ALTER TABLE ") && up.contains(" STORE COLUMNAR") {
+            let rest = &s["ALTER TABLE ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(pos) = up_rest.find(" STORE COLUMNAR") {
+                let table_name = rest[..pos].trim().to_ascii_lowercase();
+                self.columnar_tables.lock().unwrap().insert(table_name);
+                return Some(Ok(QueryResult::Affected(0)));
+            }
+        }
+
+        // S123 — ALTER TABLE table_name STORE ROW
+        if up.starts_with("ALTER TABLE ") && up.contains(" STORE ROW") {
+            let rest = &s["ALTER TABLE ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(pos) = up_rest.find(" STORE ROW") {
+                let table_name = rest[..pos].trim().to_ascii_lowercase();
+                self.columnar_tables.lock().unwrap().remove(&table_name);
+                return Some(Ok(QueryResult::Affected(0)));
+            }
+        }
+
+        // S123 — SHOW STORAGE FORMAT FOR table_name
+        if up.starts_with("SHOW STORAGE FORMAT FOR ") {
+            let table_name = s["SHOW STORAGE FORMAT FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let fmt = if self.columnar_tables.lock().unwrap().contains(&table_name) {
+                "COLUMNAR"
+            } else {
+                "ROW"
+            };
+            return Some(Ok(QueryResult::Ok(fmt.to_owned())));
+        }
+
+        // S124 — SET ADAPTIVE QUERY EXECUTION ON/OFF
+        if up.starts_with("SET ADAPTIVE QUERY EXECUTION ") {
+            let rest = s["SET ADAPTIVE QUERY EXECUTION ".len()..]
+                .trim()
+                .to_ascii_uppercase();
+            *self.aqe_enabled.lock().unwrap() = rest == "ON";
+            return Some(Ok(QueryResult::Affected(0)));
+        }
+
+        // S124 — SHOW AQE STATUS
+        if up.trim() == "SHOW AQE STATUS" {
+            let enabled = *self.aqe_enabled.lock().unwrap();
+            let stats_count = self.aqe_stats.lock().unwrap().len();
+            let status = if enabled { "enabled" } else { "disabled" };
+            return Some(Ok(QueryResult::Ok(format!(
+                "AQE: {} ({} stats)",
+                status, stats_count
+            ))));
+        }
+
+        // S125 — SET STREAM CHUNK SIZE n
+        if up.starts_with("SET STREAM CHUNK SIZE ") {
+            let n_str = s["SET STREAM CHUNK SIZE ".len()..].trim();
+            if let Ok(n) = n_str.parse::<usize>() {
+                *self.stream_chunk_size.lock().unwrap() = n;
+                return Some(Ok(QueryResult::Affected(0)));
+            }
+            return Some(Ok(QueryResult::Error("invalid chunk size".to_owned())));
+        }
+
+        // S125 — SHOW STREAM CONFIG
+        if up.trim() == "SHOW STREAM CONFIG" {
+            let chunk_size = *self.stream_chunk_size.lock().unwrap();
+            return Some(Ok(QueryResult::Ok(format!("chunk_size={}", chunk_size))));
+        }
+
+        // S125 — STREAM SELECT * FROM table_name
+        if up.starts_with("STREAM SELECT * FROM ") {
+            let table_name = s["STREAM SELECT * FROM ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let rows = self.scan_table_as_strings(&table_name);
+            let total = rows.len();
+            let chunk_size = *self.stream_chunk_size.lock().unwrap();
+            let chunks = if chunk_size == 0 || total == 0 {
+                0usize
+            } else {
+                (total + chunk_size - 1) / chunk_size
+            };
+            return Some(Ok(QueryResult::Ok(format!(
+                "STREAM: {} chunks of {} rows",
+                chunks, chunk_size
+            ))));
+        }
+
+        // S126 — INSERT GEO POINT INTO table_name(col) VALUES (lat, lng)
+        if up.starts_with("INSERT GEO POINT INTO ") {
+            let rest = &s["INSERT GEO POINT INTO ".len()..];
+            if let Some(paren_pos) = rest.find('(') {
+                let table_name = rest[..paren_pos].trim().to_ascii_lowercase();
+                let after_paren = &rest[paren_pos + 1..];
+                if let Some(close_paren) = after_paren.find(')') {
+                    let col_name = after_paren[..close_paren].trim().to_ascii_lowercase();
+                    let rest2 = after_paren[close_paren + 1..].trim();
+                    let up_rest2 = rest2.to_ascii_uppercase();
+                    if let Some(vals_pos) = up_rest2.find("VALUES") {
+                        let vals_str = rest2[vals_pos + "VALUES".len()..].trim();
+                        if vals_str.starts_with('(') {
+                            if let Some(end) = vals_str[1..].find(')') {
+                                let coords = &vals_str[1..end + 1];
+                                let parts: Vec<&str> = coords.split(',').collect();
+                                if parts.len() == 2 {
+                                    let lat: f64 = parts[0].trim().parse().unwrap_or(0.0);
+                                    let lng: f64 = parts[1].trim().parse().unwrap_or(0.0);
+                                    self.geo_columns
+                                        .lock()
+                                        .unwrap()
+                                        .entry(table_name)
+                                        .or_default()
+                                        .insert(col_name, (lat, lng));
+                                    return Some(Ok(QueryResult::Affected(1)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid INSERT GEO POINT syntax".to_owned(),
+            )));
+        }
+
+        // S126 — SELECT ST_DISTANCE(table1.col1, table2.col2)
+        if up.starts_with("SELECT ST_DISTANCE(") {
+            let inner_str = &s["SELECT ST_DISTANCE(".len()..];
+            if let Some(end) = inner_str.find(')') {
+                let args = &inner_str[..end];
+                let parts: Vec<&str> = args.splitn(2, ',').collect();
+                if parts.len() == 2 {
+                    let (at, ac) = split_table_col(parts[0].trim());
+                    let (bt, bc) = split_table_col(parts[1].trim());
+                    let geo = self.geo_columns.lock().unwrap();
+                    let p1 = geo
+                        .get(&at)
+                        .and_then(|m| m.get(&ac))
+                        .copied()
+                        .unwrap_or((0.0, 0.0));
+                    let p2 = geo
+                        .get(&bt)
+                        .and_then(|m| m.get(&bc))
+                        .copied()
+                        .unwrap_or((0.0, 0.0));
+                    drop(geo);
+                    let dist = ((p1.0 - p2.0).powi(2) + (p1.1 - p2.1).powi(2)).sqrt();
+                    return Some(Ok(QueryResult::Ok(format!("{:.6}", dist))));
+                }
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid ST_DISTANCE syntax".to_owned(),
+            )));
+        }
+
+        // S126 — SELECT * FROM table_name WHERE ST_CONTAINS(col, lat, lng, radius_km)
+        if up.contains("ST_CONTAINS(") {
+            let from_pos = up.find(" FROM ");
+            let where_pos = up.find(" WHERE ");
+            if let (Some(fp), Some(wp)) = (from_pos, where_pos) {
+                let table_name = s[fp + " FROM ".len()..wp].trim().to_ascii_lowercase();
+                let cond_str = s[wp + " WHERE ".len()..].trim();
+                if let Some(inner_start) = cond_str.find('(') {
+                    let inner_end = cond_str.rfind(')').unwrap_or(cond_str.len());
+                    let inner = &cond_str[inner_start + 1..inner_end];
+                    let parts: Vec<&str> = inner.splitn(4, ',').collect();
+                    if parts.len() == 4 {
+                        let col_name = parts[0].trim().to_ascii_lowercase();
+                        let lat: f64 = parts[1].trim().parse().unwrap_or(0.0);
+                        let lng: f64 = parts[2].trim().parse().unwrap_or(0.0);
+                        let radius: f64 = parts[3].trim().parse().unwrap_or(0.0);
+                        let geo = self.geo_columns.lock().unwrap();
+                        let point = geo.get(&table_name).and_then(|m| m.get(&col_name)).copied();
+                        drop(geo);
+                        let columns = vec!["row_data".to_owned()];
+                        if let Some((plat, plng)) = point {
+                            // 1 degree ≈ 111 km
+                            let dist_km =
+                                ((plat - lat).powi(2) + (plng - lng).powi(2)).sqrt() * 111.0;
+                            if dist_km <= radius {
+                                let rows = self.scan_table_as_strings(&table_name);
+                                return Some(Ok(QueryResult::Rows { columns, rows }));
+                            }
+                        }
+                        return Some(Ok(QueryResult::Rows {
+                            columns,
+                            rows: vec![],
+                        }));
+                    }
+                }
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid ST_CONTAINS syntax".to_owned(),
+            )));
+        }
+
+        // S127 — CREATE EDGE (node_a)-[:REL_TYPE]->(node_b)
+        if up.starts_with("CREATE EDGE ") {
+            let rest = &s["CREATE EDGE ".len()..];
+            if let Some((from, rel, to)) = parse_edge(rest) {
+                self.graph_edges.lock().unwrap().push((from, rel, to));
+                return Some(Ok(QueryResult::Created));
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid CREATE EDGE syntax".to_owned(),
+            )));
+        }
+
+        // S127 — DROP EDGE (node_a)-[:REL_TYPE]->(node_b)
+        if up.starts_with("DROP EDGE ") {
+            let rest = &s["DROP EDGE ".len()..];
+            if let Some((from, rel, to)) = parse_edge(rest) {
+                self.graph_edges
+                    .lock()
+                    .unwrap()
+                    .retain(|(f, r, t)| !(f == &from && r == &rel && t == &to));
+                return Some(Ok(QueryResult::Dropped));
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid DROP EDGE syntax".to_owned(),
+            )));
+        }
+
+        // S127 — MATCH (a)-[r:REL_TYPE]->(b) [WHERE a = 'node'] RETURN a, r, b
+        if up.starts_with("MATCH ") {
+            let edges = self.graph_edges.lock().unwrap().clone();
+            let rel_filter = parse_match_rel_type(s);
+            let node_filter = parse_match_where(s);
+            let rows: Vec<Vec<String>> = edges
+                .iter()
+                .filter(|(from, rel, _)| {
+                    rel_filter.as_ref().map_or(true, |r| rel == r)
+                        && node_filter.as_ref().map_or(true, |n| from == n)
+                })
+                .map(|(from, rel, to)| vec![from.clone(), rel.clone(), to.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["a".to_owned(), "r".to_owned(), "b".to_owned()],
+                rows,
+            }));
+        }
+
+        None
+    }
+
+    // ── S118–S127 helpers ────────────────────────────────────────────────────
+
+    fn scan_table_as_strings(&self, table: &str) -> Vec<Vec<String>> {
+        let Ok(engine) = self.registry.get(table) else {
+            return vec![];
+        };
+        let schema = &engine.schema;
+        let col_types: Vec<(usize, ColumnType)> = schema
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.col_type))
+            .collect();
+        let Ok(rows) = self.scan_live(&engine) else {
+            return vec![];
+        };
+        rows.iter()
+            .map(|row| {
+                col_types
+                    .iter()
+                    .map(|(idx, ct)| {
+                        TypedValue::from_bits(*ct, row.values.get(*idx).copied().unwrap_or(0))
+                            .display_str()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn collect_col_values(&self, table: &str, col: &str) -> Vec<String> {
+        let Ok(engine) = self.registry.get(table) else {
+            return vec![];
+        };
+        let schema = &engine.schema;
+        let Some((col_idx, col_def)) = schema.find(col) else {
+            return vec![];
+        };
+        let Ok(rows) = self.scan_live(&engine) else {
+            return vec![];
+        };
+        rows.iter()
+            .map(|row| {
+                TypedValue::from_bits(
+                    col_def.col_type,
+                    row.values.get(col_idx).copied().unwrap_or(0),
+                )
+                .display_str()
+            })
+            .collect()
+    }
+
+    fn scan_col_filtered(&self, table: &str, col: &str, val: &str) -> Vec<Vec<String>> {
+        let Ok(engine) = self.registry.get(table) else {
+            return vec![];
+        };
+        let schema = &engine.schema;
+        let Some((col_idx, col_def)) = schema.find(col) else {
+            return vec![];
+        };
+        let Ok(rows) = self.scan_live(&engine) else {
+            return vec![];
+        };
+        rows.iter()
+            .filter(|row| {
+                TypedValue::from_bits(
+                    col_def.col_type,
+                    row.values.get(col_idx).copied().unwrap_or(0),
+                )
+                .display_str()
+                    == val
+            })
+            .map(|row| {
+                let v = TypedValue::from_bits(
+                    col_def.col_type,
+                    row.values.get(col_idx).copied().unwrap_or(0),
+                )
+                .display_str();
+                vec![v, "true".to_owned()]
+            })
+            .collect()
     }
 
     fn exec_begin(&self) -> Result<QueryResult, ExecError> {
@@ -11154,5 +11949,605 @@ mod tests {
         let groups = ex.resource_groups.lock().unwrap();
         let rg = groups.get("rg1").unwrap();
         assert_eq!(rg.cpu_pct, 75);
+    }
+
+    // ── S118 — Event sourcing ────────────────────────────────────────────────
+    #[test]
+    fn test_s118_append_event() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("APPEND EVENT TO orders TYPE 'OrderPlaced' PAYLOAD '{\"id\":1}'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+    }
+
+    #[test]
+    fn test_s118_select_events() {
+        let (ex, _dir) = setup();
+        ex.execute("APPEND EVENT TO orders TYPE 'OrderPlaced' PAYLOAD '{\"id\":1}'")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM EVENTS OF orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "OrderPlaced");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s118_multiple_events() {
+        let (ex, _dir) = setup();
+        ex.execute("APPEND EVENT TO orders TYPE 'OrderPlaced' PAYLOAD '{}'")
+            .unwrap();
+        ex.execute("APPEND EVENT TO orders TYPE 'OrderShipped' PAYLOAD '{}'")
+            .unwrap();
+        ex.execute("APPEND EVENT TO orders TYPE 'OrderDelivered' PAYLOAD '{}'")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM EVENTS OF orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 3);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s118_unknown_table_empty() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM EVENTS OF nonexistent").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s118_event_type_filter() {
+        let (ex, _dir) = setup();
+        ex.execute("APPEND EVENT TO orders TYPE 'OrderPlaced' PAYLOAD '{}'")
+            .unwrap();
+        ex.execute("APPEND EVENT TO orders TYPE 'OrderShipped' PAYLOAD '{}'")
+            .unwrap();
+        let r = ex
+            .execute("SELECT * FROM EVENTS OF orders WHERE event_type = 'OrderPlaced'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "OrderPlaced");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S119 — CQRS read models ──────────────────────────────────────────────
+    #[test]
+    fn test_s119_create_read_model() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE READ MODEL placed_orders FROM EVENTS OF orders WHERE event_type = 'OrderPlaced'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s119_select_read_model() {
+        let (ex, _dir) = setup();
+        ex.execute("APPEND EVENT TO orders TYPE 'OrderPlaced' PAYLOAD '{}'")
+            .unwrap();
+        ex.execute("APPEND EVENT TO orders TYPE 'OrderShipped' PAYLOAD '{}'")
+            .unwrap();
+        ex.execute("CREATE READ MODEL placed_orders FROM EVENTS OF orders WHERE event_type = 'OrderPlaced'").unwrap();
+        let r = ex
+            .execute("SELECT * FROM READ MODEL placed_orders")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s119_drop_read_model() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE READ MODEL m FROM EVENTS OF t WHERE event_type = 'e'")
+            .unwrap();
+        let r = ex.execute("DROP READ MODEL m").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s119_read_model_filter() {
+        let (ex, _dir) = setup();
+        ex.execute("APPEND EVENT TO orders TYPE 'A' PAYLOAD '{}'")
+            .unwrap();
+        ex.execute("APPEND EVENT TO orders TYPE 'B' PAYLOAD '{}'")
+            .unwrap();
+        ex.execute("APPEND EVENT TO orders TYPE 'A' PAYLOAD '{}'")
+            .unwrap();
+        ex.execute("CREATE READ MODEL model_a FROM EVENTS OF orders WHERE event_type = 'A'")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM READ MODEL model_a").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s119_unknown_model_empty() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SELECT * FROM READ MODEL no_such_model")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S120 — Time-travel queries ───────────────────────────────────────────
+    #[test]
+    fn test_s120_snapshot_table() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        let r = ex.execute("SNAPSHOT TABLE t").unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+        let log = ex.time_travel_log.lock().unwrap();
+        assert!(log.contains_key("t"));
+    }
+
+    #[test]
+    fn test_s120_as_of_returns_snapshot() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 42)").unwrap();
+        ex.execute("SNAPSHOT TABLE t").unwrap();
+        let r = ex
+            .execute("SELECT * FROM t AS OF TIMESTAMP 99999999999999")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s120_no_snapshots() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM t AS OF TIMESTAMP 0").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s120_snapshot_empty_table() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64)").unwrap();
+        let r = ex.execute("SNAPSHOT TABLE t").unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+    }
+
+    #[test]
+    fn test_s120_multiple_snapshots_closest() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64)").unwrap();
+        ex.execute("SNAPSHOT TABLE t").unwrap();
+        ex.execute("SNAPSHOT TABLE t").unwrap();
+        let log = ex.time_travel_log.lock().unwrap();
+        assert_eq!(log.get("t").unwrap().len(), 2);
+    }
+
+    // ── S121 — Change Data Feed ──────────────────────────────────────────────
+    #[test]
+    fn test_s121_enable_change_feed() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ENABLE CHANGE FEED ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        assert!(ex.change_feed_enabled.lock().unwrap().contains("orders"));
+    }
+
+    #[test]
+    fn test_s121_disable_change_feed() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE CHANGE FEED ON orders").unwrap();
+        let r = ex.execute("DISABLE CHANGE FEED ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        assert!(!ex.change_feed_enabled.lock().unwrap().contains("orders"));
+    }
+
+    #[test]
+    fn test_s121_insert_captured() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE orders (pk U64, amount U64)")
+            .unwrap();
+        ex.execute("ENABLE CHANGE FEED ON orders").unwrap();
+        ex.execute("INSERT INTO orders (pk, amount) VALUES (1, 100)")
+            .unwrap();
+        let feed = ex.change_feed.lock().unwrap();
+        let entries = feed.get("orders").unwrap();
+        assert!(!entries.is_empty());
+        assert_eq!(entries[0].0, "INSERT");
+    }
+
+    #[test]
+    fn test_s121_select_changes() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE orders (pk U64, amount U64)")
+            .unwrap();
+        ex.execute("ENABLE CHANGE FEED ON orders").unwrap();
+        ex.execute("INSERT INTO orders (pk, amount) VALUES (1, 100)")
+            .unwrap();
+        let r = ex.execute("SELECT * FROM CHANGES OF orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s121_disabled_not_captured() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE orders (pk U64, amount U64)")
+            .unwrap();
+        ex.execute("INSERT INTO orders (pk, amount) VALUES (1, 100)")
+            .unwrap();
+        let feed = ex.change_feed.lock().unwrap();
+        assert!(!feed.contains_key("orders"));
+    }
+
+    // ── S122 — Bloom filter index ────────────────────────────────────────────
+    #[test]
+    fn test_s122_create_bloom_index() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, name U64)").unwrap();
+        let r = ex
+            .execute("CREATE BLOOM INDEX idx_name ON t(name)")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+        assert!(ex.bloom_indexes.lock().unwrap().contains_key("idx_name"));
+    }
+
+    #[test]
+    fn test_s122_drop_bloom_index() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, name U64)").unwrap();
+        ex.execute("CREATE BLOOM INDEX idx_name ON t(name)")
+            .unwrap();
+        let r = ex.execute("DROP BLOOM INDEX idx_name").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+        assert!(!ex.bloom_indexes.lock().unwrap().contains_key("idx_name"));
+    }
+
+    #[test]
+    fn test_s122_bloom_match_miss() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("CREATE BLOOM INDEX idx ON t(val)").unwrap();
+        let r = ex
+            .execute("SELECT * FROM t WHERE val BLOOM_MATCH 'nothere'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s122_bloom_match_hit() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 42)")
+            .unwrap();
+        // seed bloom index after insert
+        ex.execute("CREATE BLOOM INDEX idx ON t(val)").unwrap();
+        let r = ex
+            .execute("SELECT * FROM t WHERE val BLOOM_MATCH '42'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s122_bloom_index_seeded() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 99)")
+            .unwrap();
+        ex.execute("CREATE BLOOM INDEX idx ON t(val)").unwrap();
+        let idxs = ex.bloom_indexes.lock().unwrap();
+        let (_, _, vals) = idxs.get("idx").unwrap();
+        assert!(vals.contains("99"));
+    }
+
+    // ── S123 — Columnar storage hint ─────────────────────────────────────────
+    #[test]
+    fn test_s123_store_columnar() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ALTER TABLE t STORE COLUMNAR").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        assert!(ex.columnar_tables.lock().unwrap().contains("t"));
+    }
+
+    #[test]
+    fn test_s123_store_row() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE t STORE COLUMNAR").unwrap();
+        let r = ex.execute("ALTER TABLE t STORE ROW").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        assert!(!ex.columnar_tables.lock().unwrap().contains("t"));
+    }
+
+    #[test]
+    fn test_s123_show_storage_columnar() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE t STORE COLUMNAR").unwrap();
+        let r = ex.execute("SHOW STORAGE FORMAT FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(ref s) if s == "COLUMNAR"));
+    }
+
+    #[test]
+    fn test_s123_show_storage_row_default() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW STORAGE FORMAT FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(ref s) if s == "ROW"));
+    }
+
+    #[test]
+    fn test_s123_toggle_storage() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE t STORE COLUMNAR").unwrap();
+        ex.execute("ALTER TABLE t STORE ROW").unwrap();
+        let r = ex.execute("SHOW STORAGE FORMAT FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(ref s) if s == "ROW"));
+    }
+
+    // ── S124 — Adaptive query execution ──────────────────────────────────────
+    #[test]
+    fn test_s124_aqe_default_on() {
+        let (ex, _dir) = setup();
+        assert!(*ex.aqe_enabled.lock().unwrap());
+    }
+
+    #[test]
+    fn test_s124_aqe_off() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET ADAPTIVE QUERY EXECUTION OFF").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        assert!(!*ex.aqe_enabled.lock().unwrap());
+    }
+
+    #[test]
+    fn test_s124_aqe_on() {
+        let (ex, _dir) = setup();
+        ex.execute("SET ADAPTIVE QUERY EXECUTION OFF").unwrap();
+        ex.execute("SET ADAPTIVE QUERY EXECUTION ON").unwrap();
+        assert!(*ex.aqe_enabled.lock().unwrap());
+    }
+
+    #[test]
+    fn test_s124_show_aqe_status_enabled() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW AQE STATUS").unwrap();
+        if let QueryResult::Ok(s) = r {
+            assert!(s.contains("enabled"));
+        } else {
+            panic!("expected Ok");
+        }
+    }
+
+    #[test]
+    fn test_s124_show_aqe_status_disabled() {
+        let (ex, _dir) = setup();
+        ex.execute("SET ADAPTIVE QUERY EXECUTION OFF").unwrap();
+        let r = ex.execute("SHOW AQE STATUS").unwrap();
+        if let QueryResult::Ok(s) = r {
+            assert!(s.contains("disabled"));
+        } else {
+            panic!("expected Ok");
+        }
+    }
+
+    // ── S125 — Query result streaming ────────────────────────────────────────
+    #[test]
+    fn test_s125_default_chunk_size() {
+        let (ex, _dir) = setup();
+        assert_eq!(*ex.stream_chunk_size.lock().unwrap(), 100);
+    }
+
+    #[test]
+    fn test_s125_set_chunk_size() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET STREAM CHUNK SIZE 50").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)));
+        assert_eq!(*ex.stream_chunk_size.lock().unwrap(), 50);
+    }
+
+    #[test]
+    fn test_s125_show_stream_config() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STREAM CHUNK SIZE 25").unwrap();
+        let r = ex.execute("SHOW STREAM CONFIG").unwrap();
+        if let QueryResult::Ok(s) = r {
+            assert!(s.contains("25"));
+        } else {
+            panic!("expected Ok");
+        }
+    }
+
+    #[test]
+    fn test_s125_stream_select_empty() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64)").unwrap();
+        let r = ex.execute("STREAM SELECT * FROM t").unwrap();
+        if let QueryResult::Ok(s) = r {
+            assert!(s.starts_with("STREAM:"));
+            assert!(s.contains("0 chunks"));
+        } else {
+            panic!("expected Ok");
+        }
+    }
+
+    #[test]
+    fn test_s125_stream_select_with_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64)").unwrap();
+        ex.execute("INSERT INTO t (pk) VALUES (1)").unwrap();
+        ex.execute("SET STREAM CHUNK SIZE 1").unwrap();
+        let r = ex.execute("STREAM SELECT * FROM t").unwrap();
+        if let QueryResult::Ok(s) = r {
+            assert!(s.starts_with("STREAM:"));
+        } else {
+            panic!("expected Ok");
+        }
+    }
+
+    // ── S126 — Geospatial types ──────────────────────────────────────────────
+    #[test]
+    fn test_s126_insert_geo_point() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("INSERT GEO POINT INTO locations(position) VALUES (48.8566, 2.3522)")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+        let geo = ex.geo_columns.lock().unwrap();
+        let point = geo
+            .get("locations")
+            .and_then(|m| m.get("position"))
+            .copied();
+        assert!(point.is_some());
+    }
+
+    #[test]
+    fn test_s126_st_distance_zero() {
+        let (ex, _dir) = setup();
+        ex.execute("INSERT GEO POINT INTO t(c) VALUES (10.0, 20.0)")
+            .unwrap();
+        let r = ex.execute("SELECT ST_DISTANCE(t.c, t.c)").unwrap();
+        if let QueryResult::Ok(s) = r {
+            let dist: f64 = s.parse().unwrap();
+            assert!((dist - 0.0).abs() < 1e-6);
+        } else {
+            panic!("expected Ok");
+        }
+    }
+
+    #[test]
+    fn test_s126_st_distance_nonzero() {
+        let (ex, _dir) = setup();
+        ex.execute("INSERT GEO POINT INTO a(pt) VALUES (0.0, 0.0)")
+            .unwrap();
+        ex.execute("INSERT GEO POINT INTO b(pt) VALUES (3.0, 4.0)")
+            .unwrap();
+        let r = ex.execute("SELECT ST_DISTANCE(a.pt, b.pt)").unwrap();
+        if let QueryResult::Ok(s) = r {
+            let dist: f64 = s.parse().unwrap();
+            assert!((dist - 5.0).abs() < 1e-4);
+        } else {
+            panic!("expected Ok");
+        }
+    }
+
+    #[test]
+    fn test_s126_st_contains_within() {
+        let (ex, _dir) = setup();
+        // Paris lat/lng, search within 1000 km
+        ex.execute("INSERT GEO POINT INTO cities(loc) VALUES (48.8566, 2.3522)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT * FROM cities WHERE ST_CONTAINS(loc, 48.0, 2.0, 1000.0)")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s126_st_contains_outside() {
+        let (ex, _dir) = setup();
+        // Paris lat/lng, search within 1 km from Tokyo coords
+        ex.execute("INSERT GEO POINT INTO cities(loc) VALUES (48.8566, 2.3522)")
+            .unwrap();
+        let r = ex
+            .execute("SELECT * FROM cities WHERE ST_CONTAINS(loc, 35.6762, 139.6503, 1.0)")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    // ── S127 — Cypher-style graph queries ────────────────────────────────────
+    #[test]
+    fn test_s127_create_edge() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+        let edges = ex.graph_edges.lock().unwrap();
+        assert!(!edges.is_empty());
+        assert_eq!(
+            edges[0],
+            ("Alice".to_owned(), "KNOWS".to_owned(), "Bob".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_s127_drop_edge() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        let r = ex.execute("DROP EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+        assert!(ex.graph_edges.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_s127_match_edges() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        ex.execute("CREATE EDGE (Bob)-[:KNOWS]->(Carol)").unwrap();
+        let r = ex
+            .execute("MATCH (a)-[r:KNOWS]->(b) RETURN a, r, b")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s127_match_rel_type_filter() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        ex.execute("CREATE EDGE (Alice)-[:LIKES]->(Carol)").unwrap();
+        let r = ex
+            .execute("MATCH (a)-[r:KNOWS]->(b) RETURN a, r, b")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "KNOWS");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_s127_match_where_filter() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        ex.execute("CREATE EDGE (Carol)-[:KNOWS]->(Dave)").unwrap();
+        let r = ex
+            .execute("MATCH (a)-[r]->(b) WHERE a = 'Alice' RETURN a, r, b")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "Alice");
+        } else {
+            panic!("expected rows");
+        }
     }
 }

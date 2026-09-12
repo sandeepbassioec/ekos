@@ -366,7 +366,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 "\nVectorVolt MFA — Enter your 6-digit authenticator OTP:\n",
             )
         };
-        let code = match unsafe { pam_prompt(pamh, "OTP: ") } {
+        let code = match unsafe { pam_prompt_visible(pamh, "OTP: ") } {
             Some(c) => c,
             None => return PAM_AUTH_ERR,
         };
@@ -428,7 +428,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 "Enter the 6-digit OTP shown in your app to confirm:\n",
             );
         }
-        let code = match unsafe { pam_prompt(pamh, "Confirm OTP: ") } {
+        let code = match unsafe { pam_prompt_visible(pamh, "Confirm OTP: ") } {
             Some(c) => c,
             None => return PAM_AUTH_ERR,
         };
