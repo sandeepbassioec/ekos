@@ -93,26 +93,25 @@ pub fn enroll_totp(username: &str) -> (String, String) {
     (b32, uri)
 }
 
-/// Render a QR code for `data` as a scannable Unicode string.
-/// Each module = "██" (dark) or "  " (light) so pixels are roughly square.
-/// QR spec requires 4-module quiet zone; we use 4 for reliable phone scanning.
+/// Render a QR code using ANSI background colors — works on any terminal color scheme.
+/// Dark module = black bg (\x1b[40m), light module = white bg (\x1b[47m).
+/// Uses ECC Low + 2-module border to keep size small enough to scan on SSH.
 pub fn render_qr_text(data: &str) -> String {
-    let qr = match QrCode::encode_text(data, QrCodeEcc::Medium) {
+    let qr = match QrCode::encode_text(data, QrCodeEcc::Low) {
         Ok(q) => q,
         Err(_) => return String::from("  [QR code unavailable]\n"),
     };
     let size = qr.size();
-    let border = 4;
+    let border = 2;
+    // ANSI: \x1b[40m = black bg, \x1b[47m = white bg, \x1b[0m = reset
+    const DARK: &str = "\x1b[40m  \x1b[0m";
+    const LIGHT: &str = "\x1b[47m  \x1b[0m";
     let mut out = String::new();
     for row in -border..size + border {
         let mut line = String::new();
         for col in -border..size + border {
             let dark = row >= 0 && row < size && col >= 0 && col < size && qr.get_module(col, row);
-            if dark {
-                line.push_str("██");
-            } else {
-                line.push_str("  ");
-            }
+            line.push_str(if dark { DARK } else { LIGHT });
         }
         out.push_str(&line);
         out.push('\n');
