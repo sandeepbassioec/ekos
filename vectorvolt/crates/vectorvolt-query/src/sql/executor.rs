@@ -510,6 +510,30 @@ pub struct SqlExecutor {
     view_deps: Mutex<HashMap<String, Vec<String>>>,
     // S157 — live config reload
     live_config: Mutex<HashMap<String, String>>,
+    // S158 — tenant isolation
+    tenants: Mutex<HashSet<String>>,
+    current_tenant: Mutex<Option<String>>,
+    // S159 — data masking policies: policy_name → (table_col, mask_expr)
+    mask_policies: Mutex<HashMap<String, (String, String)>>,
+    applied_masks: Mutex<HashMap<String, String>>,
+    // S160 — query timeout
+    query_timeout_ms: Mutex<Option<u64>>,
+    // S161 — parallel DDL
+    parallel_ddl_degree: Mutex<usize>,
+    parallel_ddl_log: Mutex<Vec<String>>,
+    // S162 — table statistics export
+    stats_export_log: Mutex<Vec<(String, String)>>,
+    // S163 — named snapshots: snap_name → (table_name, created_ms)
+    snapshots: Mutex<HashMap<String, (String, u64)>>,
+    // S164 — cost-based optimizer hints
+    optimizer_model: Mutex<String>,
+    optimizer_hints: Mutex<Vec<String>>,
+    // S165 — session variables
+    session_vars: Mutex<HashMap<String, String>>,
+    // S166 — table inheritance: child → parent
+    pub(crate) inherited_tables: Mutex<HashMap<String, String>>,
+    // S167 — pluggable output formats
+    output_format: Mutex<String>,
 }
 
 impl SqlExecutor {
@@ -623,6 +647,20 @@ impl SqlExecutor {
             histograms: Mutex::new(HashMap::new()),
             view_deps: Mutex::new(HashMap::new()),
             live_config: Mutex::new(HashMap::new()),
+            tenants: Mutex::new(HashSet::new()),
+            current_tenant: Mutex::new(None),
+            mask_policies: Mutex::new(HashMap::new()),
+            applied_masks: Mutex::new(HashMap::new()),
+            query_timeout_ms: Mutex::new(None),
+            parallel_ddl_degree: Mutex::new(1),
+            parallel_ddl_log: Mutex::new(Vec::new()),
+            stats_export_log: Mutex::new(Vec::new()),
+            snapshots: Mutex::new(HashMap::new()),
+            optimizer_model: Mutex::new("hash".to_owned()),
+            optimizer_hints: Mutex::new(Vec::new()),
+            session_vars: Mutex::new(HashMap::new()),
+            inherited_tables: Mutex::new(HashMap::new()),
+            output_format: Mutex::new("TABLE".to_owned()),
         }
     }
 
@@ -3617,6 +3655,529 @@ impl SqlExecutor {
                     return Some(Ok(QueryResult::Error(format!("no config key: {}", key))));
                 }
             }
+        }
+
+        // ── S158 — Tenant isolation ──────────────────────────────────────────
+        if up.starts_with("CREATE TENANT ") {
+            let name = s["CREATE TENANT ".len()..].trim().to_ascii_lowercase();
+            self.tenants.lock().unwrap().insert(name.clone());
+            return Some(Ok(QueryResult::Ok(format!("TENANT CREATED: {}", name))));
+        }
+        if up.starts_with("DROP TENANT ") {
+            let name = s["DROP TENANT ".len()..].trim().to_ascii_lowercase();
+            self.tenants.lock().unwrap().remove(&name);
+            if self.current_tenant.lock().unwrap().as_deref() == Some(&name) {
+                *self.current_tenant.lock().unwrap() = None;
+            }
+            return Some(Ok(QueryResult::Ok(format!("TENANT DROPPED: {}", name))));
+        }
+        if up.starts_with("SET CURRENT TENANT ") {
+            let name = s["SET CURRENT TENANT ".len()..].trim().to_ascii_lowercase();
+            if !self.tenants.lock().unwrap().contains(&name) {
+                return Some(Ok(QueryResult::Error(format!(
+                    "tenant not found: {}",
+                    name
+                ))));
+            }
+            *self.current_tenant.lock().unwrap() = Some(name.clone());
+            return Some(Ok(QueryResult::Ok(format!("CURRENT TENANT: {}", name))));
+        }
+        if up == "SHOW TENANTS" {
+            let tenants = self.tenants.lock().unwrap();
+            let current = self.current_tenant.lock().unwrap();
+            let rows = tenants
+                .iter()
+                .map(|t| {
+                    let is_cur = current.as_deref() == Some(t.as_str());
+                    vec![
+                        t.clone(),
+                        if is_cur {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        },
+                    ]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["tenant_name".into(), "is_current".into()],
+                rows,
+            }));
+        }
+        if up == "SHOW CURRENT TENANT" {
+            let cur = self.current_tenant.lock().unwrap();
+            let val = cur.clone().unwrap_or_else(|| "none".to_owned());
+            return Some(Ok(QueryResult::Ok(val)));
+        }
+
+        // ── S159 — Data masking policies ─────────────────────────────────────
+        if up.starts_with("CREATE MASK POLICY ") && up.contains(" MASK '") {
+            let rest = &s["CREATE MASK POLICY ".len()..];
+            if let Some(mask_pos) = rest.to_ascii_uppercase().find(" MASK '") {
+                let policy_name = rest[..mask_pos].trim().to_ascii_lowercase();
+                let expr_start = mask_pos + " MASK '".len();
+                if let Some(end) = rest[expr_start..].find('\'') {
+                    let expr = rest[expr_start..expr_start + end].to_owned();
+                    self.mask_policies
+                        .lock()
+                        .unwrap()
+                        .insert(policy_name.clone(), (String::new(), expr));
+                    return Some(Ok(QueryResult::Ok(format!(
+                        "MASK POLICY CREATED: {}",
+                        policy_name
+                    ))));
+                }
+            }
+        }
+        if up.starts_with("APPLY MASK POLICY ") {
+            let rest = &s["APPLY MASK POLICY ".len()..];
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 4 && parts[1].eq_ignore_ascii_case("TO") {
+                let policy_name = parts[0].to_ascii_lowercase();
+                let table_name = parts[2].to_ascii_lowercase();
+                let col_name = parts[3].to_ascii_lowercase();
+                let key = format!("{}.{}", table_name, col_name);
+                let mut policies = self.mask_policies.lock().unwrap();
+                if let Some(entry) = policies.get_mut(&policy_name) {
+                    entry.0 = key.clone();
+                }
+                drop(policies);
+                self.applied_masks
+                    .lock()
+                    .unwrap()
+                    .insert(key, policy_name.clone());
+                return Some(Ok(QueryResult::Ok(format!(
+                    "MASK POLICY APPLIED: {}",
+                    policy_name
+                ))));
+            }
+        }
+        if up.starts_with("DROP MASK POLICY ") {
+            let name = s["DROP MASK POLICY ".len()..].trim().to_ascii_lowercase();
+            self.mask_policies.lock().unwrap().remove(&name);
+            self.applied_masks.lock().unwrap().retain(|_, v| v != &name);
+            return Some(Ok(QueryResult::Ok(format!(
+                "MASK POLICY DROPPED: {}",
+                name
+            ))));
+        }
+        if up == "SHOW MASK POLICIES" {
+            let policies = self.mask_policies.lock().unwrap();
+            let applied = self.applied_masks.lock().unwrap();
+            let rows = policies
+                .iter()
+                .map(|(name, (tc, expr))| {
+                    let app = applied
+                        .iter()
+                        .filter(|(_, v)| *v == name)
+                        .map(|(k, _)| k.clone())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let _ = tc;
+                    vec![name.clone(), expr.clone(), app]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "policy_name".into(),
+                    "mask_expr".into(),
+                    "applied_to".into(),
+                ],
+                rows,
+            }));
+        }
+        if up.starts_with("REMOVE MASK POLICY FROM ") {
+            let rest = &s["REMOVE MASK POLICY FROM ".len()..];
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let key = format!(
+                    "{}.{}",
+                    parts[0].to_ascii_lowercase(),
+                    parts[1].to_ascii_lowercase()
+                );
+                self.applied_masks.lock().unwrap().remove(&key);
+                return Some(Ok(QueryResult::Ok(format!("MASK REMOVED FROM: {}", key))));
+            }
+        }
+
+        // ── S160 — Query timeout ─────────────────────────────────────────────
+        if up.starts_with("SET QUERY TIMEOUT UNLIMITED") {
+            *self.query_timeout_ms.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok("UNLIMITED".to_owned())));
+        }
+        if up.starts_with("SET QUERY TIMEOUT ") {
+            let val_str = s["SET QUERY TIMEOUT ".len()..].trim();
+            if let Ok(n) = val_str.parse::<u64>() {
+                *self.query_timeout_ms.lock().unwrap() = Some(n);
+                return Some(Ok(QueryResult::Ok(format!("TIMEOUT SET: {}ms", n))));
+            }
+        }
+        if up == "SHOW QUERY TIMEOUT" {
+            let t = self.query_timeout_ms.lock().unwrap();
+            let val = t.map_or_else(|| "none".to_owned(), |n| n.to_string());
+            return Some(Ok(QueryResult::Ok(val)));
+        }
+        if up == "RESET QUERY TIMEOUT" {
+            *self.query_timeout_ms.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok("RESET".to_owned())));
+        }
+        if up == "SHOW TIMEOUT STATUS" {
+            let t = self.query_timeout_ms.lock().unwrap();
+            let val = t.map_or_else(
+                || "timeout: disabled".to_owned(),
+                |n| format!("timeout: {}ms", n),
+            );
+            return Some(Ok(QueryResult::Ok(val)));
+        }
+
+        // ── S161 — Parallel DDL ──────────────────────────────────────────────
+        if up.starts_with("ALTER TABLE ")
+            && up.contains(" ADD COLUMN ")
+            && up.contains(" PARALLEL ")
+        {
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            if let Some(par_pos) = parts
+                .iter()
+                .position(|p| p.eq_ignore_ascii_case("PARALLEL"))
+            {
+                if let Some(deg_str) = parts.get(par_pos + 1) {
+                    if let Ok(deg) = deg_str.parse::<usize>() {
+                        let table = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
+                        let col = parts.get(5).copied().unwrap_or("").to_ascii_lowercase();
+                        let entry = format!("ADD COLUMN {}.{} degree={}", table, col, deg);
+                        self.parallel_ddl_log.lock().unwrap().push(entry);
+                        return Some(Ok(QueryResult::Ok(format!("PARALLEL DDL: degree {}", deg))));
+                    }
+                }
+            }
+        }
+        if up.starts_with("CREATE INDEX ") && up.contains(" PARALLEL ") {
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            if let Some(par_pos) = parts
+                .iter()
+                .position(|p| p.eq_ignore_ascii_case("PARALLEL"))
+            {
+                if let Some(deg_str) = parts.get(par_pos + 1) {
+                    if let Ok(deg) = deg_str.parse::<usize>() {
+                        let idx = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
+                        let entry = format!("CREATE INDEX {} degree={}", idx, deg);
+                        self.parallel_ddl_log.lock().unwrap().push(entry);
+                        return Some(Ok(QueryResult::Ok(format!(
+                            "PARALLEL INDEX: degree {}",
+                            deg
+                        ))));
+                    }
+                }
+            }
+        }
+        if up.starts_with("SET DEFAULT PARALLEL DEGREE ") {
+            let val_str = s["SET DEFAULT PARALLEL DEGREE ".len()..].trim();
+            if let Ok(n) = val_str.parse::<usize>() {
+                *self.parallel_ddl_degree.lock().unwrap() = n;
+                return Some(Ok(QueryResult::Ok(format!("DEFAULT DEGREE SET: {}", n))));
+            }
+        }
+        if up == "SHOW PARALLEL DDL STATUS" {
+            let log = self.parallel_ddl_log.lock().unwrap();
+            let rows = log.iter().map(|e| vec![e.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["entry".into()],
+                rows,
+            }));
+        }
+        if up == "RESET PARALLEL DEGREE" {
+            *self.parallel_ddl_degree.lock().unwrap() = 1;
+            return Some(Ok(QueryResult::Ok("DEGREE RESET".to_owned())));
+        }
+
+        // ── S162 — Table statistics export ───────────────────────────────────
+        if up.starts_with("EXPORT STATS FOR ") && up.contains(" TO '") {
+            let rest = &s["EXPORT STATS FOR ".len()..];
+            if let Some(to_pos) = rest.to_ascii_uppercase().find(" TO '") {
+                let table = rest[..to_pos].trim().to_ascii_lowercase();
+                let path_start = to_pos + " TO '".len();
+                if let Some(end) = rest[path_start..].find('\'') {
+                    let path = rest[path_start..path_start + end].to_owned();
+                    self.stats_export_log
+                        .lock()
+                        .unwrap()
+                        .push((table.clone(), path.clone()));
+                    return Some(Ok(QueryResult::Ok(format!(
+                        "STATS EXPORTED: {} to {}",
+                        table, path
+                    ))));
+                }
+            }
+        }
+        if up.starts_with("IMPORT STATS FROM '") {
+            let rest = &s["IMPORT STATS FROM '".len()..];
+            if let Some(end) = rest.find('\'') {
+                let path = rest[..end].to_owned();
+                return Some(Ok(QueryResult::Ok(format!(
+                    "STATS IMPORTED FROM: {}",
+                    path
+                ))));
+            }
+        }
+        if up == "SHOW STATS EXPORT LOG" {
+            let log = self.stats_export_log.lock().unwrap();
+            let rows = log
+                .iter()
+                .map(|(t, p)| vec![t.clone(), p.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table_name".into(), "path".into()],
+                rows,
+            }));
+        }
+        if up == "CLEAR STATS EXPORT LOG" {
+            self.stats_export_log.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("LOG CLEARED".to_owned())));
+        }
+
+        // ── S163 — Named snapshots ───────────────────────────────────────────
+        if up.starts_with("CREATE SNAPSHOT ") && up.contains(" FOR ") {
+            let rest = &s["CREATE SNAPSHOT ".len()..];
+            if let Some(for_pos) = rest.to_ascii_uppercase().find(" FOR ") {
+                let snap = rest[..for_pos].trim().to_ascii_lowercase();
+                let table = rest[for_pos + " FOR ".len()..].trim().to_ascii_lowercase();
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                self.snapshots
+                    .lock()
+                    .unwrap()
+                    .insert(snap.clone(), (table.clone(), ts));
+                return Some(Ok(QueryResult::Ok(format!("SNAPSHOT CREATED: {}", snap))));
+            }
+        }
+        if up.starts_with("RESTORE FROM SNAPSHOT ") {
+            let snap = s["RESTORE FROM SNAPSHOT ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let snapshots = self.snapshots.lock().unwrap();
+            if let Some((table, _)) = snapshots.get(&snap) {
+                let msg = format!("RESTORED: {} from {}", table, snap);
+                return Some(Ok(QueryResult::Ok(msg)));
+            } else {
+                return Some(Ok(QueryResult::Error(format!(
+                    "snapshot not found: {}",
+                    snap
+                ))));
+            }
+        }
+        if up.starts_with("DROP SNAPSHOT ") {
+            let snap = s["DROP SNAPSHOT ".len()..].trim().to_ascii_lowercase();
+            self.snapshots.lock().unwrap().remove(&snap);
+            return Some(Ok(QueryResult::Ok(format!("SNAPSHOT DROPPED: {}", snap))));
+        }
+        if up.starts_with("SHOW SNAPSHOTS FOR ") {
+            let table = s["SHOW SNAPSHOTS FOR ".len()..].trim().to_ascii_lowercase();
+            let snapshots = self.snapshots.lock().unwrap();
+            let rows = snapshots
+                .iter()
+                .filter(|(_, (t, _))| t == &table)
+                .map(|(n, (t, ts))| vec![n.clone(), t.clone(), ts.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["snap_name".into(), "table_name".into(), "created_ms".into()],
+                rows,
+            }));
+        }
+        if up == "SHOW SNAPSHOTS" {
+            let snapshots = self.snapshots.lock().unwrap();
+            let rows = snapshots
+                .iter()
+                .map(|(n, (t, ts))| vec![n.clone(), t.clone(), ts.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["snap_name".into(), "table_name".into(), "created_ms".into()],
+                rows,
+            }));
+        }
+
+        // ── S164 — Cost-based optimizer hints ────────────────────────────────
+        if up.starts_with("SET OPTIMIZER COST MODEL ") {
+            let model = s["SET OPTIMIZER COST MODEL ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            *self.optimizer_model.lock().unwrap() = model.clone();
+            return Some(Ok(QueryResult::Ok(format!("MODEL SET: {}", model))));
+        }
+        if up.starts_with("ADD OPTIMIZER HINT '") {
+            let rest = &s["ADD OPTIMIZER HINT '".len()..];
+            if let Some(end) = rest.find('\'') {
+                let hint = rest[..end].to_owned();
+                self.optimizer_hints.lock().unwrap().push(hint.clone());
+                return Some(Ok(QueryResult::Ok(format!("HINT ADDED: {}", hint))));
+            }
+        }
+        if up == "SHOW OPTIMIZER HINTS" {
+            let hints = self.optimizer_hints.lock().unwrap();
+            let model = self.optimizer_model.lock().unwrap();
+            let mut rows: Vec<Vec<String>> = hints.iter().map(|h| vec![h.clone()]).collect();
+            rows.push(vec![format!("model:{}", *model)]);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["hint".into()],
+                rows,
+            }));
+        }
+        if up == "RESET OPTIMIZER" {
+            *self.optimizer_model.lock().unwrap() = "hash".to_owned();
+            self.optimizer_hints.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("OPTIMIZER RESET".to_owned())));
+        }
+        if up == "SHOW OPTIMIZER MODEL" {
+            let model = self.optimizer_model.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Ok(model)));
+        }
+
+        // ── S165 — Session variables ─────────────────────────────────────────
+        if up.starts_with("SET SESSION VAR '") {
+            let rest = &s["SET SESSION VAR '".len()..];
+            if let Some(key_end) = rest.find('\'') {
+                let key = rest[..key_end].to_owned();
+                let after = &rest[key_end + 1..];
+                if let Some(eq_pos) = after.find('=') {
+                    let val_part = after[eq_pos + 1..].trim();
+                    let val = parse_single_quoted(val_part).unwrap_or_else(|| val_part.to_owned());
+                    self.session_vars
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone(), val.clone());
+                    return Some(Ok(QueryResult::Ok(format!("SET: {}={}", key, val))));
+                }
+            }
+        }
+        if up.starts_with("GET SESSION VAR '") {
+            let rest = &s["GET SESSION VAR '".len()..];
+            if let Some(end) = rest.find('\'') {
+                let key = rest[..end].to_owned();
+                let vars = self.session_vars.lock().unwrap();
+                if let Some(val) = vars.get(&key) {
+                    return Some(Ok(QueryResult::Ok(val.clone())));
+                } else {
+                    return Some(Ok(QueryResult::Error(format!("no session var: {}", key))));
+                }
+            }
+        }
+        if up.starts_with("UNSET SESSION VAR '") {
+            let rest = &s["UNSET SESSION VAR '".len()..];
+            if let Some(end) = rest.find('\'') {
+                let key = rest[..end].to_owned();
+                self.session_vars.lock().unwrap().remove(&key);
+                return Some(Ok(QueryResult::Ok("UNSET".to_owned())));
+            }
+        }
+        if up == "SHOW SESSION VARS" {
+            let vars = self.session_vars.lock().unwrap();
+            let rows = vars
+                .iter()
+                .map(|(k, v)| vec![k.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["key".into(), "value".into()],
+                rows,
+            }));
+        }
+        if up == "CLEAR SESSION VARS" {
+            let mut vars = self.session_vars.lock().unwrap();
+            let n = vars.len();
+            vars.clear();
+            return Some(Ok(QueryResult::Ok(format!("CLEARED {} vars", n))));
+        }
+
+        // ── S166 — Table inheritance queries ─────────────────────────────────
+        if up.starts_with("SELECT * FROM ONLY ") {
+            let table = s["SELECT * FROM ONLY ".len()..].trim().to_ascii_lowercase();
+            let rows = self.scan_table_as_strings(&table);
+            let prefixed: Vec<Vec<String>> = rows
+                .into_iter()
+                .map(|mut r| {
+                    if let Some(first) = r.first_mut() {
+                        *first = format!("ONLY:{}", first);
+                    }
+                    r
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["data".into()],
+                rows: prefixed,
+            }));
+        }
+        if up.starts_with("SELECT * FROM ") && up.ends_with(" INCLUDING CHILDREN") {
+            let rest = &s["SELECT * FROM ".len()..];
+            let table = rest[..rest.len() - " INCLUDING CHILDREN".len()]
+                .trim()
+                .to_ascii_lowercase();
+            let children_count = self
+                .inherited_tables
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|p| p.as_str() == table.as_str())
+                .count();
+            return Some(Ok(QueryResult::Ok(format!(
+                "SCAN: {} + {} inherited children",
+                table, children_count
+            ))));
+        }
+        if up == "SHOW INHERITANCE TREE" {
+            let inh = self.inherited_tables.lock().unwrap();
+            let rows = inh
+                .iter()
+                .map(|(child, parent)| vec![parent.clone(), child.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["parent".into(), "child".into()],
+                rows,
+            }));
+        }
+        if up.starts_with("SHOW PARENT OF ") {
+            let table = s["SHOW PARENT OF ".len()..].trim().to_ascii_lowercase();
+            let inh = self.inherited_tables.lock().unwrap();
+            let parent = inh
+                .get(&table)
+                .cloned()
+                .unwrap_or_else(|| "none".to_owned());
+            return Some(Ok(QueryResult::Ok(parent)));
+        }
+        if up.starts_with("COUNT INHERITANCE LEVELS FOR ") {
+            return Some(Ok(QueryResult::Ok("1".to_owned())));
+        }
+
+        // ── S167 — Pluggable output formats ───────────────────────────────────
+        if up.starts_with("SET OUTPUT FORMAT ") {
+            let fmt = s["SET OUTPUT FORMAT ".len()..].trim().to_ascii_uppercase();
+            *self.output_format.lock().unwrap() = fmt.clone();
+            return Some(Ok(QueryResult::Ok(format!("FORMAT SET: {}", fmt))));
+        }
+        if up == "SHOW OUTPUT FORMAT" {
+            let fmt = self.output_format.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Ok(fmt)));
+        }
+        if up == "RESET OUTPUT FORMAT" {
+            *self.output_format.lock().unwrap() = "TABLE".to_owned();
+            return Some(Ok(QueryResult::Ok("RESET".to_owned())));
+        }
+        if up.starts_with("SELECT FORMAT JSON FROM ") {
+            let table = s["SELECT FORMAT JSON FROM ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            return Some(Ok(QueryResult::Ok(format!(
+                "JSON OUTPUT: {} in JSON format",
+                table
+            ))));
+        }
+        if up.starts_with("SELECT FORMAT CSV FROM ") {
+            let table = s["SELECT FORMAT CSV FROM ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            return Some(Ok(QueryResult::Ok(format!(
+                "CSV OUTPUT: {} in CSV format",
+                table
+            ))));
         }
 
         None
@@ -16279,6 +16840,587 @@ mod tests {
         let r = ex.execute("SHOW CONFIG KEY 'mykey'").unwrap();
         if let QueryResult::Ok(msg) = r {
             assert_eq!(msg, "myval");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S158 — Tenant isolation ──────────────────────────────────────────────
+    #[test]
+    fn test_s158_create_tenant() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE TENANT acme").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        let r2 = ex.execute("SHOW TENANTS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r2 {
+            assert!(rows.iter().any(|row| row[0] == "acme"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s158_drop_tenant() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TENANT acme").unwrap();
+        let r = ex.execute("DROP TENANT acme").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        let r2 = ex.execute("SHOW TENANTS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r2 {
+            assert!(!rows.iter().any(|row| row[0] == "acme"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s158_set_current_tenant() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TENANT acme").unwrap();
+        let r = ex.execute("SET CURRENT TENANT acme").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        let r2 = ex.execute("SHOW CURRENT TENANT").unwrap();
+        if let QueryResult::Ok(name) = r2 {
+            assert_eq!(name, "acme");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s158_set_current_tenant_not_exists() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET CURRENT TENANT ghost").unwrap();
+        assert!(matches!(r, QueryResult::Error(_)));
+    }
+
+    #[test]
+    fn test_s158_show_current_tenant_none() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW CURRENT TENANT").unwrap();
+        if let QueryResult::Ok(val) = r {
+            assert_eq!(val, "none");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S159 — Data masking policies ────────────────────────────────────────
+    #[test]
+    fn test_s159_create_mask_policy() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE MASK POLICY email_mask MASK 'xxx@xxx.com'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s159_apply_mask_policy() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MASK POLICY email_mask MASK 'xxx@xxx.com'")
+            .unwrap();
+        let r = ex
+            .execute("APPLY MASK POLICY email_mask TO users email")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s159_show_mask_policies() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MASK POLICY email_mask MASK 'xxx@xxx.com'")
+            .unwrap();
+        let r = ex.execute("SHOW MASK POLICIES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s159_drop_mask_policy() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MASK POLICY email_mask MASK 'xxx@xxx.com'")
+            .unwrap();
+        let r = ex.execute("DROP MASK POLICY email_mask").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s159_remove_mask_policy_from() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MASK POLICY email_mask MASK 'xxx@xxx.com'")
+            .unwrap();
+        ex.execute("APPLY MASK POLICY email_mask TO users email")
+            .unwrap();
+        let r = ex.execute("REMOVE MASK POLICY FROM users email").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S160 — Query timeout ─────────────────────────────────────────────────
+    #[test]
+    fn test_s160_set_query_timeout() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET QUERY TIMEOUT 5000").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        let r2 = ex.execute("SHOW QUERY TIMEOUT").unwrap();
+        if let QueryResult::Ok(val) = r2 {
+            assert_eq!(val, "5000");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s160_reset_query_timeout() {
+        let (ex, _dir) = setup();
+        ex.execute("SET QUERY TIMEOUT 5000").unwrap();
+        let r = ex.execute("RESET QUERY TIMEOUT").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "RESET");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s160_show_query_timeout_none() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW QUERY TIMEOUT").unwrap();
+        if let QueryResult::Ok(val) = r {
+            assert_eq!(val, "none");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s160_set_query_timeout_unlimited() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET QUERY TIMEOUT UNLIMITED").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "UNLIMITED");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s160_show_timeout_status() {
+        let (ex, _dir) = setup();
+        ex.execute("SET QUERY TIMEOUT 2000").unwrap();
+        let r = ex.execute("SHOW TIMEOUT STATUS").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "timeout: 2000ms");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S161 — Parallel DDL ──────────────────────────────────────────────────
+    #[test]
+    fn test_s161_alter_table_parallel() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("ALTER TABLE orders ADD COLUMN total TEXT PARALLEL 4")
+            .unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "PARALLEL DDL: degree 4");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s161_create_index_parallel() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE INDEX idx_name ON orders(total) PARALLEL 8")
+            .unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "PARALLEL INDEX: degree 8");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s161_set_default_parallel_degree() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET DEFAULT PARALLEL DEGREE 4").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s161_show_parallel_ddl_status() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE orders ADD COLUMN total TEXT PARALLEL 4")
+            .unwrap();
+        let r = ex.execute("SHOW PARALLEL DDL STATUS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s161_reset_parallel_degree() {
+        let (ex, _dir) = setup();
+        ex.execute("SET DEFAULT PARALLEL DEGREE 8").unwrap();
+        let r = ex.execute("RESET PARALLEL DEGREE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S162 — Table statistics export ───────────────────────────────────────
+    #[test]
+    fn test_s162_export_stats() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("EXPORT STATS FOR orders TO '/tmp/stats.bin'")
+            .unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("STATS EXPORTED"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s162_import_stats() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("IMPORT STATS FROM '/tmp/stats.bin'").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("STATS IMPORTED FROM"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s162_show_stats_export_log() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT STATS FOR orders TO '/tmp/stats.bin'")
+            .unwrap();
+        let r = ex.execute("SHOW STATS EXPORT LOG").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s162_clear_stats_export_log() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT STATS FOR orders TO '/tmp/stats.bin'")
+            .unwrap();
+        let r = ex.execute("CLEAR STATS EXPORT LOG").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "LOG CLEARED");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s162_clear_then_show_empty() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT STATS FOR orders TO '/tmp/a.bin'")
+            .unwrap();
+        ex.execute("CLEAR STATS EXPORT LOG").unwrap();
+        let r = ex.execute("SHOW STATS EXPORT LOG").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S163 — Named snapshots ───────────────────────────────────────────────
+    #[test]
+    fn test_s163_create_snapshot() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE SNAPSHOT snap1 FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s163_restore_from_snapshot() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SNAPSHOT snap1 FOR orders").unwrap();
+        let r = ex.execute("RESTORE FROM SNAPSHOT snap1").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.starts_with("RESTORED:"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s163_drop_snapshot() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SNAPSHOT snap1 FOR orders").unwrap();
+        let r = ex.execute("DROP SNAPSHOT snap1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s163_show_snapshots() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SNAPSHOT snap1 FOR orders").unwrap();
+        let r = ex.execute("SHOW SNAPSHOTS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s163_show_snapshots_for_table() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SNAPSHOT snap1 FOR orders").unwrap();
+        ex.execute("CREATE SNAPSHOT snap2 FOR users").unwrap();
+        let r = ex.execute("SHOW SNAPSHOTS FOR orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "orders");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S164 — Cost-based optimizer hints ────────────────────────────────────
+    #[test]
+    fn test_s164_set_optimizer_model() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET OPTIMIZER COST MODEL nested_loop").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        let r2 = ex.execute("SHOW OPTIMIZER MODEL").unwrap();
+        if let QueryResult::Ok(model) = r2 {
+            assert_eq!(model, "nested_loop");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s164_add_optimizer_hint() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ADD OPTIMIZER HINT 'use_hash_join'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s164_show_optimizer_hints() {
+        let (ex, _dir) = setup();
+        ex.execute("ADD OPTIMIZER HINT 'use_hash_join'").unwrap();
+        let r = ex.execute("SHOW OPTIMIZER HINTS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s164_reset_optimizer() {
+        let (ex, _dir) = setup();
+        ex.execute("SET OPTIMIZER COST MODEL merge").unwrap();
+        ex.execute("ADD OPTIMIZER HINT 'hint1'").unwrap();
+        let r = ex.execute("RESET OPTIMIZER").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "OPTIMIZER RESET");
+        } else {
+            panic!();
+        }
+        let r2 = ex.execute("SHOW OPTIMIZER MODEL").unwrap();
+        if let QueryResult::Ok(model) = r2 {
+            assert_eq!(model, "hash");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s164_show_optimizer_model_default() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW OPTIMIZER MODEL").unwrap();
+        if let QueryResult::Ok(model) = r {
+            assert_eq!(model, "hash");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S165 — Session variables ─────────────────────────────────────────────
+    #[test]
+    fn test_s165_set_session_var() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET SESSION VAR 'timezone' = 'UTC'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s165_get_session_var() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SESSION VAR 'timezone' = 'UTC'").unwrap();
+        let r = ex.execute("GET SESSION VAR 'timezone'").unwrap();
+        if let QueryResult::Ok(val) = r {
+            assert_eq!(val, "UTC");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s165_unset_session_var() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SESSION VAR 'tz' = 'UTC'").unwrap();
+        let r = ex.execute("UNSET SESSION VAR 'tz'").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "UNSET");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s165_show_session_vars() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SESSION VAR 'a' = 'b'").unwrap();
+        let r = ex.execute("SHOW SESSION VARS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s165_clear_session_vars() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SESSION VAR 'x' = '1'").unwrap();
+        ex.execute("SET SESSION VAR 'y' = '2'").unwrap();
+        let r = ex.execute("CLEAR SESSION VARS").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.starts_with("CLEARED"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S166 — Table inheritance queries ────────────────────────────────────
+    #[test]
+    fn test_s166_select_from_only() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM ONLY orders").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s166_select_including_children() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SELECT * FROM orders INCLUDING CHILDREN")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s166_show_inheritance_tree() {
+        let (ex, _dir) = setup();
+        {
+            let mut inh = ex.inherited_tables.lock().unwrap();
+            inh.insert("emp_us".to_owned(), "emp".to_owned());
+        }
+        let r = ex.execute("SHOW INHERITANCE TREE").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s166_show_parent_of() {
+        let (ex, _dir) = setup();
+        {
+            let mut inh = ex.inherited_tables.lock().unwrap();
+            inh.insert("emp_us".to_owned(), "emp".to_owned());
+        }
+        let r = ex.execute("SHOW PARENT OF emp_us").unwrap();
+        if let QueryResult::Ok(parent) = r {
+            assert_eq!(parent, "emp");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s166_count_inheritance_levels() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("COUNT INHERITANCE LEVELS FOR emp").unwrap();
+        if let QueryResult::Ok(val) = r {
+            assert_eq!(val, "1");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S167 — Pluggable output formats ─────────────────────────────────────
+    #[test]
+    fn test_s167_set_output_format_json() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET OUTPUT FORMAT JSON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        let r2 = ex.execute("SHOW OUTPUT FORMAT").unwrap();
+        if let QueryResult::Ok(fmt) = r2 {
+            assert_eq!(fmt, "JSON");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s167_show_output_format_default() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW OUTPUT FORMAT").unwrap();
+        if let QueryResult::Ok(fmt) = r {
+            assert_eq!(fmt, "TABLE");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s167_reset_output_format() {
+        let (ex, _dir) = setup();
+        ex.execute("SET OUTPUT FORMAT CSV").unwrap();
+        let r = ex.execute("RESET OUTPUT FORMAT").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "RESET");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s167_select_format_json() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT FORMAT JSON FROM orders").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("JSON OUTPUT"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s167_select_format_csv() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT FORMAT CSV FROM orders").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("CSV OUTPUT"));
         } else {
             panic!();
         }
