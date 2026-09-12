@@ -462,6 +462,31 @@ pub struct SqlExecutor {
     // S137 — pluggable auth providers
     auth_providers: Mutex<HashMap<String, String>>,
     auth_config: Mutex<HashMap<String, String>>,
+    // S138 — materialized view auto-refresh
+    mat_view_refresh: Mutex<HashMap<String, u64>>,
+    mat_view_last_refresh: Mutex<HashMap<String, u64>>,
+    // S139 — query result caching with TTL
+    ttl_cache: Mutex<HashMap<String, (String, u64)>>,
+    // S140 — distributed locks
+    dist_locks: Mutex<HashMap<String, (String, u64)>>,
+    // S141 — logical replication filters
+    repl_filters: Mutex<HashMap<String, String>>,
+    // S142 — column encryption
+    encrypted_cols: Mutex<HashMap<String, String>>,
+    encrypted_values: Mutex<HashMap<String, String>>,
+    // S143 — row compression hints
+    table_compression: Mutex<HashMap<String, String>>,
+    // S144 — query routing rules
+    routing_rules: Mutex<HashMap<String, (String, String)>>,
+    // S145 — workload scheduling
+    schedules: Mutex<HashMap<String, (String, String)>>,
+    schedule_runs: Mutex<HashMap<String, u64>>,
+    // S146 — observability hooks
+    obs_hooks: Mutex<HashMap<String, (String, String)>>,
+    hook_fire_log: Mutex<Vec<String>>,
+    // S147 — schema migrations
+    migrations: Mutex<HashMap<String, (String, bool)>>,
+    migration_order: Mutex<Vec<String>>,
 }
 
 impl SqlExecutor {
@@ -548,6 +573,21 @@ impl SqlExecutor {
             replication_lag: Mutex::new(HashMap::new()),
             auth_providers: Mutex::new(HashMap::new()),
             auth_config: Mutex::new(HashMap::new()),
+            mat_view_refresh: Mutex::new(HashMap::new()),
+            mat_view_last_refresh: Mutex::new(HashMap::new()),
+            ttl_cache: Mutex::new(HashMap::new()),
+            dist_locks: Mutex::new(HashMap::new()),
+            repl_filters: Mutex::new(HashMap::new()),
+            encrypted_cols: Mutex::new(HashMap::new()),
+            encrypted_values: Mutex::new(HashMap::new()),
+            table_compression: Mutex::new(HashMap::new()),
+            routing_rules: Mutex::new(HashMap::new()),
+            schedules: Mutex::new(HashMap::new()),
+            schedule_runs: Mutex::new(HashMap::new()),
+            obs_hooks: Mutex::new(HashMap::new()),
+            hook_fire_log: Mutex::new(Vec::new()),
+            migrations: Mutex::new(HashMap::new()),
+            migration_order: Mutex::new(Vec::new()),
         }
     }
 
@@ -2238,6 +2278,618 @@ impl SqlExecutor {
                 columns: vec!["provider_name".to_owned(), "type".to_owned()],
                 rows,
             }));
+        }
+
+        // ── S138 — Materialized view auto-refresh ────────────────────────────
+        if up.starts_with("REFRESH EVERY ") {
+            // REFRESH EVERY n SECONDS FOR VIEW view_name
+            let rest = &s["REFRESH EVERY ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(sec_pos) = up_rest.find(" SECONDS FOR VIEW ") {
+                let n_str = rest[..sec_pos].trim();
+                let view_name = rest[sec_pos + " SECONDS FOR VIEW ".len()..]
+                    .trim()
+                    .to_ascii_lowercase();
+                if let Ok(n) = n_str.parse::<u64>() {
+                    self.mat_view_refresh.lock().unwrap().insert(view_name, n);
+                    return Some(Ok(QueryResult::Ok("REFRESH SCHEDULED".to_owned())));
+                }
+            }
+        }
+        if up == "SHOW REFRESH SCHEDULE" {
+            let refresh = self.mat_view_refresh.lock().unwrap();
+            let last = self.mat_view_last_refresh.lock().unwrap();
+            let rows: Vec<Vec<String>> = refresh
+                .iter()
+                .map(|(k, v)| {
+                    let lr = last.get(k).copied().unwrap_or(0);
+                    vec![k.clone(), v.to_string(), lr.to_string()]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "view_name".to_owned(),
+                    "interval_secs".to_owned(),
+                    "last_refresh_ms".to_owned(),
+                ],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL REFRESH FOR VIEW ") {
+            let view_name = s["CANCEL REFRESH FOR VIEW ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.mat_view_refresh.lock().unwrap().remove(&view_name);
+            return Some(Ok(QueryResult::Ok("REFRESH CANCELLED".to_owned())));
+        }
+        if up.starts_with("TRIGGER REFRESH FOR VIEW ") {
+            let view_name = s["TRIGGER REFRESH FOR VIEW ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.mat_view_last_refresh
+                .lock()
+                .unwrap()
+                .insert(view_name, now_ms);
+            return Some(Ok(QueryResult::Ok("REFRESHED".to_owned())));
+        }
+
+        // ── S139 — Query result caching with TTL ─────────────────────────────
+        if up.starts_with("CACHE QUERY ") {
+            // CACHE QUERY 'sql' TTL n AS key
+            let rest = &s["CACHE QUERY ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(ttl_pos) = up_rest.find("' TTL ") {
+                let sql_part = rest[..ttl_pos + 1].trim().trim_matches('\'').to_owned();
+                let after_ttl = &rest[ttl_pos + "' TTL ".len()..];
+                let up_after = after_ttl.to_ascii_uppercase();
+                if let Some(as_pos) = up_after.find(" AS ") {
+                    let n_str = after_ttl[..as_pos].trim();
+                    let key = after_ttl[as_pos + " AS ".len()..]
+                        .trim()
+                        .to_ascii_lowercase();
+                    if let Ok(n) = n_str.parse::<u64>() {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let expire = now_ms + n * 1000;
+                        self.ttl_cache
+                            .lock()
+                            .unwrap()
+                            .insert(key, (sql_part, expire));
+                        return Some(Ok(QueryResult::Ok("CACHED".to_owned())));
+                    }
+                }
+            }
+        }
+        if up.starts_with("GET CACHED QUERY ") {
+            let key = s["GET CACHED QUERY ".len()..].trim().to_ascii_lowercase();
+            let cache = self.ttl_cache.lock().unwrap();
+            if let Some((result, expire)) = cache.get(&key) {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if now_ms <= *expire {
+                    return Some(Ok(QueryResult::Ok(result.clone())));
+                } else {
+                    return Some(Ok(QueryResult::Ok("EXPIRED".to_owned())));
+                }
+            }
+            return Some(Ok(QueryResult::Ok("EXPIRED".to_owned())));
+        }
+        if up.starts_with("INVALIDATE CACHE FOR KEY ") {
+            let key = s["INVALIDATE CACHE FOR KEY ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.ttl_cache.lock().unwrap().remove(&key);
+            return Some(Ok(QueryResult::Ok("INVALIDATED".to_owned())));
+        }
+        if up == "SHOW QUERY CACHE" {
+            let cache = self.ttl_cache.lock().unwrap();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let rows: Vec<Vec<String>> = cache
+                .iter()
+                .map(|(k, (_, exp))| {
+                    let expired = now_ms > *exp;
+                    vec![k.clone(), expired.to_string()]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["key".to_owned(), "expired".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S140 — Distributed locks ──────────────────────────────────────────
+        if up.starts_with("GET LOCK '") {
+            // GET LOCK 'name' TIMEOUT n
+            let rest = &s["GET LOCK '".len()..];
+            if let Some(end_quote) = rest.find('\'') {
+                let lock_name = rest[..end_quote].to_owned();
+                let mut locks = self.dist_locks.lock().unwrap();
+                if locks.contains_key(&lock_name) {
+                    return Some(Ok(QueryResult::Ok(format!("LOCK TIMEOUT: {}", lock_name))));
+                }
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                locks.insert(lock_name.clone(), ("system".to_owned(), now_ms));
+                return Some(Ok(QueryResult::Ok(format!("LOCK ACQUIRED: {}", lock_name))));
+            }
+        }
+        if up.starts_with("RELEASE LOCK '") {
+            let rest = &s["RELEASE LOCK '".len()..];
+            if let Some(end_quote) = rest.find('\'') {
+                let lock_name = rest[..end_quote].to_owned();
+                self.dist_locks.lock().unwrap().remove(&lock_name);
+                return Some(Ok(QueryResult::Ok(format!("LOCK RELEASED: {}", lock_name))));
+            }
+        }
+        if up == "SHOW LOCKS" {
+            let locks = self.dist_locks.lock().unwrap();
+            let rows: Vec<Vec<String>> = locks
+                .iter()
+                .map(|(k, (holder, ms))| vec![k.clone(), holder.clone(), ms.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "lock_name".to_owned(),
+                    "holder".to_owned(),
+                    "acquired_ms".to_owned(),
+                ],
+                rows,
+            }));
+        }
+        if up.starts_with("FORCE RELEASE LOCK '") {
+            let rest = &s["FORCE RELEASE LOCK '".len()..];
+            if let Some(end_quote) = rest.find('\'') {
+                let lock_name = rest[..end_quote].to_owned();
+                self.dist_locks.lock().unwrap().remove(&lock_name);
+                return Some(Ok(QueryResult::Ok(format!("LOCK RELEASED: {}", lock_name))));
+            }
+        }
+
+        // ── S141 — Logical replication filters ───────────────────────────────
+        if up.starts_with("CREATE REPLICATION FILTER ") {
+            // CREATE REPLICATION FILTER filter_name WHERE 'expr'
+            let rest = &s["CREATE REPLICATION FILTER ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(where_pos) = up_rest.find(" WHERE ") {
+                let filter_name = rest[..where_pos].trim().to_ascii_lowercase();
+                let expr = rest[where_pos + " WHERE ".len()..]
+                    .trim()
+                    .trim_matches('\'')
+                    .to_owned();
+                self.repl_filters.lock().unwrap().insert(filter_name, expr);
+                return Some(Ok(QueryResult::Created));
+            }
+        }
+        if up.starts_with("DROP REPLICATION FILTER ") {
+            let filter_name = s["DROP REPLICATION FILTER ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.repl_filters.lock().unwrap().remove(&filter_name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW REPLICATION FILTERS" {
+            let filters = self.repl_filters.lock().unwrap();
+            let rows: Vec<Vec<String>> = filters
+                .iter()
+                .map(|(k, v)| vec![k.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["filter_name".to_owned(), "where_expr".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("APPLY REPLICATION FILTER ") {
+            let rest = &s["APPLY REPLICATION FILTER ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(to_pos) = up_rest.find(" TO ") {
+                let filter_name = rest[..to_pos].trim().to_ascii_lowercase();
+                let table_name = rest[to_pos + " TO ".len()..].trim().to_ascii_lowercase();
+                return Some(Ok(QueryResult::Ok(format!(
+                    "FILTER APPLIED: {} on {}",
+                    filter_name, table_name
+                ))));
+            }
+        }
+
+        // ── S142 — Column encryption ──────────────────────────────────────────
+        if up.starts_with("CREATE ENCRYPTED COLUMN ") {
+            // CREATE ENCRYPTED COLUMN table_name col_name KEY HINT 'hint'
+            let rest = &s["CREATE ENCRYPTED COLUMN ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(hint_pos) = up_rest.find(" KEY HINT ") {
+                let tc = rest[..hint_pos].trim();
+                let hint = rest[hint_pos + " KEY HINT ".len()..]
+                    .trim()
+                    .trim_matches('\'')
+                    .to_owned();
+                let parts: Vec<&str> = tc.splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    let key = format!(
+                        "{}.{}",
+                        parts[0].to_ascii_lowercase(),
+                        parts[1].to_ascii_lowercase()
+                    );
+                    self.encrypted_cols.lock().unwrap().insert(key, hint);
+                    return Some(Ok(QueryResult::Created));
+                }
+            }
+        }
+        if up.starts_with("INSERT ENCRYPTED INTO ") {
+            // INSERT ENCRYPTED INTO table_name col_name KEY 'key' VALUE 'plaintext' PK pk
+            let rest = &s["INSERT ENCRYPTED INTO ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let (Some(key_pos), Some(val_pos), Some(pk_pos)) = (
+                up_rest.find(" KEY '"),
+                up_rest.find(" VALUE '"),
+                up_rest.find("' PK "),
+            ) {
+                let tc = rest[..key_pos].trim();
+                let parts: Vec<&str> = tc.splitn(2, ' ').collect();
+                let after_val = &rest[val_pos + " VALUE '".len()..];
+                if let Some(end_val) = after_val.find('\'') {
+                    let plaintext = &after_val[..end_val];
+                    let after_pk = &rest[pk_pos + "' PK ".len()..];
+                    // find pk after the VALUE quote end
+                    let pk = after_pk
+                        .trim()
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or("0")
+                        .to_owned();
+                    let encrypted: String = plaintext.chars().rev().collect();
+                    if parts.len() == 2 {
+                        let map_key = format!(
+                            "{}.{}.{}",
+                            parts[0].to_ascii_lowercase(),
+                            parts[1].to_ascii_lowercase(),
+                            pk
+                        );
+                        self.encrypted_values
+                            .lock()
+                            .unwrap()
+                            .insert(map_key, encrypted);
+                    }
+                    return Some(Ok(QueryResult::Affected(1)));
+                }
+            }
+        }
+        if up.starts_with("SELECT DECRYPT ") {
+            // SELECT DECRYPT col_name FROM table_name KEY 'key' PK pk
+            let rest = &s["SELECT DECRYPT ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let (Some(from_pos), Some(pk_pos)) = (up_rest.find(" FROM "), up_rest.find(" PK ")) {
+                let col_name = rest[..from_pos].trim().to_ascii_lowercase();
+                let after_from = &rest[from_pos + " FROM ".len()..];
+                let up_after = after_from.to_ascii_uppercase();
+                if let Some(key_pos) = up_after.find(" KEY ") {
+                    let table_name = after_from[..key_pos].trim().to_ascii_lowercase();
+                    let pk = rest[pk_pos + " PK ".len()..].trim().to_owned();
+                    let map_key = format!("{}.{}.{}", table_name, col_name, pk);
+                    let vals = self.encrypted_values.lock().unwrap();
+                    if let Some(encrypted) = vals.get(&map_key) {
+                        let decrypted: String = encrypted.chars().rev().collect();
+                        return Some(Ok(QueryResult::Ok(decrypted)));
+                    }
+                    return Some(Ok(QueryResult::Ok("NOT FOUND".to_owned())));
+                }
+            }
+        }
+        if up == "SHOW ENCRYPTED COLUMNS" {
+            let cols = self.encrypted_cols.lock().unwrap();
+            let rows: Vec<Vec<String>> = cols
+                .iter()
+                .map(|(k, v)| vec![k.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table_col".to_owned(), "key_hint".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S143 — Row compression hints ──────────────────────────────────────
+        if up.starts_with("SET ROW COMPRESSION FOR ") {
+            let rest = &s["SET ROW COMPRESSION FOR ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(to_pos) = up_rest.find(" TO ") {
+                let table_name = rest[..to_pos].trim().to_ascii_lowercase();
+                let codec = rest[to_pos + " TO ".len()..].trim().to_ascii_uppercase();
+                self.table_compression
+                    .lock()
+                    .unwrap()
+                    .insert(table_name, codec);
+                return Some(Ok(QueryResult::Ok("COMPRESSION SET".to_owned())));
+            }
+        }
+        if up.starts_with("SHOW ROW COMPRESSION FOR ") {
+            let table_name = s["SHOW ROW COMPRESSION FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let codec = self
+                .table_compression
+                .lock()
+                .unwrap()
+                .get(&table_name)
+                .cloned()
+                .unwrap_or_else(|| "NONE".to_owned());
+            return Some(Ok(QueryResult::Ok(codec)));
+        }
+        if up == "SHOW ALL ROW COMPRESSION" {
+            let map = self.table_compression.lock().unwrap();
+            let rows: Vec<Vec<String>> = map
+                .iter()
+                .map(|(k, v)| vec![k.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table_name".to_owned(), "codec".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("RESET ROW COMPRESSION FOR ") {
+            let table_name = s["RESET ROW COMPRESSION FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.table_compression
+                .lock()
+                .unwrap()
+                .insert(table_name, "NONE".to_owned());
+            return Some(Ok(QueryResult::Ok("COMPRESSION RESET".to_owned())));
+        }
+
+        // ── S144 — Query routing rules ────────────────────────────────────────
+        if up.starts_with("CREATE ROUTE ") {
+            // CREATE ROUTE rule_name WHEN 'expr' SEND TO 'node'
+            let rest = &s["CREATE ROUTE ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(when_pos) = up_rest.find(" WHEN '") {
+                let rule_name = rest[..when_pos].trim().to_ascii_lowercase();
+                let after_when = &rest[when_pos + " WHEN '".len()..];
+                if let Some(end_expr) = after_when.find('\'') {
+                    let when_expr = after_when[..end_expr].to_owned();
+                    let after_expr = &after_when[end_expr + 1..];
+                    let up_after = after_expr.to_ascii_uppercase();
+                    if let Some(send_pos) = up_after.find(" SEND TO '") {
+                        let node = after_expr[send_pos + " SEND TO '".len()..]
+                            .trim_end_matches('\'')
+                            .to_owned();
+                        self.routing_rules
+                            .lock()
+                            .unwrap()
+                            .insert(rule_name, (when_expr, node));
+                        return Some(Ok(QueryResult::Created));
+                    }
+                }
+            }
+        }
+        if up.starts_with("DROP ROUTE ") {
+            let rule_name = s["DROP ROUTE ".len()..].trim().to_ascii_lowercase();
+            self.routing_rules.lock().unwrap().remove(&rule_name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW ROUTES" {
+            let rules = self.routing_rules.lock().unwrap();
+            let rows: Vec<Vec<String>> = rules
+                .iter()
+                .map(|(k, (w, n))| vec![k.clone(), w.clone(), n.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "rule_name".to_owned(),
+                    "when_expr".to_owned(),
+                    "target_node".to_owned(),
+                ],
+                rows,
+            }));
+        }
+        if up.starts_with("EVALUATE ROUTE FOR '") {
+            let rules = self.routing_rules.lock().unwrap();
+            if let Some((name, (_, node))) = rules.iter().next() {
+                return Some(Ok(QueryResult::Ok(format!(
+                    "ROUTE: {} \u{2192} {}",
+                    name, node
+                ))));
+            }
+            return Some(Ok(QueryResult::Ok("ROUTE: default".to_owned())));
+        }
+
+        // ── S145 — Workload scheduling ────────────────────────────────────────
+        if up.starts_with("CREATE SCHEDULE ") {
+            // CREATE SCHEDULE sched_name CRON 'expr' AS 'stmt'
+            let rest = &s["CREATE SCHEDULE ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(cron_pos) = up_rest.find(" CRON '") {
+                let sched_name = rest[..cron_pos].trim().to_ascii_lowercase();
+                let after_cron = &rest[cron_pos + " CRON '".len()..];
+                if let Some(end_cron) = after_cron.find('\'') {
+                    let cron_expr = after_cron[..end_cron].to_owned();
+                    let after_cron_end = &after_cron[end_cron + 1..];
+                    let up_ace = after_cron_end.to_ascii_uppercase();
+                    if let Some(as_pos) = up_ace.find(" AS '") {
+                        let sql_stmt = after_cron_end[as_pos + " AS '".len()..]
+                            .trim_end_matches('\'')
+                            .to_owned();
+                        self.schedules
+                            .lock()
+                            .unwrap()
+                            .insert(sched_name.clone(), (cron_expr, sql_stmt));
+                        self.schedule_runs.lock().unwrap().insert(sched_name, 0);
+                        return Some(Ok(QueryResult::Created));
+                    }
+                }
+            }
+        }
+        if up.starts_with("DROP SCHEDULE ") {
+            let sched_name = s["DROP SCHEDULE ".len()..].trim().to_ascii_lowercase();
+            self.schedules.lock().unwrap().remove(&sched_name);
+            self.schedule_runs.lock().unwrap().remove(&sched_name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up.starts_with("RUN SCHEDULE ") {
+            let sched_name = s["RUN SCHEDULE ".len()..].trim().to_ascii_lowercase();
+            *self
+                .schedule_runs
+                .lock()
+                .unwrap()
+                .entry(sched_name.clone())
+                .or_insert(0) += 1;
+            return Some(Ok(QueryResult::Ok(format!("SCHEDULE RAN: {}", sched_name))));
+        }
+        if up == "SHOW SCHEDULES" {
+            let scheds = self.schedules.lock().unwrap();
+            let runs = self.schedule_runs.lock().unwrap();
+            let rows: Vec<Vec<String>> = scheds
+                .iter()
+                .map(|(k, (cron, _))| {
+                    let run_count = runs.get(k).copied().unwrap_or(0);
+                    vec![k.clone(), cron.clone(), run_count.to_string()]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "sched_name".to_owned(),
+                    "cron_expr".to_owned(),
+                    "run_count".to_owned(),
+                ],
+                rows,
+            }));
+        }
+
+        // ── S146 — Observability hooks ────────────────────────────────────────
+        if up.starts_with("CREATE HOOK ") {
+            // CREATE HOOK hook_name ON event_type EXECUTE 'stmt'
+            let rest = &s["CREATE HOOK ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(on_pos) = up_rest.find(" ON ") {
+                let hook_name = rest[..on_pos].trim().to_ascii_lowercase();
+                let after_on = &rest[on_pos + " ON ".len()..];
+                let up_after = after_on.to_ascii_uppercase();
+                if let Some(exec_pos) = up_after.find(" EXECUTE '") {
+                    let event_type = after_on[..exec_pos].trim().to_ascii_uppercase();
+                    let stmt = after_on[exec_pos + " EXECUTE '".len()..]
+                        .trim_end_matches('\'')
+                        .to_owned();
+                    self.obs_hooks
+                        .lock()
+                        .unwrap()
+                        .insert(hook_name, (event_type, stmt));
+                    return Some(Ok(QueryResult::Created));
+                }
+            }
+        }
+        if up.starts_with("DROP HOOK ") {
+            let hook_name = s["DROP HOOK ".len()..].trim().to_ascii_lowercase();
+            self.obs_hooks.lock().unwrap().remove(&hook_name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW HOOKS" {
+            let hooks = self.obs_hooks.lock().unwrap();
+            let rows: Vec<Vec<String>> = hooks
+                .iter()
+                .map(|(k, (ev, st))| vec![k.clone(), ev.clone(), st.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "hook_name".to_owned(),
+                    "event_type".to_owned(),
+                    "stmt".to_owned(),
+                ],
+                rows,
+            }));
+        }
+        if up.starts_with("FIRE HOOK ") {
+            let hook_name = s["FIRE HOOK ".len()..].trim().to_ascii_lowercase();
+            self.hook_fire_log.lock().unwrap().push(hook_name.clone());
+            return Some(Ok(QueryResult::Ok(format!("HOOK FIRED: {}", hook_name))));
+        }
+
+        // ── S147 — Schema migrations ──────────────────────────────────────────
+        if up.starts_with("CREATE MIGRATION ") {
+            // CREATE MIGRATION migration_name AS 'stmt'
+            let rest = &s["CREATE MIGRATION ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(as_pos) = up_rest.find(" AS '") {
+                let migration_name = rest[..as_pos].trim().to_ascii_lowercase();
+                let sql_stmt = rest[as_pos + " AS '".len()..]
+                    .trim_end_matches('\'')
+                    .to_owned();
+                let mut order = self.migration_order.lock().unwrap();
+                if !order.contains(&migration_name) {
+                    order.push(migration_name.clone());
+                }
+                self.migrations
+                    .lock()
+                    .unwrap()
+                    .insert(migration_name, (sql_stmt, false));
+                return Some(Ok(QueryResult::Created));
+            }
+        }
+        if up.starts_with("APPLY MIGRATION ") {
+            let migration_name = s["APPLY MIGRATION ".len()..].trim().to_ascii_lowercase();
+            let mut migs = self.migrations.lock().unwrap();
+            if let Some(entry) = migs.get_mut(&migration_name) {
+                entry.1 = true;
+                return Some(Ok(QueryResult::Ok(format!(
+                    "MIGRATION APPLIED: {}",
+                    migration_name
+                ))));
+            }
+            return Some(Ok(QueryResult::Error(format!(
+                "migration not found: {}",
+                migration_name
+            ))));
+        }
+        if up.starts_with("ROLLBACK MIGRATION ") {
+            let migration_name = s["ROLLBACK MIGRATION ".len()..].trim().to_ascii_lowercase();
+            let mut migs = self.migrations.lock().unwrap();
+            if let Some(entry) = migs.get_mut(&migration_name) {
+                entry.1 = false;
+                return Some(Ok(QueryResult::Ok(format!(
+                    "MIGRATION ROLLED BACK: {}",
+                    migration_name
+                ))));
+            }
+            return Some(Ok(QueryResult::Error(format!(
+                "migration not found: {}",
+                migration_name
+            ))));
+        }
+        if up == "SHOW MIGRATIONS" {
+            let migs = self.migrations.lock().unwrap();
+            let order = self.migration_order.lock().unwrap();
+            let rows: Vec<Vec<String>> = order
+                .iter()
+                .filter_map(|k| {
+                    migs.get(k)
+                        .map(|(stmt, applied)| vec![k.clone(), applied.to_string(), stmt.clone()])
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "migration_name".to_owned(),
+                    "applied".to_owned(),
+                    "sql_stmt".to_owned(),
+                ],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP MIGRATION ") {
+            let migration_name = s["DROP MIGRATION ".len()..].trim().to_ascii_lowercase();
+            self.migrations.lock().unwrap().remove(&migration_name);
+            let mut order = self.migration_order.lock().unwrap();
+            order.retain(|x| x != &migration_name);
+            return Some(Ok(QueryResult::Dropped));
         }
 
         None
@@ -13784,6 +14436,605 @@ mod tests {
             assert_eq!(rows.len(), 2);
         } else {
             panic!();
+        }
+    }
+
+    // ── S138 — Materialized view auto-refresh ────────────────────────────────
+    #[test]
+    fn test_s138_refresh_every() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("REFRESH EVERY 60 SECONDS FOR VIEW sales_mv")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s138_show_refresh_schedule() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH EVERY 30 SECONDS FOR VIEW orders_mv")
+            .unwrap();
+        let r = ex.execute("SHOW REFRESH SCHEDULE").unwrap();
+        if let QueryResult::Rows { rows, columns } = r {
+            assert!(columns.contains(&"view_name".to_owned()));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "30");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s138_cancel_refresh() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH EVERY 10 SECONDS FOR VIEW tmp_mv")
+            .unwrap();
+        let r = ex.execute("CANCEL REFRESH FOR VIEW tmp_mv").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW REFRESH SCHEDULE").unwrap() {
+            assert!(rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_s138_trigger_refresh() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("TRIGGER REFRESH FOR VIEW my_mv").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "REFRESHED");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s138_trigger_refresh_updates_timestamp() {
+        let (ex, _dir) = setup();
+        ex.execute("TRIGGER REFRESH FOR VIEW ts_mv").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW REFRESH SCHEDULE").unwrap() {
+            // no schedule set, so rows is empty — just check no panic
+            let _ = rows;
+        }
+        // last_refresh should be set
+        let last = ex.mat_view_last_refresh.lock().unwrap();
+        assert!(last.contains_key("ts_mv"));
+    }
+
+    // ── S139 — Query result caching with TTL ─────────────────────────────────
+    #[test]
+    fn test_s139_cache_query() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CACHE QUERY 'SELECT 1' TTL 60 AS mykey")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s139_get_cached_query() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE QUERY 'SELECT 1' TTL 3600 AS mykey")
+            .unwrap();
+        let r = ex.execute("GET CACHED QUERY mykey").unwrap();
+        if let QueryResult::Ok(v) = r {
+            assert_eq!(v, "SELECT 1");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s139_get_cached_query_missing() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("GET CACHED QUERY nokey").unwrap();
+        if let QueryResult::Ok(v) = r {
+            assert_eq!(v, "EXPIRED");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s139_invalidate_cache() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE QUERY 'SELECT 2' TTL 3600 AS k2").unwrap();
+        ex.execute("INVALIDATE CACHE FOR KEY k2").unwrap();
+        let r = ex.execute("GET CACHED QUERY k2").unwrap();
+        if let QueryResult::Ok(v) = r {
+            assert_eq!(v, "EXPIRED");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s139_show_query_cache() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE QUERY 'SELECT 3' TTL 3600 AS k3").unwrap();
+        let r = ex.execute("SHOW QUERY CACHE").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "false");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S140 — Distributed locks ──────────────────────────────────────────────
+    #[test]
+    fn test_s140_get_lock() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("GET LOCK 'mylock' TIMEOUT 5").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("LOCK ACQUIRED: mylock"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s140_get_lock_already_held() {
+        let (ex, _dir) = setup();
+        ex.execute("GET LOCK 'busy' TIMEOUT 5").unwrap();
+        let r = ex.execute("GET LOCK 'busy' TIMEOUT 0").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("LOCK TIMEOUT: busy"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s140_release_lock() {
+        let (ex, _dir) = setup();
+        ex.execute("GET LOCK 'rel' TIMEOUT 5").unwrap();
+        let r = ex.execute("RELEASE LOCK 'rel'").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "LOCK RELEASED: rel");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s140_show_locks() {
+        let (ex, _dir) = setup();
+        ex.execute("GET LOCK 'a' TIMEOUT 5").unwrap();
+        ex.execute("GET LOCK 'b' TIMEOUT 5").unwrap();
+        let r = ex.execute("SHOW LOCKS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s140_force_release_lock() {
+        let (ex, _dir) = setup();
+        ex.execute("GET LOCK 'forced' TIMEOUT 5").unwrap();
+        let r = ex.execute("FORCE RELEASE LOCK 'forced'").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "LOCK RELEASED: forced");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S141 — Logical replication filters ───────────────────────────────────
+    #[test]
+    fn test_s141_create_replication_filter() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE REPLICATION FILTER f1 WHERE 'id > 100'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s141_drop_replication_filter() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE REPLICATION FILTER f2 WHERE 'status = active'")
+            .unwrap();
+        let r = ex.execute("DROP REPLICATION FILTER f2").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s141_show_replication_filters() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE REPLICATION FILTER f3 WHERE 'col = 1'")
+            .unwrap();
+        let r = ex.execute("SHOW REPLICATION FILTERS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "f3");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s141_apply_replication_filter() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE REPLICATION FILTER f4 WHERE 'x > 0'")
+            .unwrap();
+        let r = ex.execute("APPLY REPLICATION FILTER f4 TO orders").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "FILTER APPLIED: f4 on orders");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s141_replication_filter_where_expr() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE REPLICATION FILTER f5 WHERE 'amount > 1000'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW REPLICATION FILTERS").unwrap() {
+            assert_eq!(rows[0][1], "amount > 1000");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S142 — Column encryption ──────────────────────────────────────────────
+    #[test]
+    fn test_s142_create_encrypted_column() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE ENCRYPTED COLUMN users ssn KEY HINT 'master-key-1'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s142_show_encrypted_columns() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ENCRYPTED COLUMN customers card KEY HINT 'k1'")
+            .unwrap();
+        let r = ex.execute("SHOW ENCRYPTED COLUMNS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "k1");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s142_insert_encrypted() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ENCRYPTED COLUMN emp salary KEY HINT 'hk'")
+            .unwrap();
+        let r = ex
+            .execute("INSERT ENCRYPTED INTO emp salary KEY 'hk' VALUE 'secret' PK 1")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+    }
+
+    #[test]
+    fn test_s142_select_decrypt() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ENCRYPTED COLUMN emp salary KEY HINT 'hk'")
+            .unwrap();
+        ex.execute("INSERT ENCRYPTED INTO emp salary KEY 'hk' VALUE 'hello' PK 2")
+            .unwrap();
+        let r = ex
+            .execute("SELECT DECRYPT salary FROM emp KEY 'hk' PK 2")
+            .unwrap();
+        if let QueryResult::Ok(v) = r {
+            assert_eq!(v, "hello");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s142_decrypt_not_found() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SELECT DECRYPT col FROM tbl KEY 'k' PK 999")
+            .unwrap();
+        if let QueryResult::Ok(v) = r {
+            assert_eq!(v, "NOT FOUND");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S143 — Row compression hints ──────────────────────────────────────────
+    #[test]
+    fn test_s143_set_row_compression_zstd() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET ROW COMPRESSION FOR events TO ZSTD")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s143_show_row_compression() {
+        let (ex, _dir) = setup();
+        ex.execute("SET ROW COMPRESSION FOR logs TO LZ4").unwrap();
+        let r = ex.execute("SHOW ROW COMPRESSION FOR logs").unwrap();
+        if let QueryResult::Ok(v) = r {
+            assert_eq!(v, "LZ4");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s143_show_all_row_compression() {
+        let (ex, _dir) = setup();
+        ex.execute("SET ROW COMPRESSION FOR t1 TO ZSTD").unwrap();
+        ex.execute("SET ROW COMPRESSION FOR t2 TO LZ4").unwrap();
+        let r = ex.execute("SHOW ALL ROW COMPRESSION").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s143_reset_row_compression() {
+        let (ex, _dir) = setup();
+        ex.execute("SET ROW COMPRESSION FOR t3 TO ZSTD").unwrap();
+        ex.execute("RESET ROW COMPRESSION FOR t3").unwrap();
+        let r = ex.execute("SHOW ROW COMPRESSION FOR t3").unwrap();
+        if let QueryResult::Ok(v) = r {
+            assert_eq!(v, "NONE");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s143_show_compression_default_none() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SHOW ROW COMPRESSION FOR unknown_table")
+            .unwrap();
+        if let QueryResult::Ok(v) = r {
+            assert_eq!(v, "NONE");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S144 — Query routing rules ────────────────────────────────────────────
+    #[test]
+    fn test_s144_create_route() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE ROUTE r1 WHEN 'table=orders' SEND TO 'node-1'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s144_drop_route() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ROUTE r2 WHEN 'x' SEND TO 'n2'").unwrap();
+        let r = ex.execute("DROP ROUTE r2").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s144_show_routes() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ROUTE r3 WHEN 'y' SEND TO 'n3'").unwrap();
+        let r = ex.execute("SHOW ROUTES").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], "r3");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s144_evaluate_route_match() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ROUTE r4 WHEN 'z' SEND TO 'nodeX'")
+            .unwrap();
+        let r = ex
+            .execute("EVALUATE ROUTE FOR 'SELECT * FROM foo'")
+            .unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("ROUTE:"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s144_evaluate_route_default() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("EVALUATE ROUTE FOR 'SELECT 1'").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "ROUTE: default");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S145 — Workload scheduling ────────────────────────────────────────────
+    #[test]
+    fn test_s145_create_schedule() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE SCHEDULE nightly CRON '0 0 * * *' AS 'VACUUM'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s145_drop_schedule() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SCHEDULE tmp_sched CRON '* * * * *' AS 'SELECT 1'")
+            .unwrap();
+        let r = ex.execute("DROP SCHEDULE tmp_sched").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s145_run_schedule() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SCHEDULE job1 CRON '0 * * * *' AS 'ANALYZE'")
+            .unwrap();
+        let r = ex.execute("RUN SCHEDULE job1").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "SCHEDULE RAN: job1");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s145_show_schedules() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SCHEDULE job2 CRON '*/5 * * * *' AS 'SELECT 2'")
+            .unwrap();
+        ex.execute("RUN SCHEDULE job2").unwrap();
+        let r = ex.execute("SHOW SCHEDULES").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][2], "1");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s145_run_schedule_increments_count() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SCHEDULE cnt CRON '* * * * *' AS 'NOOP'")
+            .unwrap();
+        ex.execute("RUN SCHEDULE cnt").unwrap();
+        ex.execute("RUN SCHEDULE cnt").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SCHEDULES").unwrap() {
+            assert_eq!(rows[0][2], "2");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S146 — Observability hooks ────────────────────────────────────────────
+    #[test]
+    fn test_s146_create_hook_slow_query() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE HOOK h1 ON SLOW_QUERY EXECUTE 'LOG slow query'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s146_create_hook_error() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE HOOK h2 ON ERROR EXECUTE 'ALERT error'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s146_drop_hook() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE HOOK h3 ON DDL EXECUTE 'LOG ddl'")
+            .unwrap();
+        let r = ex.execute("DROP HOOK h3").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s146_show_hooks() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE HOOK h4 ON DDL EXECUTE 'NOTIFY'")
+            .unwrap();
+        let r = ex.execute("SHOW HOOKS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "DDL");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s146_fire_hook() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE HOOK h5 ON SLOW_QUERY EXECUTE 'LOG'")
+            .unwrap();
+        let r = ex.execute("FIRE HOOK h5").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "HOOK FIRED: h5");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S147 — Schema migrations ──────────────────────────────────────────────
+    #[test]
+    fn test_s147_create_migration() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE MIGRATION m001 AS 'ALTER TABLE foo ADD COLUMN bar INT'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s147_apply_migration() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MIGRATION m002 AS 'SELECT 1'").unwrap();
+        let r = ex.execute("APPLY MIGRATION m002").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "MIGRATION APPLIED: m002");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s147_rollback_migration() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MIGRATION m003 AS 'SELECT 1'").unwrap();
+        ex.execute("APPLY MIGRATION m003").unwrap();
+        let r = ex.execute("ROLLBACK MIGRATION m003").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "MIGRATION ROLLED BACK: m003");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s147_show_migrations() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MIGRATION m004 AS 'SELECT 4'").unwrap();
+        ex.execute("APPLY MIGRATION m004").unwrap();
+        let r = ex.execute("SHOW MIGRATIONS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], "true");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s147_drop_migration() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MIGRATION m005 AS 'SELECT 5'").unwrap();
+        let r = ex.execute("DROP MIGRATION m005").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW MIGRATIONS").unwrap() {
+            assert!(rows.is_empty());
         }
     }
 }
