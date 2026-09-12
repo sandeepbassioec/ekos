@@ -84,8 +84,8 @@ pub fn enroll_totp(username: &str) -> (String, String) {
         1,
         30,
         secret.to_bytes().unwrap(),
-        None,
-        format!("VectorVolt:{}", username),
+        Some("VectorVolt".to_owned()),
+        username.to_owned(),
     )
     .unwrap();
     let uri = totp.get_url();
