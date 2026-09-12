@@ -3,10 +3,14 @@
 //! Real PAM calling convention:
 //!   int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
 //! We get the username via pam_get_user() from the handle.
+//!
+//! TOTP enrollment: run `vv-pam-enroll <username>` to generate a secret + QR URI.
+//! Secrets stored in /etc/vectorvolt/totp/<username>.secret (base32).
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CStr};
 use std::sync::{Mutex, OnceLock};
+use totp_rs::{Algorithm, Secret, TOTP};
 
 /// Opaque PAM handle type
 #[repr(C)]
@@ -55,6 +59,56 @@ pub fn verify_user(username: &str) -> bool {
     user_store().lock().unwrap().contains_key(username)
 }
 
+// ── TOTP helpers ──────────────────────────────────────────────────────────────
+
+const TOTP_DIR: &str = "/etc/vectorvolt/totp";
+
+/// Load the base32 TOTP secret for a user from disk (if enrolled).
+pub fn load_totp_secret(username: &str) -> Option<String> {
+    let path = format!("{}/{}.secret", TOTP_DIR, username);
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
+}
+
+/// Save a base32 TOTP secret for a user.
+pub fn save_totp_secret(username: &str, secret_b32: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(TOTP_DIR)?;
+    std::fs::write(format!("{}/{}.secret", TOTP_DIR, username), secret_b32)
+}
+
+/// Generate a new TOTP secret + return (base32_secret, otpauth_uri).
+pub fn enroll_totp(username: &str) -> (String, String) {
+    let secret = Secret::generate_secret();
+    let b32 = secret.to_encoded().to_string();
+    let totp = TOTP::new(
+        Algorithm::SHA1, 6, 1, 30,
+        secret.to_bytes().unwrap(),
+    ).unwrap();
+    let uri = totp.get_url(&format!("VectorVolt:{}", username), "VectorVolt");
+    (b32, uri)
+}
+
+/// Verify a TOTP code for a user. Returns true if valid.
+pub fn verify_totp(username: &str, code: &str) -> bool {
+    let b32 = match load_totp_secret(username) {
+        Some(s) => s,
+        None => return true, // no secret enrolled → skip TOTP (password-only mode)
+    };
+    let secret = match Secret::Encoded(b32).to_bytes() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let totp = match TOTP::new(Algorithm::SHA1, 6, 1, 30, secret) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    totp.check_current(code.trim()).unwrap_or(false)
+}
+
+/// Check whether a user has TOTP enrolled.
+pub fn is_totp_enrolled(username: &str) -> bool {
+    load_totp_secret(username).is_some()
+}
+
 /// Register a user in the store (for tests / admin tooling).
 pub fn register_user(username: &str, password: &str) {
     user_store()
@@ -91,11 +145,38 @@ struct PamConv {
 
 pub const PAM_CONV: c_int = 5;
 pub const PAM_TEXT_INFO: c_int = 4;
+pub const PAM_PROMPT_ECHO_OFF: c_int = 1;
 
 use std::ffi::c_void;
 
 unsafe extern "C" {
     fn pam_get_item(pamh: *mut PamHandle, item_type: c_int, item: *mut *const c_void) -> c_int;
+}
+
+/// Prompt the user for input via PAM conversation (no echo — for OTP/password).
+unsafe fn pam_prompt(pamh: *mut PamHandle, prompt: &str) -> Option<String> {
+    let cstr = std::ffi::CString::new(prompt).ok()?;
+    let pam_msg = PamMessage { msg_style: PAM_PROMPT_ECHO_OFF, msg: cstr.as_ptr() };
+    let msg_ptr: *const PamMessage = &pam_msg;
+    let mut msg_arr: *const PamMessage = msg_ptr;
+    let mut resp_ptr: *mut PamResponse = std::ptr::null_mut();
+    let mut conv_ptr: *const c_void = std::ptr::null();
+    let rc = unsafe { pam_get_item(pamh, PAM_CONV, &mut conv_ptr) };
+    if rc != PAM_SUCCESS || conv_ptr.is_null() {
+        return None;
+    }
+    let conv = unsafe { &*(conv_ptr as *const PamConv) };
+    let rc2 = unsafe {
+        (conv.conv)(1, &mut msg_arr as *mut *const PamMessage, &mut resp_ptr, conv.appdata_ptr)
+    };
+    if rc2 != PAM_SUCCESS || resp_ptr.is_null() {
+        return None;
+    }
+    let resp = unsafe { &*resp_ptr };
+    if resp.resp.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(resp.resp) }.to_str().ok().map(|s| s.to_owned())
 }
 
 /// Send a message to the user via PAM conversation function.
@@ -168,11 +249,22 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         Some(u) => u,
         None => return PAM_AUTH_ERR,
     };
-    if verify_user(&username) {
-        PAM_SUCCESS
-    } else {
-        PAM_AUTH_ERR
+    if !verify_user(&username) {
+        return PAM_AUTH_ERR;
     }
+    // TOTP step — only if user has enrolled an authenticator app
+    if is_totp_enrolled(&username) {
+        unsafe { pam_info_msg(pamh, "VectorVolt MFA — Enter your 6-digit OTP: ") };
+        let code = match unsafe { pam_prompt(pamh, "OTP: ") } {
+            Some(c) => c,
+            None => return PAM_AUTH_ERR,
+        };
+        if !verify_totp(&username, &code) {
+            unsafe { pam_info_msg(pamh, "VectorVolt MFA: invalid OTP\n") };
+            return PAM_AUTH_ERR;
+        }
+    }
+    PAM_SUCCESS
 }
 
 /// PAM setcred — required by PAM framework, return success.
