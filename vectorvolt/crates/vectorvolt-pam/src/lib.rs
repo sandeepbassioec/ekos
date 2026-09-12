@@ -7,6 +7,7 @@
 //! TOTP enrollment: run `vv-pam-enroll <username>` to generate a secret + QR URI.
 //! Secrets stored in /etc/vectorvolt/totp/<username>.secret (base32).
 
+use qrcodegen::{QrCode, QrCodeEcc};
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int};
 use std::sync::{Mutex, OnceLock};
@@ -90,6 +91,47 @@ pub fn enroll_totp(username: &str) -> (String, String) {
     .unwrap();
     let uri = totp.get_url();
     (b32, uri)
+}
+
+/// Render a QR code for `data` as a Unicode block-character string.
+/// Uses half-block characters (▀▄█ ) so each pair of rows = 1 terminal line.
+pub fn render_qr_text(data: &str) -> String {
+    let qr = match QrCode::encode_text(data, QrCodeEcc::Medium) {
+        Ok(q) => q,
+        Err(_) => return String::from("  [QR code unavailable]\n"),
+    };
+    let size = qr.size();
+    let border = 2;
+    let mut out = String::new();
+    let total = size + border * 2;
+    let mut row = border * -1;
+    while row < size + border {
+        let mut line = String::from("  ");
+        for col in -border..size + border {
+            let top = if row >= 0 && row < size && col >= 0 && col < size {
+                qr.get_module(col, row)
+            } else {
+                false
+            };
+            let bot = if row + 1 >= 0 && row + 1 < size && col >= 0 && col < size {
+                qr.get_module(col, row + 1)
+            } else {
+                false
+            };
+            let ch = match (top, bot) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            };
+            line.push(ch);
+        }
+        out.push_str(&line);
+        out.push('\n');
+        row += 2;
+    }
+    let _ = total; // suppress unused warning
+    out
 }
 
 /// Verify a TOTP code for a user. Returns true if valid.
@@ -387,15 +429,18 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         unsafe { pam_info_msg(pamh, instructions) };
 
         let (b32, uri) = enroll_totp(&username);
+        let qr = render_qr_text(&uri);
         unsafe {
-            pam_info_msg(pamh, &format!("Secret key (Base32):\n  {}\n\n", b32));
+            pam_info_msg(pamh, "\nScan this QR code with your authenticator app:\n\n");
+            pam_info_msg(pamh, &qr);
             pam_info_msg(
                 pamh,
-                &format!("otpauth URI (scan this or paste into app):\n  {}\n\n", uri),
+                &format!("\nOr enter this secret key manually:\n  {}\n\n", b32),
             );
+            pam_info_msg(pamh, &format!("otpauth URI:\n  {}\n\n", uri));
             pam_info_msg(
                 pamh,
-                "After adding to your app, enter the 6-digit OTP to confirm:\n",
+                "Enter the 6-digit OTP shown in your app to confirm:\n",
             );
         }
         let code = match unsafe { pam_prompt(pamh, "Confirm OTP: ") } {
