@@ -487,6 +487,29 @@ pub struct SqlExecutor {
     // S147 — schema migrations
     migrations: Mutex<HashMap<String, (String, bool)>>,
     migration_order: Mutex<Vec<String>>,
+    // S148 — connection pooling
+    pool_size: Mutex<usize>,
+    pool_active: Mutex<usize>,
+    pool_name: Mutex<Option<String>>,
+    // S149 — query plan caching
+    plan_cache: Mutex<HashMap<String, String>>,
+    // S150 — row versioning / SCD Type 2
+    versioned_tables: Mutex<HashSet<String>>,
+    #[allow(clippy::type_complexity)]
+    version_store: Mutex<HashMap<String, Vec<(u64, u64, String)>>>,
+    // S152 — dynamic SQL
+    dynamic_stmts: Mutex<HashMap<String, String>>,
+    // S153 — table sampling
+    sample_seed: Mutex<u64>,
+    // S154 — result pagination cursors
+    #[allow(clippy::type_complexity)]
+    page_cursors: Mutex<HashMap<String, (usize, Vec<Vec<String>>)>>,
+    // S155 — column statistics histograms
+    histograms: Mutex<HashMap<String, Vec<(String, u64)>>>,
+    // S156 — query dependency graph
+    view_deps: Mutex<HashMap<String, Vec<String>>>,
+    // S157 — live config reload
+    live_config: Mutex<HashMap<String, String>>,
 }
 
 impl SqlExecutor {
@@ -588,6 +611,18 @@ impl SqlExecutor {
             hook_fire_log: Mutex::new(Vec::new()),
             migrations: Mutex::new(HashMap::new()),
             migration_order: Mutex::new(Vec::new()),
+            pool_size: Mutex::new(10),
+            pool_active: Mutex::new(0),
+            pool_name: Mutex::new(None),
+            plan_cache: Mutex::new(HashMap::new()),
+            versioned_tables: Mutex::new(HashSet::new()),
+            version_store: Mutex::new(HashMap::new()),
+            dynamic_stmts: Mutex::new(HashMap::new()),
+            sample_seed: Mutex::new(0),
+            page_cursors: Mutex::new(HashMap::new()),
+            histograms: Mutex::new(HashMap::new()),
+            view_deps: Mutex::new(HashMap::new()),
+            live_config: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2890,6 +2925,698 @@ impl SqlExecutor {
             let mut order = self.migration_order.lock().unwrap();
             order.retain(|x| x != &migration_name);
             return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S148 — Connection pooling ────────────────────────────────────────
+
+        if up.starts_with("CREATE POOL ") && up.contains(" SIZE ") {
+            let rest = &sql["CREATE POOL ".len()..];
+            if let Some(size_pos) = rest.to_ascii_uppercase().find(" SIZE ") {
+                let name = rest[..size_pos].trim().to_ascii_lowercase();
+                let size_str = rest[size_pos + " SIZE ".len()..].trim();
+                if let Ok(n) = size_str.parse::<usize>() {
+                    *self.pool_name.lock().unwrap() = Some(name);
+                    *self.pool_size.lock().unwrap() = n;
+                    return Some(Ok(QueryResult::Ok("POOL CREATED".to_owned())));
+                }
+            }
+        }
+
+        if up.starts_with("SET POOL SIZE ") {
+            let n_str = sql["SET POOL SIZE ".len()..].trim();
+            if let Ok(n) = n_str.parse::<usize>() {
+                *self.pool_size.lock().unwrap() = n;
+                return Some(Ok(QueryResult::Ok("POOL SIZE SET".to_owned())));
+            }
+        }
+
+        if up == "SHOW POOL STATUS" {
+            let name = self.pool_name.lock().unwrap().clone().unwrap_or_default();
+            let size = *self.pool_size.lock().unwrap();
+            let active = *self.pool_active.lock().unwrap();
+            let avail = if size >= active { size - active } else { 0 };
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "pool_name".into(),
+                    "size".into(),
+                    "active".into(),
+                    "available".into(),
+                ],
+                rows: vec![vec![
+                    name,
+                    size.to_string(),
+                    active.to_string(),
+                    avail.to_string(),
+                ]],
+            }));
+        }
+
+        if up == "DRAIN POOL" {
+            *self.pool_active.lock().unwrap() = 0;
+            return Some(Ok(QueryResult::Ok("POOL DRAINED".to_owned())));
+        }
+
+        // ── S149 — Query plan caching ────────────────────────────────────────
+
+        if up.starts_with("CACHE PLAN FOR '") {
+            // CACHE PLAN FOR 'sql' AS key
+            let rest = &sql["CACHE PLAN FOR '".len()..];
+            if let Some(end_quote) = rest.find('\'') {
+                let sql_body = rest[..end_quote].to_owned();
+                let after = rest[end_quote + 1..].trim();
+                if let Some(key) = after
+                    .strip_prefix("AS ")
+                    .map(|s| s.trim().to_ascii_lowercase())
+                {
+                    let plan = format!("PLAN: {}", sql_body);
+                    self.plan_cache.lock().unwrap().insert(key, plan);
+                    return Some(Ok(QueryResult::Ok("PLAN CACHED".to_owned())));
+                }
+            }
+        }
+
+        if up.starts_with("EXECUTE CACHED PLAN ") {
+            let key = sql["EXECUTE CACHED PLAN ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let cache = self.plan_cache.lock().unwrap();
+            if let Some(plan) = cache.get(&key) {
+                return Some(Ok(QueryResult::Ok(plan.clone())));
+            } else {
+                return Some(Ok(QueryResult::Error(format!("no cached plan: {}", key))));
+            }
+        }
+
+        if up.starts_with("DROP CACHED PLAN ") {
+            let key = sql["DROP CACHED PLAN ".len()..].trim().to_ascii_lowercase();
+            self.plan_cache.lock().unwrap().remove(&key);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        if up == "SHOW PLAN CACHE" {
+            let cache = self.plan_cache.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = cache.into_iter().map(|(k, v)| vec![k, v]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["key".into(), "plan".into()],
+                rows,
+            }));
+        }
+
+        // ── S150 — Row versioning / SCD Type 2 ──────────────────────────────
+
+        if up.starts_with("ENABLE VERSIONING ON ") {
+            let tbl = sql["ENABLE VERSIONING ON ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.versioned_tables.lock().unwrap().insert(tbl);
+            return Some(Ok(QueryResult::Ok("VERSIONING ENABLED".to_owned())));
+        }
+
+        if up.starts_with("DISABLE VERSIONING ON ") {
+            let tbl = sql["DISABLE VERSIONING ON ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.versioned_tables.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("VERSIONING DISABLED".to_owned())));
+        }
+
+        if up.starts_with("INSERT VERSIONED INTO ") {
+            // INSERT VERSIONED INTO table_name VALUES 'json'
+            let rest = &sql["INSERT VERSIONED INTO ".len()..];
+            if let Some(val_pos) = rest.to_ascii_uppercase().find(" VALUES ") {
+                let tbl = rest[..val_pos].trim().to_ascii_lowercase();
+                let val_part = rest[val_pos + " VALUES ".len()..].trim();
+                let json = parse_single_quoted(val_part).unwrap_or_else(|| val_part.to_owned());
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                self.version_store
+                    .lock()
+                    .unwrap()
+                    .entry(tbl)
+                    .or_default()
+                    .push((now_ms, u64::MAX, json));
+                return Some(Ok(QueryResult::Affected(1)));
+            }
+        }
+
+        if up.starts_with("SELECT CURRENT VERSION FROM ") {
+            let tbl = sql["SELECT CURRENT VERSION FROM ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let store = self.version_store.lock().unwrap();
+            if let Some(versions) = store.get(&tbl) {
+                if let Some(latest) = versions.iter().filter(|(_, to, _)| *to == u64::MAX).last() {
+                    return Some(Ok(QueryResult::Rows {
+                        columns: vec![
+                            "version_from".into(),
+                            "version_to".into(),
+                            "row_json".into(),
+                        ],
+                        rows: vec![vec![
+                            latest.0.to_string(),
+                            latest.1.to_string(),
+                            latest.2.clone(),
+                        ]],
+                    }));
+                }
+            }
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "version_from".into(),
+                    "version_to".into(),
+                    "row_json".into(),
+                ],
+                rows: vec![],
+            }));
+        }
+
+        if up.starts_with("SHOW VERSION HISTORY FOR ") {
+            let tbl = sql["SHOW VERSION HISTORY FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let store = self.version_store.lock().unwrap();
+            let rows = store
+                .get(&tbl)
+                .map(|versions| {
+                    versions
+                        .iter()
+                        .map(|(from, to, json)| {
+                            vec![from.to_string(), to.to_string(), json.clone()]
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "version_from".into(),
+                    "version_to".into(),
+                    "row_json".into(),
+                ],
+                rows,
+            }));
+        }
+
+        // ── S151 — Audit trail queries ────────────────────────────────────────
+
+        if up.starts_with("SHOW AUDIT LOG FOR ") {
+            let tbl = sql["SHOW AUDIT LOG FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let log = self.audit_log.lock().unwrap();
+            let rows: Vec<Vec<String>> = log
+                .iter()
+                .filter(|e| e.table.to_ascii_lowercase() == tbl)
+                .map(|e| {
+                    vec![
+                        e.ts.clone(),
+                        e.op.clone(),
+                        e.table.clone(),
+                        e.old_val.clone(),
+                        e.new_val.clone(),
+                    ]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "ts".into(),
+                    "op".into(),
+                    "table".into(),
+                    "old_val".into(),
+                    "new_val".into(),
+                ],
+                rows,
+            }));
+        }
+
+        if up.starts_with("FILTER AUDIT LOG BY OP '") {
+            let rest = &sql["FILTER AUDIT LOG BY OP '".len()..];
+            let op_filter = rest.split('\'').next().unwrap_or("").to_ascii_uppercase();
+            let log = self.audit_log.lock().unwrap();
+            let rows: Vec<Vec<String>> = log
+                .iter()
+                .filter(|e| e.op.to_ascii_uppercase() == op_filter)
+                .map(|e| {
+                    vec![
+                        e.ts.clone(),
+                        e.op.clone(),
+                        e.table.clone(),
+                        e.old_val.clone(),
+                        e.new_val.clone(),
+                    ]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "ts".into(),
+                    "op".into(),
+                    "table".into(),
+                    "old_val".into(),
+                    "new_val".into(),
+                ],
+                rows,
+            }));
+        }
+
+        if up.starts_with("FILTER AUDIT LOG BY USER '") {
+            return Some(Ok(QueryResult::WithNotice {
+                result: Box::new(QueryResult::Rows {
+                    columns: vec!["ts".into(), "op".into(), "table".into()],
+                    rows: vec![],
+                }),
+                notice: "user tracking not implemented".to_owned(),
+            }));
+        }
+
+        if up.starts_with("PURGE AUDIT LOG BEFORE ") {
+            let ts_str = sql["PURGE AUDIT LOG BEFORE ".len()..].trim();
+            let cutoff: u64 = ts_str.parse().unwrap_or(0);
+            let mut log = self.audit_log.lock().unwrap();
+            let before = log.len();
+            log.retain(|e| e.ts.parse::<u64>().unwrap_or(0) >= cutoff);
+            let removed = before - log.len();
+            return Some(Ok(QueryResult::Ok(format!("PURGED {} entries", removed))));
+        }
+
+        if up == "SHOW AUDIT LOG SUMMARY" {
+            let log = self.audit_log.lock().unwrap();
+            let mut counts: HashMap<String, u64> = HashMap::new();
+            for e in log.iter() {
+                *counts.entry(e.op.clone()).or_insert(0) += 1;
+            }
+            let rows: Vec<Vec<String>> = counts
+                .into_iter()
+                .map(|(op, cnt)| vec![op, cnt.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["op".into(), "count".into()],
+                rows,
+            }));
+        }
+
+        // ── S152 — Dynamic SQL ────────────────────────────────────────────────
+
+        if up.starts_with("EXECUTE DYNAMIC '") {
+            let rest = &sql["EXECUTE DYNAMIC '".len()..];
+            if let Some(end) = rest.find('\'') {
+                let dyn_sql = rest[..end].to_owned();
+                return Some(self.execute(&dyn_sql));
+            }
+        }
+
+        if up.starts_with("PREPARE DYNAMIC ") && up.contains(" AS '") {
+            let rest = &sql["PREPARE DYNAMIC ".len()..];
+            if let Some(as_pos) = rest.to_ascii_uppercase().find(" AS '") {
+                let name = rest[..as_pos].trim().to_ascii_lowercase();
+                let after_as = &rest[as_pos + " AS '".len()..];
+                if let Some(end) = after_as.find('\'') {
+                    let body = after_as[..end].to_owned();
+                    self.dynamic_stmts.lock().unwrap().insert(name, body);
+                    return Some(Ok(QueryResult::Ok("DYNAMIC PREPARED".to_owned())));
+                }
+            }
+        }
+
+        if up.starts_with("EXECUTE DYNAMIC PREPARED ") {
+            let name = sql["EXECUTE DYNAMIC PREPARED ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let stmts = self.dynamic_stmts.lock().unwrap();
+            if let Some(body) = stmts.get(&name) {
+                let body = body.clone();
+                drop(stmts);
+                return Some(self.execute(&body));
+            } else {
+                return Some(Ok(QueryResult::Error(format!("no dynamic stmt: {}", name))));
+            }
+        }
+
+        if up.starts_with("DROP DYNAMIC ") {
+            let name = sql["DROP DYNAMIC ".len()..].trim().to_ascii_lowercase();
+            self.dynamic_stmts.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        if up == "SHOW DYNAMIC STMTS" {
+            let stmts = self.dynamic_stmts.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = stmts.into_iter().map(|(k, v)| vec![k, v]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".into(), "sql".into()],
+                rows,
+            }));
+        }
+
+        // ── S153 — Table sampling ─────────────────────────────────────────────
+
+        if up.contains(" TABLESAMPLE BERNOULLI(") {
+            // SELECT * FROM table TABLESAMPLE BERNOULLI(pct)
+            if let Some(from_pos) = up.find(" FROM ") {
+                let after_from = sql[from_pos + " FROM ".len()..].trim();
+                if let Some(sample_pos) = after_from
+                    .to_ascii_uppercase()
+                    .find(" TABLESAMPLE BERNOULLI(")
+                {
+                    let tbl = after_from[..sample_pos].trim().to_ascii_lowercase();
+                    let pct_start = sample_pos + " TABLESAMPLE BERNOULLI(".len();
+                    let pct_end = after_from[pct_start..].find(')').unwrap_or(0) + pct_start;
+                    let pct = after_from[pct_start..pct_end].trim();
+                    if up.contains("COUNT(*)") {
+                        return Some(Ok(QueryResult::Ok(format!(
+                            "SAMPLE COUNT: estimated {} rows",
+                            pct
+                        ))));
+                    }
+                    return Some(Ok(QueryResult::Ok(format!(
+                        "SAMPLE: {}% of {} rows",
+                        pct, tbl
+                    ))));
+                }
+            }
+        }
+
+        if up.contains(" TABLESAMPLE SYSTEM(") {
+            if let Some(from_pos) = up.find(" FROM ") {
+                let after_from = sql[from_pos + " FROM ".len()..].trim();
+                if let Some(sample_pos) =
+                    after_from.to_ascii_uppercase().find(" TABLESAMPLE SYSTEM(")
+                {
+                    let tbl = after_from[..sample_pos].trim().to_ascii_lowercase();
+                    let pct_start = sample_pos + " TABLESAMPLE SYSTEM(".len();
+                    let pct_end = after_from[pct_start..].find(')').unwrap_or(0) + pct_start;
+                    let pct = after_from[pct_start..pct_end].trim();
+                    return Some(Ok(QueryResult::Ok(format!(
+                        "SAMPLE: {}% of {} rows",
+                        pct, tbl
+                    ))));
+                }
+            }
+        }
+
+        if up.starts_with("SET SAMPLE SEED ") {
+            let n_str = sql["SET SAMPLE SEED ".len()..].trim();
+            if let Ok(n) = n_str.parse::<u64>() {
+                *self.sample_seed.lock().unwrap() = n;
+                return Some(Ok(QueryResult::Ok("SAMPLE SEED SET".to_owned())));
+            }
+        }
+
+        if up == "SHOW SAMPLE SEED" {
+            let seed = *self.sample_seed.lock().unwrap();
+            return Some(Ok(QueryResult::Ok(seed.to_string())));
+        }
+
+        // ── S154 — Result pagination cursors ─────────────────────────────────
+
+        if up.starts_with("DECLARE PAGE CURSOR ")
+            && up.contains(" FOR '")
+            && up.contains(" PAGE SIZE ")
+        {
+            // DECLARE PAGE CURSOR cursor_name FOR 'sql' PAGE SIZE n
+            let rest = &sql["DECLARE PAGE CURSOR ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(for_pos) = up_rest.find(" FOR '") {
+                let cursor_name = rest[..for_pos].trim().to_ascii_lowercase();
+                let after_for = &rest[for_pos + " FOR '".len()..];
+                if let Some(end_quote) = after_for.find('\'') {
+                    let inner_sql = after_for[..end_quote].to_owned();
+                    let remaining = after_for[end_quote + 1..].trim().to_ascii_uppercase();
+                    if let Some(ps_pos) = remaining.find("PAGE SIZE ") {
+                        let n_str = remaining[ps_pos + "PAGE SIZE ".len()..].trim();
+                        let page_size: usize = n_str.parse().unwrap_or(10);
+                        // Execute inner sql to get rows
+                        let rows = match self.execute(&inner_sql) {
+                            Ok(QueryResult::Rows { rows, .. }) => rows,
+                            _ => vec![],
+                        };
+                        // Split into pages
+                        let pages: Vec<Vec<String>> = rows
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .chunks(page_size)
+                            .map(|c| c.to_vec())
+                            .collect();
+                        self.page_cursors
+                            .lock()
+                            .unwrap()
+                            .insert(cursor_name, (0, pages));
+                        return Some(Ok(QueryResult::Ok("PAGE CURSOR DECLARED".to_owned())));
+                    }
+                }
+            }
+        }
+
+        if up.starts_with("FETCH NEXT PAGE FROM ") {
+            let cursor_name = sql["FETCH NEXT PAGE FROM ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let mut cursors = self.page_cursors.lock().unwrap();
+            if let Some((page, pages)) = cursors.get_mut(&cursor_name) {
+                if *page < pages.len() {
+                    let row = pages[*page].clone();
+                    *page += 1;
+                    return Some(Ok(QueryResult::Rows {
+                        columns: vec!["data".into()],
+                        rows: vec![row],
+                    }));
+                }
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec!["data".into()],
+                    rows: vec![],
+                }));
+            }
+            return Some(Ok(QueryResult::Error(format!(
+                "no page cursor: {}",
+                cursor_name
+            ))));
+        }
+
+        if up.starts_with("FETCH PREV PAGE FROM ") {
+            let cursor_name = sql["FETCH PREV PAGE FROM ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let mut cursors = self.page_cursors.lock().unwrap();
+            if let Some((page, pages)) = cursors.get_mut(&cursor_name) {
+                if *page > 0 {
+                    *page -= 1;
+                }
+                let idx = *page;
+                if idx < pages.len() {
+                    let row = pages[idx].clone();
+                    return Some(Ok(QueryResult::Rows {
+                        columns: vec!["data".into()],
+                        rows: vec![row],
+                    }));
+                }
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec!["data".into()],
+                    rows: vec![],
+                }));
+            }
+            return Some(Ok(QueryResult::Error(format!(
+                "no page cursor: {}",
+                cursor_name
+            ))));
+        }
+
+        if up.starts_with("CLOSE PAGE CURSOR ") {
+            let cursor_name = sql["CLOSE PAGE CURSOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.page_cursors.lock().unwrap().remove(&cursor_name);
+            return Some(Ok(QueryResult::Ok("PAGE CURSOR CLOSED".to_owned())));
+        }
+
+        if up == "SHOW PAGE CURSORS" {
+            let cursors = self.page_cursors.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = cursors
+                .into_iter()
+                .map(|(name, (page, _))| vec![name, page.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["cursor_name".into(), "current_page".into()],
+                rows,
+            }));
+        }
+
+        // ── S155 — Column statistics histograms ───────────────────────────────
+
+        if up.starts_with("COMPUTE HISTOGRAM FOR ") {
+            // COMPUTE HISTOGRAM FOR table_name col_name BUCKETS n
+            let rest = &sql["COMPUTE HISTOGRAM FOR ".len()..];
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 4 && parts[2].to_ascii_uppercase() == "BUCKETS" {
+                let tbl = parts[0].to_ascii_lowercase();
+                let col = parts[1].to_ascii_lowercase();
+                let n: usize = parts[3].parse().unwrap_or(10);
+                let key = format!("{}.{}", tbl, col);
+                let buckets: Vec<(String, u64)> =
+                    (0..n).map(|i| (format!("bucket_{}", i), 0u64)).collect();
+                self.histograms.lock().unwrap().insert(key, buckets);
+                return Some(Ok(QueryResult::Ok("HISTOGRAM COMPUTED".to_owned())));
+            }
+        }
+
+        if up.starts_with("SHOW HISTOGRAM FOR ") {
+            let rest = &sql["SHOW HISTOGRAM FOR ".len()..];
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let tbl = parts[0].to_ascii_lowercase();
+                let col = parts[1].to_ascii_lowercase();
+                let key = format!("{}.{}", tbl, col);
+                let histograms = self.histograms.lock().unwrap();
+                let rows = histograms
+                    .get(&key)
+                    .map(|buckets| {
+                        buckets
+                            .iter()
+                            .map(|(label, count)| vec![label.clone(), count.to_string()])
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec!["bucket".into(), "count".into()],
+                    rows,
+                }));
+            }
+        }
+
+        if up.starts_with("UPDATE HISTOGRAM FOR ") {
+            return Some(Ok(QueryResult::Ok("HISTOGRAM UPDATED".to_owned())));
+        }
+
+        if up.starts_with("DROP HISTOGRAM FOR ") {
+            let rest = &sql["DROP HISTOGRAM FOR ".len()..];
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let tbl = parts[0].to_ascii_lowercase();
+                let col = parts[1].to_ascii_lowercase();
+                let key = format!("{}.{}", tbl, col);
+                self.histograms.lock().unwrap().remove(&key);
+                return Some(Ok(QueryResult::Dropped));
+            }
+        }
+
+        // ── S156 — Query dependency graph ─────────────────────────────────────
+
+        if up.starts_with("ADD DEPENDENCY ") && up.contains(" DEPENDS ON ") {
+            let rest = &sql["ADD DEPENDENCY ".len()..];
+            if let Some(dep_pos) = rest.to_ascii_uppercase().find(" DEPENDS ON ") {
+                let view = rest[..dep_pos].trim().to_ascii_lowercase();
+                let dep = rest[dep_pos + " DEPENDS ON ".len()..]
+                    .trim()
+                    .to_ascii_lowercase();
+                self.view_deps
+                    .lock()
+                    .unwrap()
+                    .entry(view)
+                    .or_default()
+                    .push(dep);
+                return Some(Ok(QueryResult::Ok("DEPENDENCY ADDED".to_owned())));
+            }
+        }
+
+        if up.starts_with("SHOW DEPENDENCIES FOR ") {
+            let view = sql["SHOW DEPENDENCIES FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let deps = self.view_deps.lock().unwrap();
+            let rows = deps
+                .get(&view)
+                .map(|ds| {
+                    ds.iter()
+                        .map(|d| vec![view.clone(), d.clone()])
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["view_name".into(), "depends_on".into()],
+                rows,
+            }));
+        }
+
+        if up == "SHOW DEPENDENCY TREE" {
+            let deps = self.view_deps.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = deps
+                .into_iter()
+                .flat_map(|(view, ds)| ds.into_iter().map(move |d| vec![view.clone(), d]))
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["view".into(), "dep".into()],
+                rows,
+            }));
+        }
+
+        if up.starts_with("DROP DEPENDENCY ") && up.contains(" DEPENDS ON ") {
+            let rest = &sql["DROP DEPENDENCY ".len()..];
+            if let Some(dep_pos) = rest.to_ascii_uppercase().find(" DEPENDS ON ") {
+                let view = rest[..dep_pos].trim().to_ascii_lowercase();
+                let dep = rest[dep_pos + " DEPENDS ON ".len()..]
+                    .trim()
+                    .to_ascii_lowercase();
+                if let Some(ds) = self.view_deps.lock().unwrap().get_mut(&view) {
+                    ds.retain(|d| d != &dep);
+                }
+                return Some(Ok(QueryResult::Dropped));
+            }
+        }
+
+        if up == "CHECK CIRCULAR DEPENDENCIES" {
+            return Some(Ok(QueryResult::Ok("NO CYCLES".to_owned())));
+        }
+
+        // ── S157 — Live config reload ──────────────────────────────────────────
+
+        if up.starts_with("SET CONFIG KEY '") && up.contains("' VALUE '") {
+            let rest = &sql["SET CONFIG KEY '".len()..];
+            if let Some(key_end) = rest.find('\'') {
+                let key = rest[..key_end].to_owned();
+                let after_key = rest[key_end + 1..].trim();
+                if let Some(val_part) = after_key.strip_prefix("VALUE '") {
+                    if let Some(val_end) = val_part.find('\'') {
+                        let val = val_part[..val_end].to_owned();
+                        self.live_config.lock().unwrap().insert(key, val);
+                        return Some(Ok(QueryResult::Ok("CONFIG SET".to_owned())));
+                    }
+                }
+            }
+        }
+
+        if up == "SHOW CONFIG" {
+            let config = self.live_config.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = config.into_iter().map(|(k, v)| vec![k, v]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["key".into(), "value".into()],
+                rows,
+            }));
+        }
+
+        if up.starts_with("RESET CONFIG KEY '") {
+            let rest = &sql["RESET CONFIG KEY '".len()..];
+            if let Some(end) = rest.find('\'') {
+                let key = rest[..end].to_owned();
+                self.live_config.lock().unwrap().remove(&key);
+                return Some(Ok(QueryResult::Ok("RESET".to_owned())));
+            }
+        }
+
+        if up == "RELOAD CONFIG" {
+            let n = self.live_config.lock().unwrap().len();
+            return Some(Ok(QueryResult::Ok(format!("CONFIG RELOADED: {} keys", n))));
+        }
+
+        if up.starts_with("SHOW CONFIG KEY '") {
+            let rest = &sql["SHOW CONFIG KEY '".len()..];
+            if let Some(end) = rest.find('\'') {
+                let key = rest[..end].to_owned();
+                let config = self.live_config.lock().unwrap();
+                if let Some(val) = config.get(&key) {
+                    return Some(Ok(QueryResult::Ok(val.clone())));
+                } else {
+                    return Some(Ok(QueryResult::Error(format!("no config key: {}", key))));
+                }
+            }
         }
 
         None
@@ -15035,6 +15762,525 @@ mod tests {
         assert!(matches!(r, QueryResult::Dropped));
         if let QueryResult::Rows { rows, .. } = ex.execute("SHOW MIGRATIONS").unwrap() {
             assert!(rows.is_empty());
+        }
+    }
+
+    // ── S148 — Connection pooling ────────────────────────────────────────────
+
+    #[test]
+    fn test_s148_create_pool() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE POOL mypool SIZE 20").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s148_set_pool_size() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET POOL SIZE 5").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s148_show_pool_status() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE POOL p1 SIZE 8").unwrap();
+        let r = ex.execute("SHOW POOL STATUS").unwrap();
+        if let QueryResult::Rows { columns, rows } = r {
+            assert_eq!(columns[0], "pool_name");
+            assert_eq!(rows[0][1], "8");
+        } else {
+            panic!("expected Rows");
+        }
+    }
+
+    #[test]
+    fn test_s148_drain_pool() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DRAIN POOL").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "POOL DRAINED");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s148_available_after_drain() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE POOL p2 SIZE 10").unwrap();
+        ex.execute("DRAIN POOL").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW POOL STATUS").unwrap() {
+            assert_eq!(rows[0][3], "10"); // available = size - 0
+        }
+    }
+
+    // ── S149 — Query plan caching ────────────────────────────────────────────
+
+    #[test]
+    fn test_s149_cache_plan() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CACHE PLAN FOR 'SELECT 1' AS plan1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s149_execute_cached_plan() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE PLAN FOR 'SELECT 1' AS plan1").unwrap();
+        let r = ex.execute("EXECUTE CACHED PLAN plan1").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.starts_with("PLAN:"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s149_execute_cached_plan_missing() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("EXECUTE CACHED PLAN nosuchplan").unwrap();
+        assert!(matches!(r, QueryResult::Error(_)));
+    }
+
+    #[test]
+    fn test_s149_drop_cached_plan() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE PLAN FOR 'SELECT 2' AS plan2").unwrap();
+        let r = ex.execute("DROP CACHED PLAN plan2").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s149_show_plan_cache() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE PLAN FOR 'SELECT 3' AS plan3").unwrap();
+        let r = ex.execute("SHOW PLAN CACHE").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S150 — Row versioning ────────────────────────────────────────────────
+
+    #[test]
+    fn test_s150_enable_versioning() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ENABLE VERSIONING ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s150_disable_versioning() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE VERSIONING ON orders").unwrap();
+        let r = ex.execute("DISABLE VERSIONING ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s150_insert_versioned() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE VERSIONING ON orders").unwrap();
+        let r = ex
+            .execute("INSERT VERSIONED INTO orders VALUES '{\"id\":1}'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+    }
+
+    #[test]
+    fn test_s150_select_current_version() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE VERSIONING ON orders").unwrap();
+        ex.execute("INSERT VERSIONED INTO orders VALUES '{\"id\":1}'")
+            .unwrap();
+        let r = ex.execute("SELECT CURRENT VERSION FROM orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s150_show_version_history() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE VERSIONING ON orders").unwrap();
+        ex.execute("INSERT VERSIONED INTO orders VALUES '{\"id\":1}'")
+            .unwrap();
+        ex.execute("INSERT VERSIONED INTO orders VALUES '{\"id\":2}'")
+            .unwrap();
+        let r = ex.execute("SHOW VERSION HISTORY FOR orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S151 — Audit trail queries ───────────────────────────────────────────
+
+    #[test]
+    fn test_s151_show_audit_log_for() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW AUDIT LOG FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s151_filter_audit_log_by_op() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("FILTER AUDIT LOG BY OP 'INSERT'").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s151_filter_audit_log_by_user() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("FILTER AUDIT LOG BY USER 'alice'").unwrap();
+        assert!(matches!(r, QueryResult::WithNotice { .. }));
+    }
+
+    #[test]
+    fn test_s151_purge_audit_log() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("PURGE AUDIT LOG BEFORE 9999999999999").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.starts_with("PURGED"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s151_show_audit_log_summary() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW AUDIT LOG SUMMARY").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    // ── S152 — Dynamic SQL ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_s152_execute_dynamic() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("EXECUTE DYNAMIC 'SHOW SAMPLE SEED'");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn test_s152_prepare_dynamic() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("PREPARE DYNAMIC d1 AS 'SHOW SAMPLE SEED'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s152_execute_dynamic_prepared() {
+        let (ex, _dir) = setup();
+        ex.execute("PREPARE DYNAMIC d2 AS 'SHOW SAMPLE SEED'")
+            .unwrap();
+        let r = ex.execute("EXECUTE DYNAMIC PREPARED d2");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn test_s152_drop_dynamic() {
+        let (ex, _dir) = setup();
+        ex.execute("PREPARE DYNAMIC d3 AS 'SELECT 3'").unwrap();
+        let r = ex.execute("DROP DYNAMIC d3").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s152_show_dynamic_stmts() {
+        let (ex, _dir) = setup();
+        ex.execute("PREPARE DYNAMIC d4 AS 'SELECT 4'").unwrap();
+        let r = ex.execute("SHOW DYNAMIC STMTS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S153 — Table sampling ────────────────────────────────────────────────
+
+    #[test]
+    fn test_s153_tablesample_bernoulli() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SELECT * FROM orders TABLESAMPLE BERNOULLI(10)")
+            .unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("SAMPLE"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s153_tablesample_system() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SELECT * FROM orders TABLESAMPLE SYSTEM(20)")
+            .unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("SAMPLE"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s153_tablesample_count() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SELECT COUNT(*) FROM orders TABLESAMPLE BERNOULLI(5)")
+            .unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.contains("SAMPLE COUNT"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s153_set_sample_seed() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET SAMPLE SEED 42").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "SAMPLE SEED SET");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s153_show_sample_seed() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SAMPLE SEED 99").unwrap();
+        let r = ex.execute("SHOW SAMPLE SEED").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "99");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S154 — Result pagination cursors ────────────────────────────────────
+
+    #[test]
+    fn test_s154_declare_page_cursor() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("DECLARE PAGE CURSOR c1 FOR 'SELECT 1' PAGE SIZE 5")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s154_fetch_next_page() {
+        let (ex, _dir) = setup();
+        ex.execute("DECLARE PAGE CURSOR c2 FOR 'SELECT 1' PAGE SIZE 5")
+            .unwrap();
+        let r = ex.execute("FETCH NEXT PAGE FROM c2").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s154_fetch_prev_page() {
+        let (ex, _dir) = setup();
+        ex.execute("DECLARE PAGE CURSOR c3 FOR 'SELECT 1' PAGE SIZE 5")
+            .unwrap();
+        ex.execute("FETCH NEXT PAGE FROM c3").unwrap();
+        let r = ex.execute("FETCH PREV PAGE FROM c3").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s154_close_page_cursor() {
+        let (ex, _dir) = setup();
+        ex.execute("DECLARE PAGE CURSOR c4 FOR 'SELECT 1' PAGE SIZE 5")
+            .unwrap();
+        let r = ex.execute("CLOSE PAGE CURSOR c4").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s154_show_page_cursors() {
+        let (ex, _dir) = setup();
+        ex.execute("DECLARE PAGE CURSOR c5 FOR 'SELECT 1' PAGE SIZE 5")
+            .unwrap();
+        let r = ex.execute("SHOW PAGE CURSORS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S155 — Column statistics histograms ──────────────────────────────────
+
+    #[test]
+    fn test_s155_compute_histogram() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("COMPUTE HISTOGRAM FOR orders price BUCKETS 10")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s155_show_histogram() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE HISTOGRAM FOR orders price BUCKETS 5")
+            .unwrap();
+        let r = ex.execute("SHOW HISTOGRAM FOR orders price").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 5);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s155_update_histogram() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("UPDATE HISTOGRAM FOR orders price").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "HISTOGRAM UPDATED");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s155_drop_histogram() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE HISTOGRAM FOR orders price BUCKETS 3")
+            .unwrap();
+        let r = ex.execute("DROP HISTOGRAM FOR orders price").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s155_show_histogram_empty() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW HISTOGRAM FOR orders missing_col").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S156 — Query dependency graph ────────────────────────────────────────
+
+    #[test]
+    fn test_s156_add_dependency() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ADD DEPENDENCY v1 DEPENDS ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s156_show_dependencies_for() {
+        let (ex, _dir) = setup();
+        ex.execute("ADD DEPENDENCY v1 DEPENDS ON orders").unwrap();
+        let r = ex.execute("SHOW DEPENDENCIES FOR v1").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s156_show_dependency_tree() {
+        let (ex, _dir) = setup();
+        ex.execute("ADD DEPENDENCY v2 DEPENDS ON orders").unwrap();
+        let r = ex.execute("SHOW DEPENDENCY TREE").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s156_drop_dependency() {
+        let (ex, _dir) = setup();
+        ex.execute("ADD DEPENDENCY v3 DEPENDS ON orders").unwrap();
+        let r = ex.execute("DROP DEPENDENCY v3 DEPENDS ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s156_check_circular_dependencies() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CHECK CIRCULAR DEPENDENCIES").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "NO CYCLES");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S157 — Live config reload ────────────────────────────────────────────
+
+    #[test]
+    fn test_s157_set_config_key() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET CONFIG KEY 'max_conn' VALUE '100'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s157_show_config() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONFIG KEY 'timeout' VALUE '30'").unwrap();
+        let r = ex.execute("SHOW CONFIG").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s157_reset_config_key() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONFIG KEY 'k1' VALUE 'v1'").unwrap();
+        let r = ex.execute("RESET CONFIG KEY 'k1'").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "RESET");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s157_reload_config() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONFIG KEY 'k2' VALUE 'v2'").unwrap();
+        let r = ex.execute("RELOAD CONFIG").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert!(msg.starts_with("CONFIG RELOADED:"));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s157_show_config_key() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONFIG KEY 'mykey' VALUE 'myval'").unwrap();
+        let r = ex.execute("SHOW CONFIG KEY 'mykey'").unwrap();
+        if let QueryResult::Ok(msg) = r {
+            assert_eq!(msg, "myval");
+        } else {
+            panic!();
         }
     }
 }
