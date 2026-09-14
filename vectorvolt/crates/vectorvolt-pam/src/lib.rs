@@ -533,8 +533,8 @@ mod tests {
 
     #[test]
     fn test_s107_banner_format() {
-        assert!(BANNER.contains("VectorVolt"));
         assert!(BANNER.contains("Data OS"));
+        assert!(BANNER.contains("██"));
     }
 
     #[test]
