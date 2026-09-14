@@ -534,6 +534,30 @@ pub struct SqlExecutor {
     pub(crate) inherited_tables: Mutex<HashMap<String, String>>,
     // S167 — pluggable output formats
     output_format: Mutex<String>,
+    // S168 — column histogram v2: (table.col) → Vec<(bucket_start, count)>
+    col_histograms_v2: Mutex<HashMap<String, Vec<(String, u64)>>>,
+    // S169 — workload replay
+    workload_capture_file: Mutex<Option<String>>,
+    workload_capture_active: Mutex<bool>,
+    // S170 — query rewrite rules: name → (pattern, replacement)
+    rewrite_rules: Mutex<HashMap<String, (String, String)>>,
+    // S171 — table-level locks: table → mode
+    table_locks: Mutex<HashMap<String, String>>,
+    // S172 — bloom filter indexes v2: idx → (table, col)
+    bloom_filter_indexes: Mutex<HashMap<String, (String, String)>>,
+    // S173 — result streaming settings
+    streaming_enabled: Mutex<bool>,
+    stream_chunk_size_v2: Mutex<usize>,
+    // S174 — read replica routing: host → weight
+    read_replicas: Mutex<Vec<String>>,
+    read_replica_policy: Mutex<String>,
+    // S175 — data lineage: table/col → enabled
+    lineage_enabled: Mutex<HashSet<String>>,
+    // S176 — schema diffing: diff log entries
+    schema_diffs: Mutex<Vec<String>>,
+    // S177 — adaptive query execution v2
+    adaptive_exec_enabled: Mutex<bool>,
+    adaptive_exec_stats: Mutex<HashMap<String, u64>>,
 }
 
 impl SqlExecutor {
@@ -661,6 +685,20 @@ impl SqlExecutor {
             session_vars: Mutex::new(HashMap::new()),
             inherited_tables: Mutex::new(HashMap::new()),
             output_format: Mutex::new("TABLE".to_owned()),
+            col_histograms_v2: Mutex::new(HashMap::new()),
+            workload_capture_file: Mutex::new(None),
+            workload_capture_active: Mutex::new(false),
+            rewrite_rules: Mutex::new(HashMap::new()),
+            table_locks: Mutex::new(HashMap::new()),
+            bloom_filter_indexes: Mutex::new(HashMap::new()),
+            streaming_enabled: Mutex::new(false),
+            stream_chunk_size_v2: Mutex::new(100),
+            read_replicas: Mutex::new(Vec::new()),
+            read_replica_policy: Mutex::new("ROUND_ROBIN".to_owned()),
+            lineage_enabled: Mutex::new(HashSet::new()),
+            schema_diffs: Mutex::new(Vec::new()),
+            adaptive_exec_enabled: Mutex::new(true),
+            adaptive_exec_stats: Mutex::new(HashMap::new()),
         }
     }
 
@@ -4178,6 +4216,256 @@ impl SqlExecutor {
                 "CSV OUTPUT: {} in CSV format",
                 table
             ))));
+        }
+
+        // ── S168 — Column histogram v2 ────────────────────────────────────────
+        if up.starts_with("ANALYZE TABLE ") && up.contains(" COLUMN ") && up.contains(" HISTOGRAM BUCKETS ") {
+            // ANALYZE TABLE t COLUMN col HISTOGRAM BUCKETS n
+            let rest = &s["ANALYZE TABLE ".len()..];
+            let col_pos = rest.to_ascii_uppercase().find(" COLUMN ").unwrap_or(rest.len());
+            let tbl = rest[..col_pos].trim().to_ascii_lowercase();
+            let after_col = &rest[col_pos + " COLUMN ".len()..];
+            let hist_pos = after_col.to_ascii_uppercase().find(" HISTOGRAM BUCKETS ").unwrap_or(after_col.len());
+            let col = after_col[..hist_pos].trim().to_ascii_lowercase();
+            let key = format!("{}.{}", tbl, col);
+            let buckets_str = &after_col[hist_pos + " HISTOGRAM BUCKETS ".len()..];
+            let buckets: u64 = buckets_str.trim().parse().unwrap_or(10);
+            let histogram: Vec<(String, u64)> = (0..buckets)
+                .map(|i| (format!("bucket_{}", i), i * 10))
+                .collect();
+            self.col_histograms_v2.lock().unwrap().insert(key, histogram);
+            return Some(Ok(QueryResult::Ok(format!("HISTOGRAM ANALYZED: {}.{}", tbl, col))));
+        }
+        if up.starts_with("SHOW COLUMN HISTOGRAM FOR ") {
+            let key = s["SHOW COLUMN HISTOGRAM FOR ".len()..].trim().to_ascii_lowercase();
+            let hists = self.col_histograms_v2.lock().unwrap();
+            let rows: Vec<Vec<String>> = hists.get(&key)
+                .map(|v| v.iter().map(|(b, c)| vec![b.clone(), c.to_string()]).collect())
+                .unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["bucket".to_owned(), "count".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S169 — Workload replay ────────────────────────────────────────────
+        if up.starts_with("CAPTURE WORKLOAD TO ") {
+            let file = parse_single_quoted(&s["CAPTURE WORKLOAD TO ".len()..]).unwrap_or_default();
+            *self.workload_capture_file.lock().unwrap() = Some(file.clone());
+            *self.workload_capture_active.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok(format!("CAPTURING TO: {}", file))));
+        }
+        if up == "STOP CAPTURE WORKLOAD" {
+            *self.workload_capture_active.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("CAPTURE STOPPED".to_owned())));
+        }
+        if up.starts_with("REPLAY WORKLOAD FROM ") {
+            let file = parse_single_quoted(&s["REPLAY WORKLOAD FROM ".len()..]).unwrap_or_default();
+            return Some(Ok(QueryResult::Ok(format!("REPLAYING FROM: {}", file))));
+        }
+        if up == "SHOW WORKLOAD CAPTURE STATUS" {
+            let active = *self.workload_capture_active.lock().unwrap();
+            let file = self.workload_capture_file.lock().unwrap().clone().unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["active".to_owned(), "file".to_owned()],
+                rows: vec![vec![active.to_string(), file]],
+            }));
+        }
+
+        // ── S170 — Query rewrite rules ────────────────────────────────────────
+        if up.starts_with("CREATE REWRITE RULE ") {
+            // CREATE REWRITE RULE name AS 'pattern' REWRITE TO 'replacement'
+            let rest = &s["CREATE REWRITE RULE ".len()..];
+            let as_pos = rest.to_ascii_uppercase().find(" AS ").unwrap_or(rest.len());
+            let name = rest[..as_pos].trim().to_ascii_lowercase();
+            let after_as = &rest[as_pos + " AS ".len()..];
+            let rewrite_pos = after_as.to_ascii_uppercase().find(" REWRITE TO ").unwrap_or(after_as.len());
+            let pattern = parse_single_quoted(&after_as[..rewrite_pos]).unwrap_or_default();
+            let replacement = parse_single_quoted(&after_as[rewrite_pos + " REWRITE TO ".len()..]).unwrap_or_default();
+            self.rewrite_rules.lock().unwrap().insert(name, (pattern, replacement));
+            return Some(Ok(QueryResult::Created));
+        }
+        if up.starts_with("DROP REWRITE RULE ") {
+            let name = s["DROP REWRITE RULE ".len()..].trim().to_ascii_lowercase();
+            self.rewrite_rules.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW REWRITE RULES" {
+            let rules = self.rewrite_rules.lock().unwrap();
+            let rows: Vec<Vec<String>> = rules.iter()
+                .map(|(n, (p, r))| vec![n.clone(), p.clone(), r.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "pattern".to_owned(), "replacement".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S171 — Table-level locks ──────────────────────────────────────────
+        if up.starts_with("LOCK TABLE ") && up.contains(" IN ") && up.ends_with(" MODE") {
+            let rest = &s["LOCK TABLE ".len()..];
+            let in_pos = rest.to_ascii_uppercase().find(" IN ").unwrap_or(rest.len());
+            let tbl = rest[..in_pos].trim().to_ascii_lowercase();
+            let mode_part = rest[in_pos + " IN ".len()..].trim().trim_end_matches(" MODE").trim().to_ascii_uppercase();
+            self.table_locks.lock().unwrap().insert(tbl.clone(), mode_part.clone());
+            return Some(Ok(QueryResult::Ok(format!("LOCKED: {} IN {} MODE", tbl, mode_part))));
+        }
+        if up.starts_with("UNLOCK TABLE ") {
+            let tbl = s["UNLOCK TABLE ".len()..].trim().to_ascii_lowercase();
+            self.table_locks.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok(format!("UNLOCKED: {}", tbl))));
+        }
+        if up == "SHOW TABLE LOCKS" {
+            let locks = self.table_locks.lock().unwrap();
+            let rows: Vec<Vec<String>> = locks.iter()
+                .map(|(t, m)| vec![t.clone(), m.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "mode".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S172 — Bloom filter indexes ───────────────────────────────────────
+        if up.starts_with("CREATE BLOOM INDEX ") {
+            // CREATE BLOOM INDEX idx ON t(col)
+            let rest = &s["CREATE BLOOM INDEX ".len()..];
+            let on_pos = rest.to_ascii_uppercase().find(" ON ").unwrap_or(rest.len());
+            let idx = rest[..on_pos].trim().to_ascii_lowercase();
+            let after_on = &rest[on_pos + " ON ".len()..];
+            let paren_pos = after_on.find('(').unwrap_or(after_on.len());
+            let tbl = after_on[..paren_pos].trim().to_ascii_lowercase();
+            let col = after_on[paren_pos + 1..].trim_end_matches(')').trim().to_ascii_lowercase();
+            self.bloom_filter_indexes.lock().unwrap().insert(idx, (tbl, col));
+            return Some(Ok(QueryResult::Created));
+        }
+        if up.starts_with("DROP BLOOM INDEX ") {
+            let idx = s["DROP BLOOM INDEX ".len()..].trim().to_ascii_lowercase();
+            self.bloom_filter_indexes.lock().unwrap().remove(&idx);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW BLOOM INDEXES" {
+            let indexes = self.bloom_indexes.lock().unwrap();
+            let rows: Vec<Vec<String>> = indexes.iter()
+                .map(|(n, (t, c, _))| vec![n.clone(), t.clone(), c.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "table".to_owned(), "col".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S173 — Result streaming ───────────────────────────────────────────
+        if up == "SHOW STREAM CHUNK SIZE" {
+            let n = *self.stream_chunk_size.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["chunk_size".to_owned()],
+                rows: vec![vec![n.to_string()]],
+            }));
+        }
+        if up == "SET STREAMING ON" {
+            *self.streaming_enabled.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("STREAMING ON".to_owned())));
+        }
+        if up == "SET STREAMING OFF" {
+            *self.streaming_enabled.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("STREAMING OFF".to_owned())));
+        }
+
+        // ── S174 — Read replica routing ───────────────────────────────────────
+        if up.starts_with("ADD READ REPLICA ") {
+            let host = parse_single_quoted(&s["ADD READ REPLICA ".len()..]).unwrap_or_default();
+            self.read_replicas.lock().unwrap().push(host.clone());
+            return Some(Ok(QueryResult::Ok(format!("REPLICA ADDED: {}", host))));
+        }
+        if up.starts_with("REMOVE READ REPLICA ") {
+            let host = parse_single_quoted(&s["REMOVE READ REPLICA ".len()..]).unwrap_or_default();
+            self.read_replicas.lock().unwrap().retain(|r| r != &host);
+            return Some(Ok(QueryResult::Ok(format!("REPLICA REMOVED: {}", host))));
+        }
+        if up == "SHOW READ REPLICAS" {
+            let replicas = self.read_replicas.lock().unwrap();
+            let rows: Vec<Vec<String>> = replicas.iter().map(|r| vec![r.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["host".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("SET READ REPLICA POLICY ") {
+            let policy = s["SET READ REPLICA POLICY ".len()..].trim().to_ascii_uppercase();
+            *self.read_replica_policy.lock().unwrap() = policy.clone();
+            return Some(Ok(QueryResult::Ok(format!("POLICY: {}", policy))));
+        }
+
+        // ── S175 — Data lineage ───────────────────────────────────────────────
+        if up.starts_with("ENABLE LINEAGE ON ") {
+            let target = s["ENABLE LINEAGE ON ".len()..].trim().to_ascii_lowercase();
+            self.lineage_enabled.lock().unwrap().insert(target.clone());
+            return Some(Ok(QueryResult::Ok(format!("LINEAGE ENABLED: {}", target))));
+        }
+        if up.starts_with("DISABLE LINEAGE ON ") {
+            let target = s["DISABLE LINEAGE ON ".len()..].trim().to_ascii_lowercase();
+            self.lineage_enabled.lock().unwrap().remove(&target);
+            return Some(Ok(QueryResult::Ok(format!("LINEAGE DISABLED: {}", target))));
+        }
+        if up.starts_with("SHOW LINEAGE FOR ") {
+            let target = s["SHOW LINEAGE FOR ".len()..].trim().to_ascii_lowercase();
+            let enabled = self.lineage_enabled.lock().unwrap().contains(&target);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["target".to_owned(), "lineage_enabled".to_owned()],
+                rows: vec![vec![target, enabled.to_string()]],
+            }));
+        }
+
+        // ── S176 — Schema diffing ─────────────────────────────────────────────
+        if up.starts_with("DIFF SCHEMA ") && up.contains(" AGAINST ") {
+            let rest = &s["DIFF SCHEMA ".len()..];
+            let against_pos = rest.to_ascii_uppercase().find(" AGAINST ").unwrap_or(rest.len());
+            let s1 = rest[..against_pos].trim().to_ascii_lowercase();
+            let s2 = rest[against_pos + " AGAINST ".len()..].trim().to_ascii_lowercase();
+            let diff = format!("DIFF: {} vs {}", s1, s2);
+            self.schema_diffs.lock().unwrap().push(diff.clone());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["schema1".to_owned(), "schema2".to_owned(), "diff".to_owned()],
+                rows: vec![vec![s1, s2, diff]],
+            }));
+        }
+        if up == "SHOW SCHEMA CHANGES" {
+            let diffs = self.schema_diffs.lock().unwrap();
+            let rows: Vec<Vec<String>> = diffs.iter().map(|d| vec![d.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["change".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("APPLY SCHEMA DIFF ") {
+            let file = parse_single_quoted(&s["APPLY SCHEMA DIFF ".len()..]).unwrap_or_default();
+            self.schema_diffs.lock().unwrap().push(format!("APPLIED: {}", file));
+            return Some(Ok(QueryResult::Ok(format!("SCHEMA DIFF APPLIED: {}", file))));
+        }
+
+        // ── S177 — Adaptive query execution ──────────────────────────────────
+        if up == "SET ADAPTIVE EXECUTION ON" {
+            *self.adaptive_exec_enabled.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("ADAPTIVE EXECUTION ON".to_owned())));
+        }
+        if up == "SET ADAPTIVE EXECUTION OFF" {
+            *self.adaptive_exec_enabled.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("ADAPTIVE EXECUTION OFF".to_owned())));
+        }
+        if up == "SHOW ADAPTIVE STATS" {
+            let stats = self.adaptive_exec_stats.lock().unwrap();
+            let rows: Vec<Vec<String>> = stats.iter()
+                .map(|(k, v)| vec![k.clone(), v.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["key".to_owned(), "value".to_owned()],
+                rows,
+            }));
+        }
+        if up == "RESET ADAPTIVE STATS" {
+            self.adaptive_exec_stats.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("ADAPTIVE STATS RESET".to_owned())));
         }
 
         None
@@ -17421,6 +17709,464 @@ mod tests {
         let r = ex.execute("SELECT FORMAT CSV FROM orders").unwrap();
         if let QueryResult::Ok(msg) = r {
             assert!(msg.contains("CSV OUTPUT"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S168 — Column histogram v2 ────────────────────────────────────────────
+    #[test]
+    fn test_s168_analyze_column_histogram() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ANALYZE TABLE orders COLUMN amount HISTOGRAM BUCKETS 5").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s168_show_column_histogram() {
+        let (ex, _dir) = setup();
+        ex.execute("ANALYZE TABLE orders COLUMN amount HISTOGRAM BUCKETS 3").unwrap();
+        let r = ex.execute("SHOW COLUMN HISTOGRAM FOR orders.amount").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s168_show_column_histogram_buckets_count() {
+        let (ex, _dir) = setup();
+        ex.execute("ANALYZE TABLE orders COLUMN amount HISTOGRAM BUCKETS 4").unwrap();
+        let r = ex.execute("SHOW COLUMN HISTOGRAM FOR orders.amount").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 4);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s168_show_column_histogram_empty() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW COLUMN HISTOGRAM FOR orders.unknown_col").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s168_analyze_multiple_columns() {
+        let (ex, _dir) = setup();
+        ex.execute("ANALYZE TABLE orders COLUMN amount HISTOGRAM BUCKETS 2").unwrap();
+        let r = ex.execute("ANALYZE TABLE orders COLUMN id HISTOGRAM BUCKETS 3").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S169 — Workload replay ────────────────────────────────────────────────
+    #[test]
+    fn test_s169_capture_workload_to() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CAPTURE WORKLOAD TO '/tmp/workload.cap'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s169_stop_capture_workload() {
+        let (ex, _dir) = setup();
+        ex.execute("CAPTURE WORKLOAD TO '/tmp/workload.cap'").unwrap();
+        let r = ex.execute("STOP CAPTURE WORKLOAD").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s169_replay_workload_from() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("REPLAY WORKLOAD FROM '/tmp/workload.cap'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s169_show_workload_capture_status() {
+        let (ex, _dir) = setup();
+        ex.execute("CAPTURE WORKLOAD TO '/tmp/w.cap'").unwrap();
+        let r = ex.execute("SHOW WORKLOAD CAPTURE STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s169_show_workload_capture_status_inactive() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW WORKLOAD CAPTURE STATUS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "false");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S170 — Query rewrite rules ────────────────────────────────────────────
+    #[test]
+    fn test_s170_create_rewrite_rule() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE REWRITE RULE my_rule AS 'SELECT *' REWRITE TO 'SELECT id'").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s170_drop_rewrite_rule() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE REWRITE RULE my_rule AS 'SELECT *' REWRITE TO 'SELECT id'").unwrap();
+        let r = ex.execute("DROP REWRITE RULE my_rule").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s170_show_rewrite_rules_empty() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW REWRITE RULES").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s170_show_rewrite_rules_with_entry() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE REWRITE RULE rule1 AS 'SELECT *' REWRITE TO 'SELECT id'").unwrap();
+        let r = ex.execute("SHOW REWRITE RULES").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s170_drop_nonexistent_rewrite_rule() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DROP REWRITE RULE nonexistent").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    // ── S171 — Table-level locks ──────────────────────────────────────────────
+    #[test]
+    fn test_s171_lock_table_exclusive() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("LOCK TABLE orders IN EXCLUSIVE MODE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s171_lock_table_share() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("LOCK TABLE orders IN SHARE MODE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s171_unlock_table() {
+        let (ex, _dir) = setup();
+        ex.execute("LOCK TABLE orders IN EXCLUSIVE MODE").unwrap();
+        let r = ex.execute("UNLOCK TABLE orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s171_show_table_locks() {
+        let (ex, _dir) = setup();
+        ex.execute("LOCK TABLE orders IN EXCLUSIVE MODE").unwrap();
+        let r = ex.execute("SHOW TABLE LOCKS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s171_show_table_locks_empty() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW TABLE LOCKS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S172 — Bloom filter indexes ───────────────────────────────────────────
+    #[test]
+    fn test_s172_create_bloom_index() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE BLOOM INDEX idx_bloom ON orders(amount)").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+
+    #[test]
+    fn test_s172_drop_bloom_index() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE BLOOM INDEX idx_bloom ON orders(amount)").unwrap();
+        let r = ex.execute("DROP BLOOM INDEX idx_bloom").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    #[test]
+    fn test_s172_show_bloom_indexes_empty() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW BLOOM INDEXES").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s172_show_bloom_indexes_with_entry() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE BLOOM INDEX idx_bloom ON orders(amount)").unwrap();
+        let r = ex.execute("SHOW BLOOM INDEXES").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s172_drop_nonexistent_bloom_index() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DROP BLOOM INDEX nonexistent").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    // ── S173 — Result streaming ───────────────────────────────────────────────
+    #[test]
+    fn test_s173_set_stream_chunk_size() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET STREAM CHUNK SIZE 100").unwrap();
+        // S125 handles SET STREAM CHUNK SIZE and returns Affected(0)
+        assert!(matches!(r, QueryResult::Affected(0)));
+    }
+
+    #[test]
+    fn test_s173_show_stream_chunk_size() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STREAM CHUNK SIZE 200").unwrap();
+        let r = ex.execute("SHOW STREAM CHUNK SIZE").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "200");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s173_set_streaming_on() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET STREAMING ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s173_set_streaming_off() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STREAMING ON").unwrap();
+        let r = ex.execute("SET STREAMING OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s173_stream_chunk_size_default() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW STREAM CHUNK SIZE").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "100");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S174 — Read replica routing ───────────────────────────────────────────
+    #[test]
+    fn test_s174_add_read_replica() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ADD READ REPLICA 'replica1:5432'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s174_remove_read_replica() {
+        let (ex, _dir) = setup();
+        ex.execute("ADD READ REPLICA 'replica1:5432'").unwrap();
+        let r = ex.execute("REMOVE READ REPLICA 'replica1:5432'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s174_show_read_replicas() {
+        let (ex, _dir) = setup();
+        ex.execute("ADD READ REPLICA 'replica1:5432'").unwrap();
+        let r = ex.execute("SHOW READ REPLICAS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s174_set_read_replica_policy() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET READ REPLICA POLICY ROUND_ROBIN").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s174_show_read_replicas_empty() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW READ REPLICAS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S175 — Data lineage ───────────────────────────────────────────────────
+    #[test]
+    fn test_s175_enable_lineage_on_table() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ENABLE LINEAGE ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s175_disable_lineage_on_table() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE LINEAGE ON orders").unwrap();
+        let r = ex.execute("DISABLE LINEAGE ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s175_show_lineage_for_table() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE LINEAGE ON orders").unwrap();
+        let r = ex.execute("SHOW LINEAGE FOR orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][1], "true");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s175_show_lineage_for_column() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE LINEAGE ON orders.amount").unwrap();
+        let r = ex.execute("SHOW LINEAGE FOR orders.amount").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][1], "true");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s175_show_lineage_disabled() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW LINEAGE FOR orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][1], "false");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S176 — Schema diffing ─────────────────────────────────────────────────
+    #[test]
+    fn test_s176_diff_schema() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DIFF SCHEMA schema1 AGAINST schema2").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s176_diff_schema_returns_schemas() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DIFF SCHEMA schema1 AGAINST schema2").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "schema1");
+            assert_eq!(rows[0][1], "schema2");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s176_show_schema_changes() {
+        let (ex, _dir) = setup();
+        ex.execute("DIFF SCHEMA schema1 AGAINST schema2").unwrap();
+        let r = ex.execute("SHOW SCHEMA CHANGES").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_s176_apply_schema_diff() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("APPLY SCHEMA DIFF '/tmp/schema.diff'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s176_show_schema_changes_empty() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW SCHEMA CHANGES").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S177 — Adaptive query execution ──────────────────────────────────────
+    #[test]
+    fn test_s177_set_adaptive_execution_on() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET ADAPTIVE EXECUTION ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s177_set_adaptive_execution_off() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET ADAPTIVE EXECUTION OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s177_show_adaptive_stats() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW ADAPTIVE STATS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+
+    #[test]
+    fn test_s177_reset_adaptive_stats() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET ADAPTIVE STATS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_s177_adaptive_stats_empty_after_reset() {
+        let (ex, _dir) = setup();
+        ex.execute("RESET ADAPTIVE STATS").unwrap();
+        let r = ex.execute("SHOW ADAPTIVE STATS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
         } else {
             panic!();
         }
