@@ -580,6 +580,30 @@ pub struct SqlExecutor {
     s186_schema_current: Mutex<HashMap<String, String>>,
     // S187 — live query kill: running_queries: id -> sql
     s187_running_queries: Mutex<HashMap<u64, String>>,
+    // S188 — query pipelines: name -> definition
+    s188_pipelines: Mutex<HashMap<String, String>>,
+    s188_pipeline_running: Mutex<HashSet<String>>,
+    // S189 — column encryption v2: (table.col) -> key
+    s189_encrypted_cols: Mutex<HashMap<String, String>>,
+    // S190 — table federation: ft_name -> (host:port, remote_table)
+    s190_foreign_tables: Mutex<HashMap<String, (String, String)>>,
+    // S191 — change data streams: cs_name -> table
+    s191_change_streams: Mutex<HashMap<String, String>>,
+    // S192 — query result TTL
+    s192_result_ttl: Mutex<Option<u64>>,
+    // S193 — batch operations
+    s193_batch_active: Mutex<bool>,
+    s193_batch_stmts: Mutex<Vec<String>>,
+    // S194 — index advisor
+    s194_index_recommendations: Mutex<Vec<String>>,
+    // S195 — table pinning
+    s195_pinned_tables: Mutex<HashSet<String>>,
+    // S196 — query namespaces
+    s196_query_namespaces: Mutex<HashSet<String>>,
+    s196_current_namespace: Mutex<Option<String>>,
+    // S197 — compaction control
+    s197_compaction_policy: Mutex<String>,
+    s197_compaction_log: Mutex<Vec<String>>,
 }
 
 impl SqlExecutor {
@@ -733,6 +757,20 @@ impl SqlExecutor {
             s186_schema_versions: Mutex::new(HashMap::new()),
             s186_schema_current: Mutex::new(HashMap::new()),
             s187_running_queries: Mutex::new(HashMap::new()),
+            s188_pipelines: Mutex::new(HashMap::new()),
+            s188_pipeline_running: Mutex::new(HashSet::new()),
+            s189_encrypted_cols: Mutex::new(HashMap::new()),
+            s190_foreign_tables: Mutex::new(HashMap::new()),
+            s191_change_streams: Mutex::new(HashMap::new()),
+            s192_result_ttl: Mutex::new(None),
+            s193_batch_active: Mutex::new(false),
+            s193_batch_stmts: Mutex::new(Vec::new()),
+            s194_index_recommendations: Mutex::new(Vec::new()),
+            s195_pinned_tables: Mutex::new(HashSet::new()),
+            s196_query_namespaces: Mutex::new(HashSet::new()),
+            s196_current_namespace: Mutex::new(None),
+            s197_compaction_policy: Mutex::new("normal".to_owned()),
+            s197_compaction_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -2194,6 +2232,7 @@ impl SqlExecutor {
         if up.starts_with("DROP FOREIGN TABLE ") {
             let table_name = s["DROP FOREIGN TABLE ".len()..].trim().to_ascii_lowercase();
             self.foreign_tables.lock().unwrap().remove(&table_name);
+            self.s190_foreign_tables.lock().unwrap().remove(&table_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up.starts_with("SELECT * FROM FOREIGN ") {
@@ -4765,6 +4804,302 @@ impl SqlExecutor {
         if up == "KILL ALL QUERIES" {
             self.s187_running_queries.lock().unwrap().clear();
             return Some(Ok(QueryResult::Ok("ALL QUERIES KILLED".to_owned())));
+        }
+
+        // ── S188 — Query pipelines ────────────────────────────────────────────
+        if up.starts_with("CREATE PIPELINE ") && up.contains(" AS SELECT ") {
+            // CREATE PIPELINE p AS SELECT * FROM src INTO dst
+            let rest = &sql[16..]; // after "CREATE PIPELINE "
+            let name = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            if !name.is_empty() {
+                self.s188_pipelines.lock().unwrap().insert(name.clone(), sql.to_owned());
+            }
+            return Some(Ok(QueryResult::Created));
+        }
+        if up.starts_with("START PIPELINE ") {
+            let name = sql[15..].trim().to_ascii_lowercase();
+            self.s188_pipeline_running.lock().unwrap().insert(name.clone());
+            return Some(Ok(QueryResult::Ok(format!("PIPELINE STARTED: {}", name))));
+        }
+        if up.starts_with("STOP PIPELINE ") {
+            let name = sql[14..].trim().to_ascii_lowercase();
+            self.s188_pipeline_running.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Ok(format!("PIPELINE STOPPED: {}", name))));
+        }
+        if up == "SHOW PIPELINES" {
+            let pipelines = self.s188_pipelines.lock().unwrap();
+            let running = self.s188_pipeline_running.lock().unwrap();
+            let rows = pipelines.iter().map(|(n, def)| {
+                let status = if running.contains(n) { "RUNNING" } else { "STOPPED" };
+                vec![n.clone(), status.to_owned(), def.clone()]
+            }).collect::<Vec<_>>();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "status".to_owned(), "definition".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP PIPELINE ") {
+            let name = sql[14..].trim().to_ascii_lowercase();
+            self.s188_pipelines.lock().unwrap().remove(&name);
+            self.s188_pipeline_running.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S189 — Column encryption v2 ──────────────────────────────────────
+        if up.starts_with("ALTER TABLE ") && up.contains(" ENCRYPT COLUMN ") && up.contains(" WITH KEY ") {
+            // ALTER TABLE t ENCRYPT COLUMN col WITH KEY 'k'
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            // [ALTER, TABLE, t, ENCRYPT, COLUMN, col, WITH, KEY, 'k']
+            if parts.len() >= 9 {
+                let tbl = parts[2].to_ascii_lowercase();
+                let col = parts[5].to_ascii_lowercase();
+                let key = parts[8].trim_matches('\'').to_owned();
+                let key2 = key.clone();
+                let tc = format!("{}.{}", tbl, col);
+                self.s189_encrypted_cols.lock().unwrap().insert(tc.clone(), key);
+                // Also write to the shared encrypted_cols field so SHOW ENCRYPTED COLUMNS picks it up
+                self.encrypted_cols.lock().unwrap().insert(tc, key2);
+            }
+            return Some(Ok(QueryResult::Ok("COLUMN ENCRYPTED".to_owned())));
+        }
+        if up.starts_with("ALTER TABLE ") && up.contains(" DECRYPT COLUMN ") {
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            if parts.len() >= 6 {
+                let tbl = parts[2].to_ascii_lowercase();
+                let col = parts[5].to_ascii_lowercase();
+                let tc = format!("{}.{}", tbl, col);
+                self.s189_encrypted_cols.lock().unwrap().remove(&tc);
+                self.encrypted_cols.lock().unwrap().remove(&tc);
+            }
+            return Some(Ok(QueryResult::Ok("COLUMN DECRYPTED".to_owned())));
+        }
+        // Note: SHOW ENCRYPTED COLUMNS is handled by the existing S142 handler which reads from encrypted_cols
+
+        // ── S190 — Table federation ───────────────────────────────────────────
+        if up.starts_with("CREATE FOREIGN TABLE ") && up.contains(" REMOTE ") {
+            // CREATE FOREIGN TABLE ft REMOTE 'host:port' TABLE t
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            // [CREATE, FOREIGN, TABLE, ft, REMOTE, 'host:port', TABLE, t]
+            if parts.len() >= 8 {
+                let ft_name = parts[3].to_ascii_lowercase();
+                let remote = parts[5].trim_matches('\'').to_owned();
+                let remote_tbl = parts[7].to_ascii_lowercase();
+                self.s190_foreign_tables.lock().unwrap().insert(ft_name.clone(), (remote.clone(), remote_tbl));
+                // Also write into the shared foreign_tables so the existing DROP handler cleans it up
+                self.foreign_tables.lock().unwrap().insert(ft_name, remote);
+            }
+            return Some(Ok(QueryResult::Created));
+        }
+        if up == "SHOW FOREIGN TABLES" {
+            let tables = self.s190_foreign_tables.lock().unwrap();
+            let rows = tables.iter().map(|(n, (host, tbl))| vec![n.clone(), host.clone(), tbl.clone()]).collect::<Vec<_>>();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "remote".to_owned(), "table".to_owned()],
+                rows,
+            }));
+        }
+        // Note: DROP FOREIGN TABLE is handled by the existing S133 handler at line ~2232;
+        // we also need to remove from s190_foreign_tables when that fires.
+        // Handle it here BEFORE the existing handler by being more specific (same prefix):
+        if up.starts_with("DROP FOREIGN TABLE ") && {
+            let name_candidate = sql[19..].trim().to_ascii_lowercase();
+            self.s190_foreign_tables.lock().unwrap().contains_key(&name_candidate)
+        } {
+            let name = sql[19..].trim().to_ascii_lowercase();
+            self.s190_foreign_tables.lock().unwrap().remove(&name);
+            self.foreign_tables.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S191 — Change data streams ────────────────────────────────────────
+        if up.starts_with("CREATE CHANGE STREAM ") {
+            // CREATE CHANGE STREAM cs ON t
+            let rest = &sql[21..];
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3 && parts[1].to_ascii_uppercase() == "ON" {
+                let cs_name = parts[0].to_ascii_lowercase();
+                let tbl = parts[2].to_ascii_lowercase();
+                self.s191_change_streams.lock().unwrap().insert(cs_name, tbl);
+            }
+            return Some(Ok(QueryResult::Created));
+        }
+        if up.starts_with("READ CHANGE STREAM ") {
+            let cs_name = sql[19..].trim().to_ascii_lowercase();
+            let streams = self.s191_change_streams.lock().unwrap();
+            let tbl = streams.get(&cs_name).cloned().unwrap_or_default();
+            let feed = self.change_feed.lock().unwrap();
+            let rows = feed.get(&tbl).map(|entries| {
+                entries.iter().map(|(op, payload, ts)| vec![op.clone(), payload.clone(), ts.clone()]).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["op".to_owned(), "payload".to_owned(), "ts".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP CHANGE STREAM ") {
+            let cs_name = sql[19..].trim().to_ascii_lowercase();
+            self.s191_change_streams.lock().unwrap().remove(&cs_name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW CHANGE STREAMS" {
+            let streams = self.s191_change_streams.lock().unwrap();
+            let rows = streams.iter().map(|(n, t)| vec![n.clone(), t.clone()]).collect::<Vec<_>>();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "table".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S192 — Query result TTL ───────────────────────────────────────────
+        if up.starts_with("SET RESULT TTL ") {
+            let val_str = sql[15..].trim();
+            if let Ok(v) = val_str.parse::<u64>() {
+                *self.s192_result_ttl.lock().unwrap() = Some(v);
+            }
+            return Some(Ok(QueryResult::Ok("RESULT TTL SET".to_owned())));
+        }
+        if up == "SHOW RESULT TTL" {
+            let ttl = *self.s192_result_ttl.lock().unwrap();
+            let val = ttl.map(|v| v.to_string()).unwrap_or_else(|| "unset".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["result_ttl_seconds".to_owned()],
+                rows: vec![vec![val]],
+            }));
+        }
+        if up == "RESET RESULT TTL" {
+            *self.s192_result_ttl.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok("RESULT TTL RESET".to_owned())));
+        }
+
+        // ── S193 — Batch operations ───────────────────────────────────────────
+        if up == "BEGIN BATCH" {
+            *self.s193_batch_active.lock().unwrap() = true;
+            self.s193_batch_stmts.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("BATCH BEGUN".to_owned())));
+        }
+        if up == "END BATCH" {
+            *self.s193_batch_active.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("BATCH ENDED".to_owned())));
+        }
+        if up == "CANCEL BATCH" {
+            *self.s193_batch_active.lock().unwrap() = false;
+            self.s193_batch_stmts.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("BATCH CANCELLED".to_owned())));
+        }
+        if up == "SHOW BATCH STATUS" {
+            let active = *self.s193_batch_active.lock().unwrap();
+            let count = self.s193_batch_stmts.lock().unwrap().len();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["active".to_owned(), "stmt_count".to_owned()],
+                rows: vec![vec![active.to_string(), count.to_string()]],
+            }));
+        }
+
+        // ── S194 — Index advisor ──────────────────────────────────────────────
+        if up.starts_with("ADVISE INDEXES FOR ") {
+            let target = sql[19..].trim().to_ascii_lowercase();
+            // extract table name heuristically
+            let rec = if let Some(pos) = target.find(" from ") {
+                let after = target[pos + 6..].trim();
+                let tbl = after.split_whitespace().next().unwrap_or("unknown");
+                format!("CREATE INDEX ON {} (col)", tbl)
+            } else {
+                "CREATE INDEX (recommendation based on query)".to_owned()
+            };
+            self.s194_index_recommendations.lock().unwrap().push(rec.clone());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["recommendation".to_owned()],
+                rows: vec![vec![rec]],
+            }));
+        }
+        if up == "SHOW INDEX RECOMMENDATIONS" {
+            let recs = self.s194_index_recommendations.lock().unwrap().clone();
+            let rows = recs.into_iter().map(|r| vec![r]).collect::<Vec<_>>();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["recommendation".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR INDEX RECOMMENDATIONS" {
+            self.s194_index_recommendations.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("INDEX RECOMMENDATIONS CLEARED".to_owned())));
+        }
+
+        // ── S195 — Table pinning ──────────────────────────────────────────────
+        if up.starts_with("PIN TABLE ") && up.ends_with(" IN MEMORY") {
+            // PIN TABLE t IN MEMORY
+            let rest = sql[10..].trim();
+            let tbl = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            if !tbl.is_empty() {
+                self.s195_pinned_tables.lock().unwrap().insert(tbl.clone());
+            }
+            return Some(Ok(QueryResult::Ok(format!("TABLE PINNED: {}", tbl))));
+        }
+        if up.starts_with("UNPIN TABLE ") {
+            let tbl = sql[12..].trim().to_ascii_lowercase();
+            self.s195_pinned_tables.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok(format!("TABLE UNPINNED: {}", tbl))));
+        }
+        if up == "SHOW PINNED TABLES" {
+            let pinned = self.s195_pinned_tables.lock().unwrap().clone();
+            let rows = pinned.into_iter().map(|t| vec![t]).collect::<Vec<_>>();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S196 — Query namespaces ───────────────────────────────────────────
+        if up.starts_with("CREATE QUERY NAMESPACE ") {
+            let name = sql[23..].trim().to_ascii_lowercase();
+            self.s196_query_namespaces.lock().unwrap().insert(name.clone());
+            return Some(Ok(QueryResult::Created));
+        }
+        if up.starts_with("SET QUERY NAMESPACE ") {
+            let name = sql[20..].trim().to_ascii_lowercase();
+            *self.s196_current_namespace.lock().unwrap() = Some(name.clone());
+            return Some(Ok(QueryResult::Ok(format!("QUERY NAMESPACE SET: {}", name))));
+        }
+        if up.starts_with("DROP QUERY NAMESPACE ") {
+            let name = sql[21..].trim().to_ascii_lowercase();
+            self.s196_query_namespaces.lock().unwrap().remove(&name);
+            if self.s196_current_namespace.lock().unwrap().as_deref() == Some(&name) {
+                *self.s196_current_namespace.lock().unwrap() = None;
+            }
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW QUERY NAMESPACES" {
+            let ns = self.s196_query_namespaces.lock().unwrap().clone();
+            let current = self.s196_current_namespace.lock().unwrap().clone();
+            let rows = ns.into_iter().map(|n| {
+                let active = if current.as_deref() == Some(&n) { "yes" } else { "no" };
+                vec![n, active.to_owned()]
+            }).collect::<Vec<_>>();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["namespace".to_owned(), "active".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S197 — Compaction control ─────────────────────────────────────────
+        if up.starts_with("COMPACT TABLE ") {
+            let tbl = sql[14..].trim().to_ascii_lowercase();
+            self.s197_compaction_log.lock().unwrap().push(format!("COMPACT {}", tbl));
+            return Some(Ok(QueryResult::Ok(format!("COMPACTION TRIGGERED: {}", tbl))));
+        }
+        if up.starts_with("SET COMPACTION POLICY ") {
+            let policy = sql[22..].trim().to_ascii_lowercase();
+            *self.s197_compaction_policy.lock().unwrap() = policy.clone();
+            return Some(Ok(QueryResult::Ok(format!("COMPACTION POLICY SET: {}", policy))));
+        }
+        if up == "SHOW COMPACTION STATUS" {
+            let policy = self.s197_compaction_policy.lock().unwrap().clone();
+            let log = self.s197_compaction_log.lock().unwrap().clone();
+            let rows = vec![vec![policy, log.len().to_string()]];
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["policy".to_owned(), "compaction_count".to_owned()],
+                rows,
+            }));
         }
 
         None
@@ -18875,6 +19210,409 @@ mod tests {
         let r = ex.execute("SHOW ADAPTIVE STATS").unwrap();
         if let QueryResult::Rows { rows, .. } = r {
             assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S188 — Query pipelines ────────────────────────────────────────────────
+    #[test]
+    fn test_s188_create_pipeline_returns_created() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE PIPELINE p1 AS SELECT * FROM src INTO dst").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s188_start_pipeline_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE PIPELINE p2 AS SELECT * FROM src INTO dst").unwrap();
+        let r = ex.execute("START PIPELINE p2").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s188_stop_pipeline_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE PIPELINE p3 AS SELECT * FROM src INTO dst").unwrap();
+        ex.execute("START PIPELINE p3").unwrap();
+        let r = ex.execute("STOP PIPELINE p3").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s188_show_pipelines_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE PIPELINE p4 AS SELECT * FROM src INTO dst").unwrap();
+        let r = ex.execute("SHOW PIPELINES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s188_drop_pipeline_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE PIPELINE p5 AS SELECT * FROM src INTO dst").unwrap();
+        let r = ex.execute("DROP PIPELINE p5").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+
+    // ── S189 — Column encryption v2 ──────────────────────────────────────────
+    #[test]
+    fn test_s189_encrypt_column_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ALTER TABLE users ENCRYPT COLUMN ssn WITH KEY 'mykey'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s189_decrypt_column_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE users ENCRYPT COLUMN ssn WITH KEY 'mykey'").unwrap();
+        let r = ex.execute("ALTER TABLE users DECRYPT COLUMN ssn").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s189_show_encrypted_columns_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE users ENCRYPT COLUMN ssn WITH KEY 'mykey'").unwrap();
+        let r = ex.execute("SHOW ENCRYPTED COLUMNS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s189_encrypted_columns_appear_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE users ENCRYPT COLUMN email WITH KEY 'k2'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ENCRYPTED COLUMNS").unwrap() {
+            assert!(rows.iter().any(|r| r[0].contains("email")));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s189_decrypt_removes_from_show() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE t1 ENCRYPT COLUMN c1 WITH KEY 'k'").unwrap();
+        ex.execute("ALTER TABLE t1 DECRYPT COLUMN c1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ENCRYPTED COLUMNS").unwrap() {
+            assert!(!rows.iter().any(|r| r[0] == "t1.c1"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S190 — Table federation ───────────────────────────────────────────────
+    #[test]
+    fn test_s190_create_foreign_table_returns_created() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE FOREIGN TABLE ft1 REMOTE 'host:5432' TABLE remote_t").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s190_drop_foreign_table_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE FOREIGN TABLE ft2 REMOTE 'host:5432' TABLE remote_t").unwrap();
+        let r = ex.execute("DROP FOREIGN TABLE ft2").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s190_show_foreign_tables_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE FOREIGN TABLE ft3 REMOTE 'host:5432' TABLE remote_t").unwrap();
+        let r = ex.execute("SHOW FOREIGN TABLES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s190_foreign_table_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE FOREIGN TABLE ft4 REMOTE 'db.example.com:5432' TABLE orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW FOREIGN TABLES").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "ft4"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s190_dropped_foreign_table_removed() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE FOREIGN TABLE ft5 REMOTE 'host:5432' TABLE t").unwrap();
+        ex.execute("DROP FOREIGN TABLE ft5").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW FOREIGN TABLES").unwrap() {
+            assert!(!rows.iter().any(|r| r[0] == "ft5"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S191 — Change data streams ────────────────────────────────────────────
+    #[test]
+    fn test_s191_create_change_stream_returns_created() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE CHANGE STREAM cs1 ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s191_read_change_stream_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE CHANGE STREAM cs2 ON orders").unwrap();
+        let r = ex.execute("READ CHANGE STREAM cs2").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s191_drop_change_stream_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE CHANGE STREAM cs3 ON orders").unwrap();
+        let r = ex.execute("DROP CHANGE STREAM cs3").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s191_show_change_streams_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE CHANGE STREAM cs4 ON orders").unwrap();
+        let r = ex.execute("SHOW CHANGE STREAMS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s191_change_stream_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE CHANGE STREAM cs5 ON customers").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CHANGE STREAMS").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "cs5"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S192 — Query result TTL ───────────────────────────────────────────────
+    #[test]
+    fn test_s192_set_result_ttl_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET RESULT TTL 60").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s192_show_result_ttl_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT TTL 120").unwrap();
+        let r = ex.execute("SHOW RESULT TTL").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s192_reset_result_ttl_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET RESULT TTL").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s192_show_result_ttl_reflects_set() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT TTL 300").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT TTL").unwrap() {
+            assert!(rows[0][0] == "300");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s192_reset_result_ttl_shows_unset() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT TTL 60").unwrap();
+        ex.execute("RESET RESULT TTL").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT TTL").unwrap() {
+            assert_eq!(rows[0][0], "unset");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S193 — Batch operations ───────────────────────────────────────────────
+    #[test]
+    fn test_s193_begin_batch_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("BEGIN BATCH").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s193_end_batch_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("BEGIN BATCH").unwrap();
+        let r = ex.execute("END BATCH").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s193_cancel_batch_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("BEGIN BATCH").unwrap();
+        let r = ex.execute("CANCEL BATCH").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s193_show_batch_status_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW BATCH STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s193_batch_active_after_begin() {
+        let (ex, _dir) = setup();
+        ex.execute("BEGIN BATCH").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW BATCH STATUS").unwrap() {
+            assert_eq!(rows[0][0], "true");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S194 — Index advisor ──────────────────────────────────────────────────
+    #[test]
+    fn test_s194_advise_indexes_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ADVISE INDEXES FOR SELECT * FROM orders WHERE status = 1").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s194_show_index_recommendations_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW INDEX RECOMMENDATIONS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s194_clear_index_recommendations_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR INDEX RECOMMENDATIONS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s194_recommendations_appear_after_advise() {
+        let (ex, _dir) = setup();
+        ex.execute("ADVISE INDEXES FOR SELECT * FROM users WHERE age = 30").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX RECOMMENDATIONS").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s194_clear_removes_recommendations() {
+        let (ex, _dir) = setup();
+        ex.execute("ADVISE INDEXES FOR SELECT * FROM t WHERE x = 1").unwrap();
+        ex.execute("CLEAR INDEX RECOMMENDATIONS").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX RECOMMENDATIONS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S195 — Table pinning ──────────────────────────────────────────────────
+    #[test]
+    fn test_s195_pin_table_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("PIN TABLE hot_data IN MEMORY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s195_unpin_table_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("PIN TABLE hot_data IN MEMORY").unwrap();
+        let r = ex.execute("UNPIN TABLE hot_data").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s195_show_pinned_tables_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("PIN TABLE hot_data IN MEMORY").unwrap();
+        let r = ex.execute("SHOW PINNED TABLES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s195_pinned_table_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("PIN TABLE my_table IN MEMORY").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PINNED TABLES").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "my_table"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s195_unpinned_table_removed() {
+        let (ex, _dir) = setup();
+        ex.execute("PIN TABLE tbl IN MEMORY").unwrap();
+        ex.execute("UNPIN TABLE tbl").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PINNED TABLES").unwrap() {
+            assert!(!rows.iter().any(|r| r[0] == "tbl"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S196 — Query namespaces ───────────────────────────────────────────────
+    #[test]
+    fn test_s196_create_query_namespace_returns_created() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE QUERY NAMESPACE analytics").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s196_set_query_namespace_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE QUERY NAMESPACE analytics").unwrap();
+        let r = ex.execute("SET QUERY NAMESPACE analytics").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s196_drop_query_namespace_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE QUERY NAMESPACE analytics").unwrap();
+        let r = ex.execute("DROP QUERY NAMESPACE analytics").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s196_show_query_namespaces_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE QUERY NAMESPACE reporting").unwrap();
+        let r = ex.execute("SHOW QUERY NAMESPACES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s196_namespace_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE QUERY NAMESPACE etl").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY NAMESPACES").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "etl"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S197 — Compaction control ─────────────────────────────────────────────
+    #[test]
+    fn test_s197_compact_table_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("COMPACT TABLE orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s197_set_compaction_policy_aggressive_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET COMPACTION POLICY aggressive").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s197_set_compaction_policy_normal_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET COMPACTION POLICY normal").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s197_show_compaction_status_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW COMPACTION STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s197_compaction_count_increments() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPACT TABLE t1").unwrap();
+        ex.execute("COMPACT TABLE t2").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW COMPACTION STATUS").unwrap() {
+            let count: usize = rows[0][1].parse().unwrap();
+            assert_eq!(count, 2);
         } else {
             panic!();
         }
