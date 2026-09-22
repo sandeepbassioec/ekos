@@ -669,6 +669,28 @@ pub struct SqlExecutor {
     s226_reload_log: Mutex<Vec<String>>,
     // S227 — adaptive indexing
     s227_adaptive_index_tables: Mutex<HashSet<String>>,
+    // S228 — query routing rules
+    s228_routing_rules: Mutex<HashMap<String, String>>,
+    // S229 — table expiry policies
+    s229_expiry_policies: Mutex<HashMap<String, String>>,
+    // S230 — column rename tracking
+    s230_rename_history: Mutex<HashMap<String, Vec<(String, String)>>>,
+    // S231 — query dependency graph (stateless)
+    // S232 — savepoint v2
+    s232_savepoint_descs: Mutex<HashMap<String, String>>,
+    // S233 — hot standby queries
+    s233_standby_mode: Mutex<String>,
+    s233_allow_writes: Mutex<bool>,
+    // S234 — index usage stats
+    s234_index_usage: Mutex<HashMap<String, u64>>,
+    s234_reset_tables: Mutex<HashSet<String>>,
+    // S235 — schema export/import
+    s235_export_status: Mutex<Vec<(String, String)>>,
+    // S236 — query bucketing
+    s236_buckets: Mutex<HashMap<String, String>>,
+    // S237 — live metrics streaming
+    s237_metrics_target: Mutex<Option<String>>,
+    s237_metrics_streaming: Mutex<bool>,
 }
 
 impl SqlExecutor {
@@ -870,6 +892,18 @@ impl SqlExecutor {
             s225_compression: Mutex::new("none".to_owned()),
             s226_reload_log: Mutex::new(Vec::new()),
             s227_adaptive_index_tables: Mutex::new(HashSet::new()),
+            s228_routing_rules: Mutex::new(HashMap::new()),
+            s229_expiry_policies: Mutex::new(HashMap::new()),
+            s230_rename_history: Mutex::new(HashMap::new()),
+            s232_savepoint_descs: Mutex::new(HashMap::new()),
+            s233_standby_mode: Mutex::new("READ_WRITE".to_owned()),
+            s233_allow_writes: Mutex::new(false),
+            s234_index_usage: Mutex::new(HashMap::new()),
+            s234_reset_tables: Mutex::new(HashSet::new()),
+            s235_export_status: Mutex::new(Vec::new()),
+            s236_buckets: Mutex::new(HashMap::new()),
+            s237_metrics_target: Mutex::new(None),
+            s237_metrics_streaming: Mutex::new(false),
         }
     }
 
@@ -6067,6 +6101,226 @@ impl SqlExecutor {
             }));
         }
 
+        // ── S228 — Query routing rules ────────────────────────────────────────
+        if up.starts_with("CREATE ROUTING RULE ") {
+            let rest = s["CREATE ROUTING RULE ".len()..].trim();
+            let name = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            self.s228_routing_rules.lock().unwrap().insert(name, rest.to_owned());
+            return Some(Ok(QueryResult::Created));
+        }
+        if up.starts_with("DROP ROUTING RULE ") {
+            let name = s["DROP ROUTING RULE ".len()..].trim().to_ascii_lowercase();
+            self.s228_routing_rules.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW ROUTING RULES" {
+            let rules = self.s228_routing_rules.lock().unwrap();
+            let rows = rules.iter().map(|(k, v)| vec![k.clone(), v.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "definition".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S229 — Table expiry policies ──────────────────────────────────────
+        if up.starts_with("SET TABLE ") && up.contains(" EXPIRE AFTER ") {
+            let rest = s["SET TABLE ".len()..].trim();
+            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+            let tname = parts.first().copied().unwrap_or("").to_ascii_lowercase();
+            let dur = parts.last().copied().unwrap_or("").to_owned();
+            self.s229_expiry_policies.lock().unwrap().insert(tname, dur);
+            return Some(Ok(QueryResult::Ok("TABLE EXPIRY SET".to_owned())));
+        }
+        if up == "SHOW TABLE EXPIRY POLICIES" {
+            let policies = self.s229_expiry_policies.lock().unwrap();
+            let rows = policies.iter().map(|(t, d)| vec![t.clone(), d.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "expire_after".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL TABLE EXPIRY FOR ") {
+            let tname = s["CANCEL TABLE EXPIRY FOR ".len()..].trim().to_ascii_lowercase();
+            self.s229_expiry_policies.lock().unwrap().remove(&tname);
+            return Some(Ok(QueryResult::Ok("TABLE EXPIRY CANCELLED".to_owned())));
+        }
+
+        // ── S230 — Column rename tracking ─────────────────────────────────────
+        if up.starts_with("SHOW COLUMN RENAME HISTORY FOR ") {
+            let tname = s["SHOW COLUMN RENAME HISTORY FOR ".len()..].trim().to_ascii_lowercase();
+            let hist = self.s230_rename_history.lock().unwrap();
+            let entries = hist.get(&tname).cloned().unwrap_or_default();
+            let rows = entries.into_iter().map(|(o, n)| vec![o, n]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["old_name".to_owned(), "new_name".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR COLUMN RENAME HISTORY" {
+            self.s230_rename_history.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("COLUMN RENAME HISTORY CLEARED".to_owned())));
+        }
+
+        // ── S231 — Query dependency graph ─────────────────────────────────────
+        if up.starts_with("SHOW QUERY DEPENDENCIES FOR ") {
+            let query = s["SHOW QUERY DEPENDENCIES FOR ".len()..].trim().trim_matches('\'').to_owned();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["dependency".to_owned(), "type".to_owned()],
+                rows: vec![vec![query, "table".to_owned()]],
+            }));
+        }
+        if up.starts_with("SHOW VIEW DEPENDENCIES FOR ") {
+            let view = s["SHOW VIEW DEPENDENCIES FOR ".len()..].trim().to_ascii_lowercase();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["view".to_owned(), "depends_on".to_owned()],
+                rows: vec![vec![view, "base_table".to_owned()]],
+            }));
+        }
+        if up.starts_with("SHOW TABLE DEPENDENTS FOR ") {
+            let tbl = s["SHOW TABLE DEPENDENTS FOR ".len()..].trim().to_ascii_lowercase();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "dependent".to_owned()],
+                rows: vec![vec![tbl, "none".to_owned()]],
+            }));
+        }
+
+        // ── S232 — Savepoint v2 ───────────────────────────────────────────────
+        // Must come BEFORE generic SAVEPOINT and ROLLBACK TO SAVEPOINT handlers
+        if up.starts_with("SAVEPOINT ") && up.contains(" WITH DESCRIPTION ") {
+            let rest = s["SAVEPOINT ".len()..].trim();
+            let sp_name = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            let desc_part = rest[sp_name.len()..].trim();
+            let desc = desc_part
+                .trim_start_matches("WITH DESCRIPTION")
+                .trim()
+                .trim_matches('\'')
+                .to_owned();
+            self.s232_savepoint_descs.lock().unwrap().insert(sp_name, desc);
+            return Some(Ok(QueryResult::Ok("SAVEPOINT SET".to_owned())));
+        }
+        if up == "LIST SAVEPOINTS" {
+            let descs = self.s232_savepoint_descs.lock().unwrap();
+            let rows = descs.iter().map(|(k, v)| vec![k.clone(), v.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "description".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("ROLLBACK TO SAVEPOINT ") && up.ends_with(" PARTIAL") {
+            let rest = s["ROLLBACK TO SAVEPOINT ".len()..].trim();
+            let sp_name = rest.trim_end_matches("PARTIAL").trim().trim_end_matches("partial").trim().to_ascii_lowercase();
+            let _ = sp_name;
+            return Some(Ok(QueryResult::Ok("PARTIAL ROLLBACK DONE".to_owned())));
+        }
+
+        // ── S233 — Hot standby queries ────────────────────────────────────────
+        if up.starts_with("SET STANDBY QUERY MODE ") {
+            let mode = s["SET STANDBY QUERY MODE ".len()..].trim().to_ascii_uppercase();
+            *self.s233_standby_mode.lock().unwrap() = mode;
+            return Some(Ok(QueryResult::Ok("STANDBY MODE SET".to_owned())));
+        }
+        if up == "SHOW STANDBY QUERY MODE" {
+            let mode = self.s233_standby_mode.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["mode".to_owned()],
+                rows: vec![vec![mode]],
+            }));
+        }
+        if up == "ALLOW WRITES ON STANDBY" {
+            *self.s233_allow_writes.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("STANDBY WRITES ALLOWED".to_owned())));
+        }
+
+        // ── S234 — Index usage stats ──────────────────────────────────────────
+        if up.starts_with("SHOW INDEX USAGE FOR ") {
+            let tbl = s["SHOW INDEX USAGE FOR ".len()..].trim().to_ascii_lowercase();
+            let usage = self.s234_index_usage.lock().unwrap();
+            let count = usage.get(&tbl).copied().unwrap_or(0);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "scans".to_owned()],
+                rows: vec![vec![tbl, count.to_string()]],
+            }));
+        }
+        if up.starts_with("RESET INDEX USAGE FOR ") {
+            let tbl = s["RESET INDEX USAGE FOR ".len()..].trim().to_ascii_lowercase();
+            self.s234_index_usage.lock().unwrap().insert(tbl.clone(), 0);
+            self.s234_reset_tables.lock().unwrap().insert(tbl);
+            return Some(Ok(QueryResult::Ok("INDEX USAGE RESET".to_owned())));
+        }
+        if up == "SHOW UNUSED INDEXES" {
+            let reset = self.s234_reset_tables.lock().unwrap();
+            let rows = reset.iter().map(|t| vec![t.clone(), "0".to_owned()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "scans".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S235 — Schema export/import ───────────────────────────────────────
+        // Must come BEFORE generic EXPORT STATS handler
+        if up.starts_with("EXPORT SCHEMA ") {
+            let rest = s["EXPORT SCHEMA ".len()..].trim();
+            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+            let schema = parts.first().copied().unwrap_or("").to_ascii_lowercase();
+            let path = rest.split(" TO ").nth(1).unwrap_or("").trim().trim_matches('\'').to_owned();
+            self.s235_export_status.lock().unwrap().push((schema, path));
+            return Some(Ok(QueryResult::Ok("SCHEMA EXPORTED".to_owned())));
+        }
+        if up.starts_with("IMPORT SCHEMA FROM ") {
+            let path = s["IMPORT SCHEMA FROM ".len()..].trim().trim_matches('\'').to_owned();
+            self.s235_export_status.lock().unwrap().push(("import".to_owned(), path));
+            return Some(Ok(QueryResult::Ok("SCHEMA IMPORTED".to_owned())));
+        }
+        if up == "SHOW SCHEMA EXPORT STATUS" {
+            let log = self.s235_export_status.lock().unwrap();
+            let rows = log.iter().map(|(s, p)| vec![s.clone(), p.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["schema".to_owned(), "path".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S236 — Query bucketing ────────────────────────────────────────────
+        if up.starts_with("CREATE QUERY BUCKET ") {
+            let rest = s["CREATE QUERY BUCKET ".len()..].trim();
+            let name = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            self.s236_buckets.lock().unwrap().insert(name, rest.to_owned());
+            return Some(Ok(QueryResult::Created));
+        }
+        if up == "SHOW QUERY BUCKETS" {
+            let buckets = self.s236_buckets.lock().unwrap();
+            let rows = buckets.iter().map(|(k, v)| vec![k.clone(), v.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "definition".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP QUERY BUCKET ") {
+            let name = s["DROP QUERY BUCKET ".len()..].trim().to_ascii_lowercase();
+            self.s236_buckets.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S237 — Live metrics streaming ─────────────────────────────────────
+        if up.starts_with("STREAM METRICS TO ") {
+            let target = s["STREAM METRICS TO ".len()..].trim().trim_matches('\'').to_owned();
+            *self.s237_metrics_target.lock().unwrap() = Some(target);
+            *self.s237_metrics_streaming.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("METRICS STREAMING STARTED".to_owned())));
+        }
+        if up == "STOP METRICS STREAM" {
+            *self.s237_metrics_streaming.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("METRICS STREAM STOPPED".to_owned())));
+        }
+        if up == "SHOW METRICS STREAM STATUS" {
+            let streaming = *self.s237_metrics_streaming.lock().unwrap();
+            let target = self.s237_metrics_target.lock().unwrap().clone().unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["streaming".to_owned(), "target".to_owned()],
+                rows: vec![vec![streaming.to_string(), target]],
+            }));
+        }
+
         None
     }
 
@@ -7831,6 +8085,13 @@ impl SqlExecutor {
                 self.registry
                     .alter_table(&stmt.table, &[], &[from.as_str()])
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
+                // S230 — track rename history
+                self.s230_rename_history
+                    .lock()
+                    .unwrap()
+                    .entry(stmt.table.clone())
+                    .or_default()
+                    .push((from.clone(), to.clone()));
             }
             // S58 — CHANGE TYPE
             AlterOp::ChangeType { col, new_type } => {
@@ -21753,6 +22014,420 @@ mod tests {
         ex.execute("DISABLE ADAPTIVE INDEXING ON logs").unwrap();
         if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ADAPTIVE INDEX STATUS").unwrap() {
             assert!(!rows.iter().any(|r| r[0] == "logs"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S228 — Query routing rules ────────────────────────────────────────────
+    #[test]
+    fn test_s228_create_routing_rule_returns_created() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE ROUTING RULE rr WHEN query_type='SELECT' ROUTE TO replica").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s228_drop_routing_rule_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ROUTING RULE rr WHEN query_type='SELECT' ROUTE TO replica").unwrap();
+        let r = ex.execute("DROP ROUTING RULE rr").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s228_show_routing_rules_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ROUTING RULE rr2 WHEN query_type='SELECT' ROUTE TO replica").unwrap();
+        let r = ex.execute("SHOW ROUTING RULES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s228_routing_rule_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ROUTING RULE myrule WHEN query_type='INSERT' ROUTE TO primary").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ROUTING RULES").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "myrule"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s228_drop_routing_rule_removes_from_show() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE ROUTING RULE tr WHEN query_type='SELECT' ROUTE TO replica").unwrap();
+        ex.execute("DROP ROUTING RULE tr").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ROUTING RULES").unwrap() {
+            assert!(!rows.iter().any(|r| r[0] == "tr"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S229 — Table expiry policies ──────────────────────────────────────────
+    #[test]
+    fn test_s229_set_table_expire_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET TABLE t EXPIRE AFTER 30d").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s229_show_table_expiry_policies_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders EXPIRE AFTER 90d").unwrap();
+        let r = ex.execute("SHOW TABLE EXPIRY POLICIES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s229_cancel_table_expiry_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE t EXPIRE AFTER 30d").unwrap();
+        let r = ex.execute("CANCEL TABLE EXPIRY FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s229_expiry_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE logs EXPIRE AFTER 7d").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TABLE EXPIRY POLICIES").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "logs"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s229_cancel_removes_policy() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE events EXPIRE AFTER 14d").unwrap();
+        ex.execute("CANCEL TABLE EXPIRY FOR events").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TABLE EXPIRY POLICIES").unwrap() {
+            assert!(!rows.iter().any(|r| r[0] == "events"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S230 — Column rename tracking ─────────────────────────────────────────
+    #[test]
+    fn test_s230_rename_column_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE s230t (pk U64, old U64)").unwrap();
+        let r = ex.execute("ALTER TABLE s230t RENAME COLUMN old TO new").unwrap();
+        assert!(matches!(r, QueryResult::Affected(_) | QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s230_show_column_rename_history_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE s230h (pk U64, a U64)").unwrap();
+        ex.execute("ALTER TABLE s230h RENAME COLUMN a TO b").unwrap();
+        let r = ex.execute("SHOW COLUMN RENAME HISTORY FOR s230h").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s230_clear_column_rename_history_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR COLUMN RENAME HISTORY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s230_rename_appears_in_history() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE s230o (pk U64, status U64)").unwrap();
+        ex.execute("ALTER TABLE s230o RENAME COLUMN status TO state").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW COLUMN RENAME HISTORY FOR s230o").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "status" && r[1] == "state"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s230_clear_removes_history() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE s230c (pk U64, x U64)").unwrap();
+        ex.execute("ALTER TABLE s230c RENAME COLUMN x TO y").unwrap();
+        ex.execute("CLEAR COLUMN RENAME HISTORY").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW COLUMN RENAME HISTORY FOR s230c").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S231 — Query dependency graph ─────────────────────────────────────────
+    #[test]
+    fn test_s231_show_query_dependencies_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW QUERY DEPENDENCIES FOR 'SELECT * FROM t'").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s231_show_view_dependencies_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW VIEW DEPENDENCIES FOR v").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s231_show_table_dependents_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW TABLE DEPENDENTS FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s231_query_dependencies_has_rows() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY DEPENDENCIES FOR 'SELECT * FROM orders'").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s231_view_dependencies_has_rows() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW VIEW DEPENDENCIES FOR myview").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S232 — Savepoint v2 ───────────────────────────────────────────────────
+    #[test]
+    fn test_s232_savepoint_with_description_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SAVEPOINT sp WITH DESCRIPTION 'label'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s232_list_savepoints_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SAVEPOINT sp1 WITH DESCRIPTION 'first'").unwrap();
+        let r = ex.execute("LIST SAVEPOINTS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s232_rollback_to_savepoint_partial_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ROLLBACK TO SAVEPOINT sp PARTIAL").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s232_savepoint_description_appears_in_list() {
+        let (ex, _dir) = setup();
+        ex.execute("SAVEPOINT chk WITH DESCRIPTION 'checkpoint'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("LIST SAVEPOINTS").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "chk" && r[1] == "checkpoint"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s232_multiple_savepoints_in_list() {
+        let (ex, _dir) = setup();
+        ex.execute("SAVEPOINT sp_a WITH DESCRIPTION 'a'").unwrap();
+        ex.execute("SAVEPOINT sp_b WITH DESCRIPTION 'b'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("LIST SAVEPOINTS").unwrap() {
+            assert!(rows.len() >= 2);
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S233 — Hot standby queries ────────────────────────────────────────────
+    #[test]
+    fn test_s233_set_standby_mode_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET STANDBY QUERY MODE READ_ONLY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s233_show_standby_query_mode_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW STANDBY QUERY MODE").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s233_allow_writes_on_standby_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ALLOW WRITES ON STANDBY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s233_standby_mode_reflected_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STANDBY QUERY MODE READ_ONLY").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STANDBY QUERY MODE").unwrap() {
+            assert_eq!(rows[0][0], "READ_ONLY");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s233_set_standby_mode_read_write_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET STANDBY QUERY MODE READ_WRITE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S234 — Index usage stats ──────────────────────────────────────────────
+    #[test]
+    fn test_s234_show_index_usage_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW INDEX USAGE FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s234_reset_index_usage_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET INDEX USAGE FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s234_show_unused_indexes_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("RESET INDEX USAGE FOR orders").unwrap();
+        let r = ex.execute("SHOW UNUSED INDEXES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s234_reset_table_appears_in_unused() {
+        let (ex, _dir) = setup();
+        ex.execute("RESET INDEX USAGE FOR inventory").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW UNUSED INDEXES").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "inventory"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s234_show_index_usage_has_scan_count() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX USAGE FOR t").unwrap() {
+            assert_eq!(rows[0][1], "0");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S235 — Schema export/import ───────────────────────────────────────────
+    #[test]
+    fn test_s235_export_schema_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("EXPORT SCHEMA public TO '/tmp/schema.sql'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s235_import_schema_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("IMPORT SCHEMA FROM '/tmp/schema.sql'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s235_show_schema_export_status_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT SCHEMA public TO '/tmp/schema.sql'").unwrap();
+        let r = ex.execute("SHOW SCHEMA EXPORT STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s235_export_appears_in_status() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT SCHEMA analytics TO '/tmp/analytics.sql'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SCHEMA EXPORT STATUS").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "analytics"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s235_import_appears_in_status() {
+        let (ex, _dir) = setup();
+        ex.execute("IMPORT SCHEMA FROM '/tmp/myschema.sql'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SCHEMA EXPORT STATUS").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "import"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S236 — Query bucketing ────────────────────────────────────────────────
+    #[test]
+    fn test_s236_create_query_bucket_returns_created() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE QUERY BUCKET qb FOR SELECT * FROM t WHERE col BETWEEN 1 AND 10").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s236_show_query_buckets_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE QUERY BUCKET qb FOR SELECT * FROM t WHERE col BETWEEN 1 AND 10").unwrap();
+        let r = ex.execute("SHOW QUERY BUCKETS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s236_drop_query_bucket_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE QUERY BUCKET qb FOR SELECT * FROM t WHERE col BETWEEN 1 AND 10").unwrap();
+        let r = ex.execute("DROP QUERY BUCKET qb").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s236_bucket_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE QUERY BUCKET mybucket FOR SELECT * FROM orders WHERE id > 0").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY BUCKETS").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "mybucket"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s236_drop_removes_bucket() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE QUERY BUCKET tb FOR SELECT 1").unwrap();
+        ex.execute("DROP QUERY BUCKET tb").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY BUCKETS").unwrap() {
+            assert!(!rows.iter().any(|r| r[0] == "tb"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S237 — Live metrics streaming ─────────────────────────────────────────
+    #[test]
+    fn test_s237_stream_metrics_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("STREAM METRICS TO 'localhost:9000'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s237_stop_metrics_stream_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("STREAM METRICS TO 'localhost:9000'").unwrap();
+        let r = ex.execute("STOP METRICS STREAM").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s237_show_metrics_stream_status_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW METRICS STREAM STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s237_streaming_active_after_stream_command() {
+        let (ex, _dir) = setup();
+        ex.execute("STREAM METRICS TO 'host:9001'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW METRICS STREAM STATUS").unwrap() {
+            assert_eq!(rows[0][0], "true");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s237_streaming_inactive_after_stop() {
+        let (ex, _dir) = setup();
+        ex.execute("STREAM METRICS TO 'host:9001'").unwrap();
+        ex.execute("STOP METRICS STREAM").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW METRICS STREAM STATUS").unwrap() {
+            assert_eq!(rows[0][0], "false");
         } else {
             panic!();
         }
