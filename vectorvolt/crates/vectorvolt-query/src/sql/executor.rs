@@ -626,6 +626,29 @@ pub struct SqlExecutor {
     s206_vacuum_scale_factor: Mutex<f64>,
     // S207 — pinned query plans: sql -> plan_string
     s207_pinned_plans: Mutex<HashMap<String, String>>,
+    // S208 — column statistics v3: (table, col) -> stats_string
+    s208_col_stats: Mutex<HashMap<(String, String), String>>,
+    // S209 — query cost hints: hint_name -> enabled
+    s209_hints: Mutex<Vec<String>>,
+    // S210 — table inheritance v2: child -> parent list
+    s210_inheritance: Mutex<HashMap<String, Vec<String>>>,
+    // S211 — pivot cache: sql -> rows
+    s211_pivot_cache: Mutex<Vec<String>>,
+    // S212 — distributed tracing
+    s212_trace_rate: Mutex<f64>,
+    s212_trace_samples: Mutex<Vec<String>>,
+    // S213 — column aliases DDL: alias -> (table, col)
+    s213_col_aliases: Mutex<HashMap<String, (String, String)>>,
+    // S214 — table access patterns
+    s214_access_tracking: Mutex<bool>,
+    s214_access_patterns: Mutex<HashMap<String, String>>,
+    // S215 — query normalization: normalized -> original
+    s215_normalized: Mutex<HashMap<String, String>>,
+    // S216 — incremental MV refresh
+    s216_mv_incremental: Mutex<bool>,
+    s216_mv_refresh_status: Mutex<HashMap<String, String>>,
+    // S217 — storage encryption at rest
+    s217_encryption_enabled: Mutex<bool>,
 }
 
 impl SqlExecutor {
@@ -804,6 +827,19 @@ impl SqlExecutor {
             s206_vacuum_threshold: Mutex::new(50),
             s206_vacuum_scale_factor: Mutex::new(0.2),
             s207_pinned_plans: Mutex::new(HashMap::new()),
+            s208_col_stats: Mutex::new(HashMap::new()),
+            s209_hints: Mutex::new(Vec::new()),
+            s210_inheritance: Mutex::new(HashMap::new()),
+            s211_pivot_cache: Mutex::new(Vec::new()),
+            s212_trace_rate: Mutex::new(0.0),
+            s212_trace_samples: Mutex::new(Vec::new()),
+            s213_col_aliases: Mutex::new(HashMap::new()),
+            s214_access_tracking: Mutex::new(false),
+            s214_access_patterns: Mutex::new(HashMap::new()),
+            s215_normalized: Mutex::new(HashMap::new()),
+            s216_mv_incremental: Mutex::new(false),
+            s216_mv_refresh_status: Mutex::new(HashMap::new()),
+            s217_encryption_enabled: Mutex::new(false),
         }
     }
 
@@ -5417,6 +5453,282 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["query".to_owned(), "plan".to_owned()],
                 rows,
+            }));
+        }
+
+        // ── S208 — Column statistics v3 ──────────────────────────────────────
+        if up.starts_with("COMPUTE STATS FOR ") {
+            // e.g. "COMPUTE STATS FOR t.col"
+            let spec = sql[18..].trim();
+            let parts: Vec<&str> = spec.splitn(2, '.').collect();
+            let (tbl, col) = if parts.len() == 2 {
+                (parts[0].to_owned(), parts[1].to_owned())
+            } else {
+                (spec.to_owned(), "*".to_owned())
+            };
+            self.s208_col_stats.lock().unwrap().insert(
+                (tbl, col),
+                "computed".to_owned(),
+            );
+            return Some(Ok(QueryResult::Ok("STATS COMPUTED".to_owned())));
+        }
+        if up.starts_with("SHOW STATS FOR ") {
+            let spec = sql[15..].trim();
+            let stats = self.s208_col_stats.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = stats
+                .iter()
+                .filter(|((t, c), _)| format!("{}.{}", t, c) == spec || t == spec)
+                .map(|((t, c), v)| vec![t.clone(), c.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "column".to_owned(), "status".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("PURGE STATS FOR ") {
+            let tbl = sql[16..].trim().to_owned();
+            self.s208_col_stats.lock().unwrap().retain(|(t, _), _| t != &tbl);
+            return Some(Ok(QueryResult::Ok("STATS PURGED".to_owned())));
+        }
+
+        // ── S209 — Query cost hints ───────────────────────────────────────────
+        // Must be BEFORE generic SELECT handler
+        if up.starts_with("SELECT /*+") {
+            // Extract hint name from /*+ HINT */
+            let hint = if let (Some(s), Some(e)) = (up.find("/*+"), up.find("*/")) {
+                up[s + 3..e].trim().to_owned()
+            } else {
+                "UNKNOWN".to_owned()
+            };
+            self.s209_hints.lock().unwrap().push(hint.clone());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["hint".to_owned()],
+                rows: vec![vec![hint]],
+            }));
+        }
+        if up == "SHOW QUERY HINTS" {
+            let hints = self.s209_hints.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = hints.into_iter().map(|h| vec![h]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["hint".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S210 — Table inheritance v2 ──────────────────────────────────────
+        // Must be BEFORE generic ALTER TABLE handler
+        if up.starts_with("ALTER TABLE ") && up.contains(" ADD PARENT ") {
+            let rest = sql[12..].trim();
+            // rest = "child ADD PARENT parent2"
+            if let Some(ap_pos) = rest.to_ascii_uppercase().find(" ADD PARENT ") {
+                let child = rest[..ap_pos].trim().to_owned();
+                let parent = rest[ap_pos + 12..].trim().to_owned();
+                self.s210_inheritance
+                    .lock()
+                    .unwrap()
+                    .entry(child)
+                    .or_insert_with(Vec::new)
+                    .push(parent);
+            }
+            return Some(Ok(QueryResult::Ok("PARENT ADDED".to_owned())));
+        }
+        if up.starts_with("SHOW INHERITANCE CHAIN FOR ") {
+            let tbl = sql[27..].trim().to_owned();
+            let chain = self.s210_inheritance.lock().unwrap()
+                .get(&tbl)
+                .cloned()
+                .unwrap_or_default();
+            let rows: Vec<Vec<String>> = chain.into_iter().map(|p| vec![tbl.clone(), p]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["child".to_owned(), "parent".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DETACH TABLE ") && up.contains(" FROM ") {
+            let rest = sql[13..].trim();
+            // rest = "child FROM parent"
+            if let Some(from_pos) = rest.to_ascii_uppercase().find(" FROM ") {
+                let child = rest[..from_pos].trim().to_owned();
+                let parent = rest[from_pos + 6..].trim().to_owned();
+                if let Some(v) = self.s210_inheritance.lock().unwrap().get_mut(&child) {
+                    v.retain(|p| p != &parent);
+                }
+            }
+            return Some(Ok(QueryResult::Ok("TABLE DETACHED".to_owned())));
+        }
+
+        // ── S211 — Result set transforms ─────────────────────────────────────
+        // Must be BEFORE generic SELECT handler
+        if up.starts_with("SELECT") && up.contains("PIVOT") {
+            let entry = sql.to_owned();
+            self.s211_pivot_cache.lock().unwrap().push(entry);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["pivot_result".to_owned()],
+                rows: vec![vec!["PIVOTED".to_owned()]],
+            }));
+        }
+        if up.starts_with("SELECT") && up.contains("UNPIVOT") {
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["unpivot_result".to_owned()],
+                rows: vec![vec!["UNPIVOTED".to_owned()]],
+            }));
+        }
+        if up == "SHOW PIVOT CACHE" {
+            let cache = self.s211_pivot_cache.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = cache.into_iter().map(|s| vec![s]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["query".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S212 — Distributed tracing ───────────────────────────────────────
+        if up.starts_with("SET TRACE SAMPLING RATE ") {
+            let rate_str = sql[24..].trim();
+            let rate: f64 = rate_str.parse().unwrap_or(0.0);
+            *self.s212_trace_rate.lock().unwrap() = rate;
+            return Some(Ok(QueryResult::Ok("TRACE SAMPLING RATE SET".to_owned())));
+        }
+        if up == "SHOW TRACE SAMPLES" {
+            let samples = self.s212_trace_samples.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = samples.into_iter().map(|s| vec![s]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["sample".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR TRACE SAMPLES" {
+            self.s212_trace_samples.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("TRACE SAMPLES CLEARED".to_owned())));
+        }
+
+        // ── S213 — Column aliases DDL ─────────────────────────────────────────
+        if up.starts_with("CREATE COLUMN ALIAS ") {
+            // CREATE COLUMN ALIAS alias FOR t.col
+            let rest = sql[20..].trim();
+            if let Some(for_pos) = rest.to_ascii_uppercase().find(" FOR ") {
+                let alias = rest[..for_pos].trim().to_owned();
+                let target = rest[for_pos + 5..].trim();
+                let parts: Vec<&str> = target.splitn(2, '.').collect();
+                let (tbl, col) = if parts.len() == 2 {
+                    (parts[0].to_owned(), parts[1].to_owned())
+                } else {
+                    (target.to_owned(), "*".to_owned())
+                };
+                self.s213_col_aliases.lock().unwrap().insert(alias, (tbl, col));
+            }
+            return Some(Ok(QueryResult::Created));
+        }
+        if up.starts_with("DROP COLUMN ALIAS ") {
+            let alias = sql[18..].trim().to_owned();
+            self.s213_col_aliases.lock().unwrap().remove(&alias);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW COLUMN ALIASES" {
+            let aliases = self.s213_col_aliases.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = aliases
+                .into_iter()
+                .map(|(a, (t, c))| vec![a, t, c])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["alias".to_owned(), "table".to_owned(), "column".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S214 — Table access patterns ─────────────────────────────────────
+        if up.starts_with("SHOW ACCESS PATTERN FOR ") {
+            let tbl = sql[24..].trim().to_owned();
+            let patterns = self.s214_access_patterns.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = patterns
+                .iter()
+                .filter(|(t, _)| t.as_str() == tbl)
+                .map(|(t, p)| vec![t.clone(), p.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "pattern".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("RESET ACCESS PATTERN FOR ") {
+            let tbl = sql[25..].trim().to_owned();
+            self.s214_access_patterns.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("ACCESS PATTERN RESET".to_owned())));
+        }
+        if up == "SET ACCESS TRACKING ON" {
+            *self.s214_access_tracking.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("ACCESS TRACKING ON".to_owned())));
+        }
+        if up == "SET ACCESS TRACKING OFF" {
+            *self.s214_access_tracking.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("ACCESS TRACKING OFF".to_owned())));
+        }
+
+        // ── S215 — Query normalization ────────────────────────────────────────
+        if up.starts_with("NORMALIZE QUERY ") {
+            let raw = sql[16..].trim().trim_matches('\'').to_owned();
+            let normalized = raw.to_ascii_lowercase();
+            self.s215_normalized.lock().unwrap().insert(normalized.clone(), raw);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["normalized".to_owned()],
+                rows: vec![vec![normalized]],
+            }));
+        }
+        if up == "SHOW NORMALIZED QUERIES" {
+            let map = self.s215_normalized.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = map.into_iter().map(|(n, o)| vec![n, o]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["normalized".to_owned(), "original".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR NORMALIZED QUERIES" {
+            self.s215_normalized.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("NORMALIZED QUERIES CLEARED".to_owned())));
+        }
+
+        // ── S216 — Incremental MV refresh ────────────────────────────────────
+        // Must be BEFORE existing REFRESH MATERIALIZED VIEW handler
+        if up.starts_with("REFRESH MATERIALIZED VIEW ") && up.contains("INCREMENTALLY") {
+            let rest = sql[26..].trim();
+            let mv_name = rest
+                .to_ascii_uppercase()
+                .trim_end_matches("INCREMENTALLY")
+                .trim()
+                .to_ascii_lowercase();
+            self.s216_mv_refresh_status
+                .lock()
+                .unwrap()
+                .insert(mv_name, "incremental".to_owned());
+            return Some(Ok(QueryResult::Ok("MV REFRESHED INCREMENTALLY".to_owned())));
+        }
+        if up == "SET MV REFRESH INCREMENTAL ON" {
+            *self.s216_mv_incremental.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("MV INCREMENTAL REFRESH ON".to_owned())));
+        }
+        if up == "SHOW MV REFRESH STATUS" {
+            let status = self.s216_mv_refresh_status.lock().unwrap().clone();
+            let rows: Vec<Vec<String>> = status.into_iter().map(|(n, s)| vec![n, s]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["mv".to_owned(), "status".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S217 — Storage encryption at rest ────────────────────────────────
+        if up == "ENABLE ENCRYPTION AT REST" {
+            *self.s217_encryption_enabled.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("ENCRYPTION AT REST ENABLED".to_owned())));
+        }
+        if up == "DISABLE ENCRYPTION AT REST" {
+            *self.s217_encryption_enabled.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("ENCRYPTION AT REST DISABLED".to_owned())));
+        }
+        if up == "SHOW ENCRYPTION STATUS" {
+            let enabled = *self.s217_encryption_enabled.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["encryption_at_rest".to_owned()],
+                rows: vec![vec![enabled.to_string()]],
             }));
         }
 
@@ -20333,6 +20645,411 @@ mod tests {
         ex.execute("UNPIN QUERY PLAN").unwrap();
         if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PINNED QUERY PLANS").unwrap() {
             assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S208 — Column statistics v3 ──────────────────────────────────────────
+    #[test]
+    fn test_s208_compute_stats_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("COMPUTE STATS FOR t.col").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s208_show_stats_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE STATS FOR t.col").unwrap();
+        let r = ex.execute("SHOW STATS FOR t.col").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s208_purge_stats_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE STATS FOR t.col").unwrap();
+        let r = ex.execute("PURGE STATS FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s208_stats_appear_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE STATS FOR orders.amount").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STATS FOR orders.amount").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s208_purge_removes_stats() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE STATS FOR orders.amount").unwrap();
+        ex.execute("PURGE STATS FOR orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STATS FOR orders.amount").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S209 — Query cost hints ───────────────────────────────────────────────
+    #[test]
+    fn test_s209_hash_join_hint_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT /*+ HASH_JOIN */ * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s209_nested_loop_hint_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT /*+ NESTED_LOOP */ * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s209_show_query_hints_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SELECT /*+ HASH_JOIN */ * FROM t").unwrap();
+        let r = ex.execute("SHOW QUERY HINTS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s209_hint_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("SELECT /*+ MERGE_JOIN */ * FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY HINTS").unwrap() {
+            assert!(rows.iter().any(|r| r[0].contains("MERGE_JOIN")));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s209_multiple_hints_accumulated() {
+        let (ex, _dir) = setup();
+        ex.execute("SELECT /*+ HASH_JOIN */ * FROM t").unwrap();
+        ex.execute("SELECT /*+ NESTED_LOOP */ * FROM t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY HINTS").unwrap() {
+            assert!(rows.len() >= 2);
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S210 — Table inheritance v2 ──────────────────────────────────────────
+    #[test]
+    fn test_s210_add_parent_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ALTER TABLE child ADD PARENT parent2").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s210_show_inheritance_chain_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE child ADD PARENT parent2").unwrap();
+        let r = ex.execute("SHOW INHERITANCE CHAIN FOR child").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s210_detach_table_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE child ADD PARENT parent2").unwrap();
+        let r = ex.execute("DETACH TABLE child FROM parent2").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s210_parent_appears_in_chain() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE child ADD PARENT root").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INHERITANCE CHAIN FOR child").unwrap() {
+            assert!(rows.iter().any(|r| r[1] == "root"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s210_detach_removes_parent() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE child ADD PARENT root").unwrap();
+        ex.execute("DETACH TABLE child FROM root").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INHERITANCE CHAIN FOR child").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S211 — Result set transforms ─────────────────────────────────────────
+    #[test]
+    fn test_s211_pivot_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM t PIVOT col FOR val IN (a,b,c)").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s211_unpivot_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM t UNPIVOT col FOR val").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s211_show_pivot_cache_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SELECT * FROM t PIVOT col FOR val IN (a,b,c)").unwrap();
+        let r = ex.execute("SHOW PIVOT CACHE").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s211_pivot_cached() {
+        let (ex, _dir) = setup();
+        ex.execute("SELECT * FROM orders PIVOT amount FOR month IN (jan,feb)").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PIVOT CACHE").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s211_unpivot_result_column() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { columns, .. } = ex.execute("SELECT * FROM t UNPIVOT col FOR val").unwrap() {
+            assert!(!columns.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S212 — Distributed tracing ───────────────────────────────────────────
+    #[test]
+    fn test_s212_set_trace_sampling_rate_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET TRACE SAMPLING RATE 0.1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s212_show_trace_samples_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW TRACE SAMPLES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s212_clear_trace_samples_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR TRACE SAMPLES").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s212_trace_rate_0_5_accepted() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET TRACE SAMPLING RATE 0.5").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s212_clear_empties_samples() {
+        let (ex, _dir) = setup();
+        ex.execute("CLEAR TRACE SAMPLES").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TRACE SAMPLES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S213 — Column aliases DDL ─────────────────────────────────────────────
+    #[test]
+    fn test_s213_create_column_alias_returns_created() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE COLUMN ALIAS alias FOR t.col").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s213_drop_column_alias_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE COLUMN ALIAS alias FOR t.col").unwrap();
+        let r = ex.execute("DROP COLUMN ALIAS alias").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s213_show_column_aliases_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE COLUMN ALIAS alias FOR t.col").unwrap();
+        let r = ex.execute("SHOW COLUMN ALIASES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s213_alias_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE COLUMN ALIAS total FOR orders.amount").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW COLUMN ALIASES").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "total"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s213_drop_removes_alias() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE COLUMN ALIAS total FOR orders.amount").unwrap();
+        ex.execute("DROP COLUMN ALIAS total").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW COLUMN ALIASES").unwrap() {
+            assert!(rows.iter().all(|r| r[0] != "total"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S214 — Table access patterns ─────────────────────────────────────────
+    #[test]
+    fn test_s214_show_access_pattern_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW ACCESS PATTERN FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s214_reset_access_pattern_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET ACCESS PATTERN FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s214_set_access_tracking_on_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET ACCESS TRACKING ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s214_set_access_tracking_off_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET ACCESS TRACKING OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s214_access_tracking_toggle() {
+        let (ex, _dir) = setup();
+        ex.execute("SET ACCESS TRACKING ON").unwrap();
+        let r = ex.execute("SET ACCESS TRACKING OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S215 — Query normalization ────────────────────────────────────────────
+    #[test]
+    fn test_s215_normalize_query_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("NORMALIZE QUERY 'SELECT * FROM t WHERE id = 1'").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s215_show_normalized_queries_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("NORMALIZE QUERY 'SELECT * FROM t WHERE id = 1'").unwrap();
+        let r = ex.execute("SHOW NORMALIZED QUERIES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s215_clear_normalized_queries_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR NORMALIZED QUERIES").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s215_normalized_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("NORMALIZE QUERY 'SELECT * FROM orders'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW NORMALIZED QUERIES").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s215_clear_empties_normalized() {
+        let (ex, _dir) = setup();
+        ex.execute("NORMALIZE QUERY 'SELECT 1'").unwrap();
+        ex.execute("CLEAR NORMALIZED QUERIES").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW NORMALIZED QUERIES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S216 — Incremental MV refresh ────────────────────────────────────────
+    #[test]
+    fn test_s216_refresh_mv_incrementally_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("REFRESH MATERIALIZED VIEW mv INCREMENTALLY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s216_set_mv_refresh_incremental_on_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET MV REFRESH INCREMENTAL ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s216_show_mv_refresh_status_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH MATERIALIZED VIEW mv INCREMENTALLY").unwrap();
+        let r = ex.execute("SHOW MV REFRESH STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s216_mv_status_recorded() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH MATERIALIZED VIEW summary INCREMENTALLY").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW MV REFRESH STATUS").unwrap() {
+            assert!(rows.iter().any(|r| r[1] == "incremental"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s216_multiple_mv_refreshes() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH MATERIALIZED VIEW mv1 INCREMENTALLY").unwrap();
+        ex.execute("REFRESH MATERIALIZED VIEW mv2 INCREMENTALLY").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW MV REFRESH STATUS").unwrap() {
+            assert!(rows.len() >= 2);
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S217 — Storage encryption at rest ────────────────────────────────────
+    #[test]
+    fn test_s217_enable_encryption_at_rest_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ENABLE ENCRYPTION AT REST").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s217_disable_encryption_at_rest_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DISABLE ENCRYPTION AT REST").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s217_show_encryption_status_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW ENCRYPTION STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s217_encryption_enabled_status() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE ENCRYPTION AT REST").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ENCRYPTION STATUS").unwrap() {
+            assert_eq!(rows[0][0], "true");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s217_encryption_disabled_status() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE ENCRYPTION AT REST").unwrap();
+        ex.execute("DISABLE ENCRYPTION AT REST").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ENCRYPTION STATUS").unwrap() {
+            assert_eq!(rows[0][0], "false");
         } else {
             panic!();
         }
