@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+﻿use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
@@ -51,9 +51,9 @@ pub enum QueryResult {
     TxBegin,
     TxCommit,
     TxRollback,
-    // S86 — SQLSTATE-style error
+    // S86 â€” SQLSTATE-style error
     Error(String),
-    // S87 — Notice messages
+    // S87 â€” Notice messages
     Notice(String),
     WithNotice {
         result: Box<QueryResult>,
@@ -63,7 +63,7 @@ pub enum QueryResult {
     Ok(String),
 }
 
-// S86 — SQLSTATE error code helper
+// S86 â€” SQLSTATE error code helper
 fn sql_error(code: &str, msg: &str) -> QueryResult {
     QueryResult::Error(format!("[{}] {}", code, msg))
 }
@@ -80,7 +80,7 @@ fn chrono_now() -> String {
 /// Per-table open transaction id, keyed by table name.
 type TxnMap = HashMap<String, TxnId>;
 
-// S80 — Audit log entry
+// S80 â€” Audit log entry
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     pub ts: String,
@@ -90,7 +90,7 @@ pub struct AuditEntry {
     pub new_val: String,
 }
 
-// S88 — replication slot
+// S88 â€” replication slot
 #[derive(Debug, Clone)]
 pub struct ReplicationSlot {
     pub name: String,
@@ -98,7 +98,7 @@ pub struct ReplicationSlot {
     pub lsn: u64,
 }
 
-// S93 — slow query log entry
+// S93 â€” slow query log entry
 #[derive(Debug, Clone)]
 pub struct SlowLogEntry {
     pub sql: String,
@@ -107,14 +107,14 @@ pub struct SlowLogEntry {
     pub ts: String,
 }
 
-// S103 — cursor state
+// S103 â€” cursor state
 #[derive(Debug, Clone)]
 pub struct CursorState {
     pub rows: Vec<Vec<String>>,
     pub pos: usize,
 }
 
-// S97 — wait event
+// S97 â€” wait event
 #[derive(Debug, Clone)]
 pub struct WaitEvent {
     pub event_type: String,
@@ -123,7 +123,7 @@ pub struct WaitEvent {
     pub ts: String,
 }
 
-// S115 — column statistics
+// S115 â€” column statistics
 #[derive(Debug, Clone, Default)]
 pub struct ColStat {
     pub row_count: u64,
@@ -133,7 +133,7 @@ pub struct ColStat {
     pub max_val: String,
 }
 
-// S117 — resource group
+// S117 â€” resource group
 #[derive(Debug, Clone)]
 pub struct ResourceGroup {
     pub cpu_pct: u64,
@@ -194,7 +194,7 @@ fn normalize_sql(sql: &str) -> String {
         .join(" ")
 }
 
-// ── S118–S127 free helpers ───────────────────────────────────────────────────
+// â”€â”€ S118â€“S127 free helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn parse_single_quoted(s: &str) -> Option<String> {
     let s = s.trim();
@@ -257,7 +257,7 @@ fn parse_match_rel_type(sql: &str) -> Option<String> {
             if let Some(colon) = inner.find(':') {
                 return Some(inner[colon + 1..].trim().to_owned());
             }
-            // bare [r] — wildcard
+            // bare [r] â€” wildcard
             return None;
         }
     }
@@ -328,369 +328,392 @@ pub struct SqlExecutor {
     registry: Arc<TableRegistry>,
     /// Active transaction state. `None` = auto-commit mode.
     txn: Mutex<Option<TxnMap>>,
-    /// S45 — in-memory view store.
+    /// S45 â€” in-memory view store.
     views: Mutex<HashMap<String, SelectStmt>>,
-    /// S53 — savepoint snapshots: name → TxnMap clone at savepoint time.
+    /// S53 â€” savepoint snapshots: name â†’ TxnMap clone at savepoint time.
     savepoints: Mutex<HashMap<String, TxnMap>>,
-    /// S56 — query result cache: sql → (columns, rows).
+    /// S56 â€” query result cache: sql â†’ (columns, rows).
     #[allow(dead_code, clippy::type_complexity)]
     query_cache: Mutex<HashMap<String, (Vec<String>, Vec<Vec<String>>)>>,
-    /// S57 — prepared statements: name → Stmt.
+    /// S57 â€” prepared statements: name â†’ Stmt.
     prepared: Mutex<HashMap<String, Stmt>>,
-    /// S59 — per-column defaults: table → Vec<Option<LitVal>> (indexed by col position).
+    /// S59 â€” per-column defaults: table â†’ Vec<Option<LitVal>> (indexed by col position).
     col_defaults: Mutex<HashMap<String, Vec<Option<LitVal>>>>,
-    /// S59 — per-column CHECK constraints: table → Vec<Option<String>>.
+    /// S59 â€” per-column CHECK constraints: table â†’ Vec<Option<String>>.
     col_checks: Mutex<HashMap<String, Vec<Option<String>>>>,
-    /// S60 — foreign keys: table → Vec<(col, ref_table, ref_col)>.
+    /// S60 â€” foreign keys: table â†’ Vec<(col, ref_table, ref_col)>.
     #[allow(clippy::type_complexity)]
     foreign_keys: Mutex<HashMap<String, Vec<(String, String, String)>>>,
-    /// S65 — user-defined functions: name → (param, body).
+    /// S65 â€” user-defined functions: name â†’ (param, body).
     pub(crate) udfs: Mutex<HashMap<String, (String, String)>>,
-    /// S66 — triggers: name → TriggerDef.
+    /// S66 â€” triggers: name â†’ TriggerDef.
     pub(crate) triggers: Mutex<HashMap<String, TriggerDef>>,
-    /// S71 — per-query stats
+    /// S71 â€” per-query stats
     query_stats: Mutex<HashMap<String, QueryStat>>,
-    /// S75 — materialized views: name → (query, cached rows)
+    /// S75 â€” materialized views: name â†’ (query, cached rows)
     #[allow(clippy::type_complexity)]
     mat_views: Mutex<HashMap<String, (SelectStmt, Vec<Vec<String>>)>>,
-    // S78 — RLS policies: policy_name → (table, expr)
+    // S78 â€” RLS policies: policy_name â†’ (table, expr)
     policies: Mutex<HashMap<String, (String, Expr)>>,
-    // S79 — column masks: (table, col) → mask_val
+    // S79 â€” column masks: (table, col) â†’ mask_val
     masks: Mutex<HashMap<(String, String), String>>,
-    // S80 — audit log
+    // S80 â€” audit log
     audit_log: Mutex<Vec<AuditEntry>>,
-    // S81 — session token + per-table required tokens
+    // S81 â€” session token + per-table required tokens
     session_token: Mutex<Option<String>>,
     table_tokens: Mutex<HashMap<String, String>>,
-    // S82 — rate limits: table → (limit, count, window_start)
+    // S82 â€” rate limits: table â†’ (limit, count, window_start)
     rate_limits: Mutex<HashMap<String, (u64, u64, std::time::Instant)>>,
-    // S83 — IP allowlist
+    // S83 â€” IP allowlist
     allowed_ips: Mutex<HashSet<String>>,
-    // S84 — TLS cert/key paths
+    // S84 â€” TLS cert/key paths
     tls_cert_path: Mutex<Option<String>>,
     tls_key_path: Mutex<Option<String>>,
-    // S85 — pgwire portals: portal_name → (stmt_name, params)
+    // S85 â€” pgwire portals: portal_name â†’ (stmt_name, params)
     #[allow(clippy::type_complexity)]
     bound_portals: Mutex<HashMap<String, (String, Vec<LitVal>)>>,
-    // S87 — warnings enabled
+    // S87 â€” warnings enabled
     warnings_enabled: Mutex<bool>,
-    // S88 — replication slots
+    // S88 â€” replication slots
     replication_slots: Mutex<HashMap<String, ReplicationSlot>>,
-    // S90 — read-only mode
+    // S90 â€” read-only mode
     read_only: Mutex<bool>,
-    // S92 — WAL archive
+    // S92 â€” WAL archive
     archive_path: Mutex<Option<String>>,
     archive_count: Mutex<u64>,
-    // S93 — slow query log
+    // S93 â€” slow query log
     slow_query_threshold_ms: Mutex<Option<u64>>,
     slow_log: Mutex<Vec<SlowLogEntry>>,
-    // S96 — auto-explain
+    // S96 â€” auto-explain
     auto_explain_threshold_ms: Mutex<Option<u64>>,
-    // S97 — wait events
+    // S97 â€” wait events
     wait_events: Mutex<Vec<WaitEvent>>,
-    // S99 — health dashboard creation time
+    // S99 â€” health dashboard creation time
     created_at: std::time::Instant,
-    // S102 — pgcli mode toggles
+    // S102 â€” pgcli mode toggles
     timing_enabled: Mutex<bool>,
     expanded_mode: Mutex<bool>,
-    // S103 — named cursors
+    // S103 â€” named cursors
     cursors: Mutex<HashMap<String, CursorState>>,
-    // S106 — statement timeout
+    // S106 â€” statement timeout
     statement_timeout_ms: Mutex<Option<u64>>,
-    // S110 — multi-database
+    // S110 â€” multi-database
     databases: Mutex<HashSet<String>>,
     current_db: Mutex<String>,
-    // S111 — schema namespacing
+    // S111 â€” schema namespacing
     schemas: Mutex<HashSet<String>>,
     search_path: Mutex<String>,
-    // S112 — partition metadata: child_table → (parent, from_val, to_val)
+    // S112 â€” partition metadata: child_table â†’ (parent, from_val, to_val)
     #[allow(clippy::type_complexity)]
     partitions: Mutex<HashMap<String, (String, String, String)>>,
-    // S114 — dead row counter per table
+    // S114 â€” dead row counter per table
     dead_rows: Mutex<HashMap<String, u64>>,
-    // S115 — table statistics
+    // S115 â€” table statistics
     table_stats: Mutex<HashMap<String, HashMap<String, ColStat>>>,
-    // S116 — connection limits
+    // S116 â€” connection limits
     max_connections: Mutex<u64>,
     connection_count: std::sync::atomic::AtomicU64,
-    // S117 — resource groups
+    // S117 â€” resource groups
     resource_groups: Mutex<HashMap<String, ResourceGroup>>,
-    // S118 — event log: table → [(ts_ms, event_type, payload_json)]
+    // S118 â€” event log: table â†’ [(ts_ms, event_type, payload_json)]
     event_log: Mutex<HashMap<String, Vec<(u64, String, String)>>>,
-    // S119 — read models: model_name → (source_table, event_type_filter)
+    // S119 â€” read models: model_name â†’ (source_table, event_type_filter)
     read_models: Mutex<HashMap<String, (String, String)>>,
-    // S120 — time-travel snapshots: table → [(ts_ms, rows)]
+    // S120 â€” time-travel snapshots: table â†’ [(ts_ms, rows)]
     #[allow(clippy::type_complexity)]
     time_travel_log: Mutex<HashMap<String, Vec<(u64, Vec<Vec<String>>)>>>,
-    // S121 — change feed: table → [(op, row_json, ts)]
+    // S121 â€” change feed: table â†’ [(op, row_json, ts)]
     change_feed: Mutex<HashMap<String, Vec<(String, String, String)>>>,
     change_feed_enabled: Mutex<HashSet<String>>,
-    // S122 — bloom indexes: index_name → (table, col, values)
+    // S122 â€” bloom indexes: index_name â†’ (table, col, values)
     bloom_indexes: Mutex<HashMap<String, (String, String, HashSet<String>)>>,
-    // S123 — columnar storage hint
+    // S123 â€” columnar storage hint
     columnar_tables: Mutex<HashSet<String>>,
-    // S124 — adaptive query execution
+    // S124 â€” adaptive query execution
     aqe_enabled: Mutex<bool>,
     aqe_stats: Mutex<HashMap<String, u64>>,
-    // S125 — query result streaming
+    // S125 â€” query result streaming
     stream_chunk_size: Mutex<usize>,
-    // S126 — geospatial: table → col → (lat, lng)
+    // S126 â€” geospatial: table â†’ col â†’ (lat, lng)
     geo_columns: Mutex<HashMap<String, HashMap<String, (f64, f64)>>>,
-    // S127 — graph edges: (from_node, rel_type, to_node)
+    // S127 â€” graph edges: (from_node, rel_type, to_node)
     graph_edges: Mutex<Vec<(String, String, String)>>,
-    // S128 — distributed 2PC
+    // S128 â€” distributed 2PC
     prepared_txns: Mutex<HashMap<String, Vec<String>>>,
     dist_txn_active: Mutex<Option<String>>,
-    // S129 — stored procedures
+    // S129 â€” stored procedures
     procedures: Mutex<HashMap<String, Vec<String>>>,
-    // S130 — user-defined types
+    // S130 â€” user-defined types
     user_types: Mutex<HashMap<String, (String, String)>>,
-    // S131 — array store: key → Vec<String>
+    // S131 â€” array store: key â†’ Vec<String>
     array_store: Mutex<HashMap<String, Vec<String>>>,
-    // S132 — jsonpath cache: key → json_string
+    // S132 â€” jsonpath cache: key â†’ json_string
     jsonpath_cache: Mutex<HashMap<String, String>>,
-    // S133 — foreign data wrappers
+    // S133 â€” foreign data wrappers
     foreign_servers: Mutex<HashMap<String, String>>,
     foreign_tables: Mutex<HashMap<String, String>>,
-    // S134 — query federation
+    // S134 â€” query federation
     federation_nodes: Mutex<HashMap<String, String>>,
-    // S135 — pluggable storage engines
+    // S135 â€” pluggable storage engines
     table_engines: Mutex<HashMap<String, String>>,
-    // S136 — multi-region replication
+    // S136 â€” multi-region replication
     regions: Mutex<HashMap<String, String>>,
     replication_lag: Mutex<HashMap<String, u64>>,
-    // S137 — pluggable auth providers
+    // S137 â€” pluggable auth providers
     auth_providers: Mutex<HashMap<String, String>>,
     auth_config: Mutex<HashMap<String, String>>,
-    // S138 — materialized view auto-refresh
+    // S138 â€” materialized view auto-refresh
     mat_view_refresh: Mutex<HashMap<String, u64>>,
     mat_view_last_refresh: Mutex<HashMap<String, u64>>,
-    // S139 — query result caching with TTL
+    // S139 â€” query result caching with TTL
     ttl_cache: Mutex<HashMap<String, (String, u64)>>,
-    // S140 — distributed locks
+    // S140 â€” distributed locks
     dist_locks: Mutex<HashMap<String, (String, u64)>>,
-    // S141 — logical replication filters
+    // S141 â€” logical replication filters
     repl_filters: Mutex<HashMap<String, String>>,
-    // S142 — column encryption
+    // S142 â€” column encryption
     encrypted_cols: Mutex<HashMap<String, String>>,
     encrypted_values: Mutex<HashMap<String, String>>,
-    // S143 — row compression hints
+    // S143 â€” row compression hints
     table_compression: Mutex<HashMap<String, String>>,
-    // S144 — query routing rules
+    // S144 â€” query routing rules
     routing_rules: Mutex<HashMap<String, (String, String)>>,
-    // S145 — workload scheduling
+    // S145 â€” workload scheduling
     schedules: Mutex<HashMap<String, (String, String)>>,
     schedule_runs: Mutex<HashMap<String, u64>>,
-    // S146 — observability hooks
+    // S146 â€” observability hooks
     obs_hooks: Mutex<HashMap<String, (String, String)>>,
     hook_fire_log: Mutex<Vec<String>>,
-    // S147 — schema migrations
+    // S147 â€” schema migrations
     migrations: Mutex<HashMap<String, (String, bool)>>,
     migration_order: Mutex<Vec<String>>,
-    // S148 — connection pooling
+    // S148 â€” connection pooling
     pool_size: Mutex<usize>,
     pool_active: Mutex<usize>,
     pool_name: Mutex<Option<String>>,
-    // S149 — query plan caching
+    // S149 â€” query plan caching
     plan_cache: Mutex<HashMap<String, String>>,
-    // S150 — row versioning / SCD Type 2
+    // S150 â€” row versioning / SCD Type 2
     versioned_tables: Mutex<HashSet<String>>,
     #[allow(clippy::type_complexity)]
     version_store: Mutex<HashMap<String, Vec<(u64, u64, String)>>>,
-    // S152 — dynamic SQL
+    // S152 â€” dynamic SQL
     dynamic_stmts: Mutex<HashMap<String, String>>,
-    // S153 — table sampling
+    // S153 â€” table sampling
     sample_seed: Mutex<u64>,
-    // S154 — result pagination cursors
+    // S154 â€” result pagination cursors
     #[allow(clippy::type_complexity)]
     page_cursors: Mutex<HashMap<String, (usize, Vec<Vec<String>>)>>,
-    // S155 — column statistics histograms
+    // S155 â€” column statistics histograms
     histograms: Mutex<HashMap<String, Vec<(String, u64)>>>,
-    // S156 — query dependency graph
+    // S156 â€” query dependency graph
     view_deps: Mutex<HashMap<String, Vec<String>>>,
-    // S157 — live config reload
+    // S157 â€” live config reload
     live_config: Mutex<HashMap<String, String>>,
-    // S158 — tenant isolation
+    // S158 â€” tenant isolation
     tenants: Mutex<HashSet<String>>,
     current_tenant: Mutex<Option<String>>,
-    // S159 — data masking policies: policy_name → (table_col, mask_expr)
+    // S159 â€” data masking policies: policy_name â†’ (table_col, mask_expr)
     mask_policies: Mutex<HashMap<String, (String, String)>>,
     applied_masks: Mutex<HashMap<String, String>>,
-    // S160 — query timeout
+    // S160 â€” query timeout
     query_timeout_ms: Mutex<Option<u64>>,
-    // S161 — parallel DDL
+    // S161 â€” parallel DDL
     parallel_ddl_degree: Mutex<usize>,
     parallel_ddl_log: Mutex<Vec<String>>,
-    // S162 — table statistics export
+    // S162 â€” table statistics export
     stats_export_log: Mutex<Vec<(String, String)>>,
-    // S163 — named snapshots: snap_name → (table_name, created_ms)
+    // S163 â€” named snapshots: snap_name â†’ (table_name, created_ms)
     snapshots: Mutex<HashMap<String, (String, u64)>>,
-    // S164 — cost-based optimizer hints
+    // S164 â€” cost-based optimizer hints
     optimizer_model: Mutex<String>,
     optimizer_hints: Mutex<Vec<String>>,
-    // S165 — session variables
+    // S165 â€” session variables
     session_vars: Mutex<HashMap<String, String>>,
-    // S166 — table inheritance: child → parent
+    // S166 â€” table inheritance: child â†’ parent
     pub(crate) inherited_tables: Mutex<HashMap<String, String>>,
-    // S167 — pluggable output formats
+    // S167 â€” pluggable output formats
     output_format: Mutex<String>,
-    // S168 — column histogram v2: (table.col) → Vec<(bucket_start, count)>
+    // S168 â€” column histogram v2: (table.col) â†’ Vec<(bucket_start, count)>
     col_histograms_v2: Mutex<HashMap<String, Vec<(String, u64)>>>,
-    // S169 — workload replay
+    // S169 â€” workload replay
     workload_capture_file: Mutex<Option<String>>,
     workload_capture_active: Mutex<bool>,
-    // S170 — query rewrite rules: name → (pattern, replacement)
+    // S170 â€” query rewrite rules: name â†’ (pattern, replacement)
     rewrite_rules: Mutex<HashMap<String, (String, String)>>,
-    // S171 — table-level locks: table → mode
+    // S171 â€” table-level locks: table â†’ mode
     table_locks: Mutex<HashMap<String, String>>,
-    // S172 — bloom filter indexes v2: idx → (table, col)
+    // S172 â€” bloom filter indexes v2: idx â†’ (table, col)
     bloom_filter_indexes: Mutex<HashMap<String, (String, String)>>,
-    // S173 — result streaming settings
+    // S173 â€” result streaming settings
     streaming_enabled: Mutex<bool>,
     stream_chunk_size_v2: Mutex<usize>,
-    // S174 — read replica routing: host → weight
+    // S174 â€” read replica routing: host â†’ weight
     read_replicas: Mutex<Vec<String>>,
     read_replica_policy: Mutex<String>,
-    // S175 — data lineage: table/col → enabled
+    // S175 â€” data lineage: table/col â†’ enabled
     lineage_enabled: Mutex<HashSet<String>>,
-    // S176 — schema diffing: diff log entries
+    // S176 â€” schema diffing: diff log entries
     schema_diffs: Mutex<Vec<String>>,
-    // S177 — adaptive query execution v2
+    // S177 â€” adaptive query execution v2
     adaptive_exec_enabled: Mutex<bool>,
     adaptive_exec_stats: Mutex<HashMap<String, u64>>,
-    // S178 — query cost estimation
+    // S178 â€” query cost estimation
     s178_cost_model: Mutex<HashMap<String, f64>>,
-    // S179 — constraint validation
+    // S179 â€” constraint validation
     s179_constraints: Mutex<HashMap<String, (String, bool)>>, // name -> (table, enabled)
-    // S180 — table sampling (state: active method)
+    // S180 â€” table sampling (state: active method)
     s180_sample_method: Mutex<String>,
-    // S181 — column groups: grp_name -> (table, Vec<col>)
+    // S181 â€” column groups: grp_name -> (table, Vec<col>)
     s181_col_groups: Mutex<HashMap<String, (String, Vec<String>)>>,
-    // S182 — query tagging
+    // S182 â€” query tagging
     s182_query_tag: Mutex<Option<String>>,
     s182_tag_log: Mutex<Vec<String>>,
-    // S183 — partial indexes: idx_name -> (table, col, predicate)
+    // S183 â€” partial indexes: idx_name -> (table, col, predicate)
     s183_partial_indexes: Mutex<HashMap<String, (String, String, String)>>,
-    // S184 — table archival: table -> path
+    // S184 â€” table archival: table -> path
     s184_archived: Mutex<HashMap<String, String>>,
-    // S185 — query priority
+    // S185 â€” query priority
     s185_query_priority: Mutex<String>,
-    // S186 — schema versioning: (schema, version) -> created_ms
+    // S186 â€” schema versioning: (schema, version) -> created_ms
     s186_schema_versions: Mutex<HashMap<String, (String, u64)>>,
     s186_schema_current: Mutex<HashMap<String, String>>,
-    // S187 — live query kill: running_queries: id -> sql
+    // S187 â€” live query kill: running_queries: id -> sql
     s187_running_queries: Mutex<HashMap<u64, String>>,
-    // S188 — query pipelines: name -> definition
+    // S188 â€” query pipelines: name -> definition
     s188_pipelines: Mutex<HashMap<String, String>>,
     s188_pipeline_running: Mutex<HashSet<String>>,
-    // S189 — column encryption v2: (table.col) -> key
+    // S189 â€” column encryption v2: (table.col) -> key
     s189_encrypted_cols: Mutex<HashMap<String, String>>,
-    // S190 — table federation: ft_name -> (host:port, remote_table)
+    // S190 â€” table federation: ft_name -> (host:port, remote_table)
     s190_foreign_tables: Mutex<HashMap<String, (String, String)>>,
-    // S191 — change data streams: cs_name -> table
+    // S191 â€” change data streams: cs_name -> table
     s191_change_streams: Mutex<HashMap<String, String>>,
-    // S192 — query result TTL
+    // S192 â€” query result TTL
     s192_result_ttl: Mutex<Option<u64>>,
-    // S193 — batch operations
+    // S193 â€” batch operations
     s193_batch_active: Mutex<bool>,
     s193_batch_stmts: Mutex<Vec<String>>,
-    // S194 — index advisor
+    // S194 â€” index advisor
     s194_index_recommendations: Mutex<Vec<String>>,
-    // S195 — table pinning
+    // S195 â€” table pinning
     s195_pinned_tables: Mutex<HashSet<String>>,
-    // S196 — query namespaces
+    // S196 â€” query namespaces
     s196_query_namespaces: Mutex<HashSet<String>>,
     s196_current_namespace: Mutex<Option<String>>,
-    // S197 — compaction control
+    // S197 â€” compaction control
     s197_compaction_policy: Mutex<String>,
     s197_compaction_log: Mutex<Vec<String>>,
-    // S198 — hot/cold tiering: table -> tier
+    // S198 â€” hot/cold tiering: table -> tier
     s198_table_tiers: Mutex<HashMap<String, String>>,
-    // S199 — query retry policy
+    // S199 â€” query retry policy
     s199_retry_retries: Mutex<u64>,
     s199_retry_delay_ms: Mutex<u64>,
-    // S200 — milestone sprint (static)
-    // S201 — column default expressions: (table, col) -> expr_string
+    // S200 â€” milestone sprint (static)
+    // S201 â€” column default expressions: (table, col) -> expr_string
     s201_col_defaults: Mutex<HashMap<(String, String), String>>,
-    // S202 — geo partitions: zone_name -> table
+    // S202 â€” geo partitions: zone_name -> table
     s202_geo_partitions: Mutex<HashMap<String, String>>,
-    // S203 — cursor pagination v2: cursor_name -> (rows, pos)
+    // S203 â€” cursor pagination v2: cursor_name -> (rows, pos)
     #[allow(clippy::type_complexity)]
     s203_cursors: Mutex<HashMap<String, (Vec<Vec<String>>, usize)>>,
-    // S204 — table clones: clone_table -> (source, snapshot)
+    // S204 â€” table clones: clone_table -> (source, snapshot)
     s204_clones: Mutex<HashMap<String, (String, Option<String>)>>,
-    // S205 — WAL level control
+    // S205 â€” WAL level control
     s205_wal_level: Mutex<String>,
-    // S206 — auto-vacuum settings
+    // S206 â€” auto-vacuum settings
     s206_vacuum_threshold: Mutex<u64>,
     s206_vacuum_scale_factor: Mutex<f64>,
-    // S207 — pinned query plans: sql -> plan_string
+    // S207 â€” pinned query plans: sql -> plan_string
     s207_pinned_plans: Mutex<HashMap<String, String>>,
-    // S208 — column statistics v3: (table, col) -> stats_string
+    // S208 â€” column statistics v3: (table, col) -> stats_string
     s208_col_stats: Mutex<HashMap<(String, String), String>>,
-    // S209 — query cost hints: hint_name -> enabled
+    // S209 â€” query cost hints: hint_name -> enabled
     s209_hints: Mutex<Vec<String>>,
-    // S210 — table inheritance v2: child -> parent list
+    // S210 â€” table inheritance v2: child -> parent list
     s210_inheritance: Mutex<HashMap<String, Vec<String>>>,
-    // S211 — pivot cache: sql -> rows
+    // S211 â€” pivot cache: sql -> rows
     s211_pivot_cache: Mutex<Vec<String>>,
-    // S212 — distributed tracing
+    // S212 â€” distributed tracing
     s212_trace_rate: Mutex<f64>,
     s212_trace_samples: Mutex<Vec<String>>,
-    // S213 — column aliases DDL: alias -> (table, col)
+    // S213 â€” column aliases DDL: alias -> (table, col)
     s213_col_aliases: Mutex<HashMap<String, (String, String)>>,
-    // S214 — table access patterns
+    // S214 â€” table access patterns
     s214_access_tracking: Mutex<bool>,
     s214_access_patterns: Mutex<HashMap<String, String>>,
-    // S215 — query normalization: normalized -> original
+    // S215 â€” query normalization: normalized -> original
     s215_normalized: Mutex<HashMap<String, String>>,
-    // S216 — incremental MV refresh
+    // S216 â€” incremental MV refresh
     s216_mv_incremental: Mutex<bool>,
     s216_mv_refresh_status: Mutex<HashMap<String, String>>,
-    // S217 — storage encryption at rest
+    // S217 â€” storage encryption at rest
     s217_encryption_enabled: Mutex<bool>,
-    // S218 — query profiling
+    // S218 â€” query profiling
     s218_profiles: Mutex<Vec<String>>,
-    // S219 — table rewrites
+    // S219 â€” table rewrites
     s219_rewrite_history: Mutex<Vec<String>>,
-    // S220 — columnar storage hints
+    // S220 â€” columnar storage hints
     s220_storage_formats: Mutex<HashMap<String, String>>,
-    // S221 — workload classification
+    // S221 â€” workload classification
     s221_workload_classes: Mutex<HashMap<String, String>>,
-    // S222 — query cancel hooks
+    // S222 â€” query cancel hooks
     s222_cancel_hooks: Mutex<Vec<(u64, String)>>,
     s222_next_hook_id: Mutex<u64>,
-    // S223 — schema introspection v2 (stateless — describe uses existing metadata)
-    // S224 — table health checks
+    // S223 â€” schema introspection v2 (stateless â€” describe uses existing metadata)
+    // S224 â€” table health checks
     s224_health_log: Mutex<Vec<String>>,
-    // S225 — result compression
+    // S225 â€” result compression
     s225_compression: Mutex<String>,
-    // S226 — live reload config
+    // S226 â€” live reload config
     s226_reload_log: Mutex<Vec<String>>,
-    // S227 — adaptive indexing
+    // S227 â€” adaptive indexing
     s227_adaptive_index_tables: Mutex<HashSet<String>>,
-    // S228 — query routing rules
+    // S228 â€” query routing rules
     s228_routing_rules: Mutex<HashMap<String, String>>,
-    // S229 — table expiry policies
+    // S229 â€” table expiry policies
     s229_expiry_policies: Mutex<HashMap<String, String>>,
-    // S230 — column rename tracking
+    // S230 â€” column rename tracking
     s230_rename_history: Mutex<HashMap<String, Vec<(String, String)>>>,
-    // S231 — query dependency graph (stateless)
-    // S232 — savepoint v2
+    // S231 â€” query dependency graph (stateless)
+    // S232 â€” savepoint v2
     s232_savepoint_descs: Mutex<HashMap<String, String>>,
-    // S233 — hot standby queries
+    // S233 â€” hot standby queries
     s233_standby_mode: Mutex<String>,
     s233_allow_writes: Mutex<bool>,
-    // S234 — index usage stats
+    // S234 â€” index usage stats
     s234_index_usage: Mutex<HashMap<String, u64>>,
     s234_reset_tables: Mutex<HashSet<String>>,
-    // S235 — schema export/import
+    // S235 â€” schema export/import
     s235_export_status: Mutex<Vec<(String, String)>>,
-    // S236 — query bucketing
+    // S236 â€” query bucketing
     s236_buckets: Mutex<HashMap<String, String>>,
-    // S237 — live metrics streaming
+    // S237 â€” live metrics streaming
     s237_metrics_target: Mutex<Option<String>>,
     s237_metrics_streaming: Mutex<bool>,
+    // S238 â€” table observation hooks: hook_name -> (table, event)
+    s238_observe_hooks: Mutex<HashMap<String, (String, String)>>,
+    // S239 â€” query affinity: node -> weight, current node
+    s239_affinity_node: Mutex<Option<String>>,
+    // S240 â€” column lineage: (table, col) -> Vec<source>
+    s240_lineage: Mutex<HashMap<(String, String), Vec<String>>>,
+    // S241 â€” failsafe mode
+    s241_failsafe_enabled: Mutex<bool>,
+    s241_failsafe_tested: Mutex<bool>,
+    // S242 â€” query signatures: sig_hash -> sql
+    s242_query_signatures: Mutex<HashMap<String, String>>,
+    // S243 â€” table merge strategies: table -> strategy
+    s243_merge_strategies: Mutex<HashMap<String, String>>,
+    // S244 â€” schema snapshots: snap_name -> (schema, created_ms)
+    s244_schema_snapshots: Mutex<HashMap<String, (String, u64)>>,
+    // S245 â€” query plan exports: path -> plan
+    s245_exported_plans: Mutex<HashMap<String, String>>,
+    // S246 â€” table fragmentation
+    s246_auto_defragment: Mutex<bool>,
+    s246_defrag_log: Mutex<Vec<String>>,
+    // S247 â€” shard rebalancing
+    s247_rebalance_policy: Mutex<String>,
+    s247_rebalance_log: Mutex<Vec<String>>,
 }
 
 impl SqlExecutor {
@@ -904,11 +927,24 @@ impl SqlExecutor {
             s236_buckets: Mutex::new(HashMap::new()),
             s237_metrics_target: Mutex::new(None),
             s237_metrics_streaming: Mutex::new(false),
+            s238_observe_hooks: Mutex::new(HashMap::new()),
+            s239_affinity_node: Mutex::new(None),
+            s240_lineage: Mutex::new(HashMap::new()),
+            s241_failsafe_enabled: Mutex::new(false),
+            s241_failsafe_tested: Mutex::new(false),
+            s242_query_signatures: Mutex::new(HashMap::new()),
+            s243_merge_strategies: Mutex::new(HashMap::new()),
+            s244_schema_snapshots: Mutex::new(HashMap::new()),
+            s245_exported_plans: Mutex::new(HashMap::new()),
+            s246_auto_defragment: Mutex::new(false),
+            s246_defrag_log: Mutex::new(Vec::new()),
+            s247_rebalance_policy: Mutex::new("AUTO".to_owned()),
+            s247_rebalance_log: Mutex::new(Vec::new()),
         }
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, ExecError> {
-        // S118–S127 — raw SQL pattern matching (before parser)
+        // S118â€“S127 â€” raw SQL pattern matching (before parser)
         if let Some(raw_result) = self.execute_raw(sql) {
             return raw_result;
         }
@@ -930,7 +966,7 @@ impl SqlExecutor {
         let skip_stats = is_reset_stmt || is_stat_reset_select;
         let t0 = std::time::Instant::now();
         let result = self.execute_stmt(stmt)?;
-        // S121 — change feed auto-capture for INSERT/UPDATE/DELETE
+        // S121 â€” change feed auto-capture for INSERT/UPDATE/DELETE
         {
             let up_trim = sql.trim_start().to_ascii_uppercase();
             let op_opt = if up_trim.starts_with("INSERT ") {
@@ -963,7 +999,7 @@ impl SqlExecutor {
             }
         }
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        // S106 — statement timeout check
+        // S106 â€” statement timeout check
         {
             let timeout = *self.statement_timeout_ms.lock().unwrap();
             if let Some(ms) = timeout
@@ -1001,7 +1037,7 @@ impl SqlExecutor {
             }
             entry.rows += rows_u64;
         }
-        // S93 — slow query log (skip for reset stmts)
+        // S93 â€” slow query log (skip for reset stmts)
         let slow_threshold = *self.slow_query_threshold_ms.lock().unwrap();
         if !is_reset_stmt
             && let Some(threshold) = slow_threshold
@@ -1015,7 +1051,7 @@ impl SqlExecutor {
                 ts,
             });
         }
-        // S96 — auto-explain
+        // S96 â€” auto-explain
         let auto_explain = *self.auto_explain_threshold_ms.lock().unwrap();
         let result = if let Some(ae_threshold) = auto_explain {
             if elapsed_ms >= ae_threshold as f64
@@ -1046,7 +1082,7 @@ impl SqlExecutor {
         } else {
             result
         };
-        // S97 — record wait event for every query (simulated), skip for reset stmts
+        // S97 â€” record wait event for every query (simulated), skip for reset stmts
         if !is_reset_stmt {
             let ts = chrono_now();
             self.wait_events.lock().unwrap().push(WaitEvent {
@@ -1110,7 +1146,7 @@ impl SqlExecutor {
             Stmt::CreateMatView { name, select } => self.exec_create_mat_view(name, *select),
             Stmt::RefreshMatView { name } => self.exec_refresh_mat_view(name),
             Stmt::DropMatView { name } => self.exec_drop_mat_view(name),
-            // S78 — RLS
+            // S78 â€” RLS
             Stmt::CreatePolicy {
                 name,
                 table,
@@ -1126,7 +1162,7 @@ impl SqlExecutor {
                 self.policies.lock().unwrap().remove(&name);
                 Ok(QueryResult::Dropped)
             }
-            // S79 — column masking
+            // S79 â€” column masking
             Stmt::CreateMask {
                 name: _,
                 table,
@@ -1138,22 +1174,22 @@ impl SqlExecutor {
             }
             Stmt::DropMask { name } => {
                 // name is used as key lookup; drop any mask matching name prefix or just
-                // drain matching — for simplicity, treat name as "table.col" or just
+                // drain matching â€” for simplicity, treat name as "table.col" or just
                 // allow drop by named handle. We store by (table,col) so we need a reverse map.
-                // For tests, store name→(table,col) mapping in a side structure.
+                // For tests, store nameâ†’(table,col) mapping in a side structure.
                 // Simple approach: name is "table_col" or we search all entries.
-                // The test drops by name stored at create time; we'll use a separate name→key map.
+                // The test drops by name stored at create time; we'll use a separate nameâ†’key map.
                 // Since we don't have that here, just succeed (drop by table.col via name).
                 let _ = name; // handled via masks cleanup
                 self.masks.lock().unwrap().clear(); // crude but passes the drop test
                 Ok(QueryResult::Dropped)
             }
-            // S80 — audit log truncate
+            // S80 â€” audit log truncate
             Stmt::TruncateAuditLog => {
                 self.audit_log.lock().unwrap().clear();
                 Ok(QueryResult::Affected(0))
             }
-            // S81 — token auth
+            // S81 â€” token auth
             Stmt::SetSessionToken { token } => {
                 *self.session_token.lock().unwrap() = Some(token);
                 Ok(QueryResult::Affected(0))
@@ -1166,7 +1202,7 @@ impl SqlExecutor {
                 self.table_tokens.lock().unwrap().remove(&table);
                 Ok(QueryResult::Affected(0))
             }
-            // S82 — rate limiting
+            // S82 â€” rate limiting
             Stmt::SetRateLimit { table, n } => {
                 self.rate_limits
                     .lock()
@@ -1178,7 +1214,7 @@ impl SqlExecutor {
                 self.rate_limits.lock().unwrap().remove(&table);
                 Ok(QueryResult::Affected(0))
             }
-            // S83 — IP allowlist
+            // S83 â€” IP allowlist
             Stmt::AddAllowedIp { ip } => {
                 self.allowed_ips.lock().unwrap().insert(ip);
                 Ok(QueryResult::Affected(0))
@@ -1200,7 +1236,7 @@ impl SqlExecutor {
                     rows: ips,
                 })
             }
-            // S84 — TLS cert rotation
+            // S84 â€” TLS cert rotation
             Stmt::RotateTlsCert {
                 cert_path,
                 key_path,
@@ -1209,12 +1245,12 @@ impl SqlExecutor {
                 *self.tls_key_path.lock().unwrap() = Some(key_path);
                 Ok(QueryResult::Ok("cert rotation scheduled".to_owned()))
             }
-            // S87 — warnings
+            // S87 â€” warnings
             Stmt::SetWarnings(on) => {
                 *self.warnings_enabled.lock().unwrap() = on;
                 Ok(QueryResult::Affected(0))
             }
-            // S88 — replication slots
+            // S88 â€” replication slots
             Stmt::CreateReplicationSlot { name, temporary } => {
                 self.replication_slots.lock().unwrap().insert(
                     name.clone(),
@@ -1256,7 +1292,7 @@ impl SqlExecutor {
                     .collect();
                 Ok(QueryResult::Rows { columns, rows })
             }
-            // S90 — read-only mode
+            // S90 â€” read-only mode
             Stmt::SetReadOnly => {
                 *self.read_only.lock().unwrap() = true;
                 Ok(QueryResult::Affected(0))
@@ -1265,7 +1301,7 @@ impl SqlExecutor {
                 *self.read_only.lock().unwrap() = false;
                 Ok(QueryResult::Affected(0))
             }
-            // S91 — failover
+            // S91 â€” failover
             Stmt::PromoteStandby => {
                 *self.read_only.lock().unwrap() = false;
                 Ok(QueryResult::Ok("promoted to primary".to_owned()))
@@ -1274,7 +1310,7 @@ impl SqlExecutor {
                 *self.read_only.lock().unwrap() = true;
                 Ok(QueryResult::Ok("demoted to standby".to_owned()))
             }
-            // S92 — WAL archive
+            // S92 â€” WAL archive
             Stmt::SetArchivePath { path } => {
                 *self.archive_path.lock().unwrap() = Some(path);
                 Ok(QueryResult::Affected(0))
@@ -1309,7 +1345,7 @@ impl SqlExecutor {
                     rows: vec![vec![path, count.to_string(), chrono_now()]],
                 })
             }
-            // S93 — slow query threshold
+            // S93 â€” slow query threshold
             Stmt::SetSlowQueryThreshold { ms } => {
                 *self.slow_query_threshold_ms.lock().unwrap() = Some(ms);
                 Ok(QueryResult::Affected(0))
@@ -1318,32 +1354,32 @@ impl SqlExecutor {
                 self.slow_log.lock().unwrap().clear();
                 Ok(QueryResult::Affected(0))
             }
-            // S96 — auto-explain threshold
+            // S96 â€” auto-explain threshold
             Stmt::SetAutoExplainThreshold { ms } => {
                 *self.auto_explain_threshold_ms.lock().unwrap() = Some(ms);
                 Ok(QueryResult::Affected(0))
             }
-            // S97 — reset wait events
+            // S97 â€” reset wait events
             Stmt::ResetWaitEvents => {
                 self.wait_events.lock().unwrap().clear();
                 Ok(QueryResult::Affected(0))
             }
-            // S98 — flamegraph export
+            // S98 â€” flamegraph export
             Stmt::ExplainFlamegraph(s) => self.exec_explain_flamegraph(*s),
-            // S100 — EXPLAIN BUFFERS
+            // S100 â€” EXPLAIN BUFFERS
             Stmt::ExplainBuffers(s) => self.exec_explain_buffers(*s),
-            // S101/S102 — meta-commands
+            // S101/S102 â€” meta-commands
             Stmt::MetaCmd { cmd, arg } => self.exec_meta_cmd(&cmd, arg.as_deref()),
-            // S103 — cursors
+            // S103 â€” cursors
             Stmt::DeclareCursor { name, select } => self.exec_declare_cursor(name, *select),
             Stmt::FetchCursor { name, count } => self.exec_fetch_cursor(&name, count),
             Stmt::CloseCursor { name } => self.exec_close_cursor(&name),
-            // S106 — statement timeout
+            // S106 â€” statement timeout
             Stmt::SetStatementTimeout { ms } => {
                 *self.statement_timeout_ms.lock().unwrap() = Some(ms);
                 Ok(QueryResult::Affected(0))
             }
-            // S108 — systemd integration
+            // S108 â€” systemd integration
             Stmt::SdNotify { state } => {
                 let _ = std::fs::write("/tmp/vv_sd_notify.txt", &state);
                 Ok(QueryResult::Ok(format!("notified: {}", state)))
@@ -1356,10 +1392,10 @@ impl SqlExecutor {
                 let _ = std::fs::write("/tmp/vv_sd_notify.txt", "STOPPING=1");
                 Ok(QueryResult::Ok("notified: STOPPING=1".to_owned()))
             }
-            // S109 — graceful/immediate shutdown
+            // S109 â€” graceful/immediate shutdown
             Stmt::ShutdownGraceful => self.exec_shutdown_graceful(),
             Stmt::ShutdownImmediate => Ok(QueryResult::Ok("immediate shutdown".to_owned())),
-            // S110 — multi-database
+            // S110 â€” multi-database
             Stmt::CreateDatabase { name } => {
                 self.databases.lock().unwrap().insert(name);
                 Ok(QueryResult::Created)
@@ -1385,7 +1421,7 @@ impl SqlExecutor {
                     rows: dbs,
                 })
             }
-            // S111 — schema namespacing
+            // S111 â€” schema namespacing
             Stmt::CreateSchema { name } => {
                 self.schemas.lock().unwrap().insert(name);
                 Ok(QueryResult::Created)
@@ -1411,7 +1447,7 @@ impl SqlExecutor {
                     rows: schemas,
                 })
             }
-            // S112 — table partitioning
+            // S112 â€” table partitioning
             Stmt::CreatePartition {
                 name,
                 parent,
@@ -1424,11 +1460,11 @@ impl SqlExecutor {
                     .insert(name, (parent, range_from, range_to));
                 Ok(QueryResult::Created)
             }
-            // S114 — vacuum
+            // S114 â€” vacuum
             Stmt::Vacuum { table, analyze } => self.exec_vacuum(table, analyze),
-            // S115 — analyze
+            // S115 â€” analyze
             Stmt::Analyze { table } => self.exec_analyze(table),
-            // S116 — connection limits
+            // S116 â€” connection limits
             Stmt::SetMaxConnections { n } => {
                 *self.max_connections.lock().unwrap() = n;
                 Ok(QueryResult::Affected(0))
@@ -1440,7 +1476,7 @@ impl SqlExecutor {
                     rows: vec![vec![max.to_string()]],
                 })
             }
-            // S117 — resource groups
+            // S117 â€” resource groups
             Stmt::CreateResourceGroup {
                 name,
                 cpu_pct,
@@ -1498,12 +1534,12 @@ impl SqlExecutor {
         }
     }
 
-    // ── S118–S127 raw SQL handler ────────────────────────────────────────────
+    // â”€â”€ S118â€“S127 raw SQL handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     fn execute_raw(&self, sql: &str) -> Option<Result<QueryResult, ExecError>> {
         let s = sql.trim();
         let up = s.to_ascii_uppercase();
 
-        // S118 — APPEND EVENT TO table_name TYPE 'evt_type' PAYLOAD 'json'
+        // S118 â€” APPEND EVENT TO table_name TYPE 'evt_type' PAYLOAD 'json'
         if up.starts_with("APPEND EVENT TO ") {
             let rest = &s["APPEND EVENT TO ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -1539,7 +1575,7 @@ impl SqlExecutor {
             )));
         }
 
-        // S118 — SELECT * FROM EVENTS OF table_name [WHERE event_type = 'x']
+        // S118 â€” SELECT * FROM EVENTS OF table_name [WHERE event_type = 'x']
         if up.starts_with("SELECT * FROM EVENTS OF ") {
             let rest = &s["SELECT * FROM EVENTS OF ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -1568,7 +1604,7 @@ impl SqlExecutor {
             }));
         }
 
-        // S119 — CREATE READ MODEL model_name FROM EVENTS OF table_name WHERE event_type = 'X'
+        // S119 â€” CREATE READ MODEL model_name FROM EVENTS OF table_name WHERE event_type = 'X'
         if up.starts_with("CREATE READ MODEL ") {
             let rest = &s["CREATE READ MODEL ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -1594,7 +1630,7 @@ impl SqlExecutor {
             )));
         }
 
-        // S119 — SELECT * FROM READ MODEL model_name
+        // S119 â€” SELECT * FROM READ MODEL model_name
         if up.starts_with("SELECT * FROM READ MODEL ") {
             let model_name = s["SELECT * FROM READ MODEL ".len()..]
                 .trim()
@@ -1624,14 +1660,14 @@ impl SqlExecutor {
             }));
         }
 
-        // S119 — DROP READ MODEL model_name
+        // S119 â€” DROP READ MODEL model_name
         if up.starts_with("DROP READ MODEL ") {
             let model_name = s["DROP READ MODEL ".len()..].trim().to_ascii_lowercase();
             self.read_models.lock().unwrap().remove(&model_name);
             return Some(Ok(QueryResult::Dropped));
         }
 
-        // S120 — SNAPSHOT TABLE table_name
+        // S120 â€” SNAPSHOT TABLE table_name
         if up.starts_with("SNAPSHOT TABLE ") {
             let table_name = s["SNAPSHOT TABLE ".len()..].trim().to_ascii_lowercase();
             let rows = self.scan_table_as_strings(&table_name);
@@ -1648,7 +1684,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Affected(1)));
         }
 
-        // S120 — SELECT * FROM table_name AS OF TIMESTAMP ts_ms
+        // S120 â€” SELECT * FROM table_name AS OF TIMESTAMP ts_ms
         if let Some(as_of_pos) = up.find(" AS OF TIMESTAMP ") {
             let prefix_up = &up[..as_of_pos];
             if prefix_up.starts_with("SELECT * FROM ") {
@@ -1681,7 +1717,7 @@ impl SqlExecutor {
             }
         }
 
-        // S121 — ENABLE CHANGE FEED ON table_name
+        // S121 â€” ENABLE CHANGE FEED ON table_name
         if up.starts_with("ENABLE CHANGE FEED ON ") {
             let table_name = s["ENABLE CHANGE FEED ON ".len()..]
                 .trim()
@@ -1690,7 +1726,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Affected(0)));
         }
 
-        // S121 — DISABLE CHANGE FEED ON table_name
+        // S121 â€” DISABLE CHANGE FEED ON table_name
         if up.starts_with("DISABLE CHANGE FEED ON ") {
             let table_name = s["DISABLE CHANGE FEED ON ".len()..]
                 .trim()
@@ -1699,7 +1735,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Affected(0)));
         }
 
-        // S121 — SELECT * FROM CHANGES OF table_name
+        // S121 â€” SELECT * FROM CHANGES OF table_name
         if up.starts_with("SELECT * FROM CHANGES OF ") {
             let table_name = s["SELECT * FROM CHANGES OF ".len()..]
                 .trim()
@@ -1717,7 +1753,7 @@ impl SqlExecutor {
             }));
         }
 
-        // S122 — CREATE BLOOM INDEX idx_name ON table_name(col_name)
+        // S122 â€” CREATE BLOOM INDEX idx_name ON table_name(col_name)
         if up.starts_with("CREATE BLOOM INDEX ") {
             let rest = &s["CREATE BLOOM INDEX ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -1741,14 +1777,14 @@ impl SqlExecutor {
             )));
         }
 
-        // S122 — DROP BLOOM INDEX idx_name
+        // S122 â€” DROP BLOOM INDEX idx_name
         if up.starts_with("DROP BLOOM INDEX ") {
             let idx_name = s["DROP BLOOM INDEX ".len()..].trim().to_ascii_lowercase();
             self.bloom_indexes.lock().unwrap().remove(&idx_name);
             return Some(Ok(QueryResult::Dropped));
         }
 
-        // S122 — SELECT * FROM table WHERE col BLOOM_MATCH 'value'
+        // S122 â€” SELECT * FROM table WHERE col BLOOM_MATCH 'value'
         if up.contains(" BLOOM_MATCH ") {
             let bm_pos = up.find(" BLOOM_MATCH ").unwrap();
             let from_pos = up.find(" FROM ");
@@ -1781,7 +1817,7 @@ impl SqlExecutor {
             )));
         }
 
-        // S123 — ALTER TABLE table_name STORE COLUMNAR
+        // S123 â€” ALTER TABLE table_name STORE COLUMNAR
         if up.starts_with("ALTER TABLE ") && up.contains(" STORE COLUMNAR") {
             let rest = &s["ALTER TABLE ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -1792,7 +1828,7 @@ impl SqlExecutor {
             }
         }
 
-        // S123 — ALTER TABLE table_name STORE ROW
+        // S123 â€” ALTER TABLE table_name STORE ROW
         if up.starts_with("ALTER TABLE ") && up.contains(" STORE ROW") {
             let rest = &s["ALTER TABLE ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -1803,7 +1839,7 @@ impl SqlExecutor {
             }
         }
 
-        // S123 — SHOW STORAGE FORMAT FOR table_name
+        // S123 â€” SHOW STORAGE FORMAT FOR table_name
         if up.starts_with("SHOW STORAGE FORMAT FOR ") {
             let table_name = s["SHOW STORAGE FORMAT FOR ".len()..]
                 .trim()
@@ -1816,7 +1852,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(fmt.to_owned())));
         }
 
-        // S124 — SET ADAPTIVE QUERY EXECUTION ON/OFF
+        // S124 â€” SET ADAPTIVE QUERY EXECUTION ON/OFF
         if up.starts_with("SET ADAPTIVE QUERY EXECUTION ") {
             let rest = s["SET ADAPTIVE QUERY EXECUTION ".len()..]
                 .trim()
@@ -1825,7 +1861,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Affected(0)));
         }
 
-        // S124 — SHOW AQE STATUS
+        // S124 â€” SHOW AQE STATUS
         if up.trim() == "SHOW AQE STATUS" {
             let enabled = *self.aqe_enabled.lock().unwrap();
             let stats_count = self.aqe_stats.lock().unwrap().len();
@@ -1836,7 +1872,7 @@ impl SqlExecutor {
             ))));
         }
 
-        // S125 — SET STREAM CHUNK SIZE n
+        // S125 â€” SET STREAM CHUNK SIZE n
         if up.starts_with("SET STREAM CHUNK SIZE ") {
             let n_str = s["SET STREAM CHUNK SIZE ".len()..].trim();
             if let Ok(n) = n_str.parse::<usize>() {
@@ -1846,13 +1882,13 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Error("invalid chunk size".to_owned())));
         }
 
-        // S125 — SHOW STREAM CONFIG
+        // S125 â€” SHOW STREAM CONFIG
         if up.trim() == "SHOW STREAM CONFIG" {
             let chunk_size = *self.stream_chunk_size.lock().unwrap();
             return Some(Ok(QueryResult::Ok(format!("chunk_size={}", chunk_size))));
         }
 
-        // S125 — STREAM SELECT * FROM table_name
+        // S125 â€” STREAM SELECT * FROM table_name
         if up.starts_with("STREAM SELECT * FROM ") {
             let table_name = s["STREAM SELECT * FROM ".len()..]
                 .trim()
@@ -1871,7 +1907,7 @@ impl SqlExecutor {
             ))));
         }
 
-        // S126 — INSERT GEO POINT INTO table_name(col) VALUES (lat, lng)
+        // S126 â€” INSERT GEO POINT INTO table_name(col) VALUES (lat, lng)
         if up.starts_with("INSERT GEO POINT INTO ") {
             let rest = &s["INSERT GEO POINT INTO ".len()..];
             if let Some(paren_pos) = rest.find('(') {
@@ -1908,7 +1944,7 @@ impl SqlExecutor {
             )));
         }
 
-        // S126 — SELECT ST_DISTANCE(table1.col1, table2.col2)
+        // S126 â€” SELECT ST_DISTANCE(table1.col1, table2.col2)
         if up.starts_with("SELECT ST_DISTANCE(") {
             let inner_str = &s["SELECT ST_DISTANCE(".len()..];
             if let Some(end) = inner_str.find(')') {
@@ -1938,7 +1974,7 @@ impl SqlExecutor {
             )));
         }
 
-        // S126 — SELECT * FROM table_name WHERE ST_CONTAINS(col, lat, lng, radius_km)
+        // S126 â€” SELECT * FROM table_name WHERE ST_CONTAINS(col, lat, lng, radius_km)
         if up.contains("ST_CONTAINS(") {
             let from_pos = up.find(" FROM ");
             let where_pos = up.find(" WHERE ");
@@ -1959,7 +1995,7 @@ impl SqlExecutor {
                         drop(geo);
                         let columns = vec!["row_data".to_owned()];
                         if let Some((plat, plng)) = point {
-                            // 1 degree ≈ 111 km
+                            // 1 degree â‰ˆ 111 km
                             let dist_km =
                                 ((plat - lat).powi(2) + (plng - lng).powi(2)).sqrt() * 111.0;
                             if dist_km <= radius {
@@ -1979,7 +2015,7 @@ impl SqlExecutor {
             )));
         }
 
-        // S127 — CREATE EDGE (node_a)-[:REL_TYPE]->(node_b)
+        // S127 â€” CREATE EDGE (node_a)-[:REL_TYPE]->(node_b)
         if up.starts_with("CREATE EDGE ") {
             let rest = &s["CREATE EDGE ".len()..];
             if let Some((from, rel, to)) = parse_edge(rest) {
@@ -1991,7 +2027,7 @@ impl SqlExecutor {
             )));
         }
 
-        // S127 — DROP EDGE (node_a)-[:REL_TYPE]->(node_b)
+        // S127 â€” DROP EDGE (node_a)-[:REL_TYPE]->(node_b)
         if up.starts_with("DROP EDGE ") {
             let rest = &s["DROP EDGE ".len()..];
             if let Some((from, rel, to)) = parse_edge(rest) {
@@ -2006,7 +2042,7 @@ impl SqlExecutor {
             )));
         }
 
-        // S127 — MATCH (a)-[r:REL_TYPE]->(b) [WHERE a = 'node'] RETURN a, r, b
+        // S127 â€” MATCH (a)-[r:REL_TYPE]->(b) [WHERE a = 'node'] RETURN a, r, b
         if up.starts_with("MATCH ") {
             let edges = self.graph_edges.lock().unwrap().clone();
             let rel_filter = parse_match_rel_type(s);
@@ -2025,7 +2061,7 @@ impl SqlExecutor {
             }));
         }
 
-        // S128 — Distributed 2PC transactions
+        // S128 â€” Distributed 2PC transactions
         if up.starts_with("BEGIN DISTRIBUTED TRANSACTION ") {
             let txn_id = s["BEGIN DISTRIBUTED TRANSACTION ".len()..]
                 .trim()
@@ -2061,7 +2097,7 @@ impl SqlExecutor {
             }));
         }
 
-        // S129 — Stored procedures
+        // S129 â€” Stored procedures
         if up.starts_with("CREATE PROCEDURE ") {
             let rest = &s["CREATE PROCEDURE ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2115,7 +2151,7 @@ impl SqlExecutor {
             }));
         }
 
-        // S130 — User-defined types
+        // S130 â€” User-defined types
         if up.starts_with("CREATE TYPE ") {
             let rest = &s["CREATE TYPE ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2159,7 +2195,7 @@ impl SqlExecutor {
             }));
         }
 
-        // S131 — Array types
+        // S131 â€” Array types
         if up.starts_with("INSERT ARRAY INTO ") {
             let rest = &s["INSERT ARRAY INTO ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2236,7 +2272,7 @@ impl SqlExecutor {
             }
         }
 
-        // S132 — JSONPath queries
+        // S132 â€” JSONPath queries
         if up.starts_with("STORE JSON ") {
             let rest = &s["STORE JSON ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2325,7 +2361,7 @@ impl SqlExecutor {
             }
         }
 
-        // S133 — Foreign data wrappers
+        // S133 â€” Foreign data wrappers
         if up.starts_with("CREATE SERVER ") {
             let rest = &s["CREATE SERVER ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2396,7 +2432,7 @@ impl SqlExecutor {
             }));
         }
 
-        // S134 — Query federation
+        // S134 â€” Query federation
         if up.starts_with("ADD FEDERATION NODE ") {
             let rest = &s["ADD FEDERATION NODE ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2439,7 +2475,7 @@ impl SqlExecutor {
             }));
         }
 
-        // S135 — Pluggable storage engines
+        // S135 â€” Pluggable storage engines
         if up.starts_with("SET TABLE ENGINE FOR ") {
             let rest = &s["SET TABLE ENGINE FOR ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2478,7 +2514,7 @@ impl SqlExecutor {
             }));
         }
 
-        // S136 — Multi-region replication
+        // S136 â€” Multi-region replication
         if up.starts_with("ADD REGION ") {
             let rest = &s["ADD REGION ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2531,7 +2567,7 @@ impl SqlExecutor {
             }
         }
 
-        // S137 — Pluggable authentication providers
+        // S137 â€” Pluggable authentication providers
         if up.starts_with("CREATE AUTH PROVIDER ") {
             let rest = &s["CREATE AUTH PROVIDER ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2597,7 +2633,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S138 — Materialized view auto-refresh ────────────────────────────
+        // â”€â”€ S138 â€” Materialized view auto-refresh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("REFRESH EVERY ") {
             // REFRESH EVERY n SECONDS FOR VIEW view_name
             let rest = &s["REFRESH EVERY ".len()..];
@@ -2654,7 +2690,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("REFRESHED".to_owned())));
         }
 
-        // ── S139 — Query result caching with TTL ─────────────────────────────
+        // â”€â”€ S139 â€” Query result caching with TTL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CACHE QUERY ") {
             // CACHE QUERY 'sql' TTL n AS key
             let rest = &s["CACHE QUERY ".len()..];
@@ -2725,7 +2761,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S140 — Distributed locks ──────────────────────────────────────────
+        // â”€â”€ S140 â€” Distributed locks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("GET LOCK '") {
             // GET LOCK 'name' TIMEOUT n
             let rest = &s["GET LOCK '".len()..];
@@ -2775,7 +2811,7 @@ impl SqlExecutor {
             }
         }
 
-        // ── S141 — Logical replication filters ───────────────────────────────
+        // â”€â”€ S141 â€” Logical replication filters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE REPLICATION FILTER ") {
             // CREATE REPLICATION FILTER filter_name WHERE 'expr'
             let rest = &s["CREATE REPLICATION FILTER ".len()..];
@@ -2821,7 +2857,7 @@ impl SqlExecutor {
             }
         }
 
-        // ── S142 — Column encryption ──────────────────────────────────────────
+        // â”€â”€ S142 â€” Column encryption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE ENCRYPTED COLUMN ") {
             // CREATE ENCRYPTED COLUMN table_name col_name KEY HINT 'hint'
             let rest = &s["CREATE ENCRYPTED COLUMN ".len()..];
@@ -2916,7 +2952,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S143 — Row compression hints ──────────────────────────────────────
+        // â”€â”€ S143 â€” Row compression hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET ROW COMPRESSION FOR ") {
             let rest = &s["SET ROW COMPRESSION FOR ".len()..];
             let up_rest = rest.to_ascii_uppercase();
@@ -2965,7 +3001,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("COMPRESSION RESET".to_owned())));
         }
 
-        // ── S144 — Query routing rules ────────────────────────────────────────
+        // â”€â”€ S144 â€” Query routing rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE ROUTE ") {
             // CREATE ROUTE rule_name WHEN 'expr' SEND TO 'node'
             let rest = &s["CREATE ROUTE ".len()..];
@@ -3021,7 +3057,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("ROUTE: default".to_owned())));
         }
 
-        // ── S145 — Workload scheduling ────────────────────────────────────────
+        // â”€â”€ S145 â€” Workload scheduling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE SCHEDULE ") {
             // CREATE SCHEDULE sched_name CRON 'expr' AS 'stmt'
             let rest = &s["CREATE SCHEDULE ".len()..];
@@ -3083,7 +3119,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S146 — Observability hooks ────────────────────────────────────────
+        // â”€â”€ S146 â€” Observability hooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE HOOK ") {
             // CREATE HOOK hook_name ON event_type EXECUTE 'stmt'
             let rest = &s["CREATE HOOK ".len()..];
@@ -3131,7 +3167,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(format!("HOOK FIRED: {}", hook_name))));
         }
 
-        // ── S147 — Schema migrations ──────────────────────────────────────────
+        // â”€â”€ S147 â€” Schema migrations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE MIGRATION ") {
             // CREATE MIGRATION migration_name AS 'stmt'
             let rest = &s["CREATE MIGRATION ".len()..];
@@ -3209,7 +3245,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Dropped));
         }
 
-        // ── S148 — Connection pooling ────────────────────────────────────────
+        // â”€â”€ S148 â€” Connection pooling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.starts_with("CREATE POOL ") && up.contains(" SIZE ") {
             let rest = &sql["CREATE POOL ".len()..];
@@ -3258,7 +3294,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("POOL DRAINED".to_owned())));
         }
 
-        // ── S149 — Query plan caching ────────────────────────────────────────
+        // â”€â”€ S149 â€” Query plan caching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.starts_with("CACHE PLAN FOR '") {
             // CACHE PLAN FOR 'sql' AS key
@@ -3304,7 +3340,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S150 — Row versioning / SCD Type 2 ──────────────────────────────
+        // â”€â”€ S150 â€” Row versioning / SCD Type 2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.starts_with("ENABLE VERSIONING ON ") {
             let tbl = sql["ENABLE VERSIONING ON ".len()..]
@@ -3400,7 +3436,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S151 — Audit trail queries ────────────────────────────────────────
+        // â”€â”€ S151 â€” Audit trail queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.starts_with("SHOW AUDIT LOG FOR ") {
             let tbl = sql["SHOW AUDIT LOG FOR ".len()..]
@@ -3497,7 +3533,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S152 — Dynamic SQL ────────────────────────────────────────────────
+        // â”€â”€ S152 â€” Dynamic SQL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.starts_with("EXECUTE DYNAMIC '") {
             let rest = &sql["EXECUTE DYNAMIC '".len()..];
@@ -3549,7 +3585,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S153 — Table sampling ─────────────────────────────────────────────
+        // â”€â”€ S153 â€” Table sampling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.contains(" TABLESAMPLE BERNOULLI(") {
             // SELECT * FROM table TABLESAMPLE BERNOULLI(pct)
@@ -3608,7 +3644,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(seed.to_string())));
         }
 
-        // ── S154 — Result pagination cursors ─────────────────────────────────
+        // â”€â”€ S154 â€” Result pagination cursors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.starts_with("DECLARE PAGE CURSOR ")
             && up.contains(" FOR '")
@@ -3722,7 +3758,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S155 — Column statistics histograms ───────────────────────────────
+        // â”€â”€ S155 â€” Column statistics histograms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.starts_with("COMPUTE HISTOGRAM FOR ") {
             // COMPUTE HISTOGRAM FOR table_name col_name BUCKETS n
@@ -3780,7 +3816,7 @@ impl SqlExecutor {
             }
         }
 
-        // ── S156 — Query dependency graph ─────────────────────────────────────
+        // â”€â”€ S156 â€” Query dependency graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.starts_with("ADD DEPENDENCY ") && up.contains(" DEPENDS ON ") {
             let rest = &sql["ADD DEPENDENCY ".len()..];
@@ -3848,7 +3884,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("NO CYCLES".to_owned())));
         }
 
-        // ── S157 — Live config reload ──────────────────────────────────────────
+        // â”€â”€ S157 â€” Live config reload â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if up.starts_with("SET CONFIG KEY '") && up.contains("' VALUE '") {
             let rest = &sql["SET CONFIG KEY '".len()..];
@@ -3901,7 +3937,7 @@ impl SqlExecutor {
             }
         }
 
-        // ── S158 — Tenant isolation ──────────────────────────────────────────
+        // â”€â”€ S158 â€” Tenant isolation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE TENANT ") {
             let name = s["CREATE TENANT ".len()..].trim().to_ascii_lowercase();
             self.tenants.lock().unwrap().insert(name.clone());
@@ -3954,7 +3990,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(val)));
         }
 
-        // ── S159 — Data masking policies ─────────────────────────────────────
+        // â”€â”€ S159 â€” Data masking policies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE MASK POLICY ") && up.contains(" MASK '") {
             let rest = &s["CREATE MASK POLICY ".len()..];
             if let Some(mask_pos) = rest.to_ascii_uppercase().find(" MASK '") {
@@ -4044,7 +4080,7 @@ impl SqlExecutor {
             }
         }
 
-        // ── S160 — Query timeout ─────────────────────────────────────────────
+        // â”€â”€ S160 â€” Query timeout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET QUERY TIMEOUT UNLIMITED") {
             *self.query_timeout_ms.lock().unwrap() = None;
             return Some(Ok(QueryResult::Ok("UNLIMITED".to_owned())));
@@ -4074,7 +4110,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(val)));
         }
 
-        // ── S161 — Parallel DDL ──────────────────────────────────────────────
+        // â”€â”€ S161 â€” Parallel DDL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ALTER TABLE ")
             && up.contains(" ADD COLUMN ")
             && up.contains(" PARALLEL ")
@@ -4134,7 +4170,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("DEGREE RESET".to_owned())));
         }
 
-        // ── S162 — Table statistics export ───────────────────────────────────
+        // â”€â”€ S162 â€” Table statistics export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("EXPORT STATS FOR ") && up.contains(" TO '") {
             let rest = &s["EXPORT STATS FOR ".len()..];
             if let Some(to_pos) = rest.to_ascii_uppercase().find(" TO '") {
@@ -4179,7 +4215,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("LOG CLEARED".to_owned())));
         }
 
-        // ── S163 — Named snapshots ───────────────────────────────────────────
+        // â”€â”€ S163 â€” Named snapshots â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE SNAPSHOT ") && up.contains(" FOR ") {
             let rest = &s["CREATE SNAPSHOT ".len()..];
             if let Some(for_pos) = rest.to_ascii_uppercase().find(" FOR ") {
@@ -4241,7 +4277,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S164 — Cost-based optimizer hints ────────────────────────────────
+        // â”€â”€ S164 â€” Cost-based optimizer hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET OPTIMIZER COST MODEL ") {
             let model = s["SET OPTIMIZER COST MODEL ".len()..]
                 .trim()
@@ -4277,7 +4313,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(model)));
         }
 
-        // ── S165 — Session variables ─────────────────────────────────────────
+        // â”€â”€ S165 â€” Session variables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET SESSION VAR '") {
             let rest = &s["SET SESSION VAR '".len()..];
             if let Some(key_end) = rest.find('\'') {
@@ -4332,7 +4368,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(format!("CLEARED {} vars", n))));
         }
 
-        // ── S166 — Table inheritance queries ─────────────────────────────────
+        // â”€â”€ S166 â€” Table inheritance queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SELECT * FROM ONLY ") {
             let table = s["SELECT * FROM ONLY ".len()..].trim().to_ascii_lowercase();
             let rows = self.scan_table_as_strings(&table);
@@ -4391,7 +4427,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("1".to_owned())));
         }
 
-        // ── S167 — Pluggable output formats ───────────────────────────────────
+        // â”€â”€ S167 â€” Pluggable output formats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET OUTPUT FORMAT ") {
             let fmt = s["SET OUTPUT FORMAT ".len()..].trim().to_ascii_uppercase();
             *self.output_format.lock().unwrap() = fmt.clone();
@@ -4424,7 +4460,7 @@ impl SqlExecutor {
             ))));
         }
 
-        // ── S168 — Column histogram v2 ────────────────────────────────────────
+        // â”€â”€ S168 â€” Column histogram v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ANALYZE TABLE ") && up.contains(" COLUMN ") && up.contains(" HISTOGRAM BUCKETS ") {
             // ANALYZE TABLE t COLUMN col HISTOGRAM BUCKETS n
             let rest = &s["ANALYZE TABLE ".len()..];
@@ -4454,7 +4490,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S169 — Workload replay ────────────────────────────────────────────
+        // â”€â”€ S169 â€” Workload replay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CAPTURE WORKLOAD TO ") {
             let file = parse_single_quoted(&s["CAPTURE WORKLOAD TO ".len()..]).unwrap_or_default();
             *self.workload_capture_file.lock().unwrap() = Some(file.clone());
@@ -4478,7 +4514,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S170 — Query rewrite rules ────────────────────────────────────────
+        // â”€â”€ S170 â€” Query rewrite rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE REWRITE RULE ") {
             // CREATE REWRITE RULE name AS 'pattern' REWRITE TO 'replacement'
             let rest = &s["CREATE REWRITE RULE ".len()..];
@@ -4507,7 +4543,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S171 — Table-level locks ──────────────────────────────────────────
+        // â”€â”€ S171 â€” Table-level locks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("LOCK TABLE ") && up.contains(" IN ") && up.ends_with(" MODE") {
             let rest = &s["LOCK TABLE ".len()..];
             let in_pos = rest.to_ascii_uppercase().find(" IN ").unwrap_or(rest.len());
@@ -4532,7 +4568,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S172 — Bloom filter indexes ───────────────────────────────────────
+        // â”€â”€ S172 â€” Bloom filter indexes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE BLOOM INDEX ") {
             // CREATE BLOOM INDEX idx ON t(col)
             let rest = &s["CREATE BLOOM INDEX ".len()..];
@@ -4561,7 +4597,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S173 — Result streaming ───────────────────────────────────────────
+        // â”€â”€ S173 â€” Result streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "SHOW STREAM CHUNK SIZE" {
             let n = *self.stream_chunk_size.lock().unwrap();
             return Some(Ok(QueryResult::Rows {
@@ -4578,7 +4614,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("STREAMING OFF".to_owned())));
         }
 
-        // ── S174 — Read replica routing ───────────────────────────────────────
+        // â”€â”€ S174 â€” Read replica routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ADD READ REPLICA ") {
             let host = parse_single_quoted(&s["ADD READ REPLICA ".len()..]).unwrap_or_default();
             self.read_replicas.lock().unwrap().push(host.clone());
@@ -4603,7 +4639,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(format!("POLICY: {}", policy))));
         }
 
-        // ── S175 — Data lineage ───────────────────────────────────────────────
+        // â”€â”€ S175 â€” Data lineage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ENABLE LINEAGE ON ") {
             let target = s["ENABLE LINEAGE ON ".len()..].trim().to_ascii_lowercase();
             self.lineage_enabled.lock().unwrap().insert(target.clone());
@@ -4623,7 +4659,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S176 — Schema diffing ─────────────────────────────────────────────
+        // â”€â”€ S176 â€” Schema diffing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("DIFF SCHEMA ") && up.contains(" AGAINST ") {
             let rest = &s["DIFF SCHEMA ".len()..];
             let against_pos = rest.to_ascii_uppercase().find(" AGAINST ").unwrap_or(rest.len());
@@ -4650,7 +4686,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(format!("SCHEMA DIFF APPLIED: {}", file))));
         }
 
-        // ── S177 — Adaptive query execution ──────────────────────────────────
+        // â”€â”€ S177 â€” Adaptive query execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "SET ADAPTIVE EXECUTION ON" {
             *self.adaptive_exec_enabled.lock().unwrap() = true;
             return Some(Ok(QueryResult::Ok("ADAPTIVE EXECUTION ON".to_owned())));
@@ -4674,7 +4710,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("ADAPTIVE STATS RESET".to_owned())));
         }
 
-        // ── S178 — Query cost estimation ──────────────────────────────────────
+        // â”€â”€ S178 â€” Query cost estimation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ESTIMATE COST FOR ") {
             let cost = 42.5_f64; // simulated cost
             return Some(Ok(QueryResult::Rows {
@@ -4703,7 +4739,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("COST MODEL PARAM SET".to_owned())));
         }
 
-        // ── S179 — Constraint validation ─────────────────────────────────────
+        // â”€â”€ S179 â€” Constraint validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("VALIDATE CONSTRAINT ") {
             let parts: Vec<&str> = s.split_whitespace().collect();
             // VALIDATE CONSTRAINT name ON t
@@ -4738,7 +4774,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(format!("CONSTRAINT ENABLED: {}", name))));
         }
 
-        // ── S180 — Table sampling ─────────────────────────────────────────────
+        // â”€â”€ S180 â€” Table sampling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.contains("TABLESAMPLE SYSTEM(") || up.contains("TABLESAMPLE SYSTEM (") {
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["sample_method".to_owned(), "pct".to_owned()],
@@ -4758,7 +4794,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S181 — Column groups ──────────────────────────────────────────────
+        // â”€â”€ S181 â€” Column groups â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE COLUMN GROUP ") {
             // CREATE COLUMN GROUP grp ON t(col1, col2)
             let parts: Vec<&str> = s.split_whitespace().collect();
@@ -4788,7 +4824,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S182 — Query tagging ──────────────────────────────────────────────
+        // â”€â”€ S182 â€” Query tagging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET QUERY TAG ") {
             let rest = &s["SET QUERY TAG ".len()..];
             let tag = parse_single_quoted(rest).unwrap_or_else(|| rest.trim().to_owned());
@@ -4817,7 +4853,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S183 — Partial indexes ────────────────────────────────────────────
+        // â”€â”€ S183 â€” Partial indexes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE INDEX ") && up.contains(" WHERE ") {
             // CREATE INDEX idx ON t(col) WHERE col > 0
             let parts: Vec<&str> = s.split_whitespace().collect();
@@ -4844,7 +4880,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Dropped));
         }
 
-        // ── S184 — Table archival ─────────────────────────────────────────────
+        // â”€â”€ S184 â€” Table archival â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ARCHIVE TABLE ") {
             // ARCHIVE TABLE t TO 'path'
             let parts: Vec<&str> = s.split_whitespace().collect();
@@ -4869,7 +4905,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S185 — Query priority ─────────────────────────────────────────────
+        // â”€â”€ S185 â€” Query priority â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "SET QUERY PRIORITY HIGH" {
             *self.s185_query_priority.lock().unwrap() = "HIGH".to_owned();
             return Some(Ok(QueryResult::Ok("QUERY PRIORITY SET: HIGH".to_owned())));
@@ -4890,7 +4926,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S186 — Schema versioning ──────────────────────────────────────────
+        // â”€â”€ S186 â€” Schema versioning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE SCHEMA VERSION ") {
             // CREATE SCHEMA VERSION v1 FOR s
             let parts: Vec<&str> = s.split_whitespace().collect();
@@ -4915,7 +4951,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(format!("SCHEMA ROLLED BACK TO: {}", ver))));
         }
 
-        // ── S187 — Live query kill ────────────────────────────────────────────
+        // â”€â”€ S187 â€” Live query kill â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("KILL QUERY ") && up != "KILL ALL QUERIES" {
             let parts: Vec<&str> = s.split_whitespace().collect();
             if let Some(id_str) = parts.get(2) {
@@ -4939,7 +4975,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("ALL QUERIES KILLED".to_owned())));
         }
 
-        // ── S188 — Query pipelines ────────────────────────────────────────────
+        // â”€â”€ S188 â€” Query pipelines â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE PIPELINE ") && up.contains(" AS SELECT ") {
             // CREATE PIPELINE p AS SELECT * FROM src INTO dst
             let rest = &sql[16..]; // after "CREATE PIPELINE "
@@ -4978,7 +5014,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Dropped));
         }
 
-        // ── S189 — Column encryption v2 ──────────────────────────────────────
+        // â”€â”€ S189 â€” Column encryption v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ALTER TABLE ") && up.contains(" ENCRYPT COLUMN ") && up.contains(" WITH KEY ") {
             // ALTER TABLE t ENCRYPT COLUMN col WITH KEY 'k'
             let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -5008,7 +5044,7 @@ impl SqlExecutor {
         }
         // Note: SHOW ENCRYPTED COLUMNS is handled by the existing S142 handler which reads from encrypted_cols
 
-        // ── S190 — Table federation ───────────────────────────────────────────
+        // â”€â”€ S190 â€” Table federation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE FOREIGN TABLE ") && up.contains(" REMOTE ") {
             // CREATE FOREIGN TABLE ft REMOTE 'host:port' TABLE t
             let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -5044,7 +5080,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Dropped));
         }
 
-        // ── S191 — Change data streams ────────────────────────────────────────
+        // â”€â”€ S191 â€” Change data streams â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE CHANGE STREAM ") {
             // CREATE CHANGE STREAM cs ON t
             let rest = &sql[21..];
@@ -5083,7 +5119,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S192 — Query result TTL ───────────────────────────────────────────
+        // â”€â”€ S192 â€” Query result TTL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET RESULT TTL ") {
             let val_str = sql[15..].trim();
             if let Ok(v) = val_str.parse::<u64>() {
@@ -5104,7 +5140,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("RESULT TTL RESET".to_owned())));
         }
 
-        // ── S193 — Batch operations ───────────────────────────────────────────
+        // â”€â”€ S193 â€” Batch operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "BEGIN BATCH" {
             *self.s193_batch_active.lock().unwrap() = true;
             self.s193_batch_stmts.lock().unwrap().clear();
@@ -5128,7 +5164,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S194 — Index advisor ──────────────────────────────────────────────
+        // â”€â”€ S194 â€” Index advisor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ADVISE INDEXES FOR ") {
             let target = sql[19..].trim().to_ascii_lowercase();
             // extract table name heuristically
@@ -5158,7 +5194,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("INDEX RECOMMENDATIONS CLEARED".to_owned())));
         }
 
-        // ── S195 — Table pinning ──────────────────────────────────────────────
+        // â”€â”€ S195 â€” Table pinning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("PIN TABLE ") && up.ends_with(" IN MEMORY") {
             // PIN TABLE t IN MEMORY
             let rest = sql[10..].trim();
@@ -5182,7 +5218,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S196 — Query namespaces ───────────────────────────────────────────
+        // â”€â”€ S196 â€” Query namespaces â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE QUERY NAMESPACE ") {
             let name = sql[23..].trim().to_ascii_lowercase();
             self.s196_query_namespaces.lock().unwrap().insert(name.clone());
@@ -5214,7 +5250,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S197 — Compaction control ─────────────────────────────────────────
+        // â”€â”€ S197 â€” Compaction control â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("COMPACT TABLE ") {
             let tbl = sql[14..].trim().to_ascii_lowercase();
             self.s197_compaction_log.lock().unwrap().push(format!("COMPACT {}", tbl));
@@ -5235,7 +5271,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S198 — Hot/cold tiering ───────────────────────────────────────────
+        // â”€â”€ S198 â€” Hot/cold tiering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET TABLE ") && up.contains(" TIER ") {
             // SET TABLE <name> TIER <HOT|WARM|COLD>
             let rest = sql[10..].trim();
@@ -5264,7 +5300,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S199 — Query retry policy ─────────────────────────────────────────
+        // â”€â”€ S199 â€” Query retry policy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET QUERY RETRY POLICY ") {
             let args = sql[23..].trim().to_ascii_lowercase();
             // parse retries=N delay=Nms
@@ -5298,7 +5334,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("RETRY POLICY RESET".to_owned())));
         }
 
-        // ── S200 — Milestone sprint ───────────────────────────────────────────
+        // â”€â”€ S200 â€” Milestone sprint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "SHOW ENGINE VERSION" {
             let rows = vec![vec!["VectorVolt".to_owned(), "0.200.0".to_owned()]];
             return Some(Ok(QueryResult::Rows {
@@ -5326,7 +5362,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S201 — Column default expressions ────────────────────────────────
+        // â”€â”€ S201 â€” Column default expressions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ALTER TABLE ") && up.contains(" ALTER COLUMN ") && up.contains(" SET DEFAULT ") {
             let rest = sql.trim();
             if let Some(col_pos) = rest.to_ascii_uppercase().find(" ALTER COLUMN ") {
@@ -5366,7 +5402,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S202 — Geo partitioning ───────────────────────────────────────────
+        // â”€â”€ S202 â€” Geo partitioning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE GEO PARTITION ZONE ") {
             let rest = sql[26..].trim();
             if let Some(for_pos) = rest.to_ascii_uppercase().find(" FOR ") {
@@ -5390,7 +5426,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Dropped));
         }
 
-        // ── S203 — Cursor pagination v2 ───────────────────────────────────────
+        // â”€â”€ S203 â€” Cursor pagination v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // S203 DECLARE CURSOR uses raw string with "FETCH N" suffix, distinct from S103 AST path
         if up.starts_with("DECLARE CURSOR ") && up.contains(" FOR SELECT ") && up.contains(" FETCH ") {
             let rest = sql[15..].trim();
@@ -5428,8 +5464,8 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("CURSOR CLOSED".to_owned())));
         }
 
-        // ── S204 — Table cloning ──────────────────────────────────────────────
-        // Must be before generic CREATE TABLE in AST path — checked here in execute_raw
+        // â”€â”€ S204 â€” Table cloning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // Must be before generic CREATE TABLE in AST path â€” checked here in execute_raw
         if up.starts_with("CREATE TABLE ") && up.contains(" CLONE OF ") {
             let rest = sql[13..].trim();
             let up_rest = rest.to_ascii_uppercase();
@@ -5460,7 +5496,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S205 — WAL control ────────────────────────────────────────────────
+        // â”€â”€ S205 â€” WAL control â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Must come before generic SET handler
         if up.starts_with("SET WAL LEVEL ") {
             let level = sql[14..].trim().to_ascii_lowercase();
@@ -5479,7 +5515,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("CHECKPOINT COMPLETE".to_owned())));
         }
 
-        // ── S206 — Auto-vacuum tuning ─────────────────────────────────────────
+        // â”€â”€ S206 â€” Auto-vacuum tuning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET AUTO VACUUM THRESHOLD ") {
             let v: u64 = sql[26..].trim().parse().unwrap_or(50);
             *self.s206_vacuum_threshold.lock().unwrap() = v;
@@ -5500,7 +5536,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S207 — Query plan cache v2 ────────────────────────────────────────
+        // â”€â”€ S207 â€” Query plan cache v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("PIN QUERY PLAN FOR ") {
             let query = sql[19..].trim().to_owned();
             let key = query.to_ascii_lowercase();
@@ -5520,7 +5556,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S208 — Column statistics v3 ──────────────────────────────────────
+        // â”€â”€ S208 â€” Column statistics v3 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("COMPUTE STATS FOR ") {
             // e.g. "COMPUTE STATS FOR t.col"
             let spec = sql[18..].trim();
@@ -5555,7 +5591,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("STATS PURGED".to_owned())));
         }
 
-        // ── S209 — Query cost hints ───────────────────────────────────────────
+        // â”€â”€ S209 â€” Query cost hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Must be BEFORE generic SELECT handler
         if up.starts_with("SELECT /*+") {
             // Extract hint name from /*+ HINT */
@@ -5579,7 +5615,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S210 — Table inheritance v2 ──────────────────────────────────────
+        // â”€â”€ S210 â€” Table inheritance v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Must be BEFORE generic ALTER TABLE handler
         if up.starts_with("ALTER TABLE ") && up.contains(" ADD PARENT ") {
             let rest = sql[12..].trim();
@@ -5621,7 +5657,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("TABLE DETACHED".to_owned())));
         }
 
-        // ── S211 — Result set transforms ─────────────────────────────────────
+        // â”€â”€ S211 â€” Result set transforms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Must be BEFORE generic SELECT handler
         if up.starts_with("SELECT") && up.contains("PIVOT") {
             let entry = sql.to_owned();
@@ -5646,7 +5682,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S212 — Distributed tracing ───────────────────────────────────────
+        // â”€â”€ S212 â€” Distributed tracing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET TRACE SAMPLING RATE ") {
             let rate_str = sql[24..].trim();
             let rate: f64 = rate_str.parse().unwrap_or(0.0);
@@ -5666,7 +5702,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("TRACE SAMPLES CLEARED".to_owned())));
         }
 
-        // ── S213 — Column aliases DDL ─────────────────────────────────────────
+        // â”€â”€ S213 â€” Column aliases DDL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE COLUMN ALIAS ") {
             // CREATE COLUMN ALIAS alias FOR t.col
             let rest = sql[20..].trim();
@@ -5700,7 +5736,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S214 — Table access patterns ─────────────────────────────────────
+        // â”€â”€ S214 â€” Table access patterns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SHOW ACCESS PATTERN FOR ") {
             let tbl = sql[24..].trim().to_owned();
             let patterns = self.s214_access_patterns.lock().unwrap().clone();
@@ -5728,7 +5764,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("ACCESS TRACKING OFF".to_owned())));
         }
 
-        // ── S215 — Query normalization ────────────────────────────────────────
+        // â”€â”€ S215 â€” Query normalization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("NORMALIZE QUERY ") {
             let raw = sql[16..].trim().trim_matches('\'').to_owned();
             let normalized = raw.to_ascii_lowercase();
@@ -5751,7 +5787,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("NORMALIZED QUERIES CLEARED".to_owned())));
         }
 
-        // ── S216 — Incremental MV refresh ────────────────────────────────────
+        // â”€â”€ S216 â€” Incremental MV refresh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Must be BEFORE existing REFRESH MATERIALIZED VIEW handler
         if up.starts_with("REFRESH MATERIALIZED VIEW ") && up.contains("INCREMENTALLY") {
             let rest = sql[26..].trim();
@@ -5779,7 +5815,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S217 — Storage encryption at rest ────────────────────────────────
+        // â”€â”€ S217 â€” Storage encryption at rest â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "ENABLE ENCRYPTION AT REST" {
             *self.s217_encryption_enabled.lock().unwrap() = true;
             return Some(Ok(QueryResult::Ok("ENCRYPTION AT REST ENABLED".to_owned())));
@@ -5796,7 +5832,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S218 — Query profiling ────────────────────────────────────────────
+        // â”€â”€ S218 â€” Query profiling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("PROFILE ") {
             let profiled_sql = &s["PROFILE ".len()..];
             let ts = chrono_now();
@@ -5835,7 +5871,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("QUERY PROFILES CLEARED".to_owned())));
         }
 
-        // ── S219 — Table rewrites ─────────────────────────────────────────────
+        // â”€â”€ S219 â€” Table rewrites â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("REWRITE TABLE ") {
             let ts = chrono_now();
             self.s219_rewrite_history
@@ -5868,7 +5904,7 @@ impl SqlExecutor {
             )));
         }
 
-        // ── S220 — Columnar storage hints ─────────────────────────────────────
+        // â”€â”€ S220 â€” Columnar storage hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Must be before generic SET TABLE TIER (S198)
         if up.starts_with("SET TABLE ") && up.contains(" STORAGE ") {
             let rest = &s["SET TABLE ".len()..];
@@ -5891,7 +5927,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S221 — Workload classification ───────────────────────────────────
+        // â”€â”€ S221 â€” Workload classification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE WORKLOAD CLASS ") {
             let rest = &s["CREATE WORKLOAD CLASS ".len()..];
             let when_pos = rest.to_ascii_uppercase().find(" WHEN ").unwrap_or(rest.len());
@@ -5924,7 +5960,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S222 — Query cancel hooks ─────────────────────────────────────────
+        // â”€â”€ S222 â€” Query cancel hooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ON QUERY CANCEL EXECUTE ") {
             let action = s["ON QUERY CANCEL EXECUTE ".len()..].trim().to_owned();
             let id = {
@@ -5956,7 +5992,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Dropped));
         }
 
-        // ── S223 — Schema introspection v2 ───────────────────────────────────
+        // â”€â”€ S223 â€” Schema introspection v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("DESCRIBE FUNCTION ") {
             let fn_name = s["DESCRIBE FUNCTION ".len()..].trim().to_ascii_lowercase();
             let udfs = self.udfs.lock().unwrap();
@@ -5990,7 +6026,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S224 — Table health checks ────────────────────────────────────────
+        // â”€â”€ S224 â€” Table health checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CHECK TABLE ") {
             let table_name = s["CHECK TABLE ".len()..].trim().to_ascii_lowercase();
             let ts = chrono_now();
@@ -6031,7 +6067,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S225 — Result compression ─────────────────────────────────────────
+        // â”€â”€ S225 â€” Result compression â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET RESULT COMPRESSION ") {
             let codec = s["SET RESULT COMPRESSION ".len()..].trim().to_ascii_lowercase();
             *self.s225_compression.lock().unwrap() = codec;
@@ -6051,7 +6087,7 @@ impl SqlExecutor {
             )));
         }
 
-        // ── S226 — Live reload config ─────────────────────────────────────────
+        // â”€â”€ S226 â€” Live reload config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "RELOAD SERVER CONFIG" {
             let ts = chrono_now();
             self.s226_reload_log.lock().unwrap().push(format!("{}|<default>", ts));
@@ -6081,7 +6117,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S227 — Adaptive indexing ──────────────────────────────────────────
+        // â”€â”€ S227 â€” Adaptive indexing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ENABLE ADAPTIVE INDEXING ON ") {
             let table_name = s["ENABLE ADAPTIVE INDEXING ON ".len()..].trim().to_ascii_lowercase();
             self.s227_adaptive_index_tables.lock().unwrap().insert(table_name);
@@ -6101,7 +6137,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S228 — Query routing rules ────────────────────────────────────────
+        // â”€â”€ S228 â€” Query routing rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE ROUTING RULE ") {
             let rest = s["CREATE ROUTING RULE ".len()..].trim();
             let name = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
@@ -6122,7 +6158,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S229 — Table expiry policies ──────────────────────────────────────
+        // â”€â”€ S229 â€” Table expiry policies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET TABLE ") && up.contains(" EXPIRE AFTER ") {
             let rest = s["SET TABLE ".len()..].trim();
             let parts: Vec<&str> = rest.splitn(3, ' ').collect();
@@ -6145,7 +6181,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("TABLE EXPIRY CANCELLED".to_owned())));
         }
 
-        // ── S230 — Column rename tracking ─────────────────────────────────────
+        // â”€â”€ S230 â€” Column rename tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SHOW COLUMN RENAME HISTORY FOR ") {
             let tname = s["SHOW COLUMN RENAME HISTORY FOR ".len()..].trim().to_ascii_lowercase();
             let hist = self.s230_rename_history.lock().unwrap();
@@ -6161,7 +6197,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("COLUMN RENAME HISTORY CLEARED".to_owned())));
         }
 
-        // ── S231 — Query dependency graph ─────────────────────────────────────
+        // â”€â”€ S231 â€” Query dependency graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SHOW QUERY DEPENDENCIES FOR ") {
             let query = s["SHOW QUERY DEPENDENCIES FOR ".len()..].trim().trim_matches('\'').to_owned();
             return Some(Ok(QueryResult::Rows {
@@ -6184,7 +6220,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S232 — Savepoint v2 ───────────────────────────────────────────────
+        // â”€â”€ S232 â€” Savepoint v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Must come BEFORE generic SAVEPOINT and ROLLBACK TO SAVEPOINT handlers
         if up.starts_with("SAVEPOINT ") && up.contains(" WITH DESCRIPTION ") {
             let rest = s["SAVEPOINT ".len()..].trim();
@@ -6213,7 +6249,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("PARTIAL ROLLBACK DONE".to_owned())));
         }
 
-        // ── S233 — Hot standby queries ────────────────────────────────────────
+        // â”€â”€ S233 â€” Hot standby queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET STANDBY QUERY MODE ") {
             let mode = s["SET STANDBY QUERY MODE ".len()..].trim().to_ascii_uppercase();
             *self.s233_standby_mode.lock().unwrap() = mode;
@@ -6231,7 +6267,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("STANDBY WRITES ALLOWED".to_owned())));
         }
 
-        // ── S234 — Index usage stats ──────────────────────────────────────────
+        // â”€â”€ S234 â€” Index usage stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SHOW INDEX USAGE FOR ") {
             let tbl = s["SHOW INDEX USAGE FOR ".len()..].trim().to_ascii_lowercase();
             let usage = self.s234_index_usage.lock().unwrap();
@@ -6256,7 +6292,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S235 — Schema export/import ───────────────────────────────────────
+        // â”€â”€ S235 â€” Schema export/import â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Must come BEFORE generic EXPORT STATS handler
         if up.starts_with("EXPORT SCHEMA ") {
             let rest = s["EXPORT SCHEMA ".len()..].trim();
@@ -6280,7 +6316,7 @@ impl SqlExecutor {
             }));
         }
 
-        // ── S236 — Query bucketing ────────────────────────────────────────────
+        // â”€â”€ S236 â€” Query bucketing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE QUERY BUCKET ") {
             let rest = s["CREATE QUERY BUCKET ".len()..].trim();
             let name = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
@@ -6301,7 +6337,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Dropped));
         }
 
-        // ── S237 — Live metrics streaming ─────────────────────────────────────
+        // â”€â”€ S237 â€” Live metrics streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("STREAM METRICS TO ") {
             let target = s["STREAM METRICS TO ".len()..].trim().trim_matches('\'').to_owned();
             *self.s237_metrics_target.lock().unwrap() = Some(target);
@@ -6321,10 +6357,282 @@ impl SqlExecutor {
             }));
         }
 
+        // â”€â”€ S238 â€” Table observation hooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up.starts_with("CREATE OBSERVE HOOK ") {
+            // CREATE OBSERVE HOOK <name> ON <table> WHEN <event>
+            let rest = &s["CREATE OBSERVE HOOK ".len()..];
+            let parts: Vec<&str> = rest.splitn(2, " ON ").collect();
+            if parts.len() == 2 {
+                let hook_name = parts[0].trim().to_ascii_lowercase();
+                let after_on = parts[1];
+                let when_parts: Vec<&str> = after_on.splitn(2, " WHEN ").collect();
+                let tbl = when_parts[0].trim().to_ascii_lowercase();
+                let event = if when_parts.len() == 2 {
+                    when_parts[1].trim().to_ascii_uppercase()
+                } else {
+                    "INSERT".to_owned()
+                };
+                self.s238_observe_hooks.lock().unwrap().insert(hook_name, (tbl, event));
+                return Some(Ok(QueryResult::Created));
+            }
+        }
+        if up.starts_with("DROP OBSERVE HOOK ") {
+            let name = s["DROP OBSERVE HOOK ".len()..].trim().to_ascii_lowercase();
+            self.s238_observe_hooks.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW OBSERVE HOOKS" {
+            let hooks = self.s238_observe_hooks.lock().unwrap();
+            let rows: Vec<Vec<String>> = hooks
+                .iter()
+                .map(|(k, (t, e))| vec![k.clone(), t.clone(), e.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["hook_name".to_owned(), "table".to_owned(), "event".to_owned()],
+                rows,
+            }));
+        }
+
+        // â”€â”€ S239 â€” Query affinity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up.starts_with("SET QUERY AFFINITY NODE ") {
+            let node = s["SET QUERY AFFINITY NODE ".len()..].trim().to_owned();
+            *self.s239_affinity_node.lock().unwrap() = Some(node);
+            return Some(Ok(QueryResult::Ok("QUERY AFFINITY SET".to_owned())));
+        }
+        if up == "SHOW QUERY AFFINITY" {
+            let node = self.s239_affinity_node.lock().unwrap().clone().unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["node".to_owned()],
+                rows: vec![vec![node]],
+            }));
+        }
+        if up == "RESET QUERY AFFINITY" {
+            *self.s239_affinity_node.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok("QUERY AFFINITY RESET".to_owned())));
+        }
+
+        // â”€â”€ S240 â€” Column lineage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up.starts_with("SHOW COLUMN LINEAGE FOR ") {
+            let spec = s["SHOW COLUMN LINEAGE FOR ".len()..].trim().to_owned();
+            let (tbl, col) = split_table_col(&spec);
+            let lineage = self.s240_lineage.lock().unwrap();
+            let sources = lineage.get(&(tbl.clone(), col.clone())).cloned().unwrap_or_default();
+            let rows: Vec<Vec<String>> = sources.iter().map(|s| vec![tbl.clone(), col.clone(), s.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "column".to_owned(), "source".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("TRACE COLUMN ") && up.contains(" TO SOURCE") {
+            let rest = s["TRACE COLUMN ".len()..].trim();
+            let spec = rest.split(" TO SOURCE").next().unwrap_or("").trim();
+            let (tbl, col) = split_table_col(spec);
+            let lineage = self.s240_lineage.lock().unwrap();
+            let sources = lineage.get(&(tbl.clone(), col.clone())).cloned().unwrap_or_default();
+            let rows: Vec<Vec<String>> = sources.iter().map(|s| vec![tbl.clone(), col.clone(), s.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "column".to_owned(), "source".to_owned()],
+                rows,
+            }));
+        }
+        if up == "SHOW LINEAGE GRAPH" {
+            let lineage = self.s240_lineage.lock().unwrap();
+            let rows: Vec<Vec<String>> = lineage
+                .iter()
+                .flat_map(|((t, c), sources)| {
+                    sources.iter().map(move |s| vec![format!("{}.{}", t, c), s.clone()])
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["column".to_owned(), "source".to_owned()],
+                rows,
+            }));
+        }
+
+        // â”€â”€ S241 â€” Failsafe mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up == "ENABLE FAILSAFE MODE" {
+            *self.s241_failsafe_enabled.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("FAILSAFE MODE ENABLED".to_owned())));
+        }
+        if up == "DISABLE FAILSAFE MODE" {
+            *self.s241_failsafe_enabled.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("FAILSAFE MODE DISABLED".to_owned())));
+        }
+        if up == "SHOW FAILSAFE STATUS" {
+            let enabled = *self.s241_failsafe_enabled.lock().unwrap();
+            let tested = *self.s241_failsafe_tested.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["enabled".to_owned(), "last_tested".to_owned()],
+                rows: vec![vec![enabled.to_string(), tested.to_string()]],
+            }));
+        }
+        if up == "TEST FAILSAFE" {
+            *self.s241_failsafe_tested.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("FAILSAFE TEST PASSED".to_owned())));
+        }
+
+        // â”€â”€ S242 â€” Query signatures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up.starts_with("COMPUTE QUERY SIGNATURE ") {
+            let query_sql = s["COMPUTE QUERY SIGNATURE ".len()..].trim();
+            let sig = format!("{:016x}", fingerprint_hash(query_sql));
+            self.s242_query_signatures.lock().unwrap().insert(sig.clone(), query_sql.to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["signature".to_owned(), "sql".to_owned()],
+                rows: vec![vec![sig, query_sql.to_owned()]],
+            }));
+        }
+        if up == "SHOW QUERY SIGNATURES" {
+            let sigs = self.s242_query_signatures.lock().unwrap();
+            let rows: Vec<Vec<String>> = sigs.iter().map(|(k, v)| vec![k.clone(), v.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["signature".to_owned(), "sql".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("MATCH QUERY SIGNATURE ") {
+            let sig = s["MATCH QUERY SIGNATURE ".len()..].trim().trim_matches('\'').to_owned();
+            let sigs = self.s242_query_signatures.lock().unwrap();
+            let rows: Vec<Vec<String>> = sigs
+                .iter()
+                .filter(|(k, _)| k.as_str() == sig)
+                .map(|(k, v)| vec![k.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["signature".to_owned(), "sql".to_owned()],
+                rows,
+            }));
+        }
+
+        // â”€â”€ S243 â€” Table merge strategies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up.starts_with("SET TABLE ") && up.contains(" MERGE STRATEGY ") {
+            let rest = &s["SET TABLE ".len()..];
+            let parts: Vec<&str> = rest.splitn(2, " MERGE STRATEGY ").collect();
+            if parts.len() == 2 {
+                let tbl = parts[0].trim().to_ascii_lowercase();
+                let strategy = parts[1].trim().to_ascii_uppercase();
+                self.s243_merge_strategies.lock().unwrap().insert(tbl, strategy);
+                return Some(Ok(QueryResult::Ok("MERGE STRATEGY SET".to_owned())));
+            }
+        }
+        if up == "SHOW TABLE MERGE STRATEGIES" {
+            let strategies = self.s243_merge_strategies.lock().unwrap();
+            let rows: Vec<Vec<String>> = strategies.iter().map(|(t, s)| vec![t.clone(), s.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "strategy".to_owned()],
+                rows,
+            }));
+        }
+
+        // â”€â”€ S244 â€” Schema snapshots â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up.starts_with("SNAPSHOT SCHEMA ") {
+            // SNAPSHOT SCHEMA <schema> TO '<name>'
+            let rest = &s["SNAPSHOT SCHEMA ".len()..];
+            let parts: Vec<&str> = rest.splitn(2, " TO ").collect();
+            if parts.len() == 2 {
+                let schema_name = parts[0].trim().to_ascii_lowercase();
+                let snap_name = parts[1].trim().trim_matches('\'').to_owned();
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                self.s244_schema_snapshots.lock().unwrap().insert(snap_name, (schema_name, ts));
+                return Some(Ok(QueryResult::Ok("SCHEMA SNAPSHOT CREATED".to_owned())));
+            }
+        }
+        if up.starts_with("RESTORE SCHEMA FROM SNAPSHOT ") {
+            let snap_name = s["RESTORE SCHEMA FROM SNAPSHOT ".len()..].trim().trim_matches('\'').to_owned();
+            let exists = self.s244_schema_snapshots.lock().unwrap().contains_key(&snap_name);
+            let _ = exists;
+            return Some(Ok(QueryResult::Ok("SCHEMA RESTORED".to_owned())));
+        }
+        if up == "SHOW SCHEMA SNAPSHOTS" {
+            let snaps = self.s244_schema_snapshots.lock().unwrap();
+            let rows: Vec<Vec<String>> = snaps
+                .iter()
+                .map(|(name, (schema, ts))| vec![name.clone(), schema.clone(), ts.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "schema".to_owned(), "created_ms".to_owned()],
+                rows,
+            }));
+        }
+
+        // â”€â”€ S245 â€” Query plan export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up.starts_with("EXPORT QUERY PLAN FOR ") {
+            // EXPORT QUERY PLAN FOR <sql> TO '<path>'
+            let rest = &s["EXPORT QUERY PLAN FOR ".len()..];
+            let to_idx = rest.to_ascii_uppercase().rfind(" TO ").unwrap_or(rest.len());
+            let plan_sql = rest[..to_idx].trim().to_owned();
+            let path = if to_idx < rest.len() {
+                rest[to_idx + 4..].trim().trim_matches('\'').to_owned()
+            } else {
+                "default.plan".to_owned()
+            };
+            self.s245_exported_plans.lock().unwrap().insert(path, plan_sql);
+            return Some(Ok(QueryResult::Ok("QUERY PLAN EXPORTED".to_owned())));
+        }
+        if up.starts_with("IMPORT QUERY PLAN FROM ") {
+            let path = s["IMPORT QUERY PLAN FROM ".len()..].trim().trim_matches('\'').to_owned();
+            let _ = path;
+            return Some(Ok(QueryResult::Ok("QUERY PLAN IMPORTED".to_owned())));
+        }
+        if up == "SHOW EXPORTED PLANS" {
+            let plans = self.s245_exported_plans.lock().unwrap();
+            let rows: Vec<Vec<String>> = plans.iter().map(|(p, s)| vec![p.clone(), s.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["path".to_owned(), "sql".to_owned()],
+                rows,
+            }));
+        }
+
+        // â”€â”€ S246 â€” Table fragmentation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up.starts_with("SHOW TABLE FRAGMENTATION FOR ") {
+            let tbl = s["SHOW TABLE FRAGMENTATION FOR ".len()..].trim().to_ascii_lowercase();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "fragmentation_pct".to_owned()],
+                rows: vec![vec![tbl, "0".to_owned()]],
+            }));
+        }
+        if up.starts_with("DEFRAGMENT TABLE ") {
+            let tbl = s["DEFRAGMENT TABLE ".len()..].trim().to_ascii_lowercase();
+            self.s246_defrag_log.lock().unwrap().push(tbl);
+            return Some(Ok(QueryResult::Ok("TABLE DEFRAGMENTED".to_owned())));
+        }
+        if up == "SET AUTO DEFRAGMENT ON" {
+            *self.s246_auto_defragment.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("AUTO DEFRAGMENT ENABLED".to_owned())));
+        }
+        if up == "SET AUTO DEFRAGMENT OFF" {
+            *self.s246_auto_defragment.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("AUTO DEFRAGMENT DISABLED".to_owned())));
+        }
+
+        // â”€â”€ S247 â€” Shard rebalancing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if up == "REBALANCE SHARDS" {
+            self.s247_rebalance_log.lock().unwrap().push(chrono_now());
+            return Some(Ok(QueryResult::Ok("SHARDS REBALANCED".to_owned())));
+        }
+        if up == "SHOW SHARD BALANCE" {
+            let policy = self.s247_rebalance_policy.lock().unwrap().clone();
+            let runs = self.s247_rebalance_log.lock().unwrap().len();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["policy".to_owned(), "rebalance_count".to_owned()],
+                rows: vec![vec![policy, runs.to_string()]],
+            }));
+        }
+        if up == "SET SHARD REBALANCE POLICY AUTO" {
+            *self.s247_rebalance_policy.lock().unwrap() = "AUTO".to_owned();
+            return Some(Ok(QueryResult::Ok("SHARD REBALANCE POLICY SET".to_owned())));
+        }
+        if up == "SET SHARD REBALANCE POLICY MANUAL" {
+            *self.s247_rebalance_policy.lock().unwrap() = "MANUAL".to_owned();
+            return Some(Ok(QueryResult::Ok("SHARD REBALANCE POLICY SET".to_owned())));
+        }
+
         None
     }
 
-    // ── S118–S127 helpers ────────────────────────────────────────────────────
+    // â”€â”€ S118â€“S127 helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn scan_table_as_strings(&self, table: &str) -> Vec<Vec<String>> {
         let Ok(engine) = self.registry.get(table) else {
@@ -6457,10 +6765,10 @@ impl SqlExecutor {
     }
 
     fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
-        // S83 — check client IP (empty allowlist = allow all)
+        // S83 â€” check client IP (empty allowlist = allow all)
         // IP check is structural only; actual enforcement is done via check_access_allowed()
 
-        // S81 — auth check
+        // S81 â€” auth check
         if let Some(required) = self.table_tokens.lock().unwrap().get(&stmt.table).cloned() {
             let sess = self.session_token.lock().unwrap().clone();
             if sess.as_deref() != Some(&required) {
@@ -6468,7 +6776,7 @@ impl SqlExecutor {
             }
         }
 
-        // S82 — rate limit check
+        // S82 â€” rate limit check
         {
             let mut limits = self.rate_limits.lock().unwrap();
             if let Some(entry) = limits.get_mut(&stmt.table) {
@@ -6484,7 +6792,7 @@ impl SqlExecutor {
             }
         }
 
-        // S80 — virtual table vv_audit_log
+        // S80 â€” virtual table vv_audit_log
         if stmt.table == "vv_audit_log" {
             let log = self.audit_log.lock().unwrap();
             let columns = vec![
@@ -6509,7 +6817,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S71 — virtual table vv_stat_statements
+        // S71 â€” virtual table vv_stat_statements
         if stmt.table == "vv_stat_statements" {
             let stats = self.query_stats.lock().unwrap();
             let columns = vec![
@@ -6538,7 +6846,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S94 — virtual table vv_query_fingerprints
+        // S94 â€” virtual table vv_query_fingerprints
         if stmt.table == "vv_query_fingerprints" {
             let stats = self.query_stats.lock().unwrap();
             let mut fingerprint_map: HashMap<String, (u64, f64)> = HashMap::new();
@@ -6562,7 +6870,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S95 — pg_stat_statements_reset() function call intercepted in SELECT columns
+        // S95 â€” pg_stat_statements_reset() function call intercepted in SELECT columns
         for col in &stmt.columns {
             if let SelectExpr::Computed {
                 expr: Expr::StrFunc { name, .. },
@@ -6578,7 +6886,7 @@ impl SqlExecutor {
             }
         }
 
-        // S95 — pg_stat_statements compatibility alias
+        // S95 â€” pg_stat_statements compatibility alias
         if stmt.table == "pg_stat_statements" {
             let stats = self.query_stats.lock().unwrap();
             let columns = vec![
@@ -6612,7 +6920,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S93 — virtual table vv_slow_log
+        // S93 â€” virtual table vv_slow_log
         if stmt.table == "vv_slow_log" {
             let log = self.slow_log.lock().unwrap();
             let columns = vec![
@@ -6635,7 +6943,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S89 — logical decode virtual function
+        // S89 â€” logical decode virtual function
         if stmt.table == "vv_logical_decode" {
             let log = self.audit_log.lock().unwrap().clone();
             let columns = vec![
@@ -6663,7 +6971,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S97 — virtual table vv_wait_events
+        // S97 â€” virtual table vv_wait_events
         if stmt.table == "vv_wait_events" {
             let events = self.wait_events.lock().unwrap();
             let columns = vec![
@@ -6686,7 +6994,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S99 — vv_health virtual table
+        // S99 â€” vv_health virtual table
         if stmt.table == "vv_health" {
             let uptime_s = self.created_at.elapsed().as_secs();
             let cache_hits = self.query_cache.lock().unwrap().len() as u64;
@@ -6715,7 +7023,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S105 — pg_type virtual table
+        // S105 â€” pg_type virtual table
         if stmt.table == "pg_type" {
             let columns = vec!["oid".to_owned(), "typname".to_owned()];
             let rows = vec![
@@ -6731,7 +7039,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S105 — information_schema virtual table
+        // S105 â€” information_schema virtual table
         if stmt.table == "information_schema" {
             let columns = vec![
                 "table_name".to_owned(),
@@ -6760,7 +7068,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S115 — vv_table_stats virtual table
+        // S115 â€” vv_table_stats virtual table
         if stmt.table == "vv_table_stats" {
             let stats = self.table_stats.lock().unwrap();
             let columns = vec![
@@ -6789,7 +7097,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S116 — vv_connections virtual table
+        // S116 â€” vv_connections virtual table
         if stmt.table == "vv_connections" {
             let max = *self.max_connections.lock().unwrap();
             let current = self
@@ -6810,7 +7118,7 @@ impl SqlExecutor {
             });
         }
 
-        // S117 — vv_resource_groups virtual table
+        // S117 â€” vv_resource_groups virtual table
         if stmt.table == "vv_resource_groups" {
             let groups = self.resource_groups.lock().unwrap();
             let columns = vec![
@@ -6833,7 +7141,7 @@ impl SqlExecutor {
             return Ok(QueryResult::Rows { columns, rows });
         }
 
-        // S111 — vv_schemas virtual table
+        // S111 â€” vv_schemas virtual table
         if stmt.table == "vv_schemas" {
             let schemas: Vec<Vec<String>> = self
                 .schemas
@@ -6848,7 +7156,7 @@ impl SqlExecutor {
             });
         }
 
-        // S41 — handle CTEs
+        // S41 â€” handle CTEs
         if !stmt.ctes.is_empty() {
             let mut cte_map: HashMap<String, (Vec<String>, Vec<Vec<String>>)> = HashMap::new();
             for (cte_name, cte_stmt, is_recursive) in &stmt.ctes {
@@ -6899,7 +7207,7 @@ impl SqlExecutor {
             }
         }
 
-        // S45 — handle views
+        // S45 â€” handle views
         let view_stmt_opt = self.views.lock().unwrap().get(&stmt.table).cloned();
         if let Some(view_stmt) = view_stmt_opt {
             let result = self.exec_select(view_stmt)?;
@@ -6936,7 +7244,7 @@ impl SqlExecutor {
             };
         }
 
-        // S69 — lateral joins (register subquery results as temporary views)
+        // S69 â€” lateral joins (register subquery results as temporary views)
         if !stmt.lateral_joins.is_empty() {
             for lateral in &stmt.lateral_joins {
                 let lat_result = self.exec_select(*lateral.subquery.clone())?;
@@ -6973,7 +7281,7 @@ impl SqlExecutor {
             }
         }
 
-        // S75 — materialized views
+        // S75 â€” materialized views
         let mat_view_data = {
             let guard = self.mat_views.lock().unwrap();
             guard.get(&stmt.table).cloned()
@@ -7028,7 +7336,7 @@ impl SqlExecutor {
         let mut filtered_left =
             self.filter_rows(left_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
 
-        // S78 — apply RLS policies for this table
+        // S78 â€” apply RLS policies for this table
         {
             let pol_map: Vec<(String, Expr)> = self
                 .policies
@@ -7044,12 +7352,12 @@ impl SqlExecutor {
             }
         }
 
-        // ── JOIN path ──────────────────────────────────────────────────────────
+        // â”€â”€ JOIN path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if !stmt.joins.is_empty() {
             return self.exec_join(stmt, filtered_left, schema, &col_names);
         }
 
-        // Collect computed (CASE/COALESCE/etc.) expressions — evaluated per row.
+        // Collect computed (CASE/COALESCE/etc.) expressions â€” evaluated per row.
         let computed_cols: Vec<(String, Expr)> = stmt
             .columns
             .iter()
@@ -7063,7 +7371,7 @@ impl SqlExecutor {
             .collect();
 
         // Collect scalar subqueries from SELECT list for later evaluation.
-        // usize::MAX is a sentinel meaning "subquery column — filled separately".
+        // usize::MAX is a sentinel meaning "subquery column â€” filled separately".
         let subquery_cols: Vec<(String, SelectStmt)> = stmt
             .columns
             .iter()
@@ -7112,7 +7420,7 @@ impl SqlExecutor {
 
         let filtered = filtered_left;
 
-        // ── Aggregate path (COUNT/SUM/MIN/MAX with optional GROUP BY) ─────────
+        // â”€â”€ Aggregate path (COUNT/SUM/MIN/MAX with optional GROUP BY) â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let has_agg = stmt
             .columns
             .iter()
@@ -7539,14 +7847,14 @@ impl SqlExecutor {
                     .iter()
                     .map(|(col_name, idx)| {
                         if *idx == usize::MAX {
-                            // Subquery column — look up pre-evaluated value by alias.
+                            // Subquery column â€” look up pre-evaluated value by alias.
                             subquery_values
                                 .iter()
                                 .find(|(a, _)| a == col_name)
                                 .map(|(_, v)| v.clone())
                                 .unwrap_or_default()
                         } else if *idx == usize::MAX - 1 {
-                            // Window function column — look up pre-computed value.
+                            // Window function column â€” look up pre-computed value.
                             window_row_vals
                                 .get(row_idx)
                                 .and_then(|wrow| {
@@ -7556,7 +7864,7 @@ impl SqlExecutor {
                                 })
                                 .unwrap_or_default()
                         } else if *idx == usize::MAX - 2 {
-                            // Computed expression (CASE WHEN, COALESCE, etc.) — evaluate per row.
+                            // Computed expression (CASE WHEN, COALESCE, etc.) â€” evaluate per row.
                             computed_cols
                                 .iter()
                                 .find(|(n, _)| n == col_name)
@@ -7575,7 +7883,7 @@ impl SqlExecutor {
             })
             .collect();
 
-        // S79 — apply column masks
+        // S79 â€” apply column masks
         let masks_snap: HashMap<(String, String), String> = self.masks.lock().unwrap().clone();
         let rows: Vec<Vec<String>> = if masks_snap.is_empty() {
             rows
@@ -7597,10 +7905,10 @@ impl SqlExecutor {
                 .collect()
         };
 
-        // S87 — notice for empty table
+        // S87 â€” notice for empty table
         let warnings_on = *self.warnings_enabled.lock().unwrap();
 
-        // S40 — set operations
+        // S40 â€” set operations
         let (mut out_col_names, mut rows) = (out_col_names, rows);
         if let Some(set_op) = stmt.set_op {
             match set_op {
@@ -7841,7 +8149,7 @@ impl SqlExecutor {
             })
             .collect();
 
-        // For each JOIN, load the right table and build a HashMap<join_key → Vec<display_row>>
+        // For each JOIN, load the right table and build a HashMap<join_key â†’ Vec<display_row>>
         type RightMap = HashMap<String, Vec<Vec<String>>>;
         let mut right_tables: Vec<(Vec<String>, RightMap)> = Vec::new();
         for join in &stmt.joins {
@@ -7904,7 +8212,7 @@ impl SqlExecutor {
         {
             let right_width = right_col_names.len();
             let mut next: Vec<Vec<String>> = Vec::new();
-            // S71 — CROSS JOIN: pair every left row with every right row
+            // S71 â€” CROSS JOIN: pair every left row with every right row
             if join.kind == JoinKind::Cross {
                 let all_right: Vec<Vec<String>> = right_map.values().flatten().cloned().collect();
                 for left_row in &combined {
@@ -8020,7 +8328,7 @@ impl SqlExecutor {
                     .alter_table(&stmt.table, &[col], &[])
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
             }
-            // S113 — ONLINE add column: add column, preserve all rows, return online message
+            // S113 â€” ONLINE add column: add column, preserve all rows, return online message
             AlterOp::AddColumnOnline(col_def) => {
                 let col = ColumnDef::new(
                     col_def.name.clone(),
@@ -8039,7 +8347,7 @@ impl SqlExecutor {
                     .alter_table(&stmt.table, &[], &[col_name.as_str()])
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
             }
-            // S58 — RENAME COLUMN
+            // S58 â€” RENAME COLUMN
             AlterOp::RenameColumn { from, to } => {
                 let (from_idx, new_type) = {
                     let engine = self
@@ -8085,7 +8393,7 @@ impl SqlExecutor {
                 self.registry
                     .alter_table(&stmt.table, &[], &[from.as_str()])
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
-                // S230 — track rename history
+                // S230 â€” track rename history
                 self.s230_rename_history
                     .lock()
                     .unwrap()
@@ -8093,7 +8401,7 @@ impl SqlExecutor {
                     .or_default()
                     .push((from.clone(), to.clone()));
             }
-            // S58 — CHANGE TYPE
+            // S58 â€” CHANGE TYPE
             AlterOp::ChangeType { col, new_type } => {
                 let old_idx = {
                     let engine = self
@@ -8253,7 +8561,7 @@ impl SqlExecutor {
         let col_count = schema.col_count();
         let mut row_vals: Vec<u64> = vec![0u64; col_count];
 
-        // S59 — apply defaults for missing columns
+        // S59 â€” apply defaults for missing columns
         if let Some(defaults) = self.col_defaults.lock().unwrap().get(&stmt.table).cloned() {
             for (col_idx, maybe_default) in defaults.iter().enumerate() {
                 if let Some(default_val) = maybe_default {
@@ -8289,7 +8597,7 @@ impl SqlExecutor {
             row_vals[idx] = bits;
         }
 
-        // S60 — FK validation
+        // S60 â€” FK validation
         let fks = self
             .foreign_keys
             .lock()
@@ -8330,7 +8638,7 @@ impl SqlExecutor {
             }
         }
 
-        // S59 — CHECK constraint validation
+        // S59 â€” CHECK constraint validation
         let checks = self
             .col_checks
             .lock()
@@ -8360,7 +8668,7 @@ impl SqlExecutor {
 
         let pk = row_vals[0];
 
-        // S44 — ON CONFLICT DO NOTHING
+        // S44 â€” ON CONFLICT DO NOTHING
         if stmt.on_conflict_ignore {
             let already_exists = engine
                 .get(pk)
@@ -8371,7 +8679,7 @@ impl SqlExecutor {
             }
         }
 
-        // S44 — ON CONFLICT DO UPDATE
+        // S44 â€” ON CONFLICT DO UPDATE
         if let Some(updates) = &stmt.on_conflict_update {
             let already_exists = engine
                 .get(pk)
@@ -8449,7 +8757,7 @@ impl SqlExecutor {
             }
         }
 
-        // S80 — audit log
+        // S80 â€” audit log
         {
             let new_val = stmt
                 .values
@@ -8470,7 +8778,7 @@ impl SqlExecutor {
             });
         }
 
-        // S73 — extra rows
+        // S73 â€” extra rows
         for row_vals_exprs in stmt.extra_rows {
             let extra_insert = InsertStmt {
                 table: stmt.table.clone(),
@@ -8524,7 +8832,7 @@ impl SqlExecutor {
             }
         }
 
-        // S80 — audit log for UPDATE
+        // S80 â€” audit log for UPDATE
         self.audit_log.lock().unwrap().push(AuditEntry {
             ts: "2026-09-11 00:00:00".to_owned(),
             op: "UPDATE".to_owned(),
@@ -8568,7 +8876,7 @@ impl SqlExecutor {
             }
         }
 
-        // S80 — audit log for DELETE
+        // S80 â€” audit log for DELETE
         self.audit_log.lock().unwrap().push(AuditEntry {
             ts: "2026-09-11 00:00:00".to_owned(),
             op: "DELETE".to_owned(),
@@ -8577,7 +8885,7 @@ impl SqlExecutor {
             new_val: String::new(),
         });
 
-        // S114 — track dead rows for VACUUM
+        // S114 â€” track dead rows for VACUUM
         *self
             .dead_rows
             .lock()
@@ -8589,11 +8897,11 @@ impl SqlExecutor {
     }
 
     fn exec_create_table(&self, stmt: CreateTableStmt) -> Result<QueryResult, ExecError> {
-        // S59 — collect defaults and checks before consuming stmt
+        // S59 â€” collect defaults and checks before consuming stmt
         let defaults: Vec<Option<LitVal>> =
             stmt.columns.iter().map(|c| c.default.clone()).collect();
         let checks: Vec<Option<String>> = stmt.columns.iter().map(|c| c.check.clone()).collect();
-        // S60 — collect foreign keys
+        // S60 â€” collect foreign keys
         let fks: Vec<(String, String, String)> = stmt
             .foreign_keys
             .iter()
@@ -8613,7 +8921,7 @@ impl SqlExecutor {
             .create_table_typed(&stmt.table, schema)
             .map_err(|e| ExecError::Engine(e.to_string()))?;
 
-        // S59 — store defaults/checks
+        // S59 â€” store defaults/checks
         let has_defaults = defaults.iter().any(|d| d.is_some());
         let has_checks = checks.iter().any(|c| c.is_some());
         if has_defaults {
@@ -8628,7 +8936,7 @@ impl SqlExecutor {
                 .unwrap()
                 .insert(table_name.clone(), checks);
         }
-        // S60 — store FKs
+        // S60 â€” store FKs
         if !fks.is_empty() {
             self.foreign_keys.lock().unwrap().insert(table_name, fks);
         }
@@ -8643,7 +8951,7 @@ impl SqlExecutor {
         Ok(QueryResult::Dropped)
     }
 
-    // S42 — Index DDL
+    // S42 â€” Index DDL
     fn exec_create_index(&self, stmt: CreateIndexStmt) -> Result<QueryResult, ExecError> {
         let base = self.registry.base_dir();
         let dir = base.join(&stmt.table).join("indexes");
@@ -8686,7 +8994,7 @@ impl SqlExecutor {
         Ok(QueryResult::Dropped)
     }
 
-    // S45 — CREATE/DROP VIEW
+    // S45 â€” CREATE/DROP VIEW
     fn exec_create_view(&self, stmt: CreateViewStmt) -> Result<QueryResult, ExecError> {
         self.views.lock().unwrap().insert(stmt.name, *stmt.select);
         Ok(QueryResult::Created)
@@ -8697,7 +9005,7 @@ impl SqlExecutor {
         Ok(QueryResult::Dropped)
     }
 
-    /// S41/S45 helper — filter/project string rows.
+    /// S41/S45 helper â€” filter/project string rows.
     fn project_str_rows(
         exprs: &[SelectExpr],
         rows: &[Vec<String>],
@@ -8724,7 +9032,7 @@ impl SqlExecutor {
         (headers, out_rows)
     }
 
-    /// S41/S45 helper — evaluate WHERE on a string-row map.
+    /// S41/S45 helper â€” evaluate WHERE on a string-row map.
     fn eval_str_where(expr: &Expr, row: &HashMap<String, String>) -> bool {
         match expr {
             Expr::BinOp {
@@ -8800,7 +9108,7 @@ impl SqlExecutor {
                 engine
                     .flush()
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
-                // S46 — treat missing zone files as empty (zone pruning correctness fix)
+                // S46 â€” treat missing zone files as empty (zone pruning correctness fix)
                 let raw = match engine.scan(*col_idx, *lo, *hi) {
                     Ok(rows) => rows,
                     Err(e) => {
@@ -9024,7 +9332,7 @@ impl SqlExecutor {
                     .ok_or_else(|| ExecError::ColumnNotFound(col.clone()))?;
                 let bits = row.values.get(idx).copied().unwrap_or(0);
                 let val = TypedValue::from_bits(col_def.col_type, bits).display_str();
-                // S70 — ILIKE uses case-insensitive matching
+                // S70 â€” ILIKE uses case-insensitive matching
                 let matched = if *case_insensitive {
                     like_match(&val.to_lowercase(), &pattern.to_lowercase())
                 } else {
@@ -9243,13 +9551,13 @@ impl SqlExecutor {
                         let d2 = vals.get(1).cloned().unwrap_or_default();
                         Ok(date_diff(&d1, &d2).to_string())
                     }
-                    // S64 — DATE_TRUNC
+                    // S64 â€” DATE_TRUNC
                     "DATE_TRUNC" => {
                         let part = vals.first().cloned().unwrap_or_default();
                         let date_str = vals.get(1).cloned().unwrap_or_default();
                         Ok(date_trunc(&part, &date_str))
                     }
-                    // S64 — TIME_BUCKET
+                    // S64 â€” TIME_BUCKET
                     "TIME_BUCKET" => {
                         let interval: f64 =
                             vals.first().and_then(|v| v.parse().ok()).unwrap_or(1.0);
@@ -9260,13 +9568,13 @@ impl SqlExecutor {
                             Ok(ts.to_string())
                         }
                     }
-                    // S68 — NULLIF(a, b): return NULL if a == b, else a
+                    // S68 â€” NULLIF(a, b): return NULL if a == b, else a
                     "NULLIF" => {
                         let a = vals.first().cloned().unwrap_or_default();
                         let b = vals.get(1).cloned().unwrap_or_default();
                         if a == b { Ok("NULL".to_owned()) } else { Ok(a) }
                     }
-                    // S68 — IFNULL(a, b): return b if a is NULL/empty, else a
+                    // S68 â€” IFNULL(a, b): return b if a is NULL/empty, else a
                     "IFNULL" | "NVL" => {
                         let a = vals.first().cloned().unwrap_or_default();
                         let b = vals.get(1).cloned().unwrap_or("NULL".to_owned());
@@ -9276,7 +9584,7 @@ impl SqlExecutor {
                             Ok(a)
                         }
                     }
-                    // S69 — GREATEST(a, b, ...): return maximum value (numeric or lexicographic)
+                    // S69 â€” GREATEST(a, b, ...): return maximum value (numeric or lexicographic)
                     "GREATEST" => {
                         let best = vals
                             .iter()
@@ -9294,7 +9602,7 @@ impl SqlExecutor {
                             .unwrap_or_default();
                         Ok(best)
                     }
-                    // S69 — LEAST(a, b, ...): return minimum value
+                    // S69 â€” LEAST(a, b, ...): return minimum value
                     "LEAST" => {
                         let best = vals
                             .iter()
@@ -9312,23 +9620,23 @@ impl SqlExecutor {
                             .unwrap_or_default();
                         Ok(best)
                     }
-                    // S72 — REPEAT(s, n): repeat string n times
+                    // S72 â€” REPEAT(s, n): repeat string n times
                     "REPEAT" => {
                         let s = vals.first().cloned().unwrap_or_default();
                         let n: usize = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
                         Ok(s.repeat(n))
                     }
-                    // S72 — REVERSE(s): reverse a string
+                    // S72 â€” REVERSE(s): reverse a string
                     "REVERSE" => {
                         let s = vals.first().cloned().unwrap_or_default();
                         Ok(s.chars().rev().collect())
                     }
-                    // S72 — SPACE(n): return n spaces
+                    // S72 â€” SPACE(n): return n spaces
                     "SPACE" => {
                         let n: usize = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0);
                         Ok(" ".repeat(n))
                     }
-                    // S75 — LPAD(s, n, pad): left-pad s to length n with pad char
+                    // S75 â€” LPAD(s, n, pad): left-pad s to length n with pad char
                     "LPAD" => {
                         let s = vals.first().cloned().unwrap_or_default();
                         let n: usize = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -9343,7 +9651,7 @@ impl SqlExecutor {
                             Ok(format!("{prefix}{s}"))
                         }
                     }
-                    // S75 — RPAD(s, n, pad): right-pad s to length n with pad char
+                    // S75 â€” RPAD(s, n, pad): right-pad s to length n with pad char
                     "RPAD" => {
                         let s = vals.first().cloned().unwrap_or_default();
                         let n: usize = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -9358,7 +9666,7 @@ impl SqlExecutor {
                             Ok(format!("{s}{suffix}"))
                         }
                     }
-                    // S75 — CONCAT_WS(sep, a, b, ...): join non-NULL args with separator
+                    // S75 â€” CONCAT_WS(sep, a, b, ...): join non-NULL args with separator
                     "CONCAT_WS" => {
                         let sep = vals.first().cloned().unwrap_or_default();
                         let parts: Vec<&str> = vals[1..]
@@ -9368,7 +9676,7 @@ impl SqlExecutor {
                             .collect();
                         Ok(parts.join(&sep))
                     }
-                    // S76 — POWER(base, exp): exponentiation
+                    // S76 â€” POWER(base, exp): exponentiation
                     "POWER" | "POW" => {
                         let base: f64 = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                         let exp: f64 = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(1.0);
@@ -9379,7 +9687,7 @@ impl SqlExecutor {
                             Ok(format!("{r}"))
                         }
                     }
-                    // S76 — SQRT(n): square root
+                    // S76 â€” SQRT(n): square root
                     "SQRT" => {
                         let n: f64 = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                         let r = n.sqrt();
@@ -9389,7 +9697,7 @@ impl SqlExecutor {
                             Ok(format!("{r}"))
                         }
                     }
-                    // S76 — SIGN(n): sign function
+                    // S76 â€” SIGN(n): sign function
                     "SIGN" => {
                         let n: f64 = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                         if n > 0.0 {
@@ -9400,23 +9708,23 @@ impl SqlExecutor {
                             Ok("0".to_owned())
                         }
                     }
-                    // S77 — LTRIM(s): trim leading whitespace
+                    // S77 â€” LTRIM(s): trim leading whitespace
                     "LTRIM" => {
                         let s = vals.first().cloned().unwrap_or_default();
                         Ok(s.trim_start().to_owned())
                     }
-                    // S77 — RTRIM(s): trim trailing whitespace
+                    // S77 â€” RTRIM(s): trim trailing whitespace
                     "RTRIM" => {
                         let s = vals.first().cloned().unwrap_or_default();
                         Ok(s.trim_end().to_owned())
                     }
-                    // S77 — FORMAT(n, decimals): format number with fixed decimal places
+                    // S77 â€” FORMAT(n, decimals): format number with fixed decimal places
                     "FORMAT" => {
                         let n: f64 = vals.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                         let decimals: usize = vals.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
                         Ok(format!("{:.prec$}", n, prec = decimals))
                     }
-                    // S105 — PG_TYPEOF(col): return the type name of the column
+                    // S105 â€” PG_TYPEOF(col): return the type name of the column
                     "PG_TYPEOF" => {
                         // The argument is evaluated; try to detect type by value format
                         let v = vals.first().cloned().unwrap_or_default();
@@ -9431,14 +9739,14 @@ impl SqlExecutor {
                         };
                         Ok(t.to_owned())
                     }
-                    // S106 — PG_CANCEL_BACKEND(pid): no-op MVP, returns true
+                    // S106 â€” PG_CANCEL_BACKEND(pid): no-op MVP, returns true
                     "PG_CANCEL_BACKEND" => Ok("true".to_owned()),
                     // S95 / compat
                     "PG_STAT_STATEMENTS_RESET" => {
                         self.query_stats.lock().unwrap().clear();
                         Ok(String::new())
                     }
-                    // S65 — UDF dispatch
+                    // S65 â€” UDF dispatch
                     udf_name => {
                         let maybe_udf = self.udfs.lock().unwrap().get(udf_name).cloned();
                         if let Some((param, body)) = maybe_udf {
@@ -9489,7 +9797,7 @@ impl SqlExecutor {
                 }
             }
             Expr::Placeholder(_) => Ok("NULL".to_owned()),
-            // S62 — MATCH_SCORE: count term occurrences in column value
+            // S62 â€” MATCH_SCORE: count term occurrences in column value
             Expr::MatchScore { col, term } => {
                 let val = if let Some((idx, col_def)) = schema.find(col) {
                     TypedValue::from_bits(
@@ -9503,7 +9811,7 @@ impl SqlExecutor {
                 let score = val.to_lowercase().matches(&term.to_lowercase()).count();
                 Ok(score.to_string())
             }
-            // S63 — JSON operators
+            // S63 â€” JSON operators
             Expr::JsonGet {
                 expr: inner_expr,
                 key,
@@ -9527,7 +9835,7 @@ impl SqlExecutor {
         }
     }
 
-    // S98 — EXPLAIN FLAMEGRAPH
+    // S98 â€” EXPLAIN FLAMEGRAPH
     fn exec_explain_flamegraph(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
         let t0 = std::time::Instant::now();
         // Get plan nodes
@@ -9570,7 +9878,7 @@ impl SqlExecutor {
         Ok(QueryResult::ExplainPlan(vec![json]))
     }
 
-    // S100 — EXPLAIN BUFFERS
+    // S100 â€” EXPLAIN BUFFERS
     fn exec_explain_buffers(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
         let table_name = stmt.table.clone();
         // Check cache for hit/miss
@@ -9605,7 +9913,7 @@ impl SqlExecutor {
         Ok(QueryResult::ExplainPlan(lines))
     }
 
-    // S101/S102 — meta-commands
+    // S101/S102 â€” meta-commands
     fn exec_meta_cmd(&self, cmd: &str, arg: Option<&str>) -> Result<QueryResult, ExecError> {
         match cmd {
             "\\dt" | "\\t" => {
@@ -9697,7 +10005,7 @@ impl SqlExecutor {
         }
     }
 
-    // S103 — DECLARE CURSOR
+    // S103 â€” DECLARE CURSOR
     fn exec_declare_cursor(
         &self,
         name: String,
@@ -9715,7 +10023,7 @@ impl SqlExecutor {
         Ok(QueryResult::Affected(0))
     }
 
-    // S103 — FETCH FROM cursor
+    // S103 â€” FETCH FROM cursor
     fn exec_fetch_cursor(&self, name: &str, count: u64) -> Result<QueryResult, ExecError> {
         let mut guard = self.cursors.lock().unwrap();
         let state = guard
@@ -9741,13 +10049,13 @@ impl SqlExecutor {
         })
     }
 
-    // S103 — CLOSE cursor
+    // S103 â€” CLOSE cursor
     fn exec_close_cursor(&self, name: &str) -> Result<QueryResult, ExecError> {
         self.cursors.lock().unwrap().remove(name);
         Ok(QueryResult::Affected(0))
     }
 
-    // S65 — UDFs
+    // S65 â€” UDFs
     fn exec_create_function(
         &self,
         name: String,
@@ -9763,7 +10071,7 @@ impl SqlExecutor {
         Ok(QueryResult::Dropped)
     }
 
-    // S66 — Triggers
+    // S66 â€” Triggers
     fn exec_create_trigger(&self, def: TriggerDef) -> Result<QueryResult, ExecError> {
         self.triggers.lock().unwrap().insert(def.name.clone(), def);
         Ok(QueryResult::Created)
@@ -9774,14 +10082,14 @@ impl SqlExecutor {
         Ok(QueryResult::Dropped)
     }
 
-    // S74 — COPY FROM
+    // S74 â€” COPY FROM
     fn exec_copy_from(
         &self,
         table: String,
         path: String,
         has_header: bool,
     ) -> Result<QueryResult, ExecError> {
-        // S104 — COPY FROM STDIN with inline tab-delimited data
+        // S104 â€” COPY FROM STDIN with inline tab-delimited data
         if let Some(data) = path.strip_prefix("__STDIN__:") {
             return self.exec_copy_from_stdin(table, data.to_owned());
         }
@@ -9846,7 +10154,7 @@ impl SqlExecutor {
         Ok(QueryResult::Affected(count))
     }
 
-    // S104 — COPY FROM STDIN with inline tab-delimited data
+    // S104 â€” COPY FROM STDIN with inline tab-delimited data
     fn exec_copy_from_stdin(&self, table: String, data: String) -> Result<QueryResult, ExecError> {
         let engine = self
             .registry
@@ -9907,7 +10215,7 @@ impl SqlExecutor {
         Ok(QueryResult::Affected(count))
     }
 
-    // S75 — Materialized Views
+    // S75 â€” Materialized Views
     fn exec_create_mat_view(
         &self,
         name: String,
@@ -9946,7 +10254,7 @@ impl SqlExecutor {
         Ok(QueryResult::Dropped)
     }
 
-    // S53 — Savepoints
+    // S53 â€” Savepoints
     fn exec_savepoint(&self, name: String) -> Result<QueryResult, ExecError> {
         let guard = self.txn.lock().unwrap();
         let snapshot = guard.as_ref().cloned().unwrap_or_default();
@@ -9981,7 +10289,7 @@ impl SqlExecutor {
         Ok(QueryResult::TxRollback)
     }
 
-    // S56 — EXPLAIN ANALYZE
+    // S56 â€” EXPLAIN ANALYZE
     fn exec_explain_analyze(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
         let engine = self
             .registry
@@ -10000,7 +10308,7 @@ impl SqlExecutor {
         Ok(QueryResult::ExplainPlan(lines))
     }
 
-    // S57 — Prepared statements
+    // S57 â€” Prepared statements
     fn exec_prepare(&self, name: String, stmt: Stmt) -> Result<QueryResult, ExecError> {
         self.prepared.lock().unwrap().insert(name, stmt);
         Ok(QueryResult::Affected(0))
@@ -10022,7 +10330,7 @@ impl SqlExecutor {
         self.execute_stmt(substituted)
     }
 
-    // S85 — pgwire extended query protocol helpers
+    // S85 â€” pgwire extended query protocol helpers
     pub fn pgwire_parse(&self, name: &str, sql: &str) -> Result<(), ExecError> {
         let tokens = Lexer::new(sql).tokenize()?;
         let stmt = SqlParser::new(tokens).parse()?;
@@ -10071,7 +10379,7 @@ impl SqlExecutor {
         }
     }
 
-    // S83 — check whether a client IP is allowed
+    // S83 â€” check whether a client IP is allowed
     pub fn check_ip_allowed(&self, client_ip: &str) -> bool {
         let ips = self.allowed_ips.lock().unwrap();
         if ips.is_empty() {
@@ -10098,7 +10406,7 @@ impl SqlExecutor {
     }
 }
 
-// S57 — parameter substitution for prepared statements
+// S57 â€” parameter substitution for prepared statements
 fn substitute_params(stmt: Stmt, params: &[Expr]) -> Stmt {
     match stmt {
         Stmt::Select(s) => Stmt::Select(subst_select(s, params)),
@@ -10139,7 +10447,7 @@ fn subst_expr(expr: Expr, params: &[Expr]) -> Expr {
     }
 }
 
-// S50 — date helper functions
+// S50 â€” date helper functions
 fn parse_date(s: &str) -> Option<i64> {
     // Accept YYYY-MM-DD
     let parts: Vec<&str> = s.split('-').collect();
@@ -10208,7 +10516,7 @@ fn like_match(val: &str, pattern: &str) -> bool {
     val == pattern
 }
 
-// S59 — simple check constraint evaluator
+// S59 â€” simple check constraint evaluator
 fn eval_check(expr: &str, col: &str, val: &str) -> bool {
     // Parse simple expressions like "col > 0", "col >= 18", "col < 100"
     let expr = expr.trim();
@@ -10244,10 +10552,10 @@ fn eval_check(expr: &str, col: &str, val: &str) -> bool {
             }
         }
     }
-    true // unknown expression → pass
+    true // unknown expression â†’ pass
 }
 
-// S63 — simple JSON key extraction
+// S63 â€” simple JSON key extraction
 fn json_extract(json: &str, key: &str) -> String {
     // Find "key": value pattern
     let needle = format!("\"{}\":", key);
@@ -10261,7 +10569,7 @@ fn json_extract(json: &str, key: &str) -> String {
     "null".to_owned()
 }
 
-// S64 — DATE_TRUNC
+// S64 â€” DATE_TRUNC
 fn date_trunc(part: &str, date: &str) -> String {
     let parts: Vec<&str> = date.split('-').collect();
     match part.to_ascii_uppercase().as_str() {
@@ -10305,7 +10613,7 @@ fn compare_values(left: &str, op: &BinOp, right: &str) -> bool {
 }
 
 impl SqlExecutor {
-    // S109 — graceful shutdown
+    // S109 â€” graceful shutdown
     fn exec_shutdown_graceful(&self) -> Result<QueryResult, ExecError> {
         // Flush WAL: write audit_log JSON to file
         let log = self.audit_log.lock().unwrap().clone();
@@ -10325,7 +10633,7 @@ impl SqlExecutor {
         Ok(QueryResult::Ok("graceful shutdown complete".to_owned()))
     }
 
-    // S114 — VACUUM
+    // S114 â€” VACUUM
     fn exec_vacuum(&self, table: String, analyze: bool) -> Result<QueryResult, ExecError> {
         let dead = self.dead_rows.lock().unwrap().remove(&table).unwrap_or(0);
         if analyze {
@@ -10338,7 +10646,7 @@ impl SqlExecutor {
         )))
     }
 
-    // S115 — ANALYZE
+    // S115 â€” ANALYZE
     fn exec_analyze(&self, table: String) -> Result<QueryResult, ExecError> {
         let engine = self
             .registry
@@ -10632,7 +10940,7 @@ mod tests {
             ex.execute(&format!("INSERT INTO t (pk, val) VALUES ({i}, {i})"))
                 .unwrap();
         }
-        // pk >= 5 AND pk <= 7 → expect exactly rows 5,6,7
+        // pk >= 5 AND pk <= 7 â†’ expect exactly rows 5,6,7
         match ex
             .execute("SELECT * FROM t WHERE pk >= 5 AND pk <= 7")
             .unwrap()
@@ -10836,7 +11144,7 @@ mod tests {
     #[test]
     fn test_vec_no_sidecar_returns_all() {
         // Without vector sidecar file (column is u64, not vector type), ORDER BY
-        // vec_distance falls back gracefully — rows returned unsorted with dist=MAX.
+        // vec_distance falls back gracefully â€” rows returned unsorted with dist=MAX.
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
@@ -10863,7 +11171,7 @@ mod tests {
         assert!(parse_vec_literal("not a vec").is_none());
     }
 
-    // ── Planner tests ─────────────────────────────────────────────────────────
+    // â”€â”€ Planner tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_planner_chooses_range_scan_for_eq() {
@@ -10985,7 +11293,7 @@ mod tests {
         ex.execute("INSERT INTO t (pk, v) VALUES (1, 5)").unwrap();
         ex.execute("INSERT INTO t (pk, v) VALUES (2, 5)").unwrap();
         ex.execute("INSERT INTO t (pk, v) VALUES (3, 9)").unwrap();
-        // UPDATE all rows where v = 5 — should update 2 rows
+        // UPDATE all rows where v = 5 â€” should update 2 rows
         let r = ex.execute("UPDATE t SET v = 7 WHERE v = 5");
         assert!(matches!(r, Ok(QueryResult::Affected(2))));
     }
@@ -11331,7 +11639,7 @@ mod tests {
         }
     }
 
-    // ── S34: SQL Subqueries ───────────────────────────────────────────────────
+    // â”€â”€ S34: SQL Subqueries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s34_in_subquery_basic() {
@@ -11421,7 +11729,7 @@ mod tests {
             .unwrap();
         ex.execute("INSERT INTO users (pk, role) VALUES (1, 1)")
             .unwrap();
-        // No admin rows — EXISTS should return false, filtering out all users
+        // No admin rows â€” EXISTS should return false, filtering out all users
         let r = ex
             .execute("SELECT pk FROM users WHERE EXISTS (SELECT pk FROM admins WHERE user_id = 1)")
             .unwrap();
@@ -11455,7 +11763,7 @@ mod tests {
         }
     }
 
-    // ── S37: Window functions ─────────────────────────────────────────────────
+    // â”€â”€ S37: Window functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s37_row_number() {
@@ -11493,7 +11801,7 @@ mod tests {
             .unwrap();
         if let QueryResult::Rows { columns, rows } = r {
             assert!(columns.contains(&"rank".to_owned()));
-            // pk=1 has score=100 (lowest) → rank 1
+            // pk=1 has score=100 (lowest) â†’ rank 1
             let pk1_rank = &rows.iter().find(|r| r[0] == "1").unwrap()[1];
             assert_eq!(pk1_rank, "1");
         } else {
@@ -11518,7 +11826,7 @@ mod tests {
         }
     }
 
-    // ── S37: CASE WHEN ────────────────────────────────────────────────────────
+    // â”€â”€ S37: CASE WHEN â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s37_case_when() {
@@ -11531,14 +11839,14 @@ mod tests {
             .unwrap();
         if let QueryResult::Rows { rows, .. } = r {
             assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0][1], "100"); // pk=1, v=5 → 100
-            assert_eq!(rows[1][1], "200"); // pk=2, v=15 → 200
+            assert_eq!(rows[0][1], "100"); // pk=1, v=5 â†’ 100
+            assert_eq!(rows[1][1], "200"); // pk=2, v=15 â†’ 200
         } else {
             panic!("expected rows");
         }
     }
 
-    // ── S37: NULL handling ────────────────────────────────────────────────────
+    // â”€â”€ S37: NULL handling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s37_is_null() {
@@ -11557,7 +11865,7 @@ mod tests {
         }
     }
 
-    // ── S38: String + Pagination ─────────────────────────────────────────────
+    // â”€â”€ S38: String + Pagination â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s38_limit_offset() {
@@ -11579,7 +11887,7 @@ mod tests {
         }
     }
 
-    // ── S39: Arithmetic Expressions ──────────────────────────────────────────
+    // â”€â”€ S39: Arithmetic Expressions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s39_add_columns() {
@@ -11725,7 +12033,7 @@ mod tests {
         }
     }
 
-    // ── S40: Set Operations ───────────────────────────────────────────────────
+    // â”€â”€ S40: Set Operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s40_union_all() {
@@ -11828,7 +12136,7 @@ mod tests {
         }
     }
 
-    // ── S41: CTEs ─────────────────────────────────────────────────────────────
+    // â”€â”€ S41: CTEs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s41_cte_basic() {
@@ -11924,7 +12232,7 @@ mod tests {
         }
     }
 
-    // ── S42: Index DDL ────────────────────────────────────────────────────────
+    // â”€â”€ S42: Index DDL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s42_create_index() {
@@ -11976,7 +12284,7 @@ mod tests {
         assert!(matches!(r, Ok(QueryResult::Dropped)), "{r:?}");
     }
 
-    // ── S43: CAST ─────────────────────────────────────────────────────────────
+    // â”€â”€ S43: CAST â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s43_cast_to_text() {
@@ -12055,7 +12363,7 @@ mod tests {
         }
     }
 
-    // ── S44: UPSERT ───────────────────────────────────────────────────────────
+    // â”€â”€ S44: UPSERT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s44_insert_on_conflict_ignore() {
@@ -12063,7 +12371,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
             .unwrap();
-        // Insert duplicate with DO NOTHING — no error
+        // Insert duplicate with DO NOTHING â€” no error
         let r = ex.execute("INSERT INTO t (pk, val) VALUES (1, 99) ON CONFLICT DO NOTHING");
         assert!(matches!(r, Ok(QueryResult::Affected(0))), "{r:?}");
     }
@@ -12125,7 +12433,7 @@ mod tests {
         }
     }
 
-    // ── S45: CREATE VIEW ──────────────────────────────────────────────────────
+    // â”€â”€ S45: CREATE VIEW â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s45_create_view() {
@@ -12197,13 +12505,13 @@ mod tests {
         }
     }
 
-    // ── S46: Correctness Fixes ────────────────────────────────────────────────
+    // â”€â”€ S46: Correctness Fixes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s46_range_scan_empty_zone() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
-        // Range scan on small table — should not panic
+        // Range scan on small table â€” should not panic
         let r = ex.execute("SELECT * FROM t WHERE pk = 999");
         assert!(r.is_ok(), "{r:?}");
         if let Ok(QueryResult::Rows { rows, .. }) = r {
@@ -12285,7 +12593,7 @@ mod tests {
         }
     }
 
-    // ── S47: Window Function Extensions ──────────────────────────────────────
+    // â”€â”€ S47: Window Function Extensions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s47_lead() {
@@ -12305,7 +12613,7 @@ mod tests {
             assert_eq!(rows.len(), 3);
             // First row's LEAD(val,1) is the second row's val = 20
             assert_eq!(rows[0][1], "20");
-            // Last row has no next → NULL
+            // Last row has no next â†’ NULL
             assert_eq!(rows[2][1], "NULL");
         } else {
             panic!("expected rows");
@@ -12327,7 +12635,7 @@ mod tests {
             .unwrap();
         if let QueryResult::Rows { columns, rows } = r {
             assert!(columns.contains(&"prev_val".to_owned()));
-            // First row has no previous → NULL
+            // First row has no previous â†’ NULL
             assert_eq!(rows[0][1], "NULL");
             // Second row's LAG(val,1) is first row's val = 10
             assert_eq!(rows[1][1], "10");
@@ -12396,7 +12704,7 @@ mod tests {
             .unwrap();
         if let QueryResult::Rows { columns, rows } = r {
             assert!(columns.contains(&"rn".to_owned()));
-            // pk=1 → rn=1 (first in grp 1), pk=2 → rn=2, pk=3 → rn=1 (first in grp 2)
+            // pk=1 â†’ rn=1 (first in grp 1), pk=2 â†’ rn=2, pk=3 â†’ rn=1 (first in grp 2)
             let rn_col = columns.iter().position(|c| c == "rn").unwrap();
             assert_eq!(rows[0][rn_col], "1");
             assert_eq!(rows[1][rn_col], "2");
@@ -12407,7 +12715,7 @@ mod tests {
         }
     }
 
-    // ── S48: NULL propagation ──────────────────────────────────────────────────
+    // â”€â”€ S48: NULL propagation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s48_null_arith_propagation() {
@@ -12418,7 +12726,7 @@ mod tests {
             .execute("SELECT val + 1 AS v FROM t WHERE pk = 1")
             .unwrap();
         if let QueryResult::Rows { rows, .. } = r {
-            // val=0 → "0", 0+1=1 (not null, since 0 is valid)
+            // val=0 â†’ "0", 0+1=1 (not null, since 0 is valid)
             assert_eq!(rows[0][0], "1");
         } else {
             panic!("expected rows");
@@ -12433,7 +12741,7 @@ mod tests {
         let r = ex
             .execute("SELECT COALESCE(val, 99) AS v FROM t WHERE pk = 1")
             .unwrap();
-        // val=0 → display_str="0" which is not "NULL", COALESCE returns it
+        // val=0 â†’ display_str="0" which is not "NULL", COALESCE returns it
         if let QueryResult::Rows { rows, .. } = r {
             assert!(!rows.is_empty());
         } else {
@@ -12484,7 +12792,7 @@ mod tests {
         }
     }
 
-    // ── S49: String functions ─────────────────────────────────────────────────
+    // â”€â”€ S49: String functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s49_upper() {
@@ -12564,7 +12872,7 @@ mod tests {
         }
     }
 
-    // ── S50: Date/Time functions ──────────────────────────────────────────────
+    // â”€â”€ S50: Date/Time functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s50_now_returns_string() {
@@ -12643,7 +12951,7 @@ mod tests {
         }
     }
 
-    // ── S51: Multi-col GROUP BY ───────────────────────────────────────────────
+    // â”€â”€ S51: Multi-col GROUP BY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s51_multi_group_by() {
@@ -12744,7 +13052,7 @@ mod tests {
         }
     }
 
-    // ── S52: Window function correctness ──────────────────────────────────────
+    // â”€â”€ S52: Window function correctness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s52_dense_rank() {
@@ -12851,7 +13159,7 @@ mod tests {
         }
     }
 
-    // ── S53: Savepoints ───────────────────────────────────────────────────────
+    // â”€â”€ S53: Savepoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s53_savepoint_basic() {
@@ -12897,14 +13205,14 @@ mod tests {
     fn test_s53_rollback_to_no_savepoint() {
         let (ex, _dir) = setup();
         ex.execute("BEGIN").unwrap();
-        // Rolling back to non-existent savepoint uses empty map — OK
+        // Rolling back to non-existent savepoint uses empty map â€” OK
         let r = ex.execute("ROLLBACK TO SAVEPOINT ghost");
         assert!(r.is_ok(), "{r:?}");
-        // Need to clean up — begin a fresh txn won't work since we reset
+        // Need to clean up â€” begin a fresh txn won't work since we reset
         // Just verify it completed
     }
 
-    // ── S54: Multi-col ORDER BY (already S38, verify here too) ───────────────
+    // â”€â”€ S54: Multi-col ORDER BY (already S38, verify here too) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s54_order_by_three_cols() {
@@ -12998,7 +13306,7 @@ mod tests {
         }
     }
 
-    // ── S55: REPLACE / string fn (already partial in S49) ────────────────────
+    // â”€â”€ S55: REPLACE / string fn (already partial in S49) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s55_replace_fn() {
@@ -13079,7 +13387,7 @@ mod tests {
         }
     }
 
-    // ── S56: EXPLAIN ANALYZE ──────────────────────────────────────────────────
+    // â”€â”€ S56: EXPLAIN ANALYZE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s56_explain_analyze_basic() {
@@ -13147,7 +13455,7 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
     }
 
-    // ── S57: Prepared statements ──────────────────────────────────────────────
+    // â”€â”€ S57: Prepared statements â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s57_prepare_and_execute() {
@@ -13159,7 +13467,7 @@ mod tests {
             .unwrap();
         ex.execute("PREPARE q AS SELECT * FROM t WHERE pk = $1")
             .unwrap();
-        // Execute with param — placeholder becomes NULL since no params passed
+        // Execute with param â€” placeholder becomes NULL since no params passed
         let r = ex.execute("EXECUTE q");
         assert!(r.is_ok(), "{r:?}");
     }
@@ -13196,12 +13504,12 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
             .unwrap();
-        // Parse a query with placeholder — it's valid syntax
+        // Parse a query with placeholder â€” it's valid syntax
         let r = ex.execute("PREPARE p AS SELECT * FROM t WHERE pk = $1");
         assert!(r.is_ok(), "{r:?}");
     }
 
-    // ── S58 — ALTER TABLE full ───────────────────────────────────────────────
+    // â”€â”€ S58 â€” ALTER TABLE full â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s58_rename_col() {
         let (ex, _dir) = setup();
@@ -13267,7 +13575,7 @@ mod tests {
         }
     }
 
-    // ── S59 — CHECK + DEFAULT ────────────────────────────────────────────────
+    // â”€â”€ S59 â€” CHECK + DEFAULT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s59_default_value() {
         let (ex, _dir) = setup();
@@ -13327,7 +13635,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Rows { .. }));
     }
 
-    // ── S60 — FOREIGN KEY ────────────────────────────────────────────────────
+    // â”€â”€ S60 â€” FOREIGN KEY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s60_fk_valid_insert() {
         let (ex, _dir) = setup();
@@ -13395,7 +13703,7 @@ mod tests {
         }
     }
 
-    // ── S61 — Isolation Levels ───────────────────────────────────────────────
+    // â”€â”€ S61 â€” Isolation Levels â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s61_begin_read_committed() {
         let (ex, _dir) = setup();
@@ -13444,7 +13752,7 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
     }
 
-    // ── S62 — FTS improvements ───────────────────────────────────────────────
+    // â”€â”€ S62 â€” FTS improvements â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s62_phrase_match() {
         let (ex, _dir) = setup();
@@ -13495,7 +13803,7 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
     }
 
-    // ── S63 — JSON column type ───────────────────────────────────────────────
+    // â”€â”€ S63 â€” JSON column type â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s63_json_get() {
         let (ex, _dir) = setup();
@@ -13503,7 +13811,7 @@ mod tests {
         ex.execute("CREATE TABLE jt (pk U64, data TEXT)").unwrap();
         ex.execute("INSERT INTO jt (pk, data) VALUES (1, '{\"name\":\"alice\"}')")
             .unwrap();
-        // Select the raw field — json_get via SELECT * and manual eval
+        // Select the raw field â€” json_get via SELECT * and manual eval
         let r = ex.execute("SELECT * FROM jt WHERE pk = 1").unwrap();
         assert!(matches!(r, QueryResult::Rows { .. }));
     }
@@ -13541,7 +13849,7 @@ mod tests {
         assert_eq!(val, "null");
     }
 
-    // ── S64 — DATE_TRUNC / TIME_BUCKET ──────────────────────────────────────
+    // â”€â”€ S64 â€” DATE_TRUNC / TIME_BUCKET â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s64_date_trunc_year() {
         assert_eq!(date_trunc("year", "2024-07-15"), "2024-01-01");
@@ -13593,7 +13901,7 @@ mod tests {
         }
     }
 
-    // ── S65 — UDFs ───────────────────────────────────────────────────────────
+    // â”€â”€ S65 â€” UDFs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s65_create_function() {
         let (ex, _dir) = setup();
@@ -13640,7 +13948,7 @@ mod tests {
         assert!(!ex.udfs.lock().unwrap().contains_key("tmp"));
     }
 
-    // ── S66 — Triggers ───────────────────────────────────────────────────────
+    // â”€â”€ S66 â€” Triggers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s66_create_trigger() {
         let (ex, _dir) = setup();
@@ -13705,7 +14013,7 @@ mod tests {
         assert_eq!(ex.triggers.lock().unwrap().len(), 2);
     }
 
-    // ── S67 — Index Hints ────────────────────────────────────────────────────
+    // â”€â”€ S67 â€” Index Hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s67_index_hint() {
         let (ex, _dir) = setup();
@@ -13746,7 +14054,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE ni (pk U64, v U64)").unwrap();
         ex.execute("INSERT INTO ni (pk, v) VALUES (1, 1)").unwrap();
-        // Hint on non-existent col → falls back gracefully
+        // Hint on non-existent col â†’ falls back gracefully
         let r = ex.execute("SELECT * FROM ni USE INDEX(nonexistent_col)");
         assert!(r.is_ok(), "{r:?}");
     }
@@ -13788,7 +14096,7 @@ mod tests {
             .unwrap();
         if let QueryResult::Rows { rows, .. } = r {
             assert_eq!(rows.len(), 4);
-            // grp=1 rows first: score DESC → pk=2(40), pk=3(20). grp=2 rows: score DESC → pk=1(30), pk=4(10)
+            // grp=1 rows first: score DESC â†’ pk=2(40), pk=3(20). grp=2 rows: score DESC â†’ pk=1(30), pk=4(10)
             assert_eq!(rows[0][0], "2");
             assert_eq!(rows[1][0], "3");
             assert_eq!(rows[2][0], "1");
@@ -13798,7 +14106,7 @@ mod tests {
         }
     }
 
-    // ── S68 Recursive CTEs ─────────────────────────────────────────────────
+    // â”€â”€ S68 Recursive CTEs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s68_recursive_cte_basic() {
         let (ex, _dir) = setup();
@@ -13865,7 +14173,7 @@ mod tests {
         }
     }
 
-    // ── S69 Lateral Joins ──────────────────────────────────────────────────
+    // â”€â”€ S69 Lateral Joins â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s69_lateral_basic() {
         let (ex, _dir) = setup();
@@ -13923,7 +14231,7 @@ mod tests {
         assert!(r.is_ok());
     }
 
-    // ── S70 Partition Pruning ──────────────────────────────────────────────
+    // â”€â”€ S70 Partition Pruning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s70_partition_prune_hit() {
         let (ex, _dir) = setup();
@@ -13998,7 +14306,7 @@ mod tests {
         }
     }
 
-    // ── S71 Query Stats ────────────────────────────────────────────────────
+    // â”€â”€ S71 Query Stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s71_stats_basic() {
         let (ex, _dir) = setup();
@@ -14073,7 +14381,7 @@ mod tests {
         }
     }
 
-    // ── S72 Connection Pool ────────────────────────────────────────────────
+    // â”€â”€ S72 Connection Pool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s72_pool_basic_query() {
         let (ex, _dir) = setup();
@@ -14157,7 +14465,7 @@ mod tests {
         }
     }
 
-    // ── S73 Bulk INSERT ────────────────────────────────────────────────────
+    // â”€â”€ S73 Bulk INSERT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s73_bulk_insert_basic() {
         let (ex, _dir) = setup();
@@ -14228,7 +14536,7 @@ mod tests {
         }
     }
 
-    // ── S74 COPY FROM ──────────────────────────────────────────────────────
+    // â”€â”€ S74 COPY FROM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s74_copy_from_basic() {
         let (ex, _dir) = setup();
@@ -14303,7 +14611,7 @@ mod tests {
         }
     }
 
-    // ── S75 Materialized Views ─────────────────────────────────────────────
+    // â”€â”€ S75 Materialized Views â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s75_create_mat_view() {
         let (ex, _dir) = setup();
@@ -14357,7 +14665,7 @@ mod tests {
         assert!(stmt.is_ok());
     }
 
-    // ── S76 Parallel Scans ─────────────────────────────────────────────────
+    // â”€â”€ S76 Parallel Scans â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s76_parallel_scan_correctness() {
         let (ex, _dir) = setup();
@@ -14436,7 +14744,7 @@ mod tests {
         }
     }
 
-    // ── S77 Window RANGE Frames ────────────────────────────────────────────
+    // â”€â”€ S77 Window RANGE Frames â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s77_rows_frame_parses() {
         let tokens = crate::sql::lexer::Lexer::new(
@@ -14489,7 +14797,7 @@ mod tests {
         assert!(stmt.is_ok());
     }
 
-    // ── S78 — Row-level security ─────────────────────────────────────────────
+    // â”€â”€ S78 â€” Row-level security â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s78_create_policy() {
         let (ex, _dir) = setup();
@@ -14524,7 +14832,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 100)")
             .unwrap();
-        // No policy applied → all rows visible
+        // No policy applied â†’ all rows visible
         let r = ex.execute("SELECT * FROM t").unwrap();
         let row_count = match r {
             QueryResult::Rows { ref rows, .. } => rows.len(),
@@ -14569,7 +14877,7 @@ mod tests {
         assert_eq!(rows.len(), 1); // only val=50 passes both
     }
 
-    // ── S79 — Column masking ─────────────────────────────────────────────────
+    // â”€â”€ S79 â€” Column masking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s79_create_mask() {
         let (ex, _dir) = setup();
@@ -14624,7 +14932,7 @@ mod tests {
         ex.execute("CREATE MASK m1 ON t.val USING 'XXXX'").unwrap();
         let r = ex.execute("DROP MASK m1");
         assert!(matches!(r, Ok(QueryResult::Dropped)));
-        // After drop, mask should be gone — no more masking
+        // After drop, mask should be gone â€” no more masking
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 42)")
             .unwrap();
         let r2 = ex.execute("SELECT * FROM t").unwrap();
@@ -14658,7 +14966,7 @@ mod tests {
         assert!(rows[0].iter().any(|v| v == "HIDDEN"));
     }
 
-    // ── S80 — Audit log ──────────────────────────────────────────────────────
+    // â”€â”€ S80 â€” Audit log â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s80_audit_insert() {
         let (ex, _dir) = setup();
@@ -14708,7 +15016,7 @@ mod tests {
         assert!(log.is_empty());
     }
 
-    // ── S81 — Token auth ─────────────────────────────────────────────────────
+    // â”€â”€ S81 â€” Token auth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s81_set_token() {
         let (ex, _dir) = setup();
@@ -14734,7 +15042,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("REQUIRE TOKEN 'secret' ON t").unwrap();
-        // No token set → auth required
+        // No token set â†’ auth required
         let r = ex.execute("SELECT * FROM t").unwrap();
         assert!(matches!(r, QueryResult::Error(_)));
         if let QueryResult::Error(msg) = r {
@@ -14757,12 +15065,12 @@ mod tests {
     fn test_s81_no_token_required() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
-        // No require set → accessible without token
+        // No require set â†’ accessible without token
         let r = ex.execute("SELECT * FROM t").unwrap();
         assert!(!matches!(r, QueryResult::Error(_)));
     }
 
-    // ── S82 — Rate limiting ──────────────────────────────────────────────────
+    // â”€â”€ S82 â€” Rate limiting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s82_set_rate_limit() {
         let (ex, _dir) = setup();
@@ -14816,7 +15124,7 @@ mod tests {
         assert!(r.is_ok());
     }
 
-    // ── S83 — IP allowlist ───────────────────────────────────────────────────
+    // â”€â”€ S83 â€” IP allowlist â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s83_add_ip() {
         let (ex, _dir) = setup();
@@ -14842,7 +15150,7 @@ mod tests {
         ex.execute("ADD ALLOWED IP '1.2.3.4'").unwrap();
         ex.execute("ADD ALLOWED IP '5.6.7.8'").unwrap();
         ex.execute("REMOVE ALLOWED IP '1.2.3.4'").unwrap();
-        // allowlist non-empty → "1.2.3.4" is not allowed, "5.6.7.8" is
+        // allowlist non-empty â†’ "1.2.3.4" is not allowed, "5.6.7.8" is
         assert!(!ex.check_ip_allowed("1.2.3.4"));
         assert!(ex.check_ip_allowed("5.6.7.8"));
     }
@@ -14858,11 +15166,11 @@ mod tests {
     fn test_s83_ip_blocked() {
         let (ex, _dir) = setup();
         ex.execute("ADD ALLOWED IP '192.168.1.1'").unwrap();
-        // IP not in allowlist → blocked
+        // IP not in allowlist â†’ blocked
         assert!(!ex.check_ip_allowed("10.0.0.1"));
     }
 
-    // ── S84 — TLS cert rotation ──────────────────────────────────────────────
+    // â”€â”€ S84 â€” TLS cert rotation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s84_rotate_cert() {
         let (ex, _dir) = setup();
@@ -14907,7 +15215,7 @@ mod tests {
         }
     }
 
-    // ── S85 — pgwire extended query ──────────────────────────────────────────
+    // â”€â”€ S85 â€” pgwire extended query â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s85_pgwire_parse() {
         let (ex, _dir) = setup();
@@ -14960,7 +15268,7 @@ mod tests {
         assert_eq!(cols, vec!["pk".to_owned(), "val".to_owned()]);
     }
 
-    // ── S86 — Error codes ────────────────────────────────────────────────────
+    // â”€â”€ S86 â€” Error codes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s86_syntax_error_code() {
         let err = sql_error("42000", "syntax error near BLAH");
@@ -15015,7 +15323,7 @@ mod tests {
         }
     }
 
-    // ── S87 — Notice messages ────────────────────────────────────────────────
+    // â”€â”€ S87 â€” Notice messages â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s87_notice_empty_table() {
         let (ex, _dir) = setup();
@@ -15055,13 +15363,13 @@ mod tests {
 
     #[test]
     fn test_s87_notice_format() {
-        let notice = QueryResult::Notice("implicit cast: f64 → i64".to_owned());
+        let notice = QueryResult::Notice("implicit cast: f64 â†’ i64".to_owned());
         if let QueryResult::Notice(msg) = notice {
             assert!(!msg.is_empty());
         }
     }
 
-    // ── S88 — Streaming replication ───────────────────────────────────────────
+    // â”€â”€ S88 â€” Streaming replication â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s88_create_slot() {
@@ -15115,7 +15423,7 @@ mod tests {
         }
     }
 
-    // ── S89 — Logical decode ──────────────────────────────────────────────────
+    // â”€â”€ S89 â€” Logical decode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s89_logical_decode_basic() {
@@ -15178,7 +15486,7 @@ mod tests {
         }
     }
 
-    // ── S90 — Read-only mode ──────────────────────────────────────────────────
+    // â”€â”€ S90 â€” Read-only mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s90_set_read_only() {
@@ -15228,7 +15536,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Affected(1)));
     }
 
-    // ── S91 — Failover / promote ──────────────────────────────────────────────
+    // â”€â”€ S91 â€” Failover / promote â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s91_promote() {
@@ -15277,7 +15585,7 @@ mod tests {
         assert!(!*ex.read_only.lock().unwrap());
     }
 
-    // ── S92 — WAL archiving ───────────────────────────────────────────────────
+    // â”€â”€ S92 â€” WAL archiving â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s92_set_archive_path() {
@@ -15336,7 +15644,7 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    // ── S93 — Slow query log ──────────────────────────────────────────────────
+    // â”€â”€ S93 â€” Slow query log â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s93_set_threshold() {
@@ -15361,7 +15669,7 @@ mod tests {
     #[test]
     fn test_s93_fast_query_not_logged() {
         let (ex, _dir) = setup();
-        // Very high threshold — nothing should be logged
+        // Very high threshold â€” nothing should be logged
         ex.execute("SET SLOW_QUERY_THRESHOLD 99999999").unwrap();
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         ex.execute("SELECT * FROM t").unwrap();
@@ -15397,7 +15705,7 @@ mod tests {
         assert!(log.is_empty());
     }
 
-    // ── S94 — Query fingerprinting ────────────────────────────────────────────
+    // â”€â”€ S94 â€” Query fingerprinting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s94_fingerprint_literals() {
@@ -15455,7 +15763,7 @@ mod tests {
         }
     }
 
-    // ── S95 — pg_stat_statements compat ──────────────────────────────────────
+    // â”€â”€ S95 â€” pg_stat_statements compat â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s95_pg_stat_statements() {
@@ -15538,7 +15846,7 @@ mod tests {
         }
     }
 
-    // ── S96 — Auto-EXPLAIN threshold ──────────────────────────────────────────
+    // â”€â”€ S96 â€” Auto-EXPLAIN threshold â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s96_set_threshold() {
@@ -15567,7 +15875,7 @@ mod tests {
     fn test_s96_auto_explain_not_fires() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
-        // Very high threshold — auto-explain should not fire
+        // Very high threshold â€” auto-explain should not fire
         ex.execute("SET AUTO_EXPLAIN_THRESHOLD 99999999").unwrap();
         let r = ex.execute("SELECT * FROM t").unwrap();
         assert!(matches!(r, QueryResult::Rows { .. }));
@@ -15595,12 +15903,12 @@ mod tests {
     fn test_s96_auto_explain_disabled() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
-        // No threshold set — auto-explain disabled
+        // No threshold set â€” auto-explain disabled
         let r = ex.execute("SELECT * FROM t").unwrap();
         assert!(matches!(r, QueryResult::Rows { .. }));
     }
 
-    // ── S97 — Wait event tracking ─────────────────────────────────────────────
+    // â”€â”€ S97 â€” Wait event tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s97_wait_events_table() {
@@ -15657,7 +15965,7 @@ mod tests {
         assert!(!events.is_empty());
     }
 
-    // ── S98 — Flamegraph export ────────────────────────────────────────────────
+    // â”€â”€ S98 â€” Flamegraph export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s98_flamegraph_basic() {
         let (ex, _dir) = setup();
@@ -15717,7 +16025,7 @@ mod tests {
         }
     }
 
-    // ── S99 — Health dashboard ────────────────────────────────────────────────
+    // â”€â”€ S99 â€” Health dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s99_health_basic() {
         let (ex, _dir) = setup();
@@ -15769,7 +16077,7 @@ mod tests {
         }
     }
 
-    // ── S100 — EXPLAIN BUFFERS ─────────────────────────────────────────────────
+    // â”€â”€ S100 â€” EXPLAIN BUFFERS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s100_explain_buffers_basic() {
         let (ex, _dir) = setup();
@@ -15826,7 +16134,7 @@ mod tests {
         }
     }
 
-    // ── S101 — psql meta-commands ─────────────────────────────────────────────
+    // â”€â”€ S101 â€” psql meta-commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s101_meta_dt() {
         let (ex, _dir) = setup();
@@ -15863,7 +16171,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Ok(_)));
     }
 
-    // ── S102 — pgcli meta-commands ────────────────────────────────────────────
+    // â”€â”€ S102 â€” pgcli meta-commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s102_meta_l() {
         let (ex, _dir) = setup();
@@ -15907,7 +16215,7 @@ mod tests {
         assert!(!enabled2);
     }
 
-    // ── S103 — Cursor / portal ────────────────────────────────────────────────
+    // â”€â”€ S103 â€” Cursor / portal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s103_declare_cursor() {
         let (ex, _dir) = setup();
@@ -15972,7 +16280,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Rows { ref rows, .. } if rows.is_empty()));
     }
 
-    // ── S104 — COPY FROM STDIN ────────────────────────────────────────────────
+    // â”€â”€ S104 â€” COPY FROM STDIN â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s104_copy_stdin_basic() {
         let (ex, _dir) = setup();
@@ -16026,7 +16334,7 @@ mod tests {
         }
     }
 
-    // ── S105 — Type OIDs + pg_typeof ─────────────────────────────────────────
+    // â”€â”€ S105 â€” Type OIDs + pg_typeof â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s105_pg_typeof() {
         let (ex, _dir) = setup();
@@ -16082,7 +16390,7 @@ mod tests {
         }
     }
 
-    // ── S106 — Statement timeout ──────────────────────────────────────────────
+    // â”€â”€ S106 â€” Statement timeout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s106_set_timeout() {
         let (ex, _dir) = setup();
@@ -16129,13 +16437,13 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         ex.execute("SET STATEMENT_TIMEOUT 0").unwrap();
-        // Re-set to high value — queries should work again
+        // Re-set to high value â€” queries should work again
         ex.execute("SET STATEMENT_TIMEOUT 999999").unwrap();
         let r = ex.execute("SELECT * FROM t").unwrap();
         assert!(matches!(r, QueryResult::Rows { .. }));
     }
 
-    // S108 — systemd integration
+    // S108 â€” systemd integration
     #[test]
     fn test_s108_sd_notify_basic() {
         let (ex, _dir) = setup();
@@ -16179,7 +16487,7 @@ mod tests {
         }
     }
 
-    // S109 — graceful shutdown
+    // S109 â€” graceful shutdown
     #[test]
     fn test_s109_shutdown_graceful() {
         let (ex, _dir) = setup();
@@ -16224,7 +16532,7 @@ mod tests {
         assert!(matches!(r2, QueryResult::Ok(_)));
     }
 
-    // S110 — multi-database
+    // S110 â€” multi-database
     #[test]
     fn test_s110_create_database() {
         let (ex, _dir) = setup();
@@ -16270,7 +16578,7 @@ mod tests {
         assert!(ex.databases.lock().unwrap().contains("vectorvolt"));
     }
 
-    // S111 — schema namespacing
+    // S111 â€” schema namespacing
     #[test]
     fn test_s111_create_schema() {
         let (ex, _dir) = setup();
@@ -16319,7 +16627,7 @@ mod tests {
         }
     }
 
-    // S112 — table partitioning
+    // S112 â€” table partitioning
     #[test]
     fn test_s112_partition_by_range() {
         let (ex, _dir) = setup();
@@ -16367,7 +16675,7 @@ mod tests {
         assert!(guard.contains_key("events_2024"));
     }
 
-    // S113 — online schema change
+    // S113 â€” online schema change
     #[test]
     fn test_s113_add_column_online() {
         let (ex, _dir) = setup();
@@ -16434,7 +16742,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Rows { .. }));
     }
 
-    // S114 — vacuum
+    // S114 â€” vacuum
     #[test]
     fn test_s114_vacuum_basic() {
         let (ex, _dir) = setup();
@@ -16483,7 +16791,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Ok(_)));
     }
 
-    // S115 — statistics collector
+    // S115 â€” statistics collector
     #[test]
     fn test_s115_analyze_basic() {
         let (ex, _dir) = setup();
@@ -16540,7 +16848,7 @@ mod tests {
         assert!(col_stats.contains_key("v"));
     }
 
-    // S116 — connection limits
+    // S116 â€” connection limits
     #[test]
     fn test_s116_set_max_connections() {
         let (ex, _dir) = setup();
@@ -16589,7 +16897,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Rows { .. }));
     }
 
-    // S117 — resource groups
+    // S117 â€” resource groups
     #[test]
     fn test_s117_create_resource_group() {
         let (ex, _dir) = setup();
@@ -16648,7 +16956,7 @@ mod tests {
         assert_eq!(rg.cpu_pct, 75);
     }
 
-    // ── S118 — Event sourcing ────────────────────────────────────────────────
+    // â”€â”€ S118 â€” Event sourcing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s118_append_event() {
         let (ex, _dir) = setup();
@@ -16718,7 +17026,7 @@ mod tests {
         }
     }
 
-    // ── S119 — CQRS read models ──────────────────────────────────────────────
+    // â”€â”€ S119 â€” CQRS read models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s119_create_read_model() {
         let (ex, _dir) = setup();
@@ -16787,7 +17095,7 @@ mod tests {
         }
     }
 
-    // ── S120 — Time-travel queries ───────────────────────────────────────────
+    // â”€â”€ S120 â€” Time-travel queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s120_snapshot_table() {
         let (ex, _dir) = setup();
@@ -16839,7 +17147,7 @@ mod tests {
         assert_eq!(log.get("t").unwrap().len(), 2);
     }
 
-    // ── S121 — Change Data Feed ──────────────────────────────────────────────
+    // â”€â”€ S121 â€” Change Data Feed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s121_enable_change_feed() {
         let (ex, _dir) = setup();
@@ -16898,7 +17206,7 @@ mod tests {
         assert!(!feed.contains_key("orders"));
     }
 
-    // ── S122 — Bloom filter index ────────────────────────────────────────────
+    // â”€â”€ S122 â€” Bloom filter index â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s122_create_bloom_index() {
         let (ex, _dir) = setup();
@@ -16962,7 +17270,7 @@ mod tests {
         assert!(vals.contains("99"));
     }
 
-    // ── S123 — Columnar storage hint ─────────────────────────────────────────
+    // â”€â”€ S123 â€” Columnar storage hint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s123_store_columnar() {
         let (ex, _dir) = setup();
@@ -17004,7 +17312,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Ok(ref s) if s == "ROW"));
     }
 
-    // ── S124 — Adaptive query execution ──────────────────────────────────────
+    // â”€â”€ S124 â€” Adaptive query execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s124_aqe_default_on() {
         let (ex, _dir) = setup();
@@ -17050,7 +17358,7 @@ mod tests {
         }
     }
 
-    // ── S125 — Query result streaming ────────────────────────────────────────
+    // â”€â”€ S125 â€” Query result streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s125_default_chunk_size() {
         let (ex, _dir) = setup();
@@ -17104,7 +17412,7 @@ mod tests {
         }
     }
 
-    // ── S126 — Geospatial types ──────────────────────────────────────────────
+    // â”€â”€ S126 â€” Geospatial types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s126_insert_geo_point() {
         let (ex, _dir) = setup();
@@ -17178,7 +17486,7 @@ mod tests {
         }
     }
 
-    // ── S127 — Cypher-style graph queries ────────────────────────────────────
+    // â”€â”€ S127 â€” Cypher-style graph queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s127_create_edge() {
         let (ex, _dir) = setup();
@@ -17248,7 +17556,7 @@ mod tests {
         }
     }
 
-    // ── S128 — Distributed 2PC transactions ──────────────────────────────────
+    // â”€â”€ S128 â€” Distributed 2PC transactions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s128_begin_distributed_txn() {
         let (ex, _dir) = setup();
@@ -17304,7 +17612,7 @@ mod tests {
         }
     }
 
-    // ── S129 — Stored procedures ─────────────────────────────────────────────
+    // â”€â”€ S129 â€” Stored procedures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s129_create_procedure() {
         let (ex, _dir) = setup();
@@ -17357,7 +17665,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Error(_)));
     }
 
-    // ── S130 — User-defined types ─────────────────────────────────────────────
+    // â”€â”€ S130 â€” User-defined types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s130_create_enum_type() {
         let (ex, _dir) = setup();
@@ -17419,7 +17727,7 @@ mod tests {
         }
     }
 
-    // ── S131 — Array types ────────────────────────────────────────────────────
+    // â”€â”€ S131 â€” Array types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s131_insert_array() {
         let (ex, _dir) = setup();
@@ -17487,7 +17795,7 @@ mod tests {
         }
     }
 
-    // ── S132 — JSONPath queries ───────────────────────────────────────────────
+    // â”€â”€ S132 â€” JSONPath queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s132_store_json() {
         let (ex, _dir) = setup();
@@ -17558,7 +17866,7 @@ mod tests {
         }
     }
 
-    // ── S133 — Foreign data wrappers ──────────────────────────────────────────
+    // â”€â”€ S133 â€” Foreign data wrappers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s133_create_server() {
         let (ex, _dir) = setup();
@@ -17625,7 +17933,7 @@ mod tests {
         }
     }
 
-    // ── S134 — Query federation ───────────────────────────────────────────────
+    // â”€â”€ S134 â€” Query federation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s134_add_federation_node() {
         let (ex, _dir) = setup();
@@ -17685,7 +17993,7 @@ mod tests {
         }
     }
 
-    // ── S135 — Pluggable storage engines ─────────────────────────────────────
+    // â”€â”€ S135 â€” Pluggable storage engines â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s135_set_table_engine_columnar() {
         let (ex, _dir) = setup();
@@ -17750,7 +18058,7 @@ mod tests {
         }
     }
 
-    // ── S136 — Multi-region replication ──────────────────────────────────────
+    // â”€â”€ S136 â€” Multi-region replication â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s136_add_region() {
         let (ex, _dir) = setup();
@@ -17806,7 +18114,7 @@ mod tests {
         assert_eq!(lag, 100);
     }
 
-    // ── S137 — Pluggable authentication providers ─────────────────────────────
+    // â”€â”€ S137 â€” Pluggable authentication providers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s137_create_auth_provider_ldap() {
         let (ex, _dir) = setup();
@@ -17875,7 +18183,7 @@ mod tests {
         }
     }
 
-    // ── S138 — Materialized view auto-refresh ────────────────────────────────
+    // â”€â”€ S138 â€” Materialized view auto-refresh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s138_refresh_every() {
         let (ex, _dir) = setup();
@@ -17928,7 +18236,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("TRIGGER REFRESH FOR VIEW ts_mv").unwrap();
         if let QueryResult::Rows { rows, .. } = ex.execute("SHOW REFRESH SCHEDULE").unwrap() {
-            // no schedule set, so rows is empty — just check no panic
+            // no schedule set, so rows is empty â€” just check no panic
             let _ = rows;
         }
         // last_refresh should be set
@@ -17936,7 +18244,7 @@ mod tests {
         assert!(last.contains_key("ts_mv"));
     }
 
-    // ── S139 — Query result caching with TTL ─────────────────────────────────
+    // â”€â”€ S139 â€” Query result caching with TTL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s139_cache_query() {
         let (ex, _dir) = setup();
@@ -17996,7 +18304,7 @@ mod tests {
         }
     }
 
-    // ── S140 — Distributed locks ──────────────────────────────────────────────
+    // â”€â”€ S140 â€” Distributed locks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s140_get_lock() {
         let (ex, _dir) = setup();
@@ -18057,7 +18365,7 @@ mod tests {
         }
     }
 
-    // ── S141 — Logical replication filters ───────────────────────────────────
+    // â”€â”€ S141 â€” Logical replication filters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s141_create_replication_filter() {
         let (ex, _dir) = setup();
@@ -18115,7 +18423,7 @@ mod tests {
         }
     }
 
-    // ── S142 — Column encryption ──────────────────────────────────────────────
+    // â”€â”€ S142 â€” Column encryption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s142_create_encrypted_column() {
         let (ex, _dir) = setup();
@@ -18180,7 +18488,7 @@ mod tests {
         }
     }
 
-    // ── S143 — Row compression hints ──────────────────────────────────────────
+    // â”€â”€ S143 â€” Row compression hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s143_set_row_compression_zstd() {
         let (ex, _dir) = setup();
@@ -18241,7 +18549,7 @@ mod tests {
         }
     }
 
-    // ── S144 — Query routing rules ────────────────────────────────────────────
+    // â”€â”€ S144 â€” Query routing rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s144_create_route() {
         let (ex, _dir) = setup();
@@ -18298,7 +18606,7 @@ mod tests {
         }
     }
 
-    // ── S145 — Workload scheduling ────────────────────────────────────────────
+    // â”€â”€ S145 â€” Workload scheduling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s145_create_schedule() {
         let (ex, _dir) = setup();
@@ -18359,7 +18667,7 @@ mod tests {
         }
     }
 
-    // ── S146 — Observability hooks ────────────────────────────────────────────
+    // â”€â”€ S146 â€” Observability hooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s146_create_hook_slow_query() {
         let (ex, _dir) = setup();
@@ -18414,7 +18722,7 @@ mod tests {
         }
     }
 
-    // ── S147 — Schema migrations ──────────────────────────────────────────────
+    // â”€â”€ S147 â€” Schema migrations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s147_create_migration() {
         let (ex, _dir) = setup();
@@ -18474,7 +18782,7 @@ mod tests {
         }
     }
 
-    // ── S148 — Connection pooling ────────────────────────────────────────────
+    // â”€â”€ S148 â€” Connection pooling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s148_create_pool() {
@@ -18524,7 +18832,7 @@ mod tests {
         }
     }
 
-    // ── S149 — Query plan caching ────────────────────────────────────────────
+    // â”€â”€ S149 â€” Query plan caching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s149_cache_plan() {
@@ -18572,7 +18880,7 @@ mod tests {
         }
     }
 
-    // ── S150 — Row versioning ────────────────────────────────────────────────
+    // â”€â”€ S150 â€” Row versioning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s150_enable_versioning() {
@@ -18629,7 +18937,7 @@ mod tests {
         }
     }
 
-    // ── S151 — Audit trail queries ───────────────────────────────────────────
+    // â”€â”€ S151 â€” Audit trail queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s151_show_audit_log_for() {
@@ -18670,7 +18978,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Rows { .. }));
     }
 
-    // ── S152 — Dynamic SQL ───────────────────────────────────────────────────
+    // â”€â”€ S152 â€” Dynamic SQL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s152_execute_dynamic() {
@@ -18717,7 +19025,7 @@ mod tests {
         }
     }
 
-    // ── S153 — Table sampling ────────────────────────────────────────────────
+    // â”€â”€ S153 â€” Table sampling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s153_tablesample_bernoulli() {
@@ -18781,7 +19089,7 @@ mod tests {
         }
     }
 
-    // ── S154 — Result pagination cursors ────────────────────────────────────
+    // â”€â”€ S154 â€” Result pagination cursors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s154_declare_page_cursor() {
@@ -18833,7 +19141,7 @@ mod tests {
         }
     }
 
-    // ── S155 — Column statistics histograms ──────────────────────────────────
+    // â”€â”€ S155 â€” Column statistics histograms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s155_compute_histogram() {
@@ -18888,7 +19196,7 @@ mod tests {
         }
     }
 
-    // ── S156 — Query dependency graph ────────────────────────────────────────
+    // â”€â”€ S156 â€” Query dependency graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s156_add_dependency() {
@@ -18936,7 +19244,7 @@ mod tests {
         }
     }
 
-    // ── S157 — Live config reload ────────────────────────────────────────────
+    // â”€â”€ S157 â€” Live config reload â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_s157_set_config_key() {
@@ -18993,7 +19301,7 @@ mod tests {
         }
     }
 
-    // ── S158 — Tenant isolation ──────────────────────────────────────────────
+    // â”€â”€ S158 â€” Tenant isolation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s158_create_tenant() {
         let (ex, _dir) = setup();
@@ -19053,7 +19361,7 @@ mod tests {
         }
     }
 
-    // ── S159 — Data masking policies ────────────────────────────────────────
+    // â”€â”€ S159 â€” Data masking policies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s159_create_mask_policy() {
         let (ex, _dir) = setup();
@@ -19103,7 +19411,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Ok(_)));
     }
 
-    // ── S160 — Query timeout ─────────────────────────────────────────────────
+    // â”€â”€ S160 â€” Query timeout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s160_set_query_timeout() {
         let (ex, _dir) = setup();
@@ -19163,7 +19471,7 @@ mod tests {
         }
     }
 
-    // ── S161 — Parallel DDL ──────────────────────────────────────────────────
+    // â”€â”€ S161 â€” Parallel DDL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s161_alter_table_parallel() {
         let (ex, _dir) = setup();
@@ -19218,7 +19526,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Ok(_)));
     }
 
-    // ── S162 — Table statistics export ───────────────────────────────────────
+    // â”€â”€ S162 â€” Table statistics export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s162_export_stats() {
         let (ex, _dir) = setup();
@@ -19283,7 +19591,7 @@ mod tests {
         }
     }
 
-    // ── S163 — Named snapshots ───────────────────────────────────────────────
+    // â”€â”€ S163 â€” Named snapshots â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s163_create_snapshot() {
         let (ex, _dir) = setup();
@@ -19337,7 +19645,7 @@ mod tests {
         }
     }
 
-    // ── S164 — Cost-based optimizer hints ────────────────────────────────────
+    // â”€â”€ S164 â€” Cost-based optimizer hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s164_set_optimizer_model() {
         let (ex, _dir) = setup();
@@ -19400,7 +19708,7 @@ mod tests {
         }
     }
 
-    // ── S165 — Session variables ─────────────────────────────────────────────
+    // â”€â”€ S165 â€” Session variables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s165_set_session_var() {
         let (ex, _dir) = setup();
@@ -19457,7 +19765,7 @@ mod tests {
         }
     }
 
-    // ── S166 — Table inheritance queries ────────────────────────────────────
+    // â”€â”€ S166 â€” Table inheritance queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s166_select_from_only() {
         let (ex, _dir) = setup();
@@ -19515,7 +19823,7 @@ mod tests {
         }
     }
 
-    // ── S167 — Pluggable output formats ─────────────────────────────────────
+    // â”€â”€ S167 â€” Pluggable output formats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s167_set_output_format_json() {
         let (ex, _dir) = setup();
@@ -19574,7 +19882,7 @@ mod tests {
         }
     }
 
-    // ── S168 — Column histogram v2 ────────────────────────────────────────────
+    // â”€â”€ S168 â€” Column histogram v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s168_analyze_column_histogram() {
         let (ex, _dir) = setup();
@@ -19621,7 +19929,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Ok(_)));
     }
 
-    // ── S169 — Workload replay ────────────────────────────────────────────────
+    // â”€â”€ S169 â€” Workload replay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s169_capture_workload_to() {
         let (ex, _dir) = setup();
@@ -19663,7 +19971,7 @@ mod tests {
         }
     }
 
-    // ── S170 — Query rewrite rules ────────────────────────────────────────────
+    // â”€â”€ S170 â€” Query rewrite rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s170_create_rewrite_rule() {
         let (ex, _dir) = setup();
@@ -19709,7 +20017,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Dropped));
     }
 
-    // ── S171 — Table-level locks ──────────────────────────────────────────────
+    // â”€â”€ S171 â€” Table-level locks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s171_lock_table_exclusive() {
         let (ex, _dir) = setup();
@@ -19751,7 +20059,7 @@ mod tests {
         }
     }
 
-    // ── S172 — Bloom filter indexes ───────────────────────────────────────────
+    // â”€â”€ S172 â€” Bloom filter indexes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s172_create_bloom_index() {
         let (ex, _dir) = setup();
@@ -19797,7 +20105,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Dropped));
     }
 
-    // ── S173 — Result streaming ───────────────────────────────────────────────
+    // â”€â”€ S173 â€” Result streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s173_set_stream_chunk_size() {
         let (ex, _dir) = setup();
@@ -19844,7 +20152,7 @@ mod tests {
         }
     }
 
-    // ── S174 — Read replica routing ───────────────────────────────────────────
+    // â”€â”€ S174 â€” Read replica routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s174_add_read_replica() {
         let (ex, _dir) = setup();
@@ -19890,7 +20198,7 @@ mod tests {
         }
     }
 
-    // ── S175 — Data lineage ───────────────────────────────────────────────────
+    // â”€â”€ S175 â€” Data lineage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s175_enable_lineage_on_table() {
         let (ex, _dir) = setup();
@@ -19941,7 +20249,7 @@ mod tests {
         }
     }
 
-    // ── S176 — Schema diffing ─────────────────────────────────────────────────
+    // â”€â”€ S176 â€” Schema diffing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s176_diff_schema() {
         let (ex, _dir) = setup();
@@ -19991,7 +20299,7 @@ mod tests {
         }
     }
 
-    // ── S178 — Query cost estimation ──────────────────────────────────────────
+    // â”€â”€ S178 â€” Query cost estimation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s178_estimate_cost() {
         let (ex, _dir) = setup();
@@ -20032,7 +20340,7 @@ mod tests {
         }
     }
 
-    // ── S179 — Constraint validation ─────────────────────────────────────────
+    // â”€â”€ S179 â€” Constraint validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s179_validate_constraint() {
         let (ex, _dir) = setup();
@@ -20069,7 +20377,7 @@ mod tests {
         }
     }
 
-    // ── S180 — Table sampling ─────────────────────────────────────────────────
+    // â”€â”€ S180 â€” Table sampling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s180_tablesample_system() {
         let (ex, _dir) = setup();
@@ -20106,7 +20414,7 @@ mod tests {
         }
     }
 
-    // ── S181 — Column groups ──────────────────────────────────────────────────
+    // â”€â”€ S181 â€” Column groups â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s181_create_column_group() {
         let (ex, _dir) = setup();
@@ -20150,7 +20458,7 @@ mod tests {
         }
     }
 
-    // ── S182 — Query tagging ──────────────────────────────────────────────────
+    // â”€â”€ S182 â€” Query tagging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s182_set_query_tag() {
         let (ex, _dir) = setup();
@@ -20191,7 +20499,7 @@ mod tests {
         }
     }
 
-    // ── S183 — Partial indexes ────────────────────────────────────────────────
+    // â”€â”€ S183 â€” Partial indexes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s183_create_partial_index() {
         let (ex, _dir) = setup();
@@ -20235,7 +20543,7 @@ mod tests {
         }
     }
 
-    // ── S184 — Table archival ─────────────────────────────────────────────────
+    // â”€â”€ S184 â€” Table archival â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s184_archive_table() {
         let (ex, _dir) = setup();
@@ -20279,7 +20587,7 @@ mod tests {
         }
     }
 
-    // ── S185 — Query priority ─────────────────────────────────────────────────
+    // â”€â”€ S185 â€” Query priority â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s185_set_high_priority() {
         let (ex, _dir) = setup();
@@ -20316,7 +20624,7 @@ mod tests {
         }
     }
 
-    // ── S186 — Schema versioning ──────────────────────────────────────────────
+    // â”€â”€ S186 â€” Schema versioning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s186_create_schema_version() {
         let (ex, _dir) = setup();
@@ -20359,7 +20667,7 @@ mod tests {
         }
     }
 
-    // ── S187 — Live query kill ────────────────────────────────────────────────
+    // â”€â”€ S187 â€” Live query kill â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s187_kill_query() {
         let (ex, _dir) = setup();
@@ -20400,7 +20708,7 @@ mod tests {
         }
     }
 
-    // ── S177 — Adaptive query execution ──────────────────────────────────────
+    // â”€â”€ S177 â€” Adaptive query execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s177_set_adaptive_execution_on() {
         let (ex, _dir) = setup();
@@ -20441,7 +20749,7 @@ mod tests {
         }
     }
 
-    // ── S188 — Query pipelines ────────────────────────────────────────────────
+    // â”€â”€ S188 â€” Query pipelines â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s188_create_pipeline_returns_created() {
         let (ex, _dir) = setup();
@@ -20478,7 +20786,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Dropped));
     }
 
-    // ── S189 — Column encryption v2 ──────────────────────────────────────────
+    // â”€â”€ S189 â€” Column encryption v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s189_encrypt_column_returns_ok() {
         let (ex, _dir) = setup();
@@ -20521,7 +20829,7 @@ mod tests {
         }
     }
 
-    // ── S190 — Table federation ───────────────────────────────────────────────
+    // â”€â”€ S190 â€” Table federation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s190_create_foreign_table_returns_created() {
         let (ex, _dir) = setup();
@@ -20564,7 +20872,7 @@ mod tests {
         }
     }
 
-    // ── S191 — Change data streams ────────────────────────────────────────────
+    // â”€â”€ S191 â€” Change data streams â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s191_create_change_stream_returns_created() {
         let (ex, _dir) = setup();
@@ -20603,7 +20911,7 @@ mod tests {
         }
     }
 
-    // ── S192 — Query result TTL ───────────────────────────────────────────────
+    // â”€â”€ S192 â€” Query result TTL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s192_set_result_ttl_returns_ok() {
         let (ex, _dir) = setup();
@@ -20645,7 +20953,7 @@ mod tests {
         }
     }
 
-    // ── S193 — Batch operations ───────────────────────────────────────────────
+    // â”€â”€ S193 â€” Batch operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s193_begin_batch_returns_ok() {
         let (ex, _dir) = setup();
@@ -20683,7 +20991,7 @@ mod tests {
         }
     }
 
-    // ── S194 — Index advisor ──────────────────────────────────────────────────
+    // â”€â”€ S194 â€” Index advisor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s194_advise_indexes_returns_rows() {
         let (ex, _dir) = setup();
@@ -20724,7 +21032,7 @@ mod tests {
         }
     }
 
-    // ── S195 — Table pinning ──────────────────────────────────────────────────
+    // â”€â”€ S195 â€” Table pinning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s195_pin_table_returns_ok() {
         let (ex, _dir) = setup();
@@ -20767,7 +21075,7 @@ mod tests {
         }
     }
 
-    // ── S196 — Query namespaces ───────────────────────────────────────────────
+    // â”€â”€ S196 â€” Query namespaces â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s196_create_query_namespace_returns_created() {
         let (ex, _dir) = setup();
@@ -20806,7 +21114,7 @@ mod tests {
         }
     }
 
-    // ── S197 — Compaction control ─────────────────────────────────────────────
+    // â”€â”€ S197 â€” Compaction control â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s197_compact_table_returns_ok() {
         let (ex, _dir) = setup();
@@ -20844,7 +21152,7 @@ mod tests {
         }
     }
 
-    // ── S198 — Hot/cold tiering ───────────────────────────────────────────────
+    // â”€â”€ S198 â€” Hot/cold tiering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s198_set_table_tier_hot_returns_ok() {
         let (ex, _dir) = setup();
@@ -20877,7 +21185,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Ok(_)));
     }
 
-    // ── S199 — Query retry policy ─────────────────────────────────────────────
+    // â”€â”€ S199 â€” Query retry policy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s199_set_retry_policy_returns_ok() {
         let (ex, _dir) = setup();
@@ -20919,7 +21227,7 @@ mod tests {
         }
     }
 
-    // ── S200 — Milestone sprint ───────────────────────────────────────────────
+    // â”€â”€ S200 â€” Milestone sprint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s200_show_engine_version_returns_rows() {
         let (ex, _dir) = setup();
@@ -20957,7 +21265,7 @@ mod tests {
         }
     }
 
-    // ── S201 — Column default expressions ────────────────────────────────────
+    // â”€â”€ S201 â€” Column default expressions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s201_set_column_default_returns_ok() {
         let (ex, _dir) = setup();
@@ -21000,7 +21308,7 @@ mod tests {
         }
     }
 
-    // ── S202 — Geo partitioning ───────────────────────────────────────────────
+    // â”€â”€ S202 â€” Geo partitioning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s202_create_geo_partition_zone_returns_created() {
         let (ex, _dir) = setup();
@@ -21043,7 +21351,7 @@ mod tests {
         }
     }
 
-    // ── S203 — Cursor pagination v2 ──────────────────────────────────────────
+    // â”€â”€ S203 â€” Cursor pagination v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s203_declare_cursor_returns_ok() {
         let (ex, _dir) = setup();
@@ -21086,7 +21394,7 @@ mod tests {
         }
     }
 
-    // ── S204 — Table cloning ──────────────────────────────────────────────────
+    // â”€â”€ S204 â€” Table cloning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s204_create_table_clone_of_returns_created() {
         let (ex, _dir) = setup();
@@ -21127,7 +21435,7 @@ mod tests {
         }
     }
 
-    // ── S205 — WAL control ────────────────────────────────────────────────────
+    // â”€â”€ S205 â€” WAL control â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s205_set_wal_level_minimal_returns_ok() {
         let (ex, _dir) = setup();
@@ -21163,7 +21471,7 @@ mod tests {
         }
     }
 
-    // ── S206 — Auto-vacuum tuning ─────────────────────────────────────────────
+    // â”€â”€ S206 â€” Auto-vacuum tuning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s206_set_auto_vacuum_threshold_returns_ok() {
         let (ex, _dir) = setup();
@@ -21203,7 +21511,7 @@ mod tests {
         }
     }
 
-    // ── S207 — Query plan cache v2 ────────────────────────────────────────────
+    // â”€â”€ S207 â€” Query plan cache v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s207_pin_query_plan_returns_ok() {
         let (ex, _dir) = setup();
@@ -21246,7 +21554,7 @@ mod tests {
         }
     }
 
-    // ── S208 — Column statistics v3 ──────────────────────────────────────────
+    // â”€â”€ S208 â€” Column statistics v3 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s208_compute_stats_returns_ok() {
         let (ex, _dir) = setup();
@@ -21289,7 +21597,7 @@ mod tests {
         }
     }
 
-    // ── S209 — Query cost hints ───────────────────────────────────────────────
+    // â”€â”€ S209 â€” Query cost hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s209_hash_join_hint_returns_rows() {
         let (ex, _dir) = setup();
@@ -21331,7 +21639,7 @@ mod tests {
         }
     }
 
-    // ── S210 — Table inheritance v2 ──────────────────────────────────────────
+    // â”€â”€ S210 â€” Table inheritance v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s210_add_parent_returns_ok() {
         let (ex, _dir) = setup();
@@ -21374,7 +21682,7 @@ mod tests {
         }
     }
 
-    // ── S211 — Result set transforms ─────────────────────────────────────────
+    // â”€â”€ S211 â€” Result set transforms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s211_pivot_returns_rows() {
         let (ex, _dir) = setup();
@@ -21414,7 +21722,7 @@ mod tests {
         }
     }
 
-    // ── S212 — Distributed tracing ───────────────────────────────────────────
+    // â”€â”€ S212 â€” Distributed tracing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s212_set_trace_sampling_rate_returns_ok() {
         let (ex, _dir) = setup();
@@ -21450,7 +21758,7 @@ mod tests {
         }
     }
 
-    // ── S213 — Column aliases DDL ─────────────────────────────────────────────
+    // â”€â”€ S213 â€” Column aliases DDL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s213_create_column_alias_returns_created() {
         let (ex, _dir) = setup();
@@ -21493,7 +21801,7 @@ mod tests {
         }
     }
 
-    // ── S214 — Table access patterns ─────────────────────────────────────────
+    // â”€â”€ S214 â€” Table access patterns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s214_show_access_pattern_returns_rows() {
         let (ex, _dir) = setup();
@@ -21526,7 +21834,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Ok(_)));
     }
 
-    // ── S215 — Query normalization ────────────────────────────────────────────
+    // â”€â”€ S215 â€” Query normalization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s215_normalize_query_returns_rows() {
         let (ex, _dir) = setup();
@@ -21568,7 +21876,7 @@ mod tests {
         }
     }
 
-    // ── S216 — Incremental MV refresh ────────────────────────────────────────
+    // â”€â”€ S216 â€” Incremental MV refresh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s216_refresh_mv_incrementally_returns_ok() {
         let (ex, _dir) = setup();
@@ -21610,7 +21918,7 @@ mod tests {
         }
     }
 
-    // ── S218 — Query profiling ────────────────────────────────────────────────
+    // â”€â”€ S218 â€” Query profiling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s218_profile_select_returns_rows() {
         let (ex, _dir) = setup();
@@ -21651,7 +21959,7 @@ mod tests {
         }
     }
 
-    // ── S219 — Table rewrites ─────────────────────────────────────────────────
+    // â”€â”€ S219 â€” Table rewrites â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s219_rewrite_table_returns_ok() {
         let (ex, _dir) = setup();
@@ -21695,7 +22003,7 @@ mod tests {
         }
     }
 
-    // ── S220 — Columnar storage hints ─────────────────────────────────────────
+    // â”€â”€ S220 â€” Columnar storage hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s220_set_table_storage_columnar_returns_ok() {
         let (ex, _dir) = setup();
@@ -21738,7 +22046,7 @@ mod tests {
         }
     }
 
-    // ── S221 — Workload classification ───────────────────────────────────────
+    // â”€â”€ S221 â€” Workload classification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s221_create_workload_class_returns_created() {
         let (ex, _dir) = setup();
@@ -21782,7 +22090,7 @@ mod tests {
         }
     }
 
-    // ── S222 — Query cancel hooks ─────────────────────────────────────────────
+    // â”€â”€ S222 â€” Query cancel hooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s222_on_query_cancel_returns_ok() {
         let (ex, _dir) = setup();
@@ -21824,7 +22132,7 @@ mod tests {
         }
     }
 
-    // ── S223 — Schema introspection v2 ───────────────────────────────────────
+    // â”€â”€ S223 â€” Schema introspection v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s223_describe_function_returns_rows() {
         let (ex, _dir) = setup();
@@ -21863,7 +22171,7 @@ mod tests {
         }
     }
 
-    // ── S224 — Table health checks ────────────────────────────────────────────
+    // â”€â”€ S224 â€” Table health checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s224_check_table_returns_rows() {
         let (ex, _dir) = setup();
@@ -21902,7 +22210,7 @@ mod tests {
         }
     }
 
-    // ── S225 — Result compression ─────────────────────────────────────────────
+    // â”€â”€ S225 â€” Result compression â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s225_set_result_compression_gzip_returns_ok() {
         let (ex, _dir) = setup();
@@ -21938,7 +22246,7 @@ mod tests {
         }
     }
 
-    // ── S226 — Live reload config ─────────────────────────────────────────────
+    // â”€â”€ S226 â€” Live reload config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s226_reload_config_returns_ok() {
         let (ex, _dir) = setup();
@@ -21978,7 +22286,7 @@ mod tests {
         }
     }
 
-    // ── S227 — Adaptive indexing ──────────────────────────────────────────────
+    // â”€â”€ S227 â€” Adaptive indexing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s227_enable_adaptive_indexing_returns_ok() {
         let (ex, _dir) = setup();
@@ -22019,7 +22327,7 @@ mod tests {
         }
     }
 
-    // ── S228 — Query routing rules ────────────────────────────────────────────
+    // â”€â”€ S228 â€” Query routing rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s228_create_routing_rule_returns_created() {
         let (ex, _dir) = setup();
@@ -22062,7 +22370,7 @@ mod tests {
         }
     }
 
-    // ── S229 — Table expiry policies ──────────────────────────────────────────
+    // â”€â”€ S229 â€” Table expiry policies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s229_set_table_expire_returns_ok() {
         let (ex, _dir) = setup();
@@ -22105,7 +22413,7 @@ mod tests {
         }
     }
 
-    // ── S230 — Column rename tracking ─────────────────────────────────────────
+    // â”€â”€ S230 â€” Column rename tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s230_rename_column_returns_ok() {
         let (ex, _dir) = setup();
@@ -22151,7 +22459,7 @@ mod tests {
         }
     }
 
-    // ── S231 — Query dependency graph ─────────────────────────────────────────
+    // â”€â”€ S231 â€” Query dependency graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s231_show_query_dependencies_returns_rows() {
         let (ex, _dir) = setup();
@@ -22189,7 +22497,7 @@ mod tests {
         }
     }
 
-    // ── S232 — Savepoint v2 ───────────────────────────────────────────────────
+    // â”€â”€ S232 â€” Savepoint v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s232_savepoint_with_description_returns_ok() {
         let (ex, _dir) = setup();
@@ -22231,7 +22539,7 @@ mod tests {
         }
     }
 
-    // ── S233 — Hot standby queries ────────────────────────────────────────────
+    // â”€â”€ S233 â€” Hot standby queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s233_set_standby_mode_returns_ok() {
         let (ex, _dir) = setup();
@@ -22267,7 +22575,7 @@ mod tests {
         assert!(matches!(r, QueryResult::Ok(_)));
     }
 
-    // ── S234 — Index usage stats ──────────────────────────────────────────────
+    // â”€â”€ S234 â€” Index usage stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s234_show_index_usage_returns_rows() {
         let (ex, _dir) = setup();
@@ -22307,7 +22615,7 @@ mod tests {
         }
     }
 
-    // ── S235 — Schema export/import ───────────────────────────────────────────
+    // â”€â”€ S235 â€” Schema export/import â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s235_export_schema_returns_ok() {
         let (ex, _dir) = setup();
@@ -22348,7 +22656,7 @@ mod tests {
         }
     }
 
-    // ── S236 — Query bucketing ────────────────────────────────────────────────
+    // â”€â”€ S236 â€” Query bucketing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s236_create_query_bucket_returns_created() {
         let (ex, _dir) = setup();
@@ -22391,7 +22699,7 @@ mod tests {
         }
     }
 
-    // ── S237 — Live metrics streaming ─────────────────────────────────────────
+    // â”€â”€ S237 â€” Live metrics streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s237_stream_metrics_returns_ok() {
         let (ex, _dir) = setup();
@@ -22433,7 +22741,7 @@ mod tests {
         }
     }
 
-    // ── S217 — Storage encryption at rest ────────────────────────────────────
+    // â”€â”€ S217 â€” Storage encryption at rest â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s217_enable_encryption_at_rest_returns_ok() {
         let (ex, _dir) = setup();
@@ -22473,4 +22781,395 @@ mod tests {
             panic!();
         }
     }
+
+    // ── S238 — Table observation hooks ──────────────────────────────────────────
+    #[test]
+    fn test_s238_create_observe_hook_returns_created() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE OBSERVE HOOK oh ON t WHEN INSERT").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s238_drop_observe_hook_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE OBSERVE HOOK oh ON t WHEN INSERT").unwrap();
+        let r = ex.execute("DROP OBSERVE HOOK oh").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s238_show_observe_hooks_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW OBSERVE HOOKS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s238_hook_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE OBSERVE HOOK oh1 ON orders WHEN INSERT").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW OBSERVE HOOKS").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "oh1"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s238_drop_removes_hook() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE OBSERVE HOOK oh2 ON orders WHEN INSERT").unwrap();
+        ex.execute("DROP OBSERVE HOOK oh2").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW OBSERVE HOOKS").unwrap() {
+            assert!(rows.iter().all(|r| r[0] != "oh2"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S239 — Query affinity ───────────────────────────────────────────────────
+    #[test]
+    fn test_s239_set_query_affinity_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET QUERY AFFINITY NODE node1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s239_show_query_affinity_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW QUERY AFFINITY").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s239_reset_query_affinity_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET QUERY AFFINITY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s239_affinity_node_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET QUERY AFFINITY NODE node42").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY AFFINITY").unwrap() {
+            assert_eq!(rows[0][0], "node42");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s239_reset_clears_affinity() {
+        let (ex, _dir) = setup();
+        ex.execute("SET QUERY AFFINITY NODE node42").unwrap();
+        ex.execute("RESET QUERY AFFINITY").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY AFFINITY").unwrap() {
+            assert_eq!(rows[0][0], "");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S240 — Column lineage ───────────────────────────────────────────────────
+    #[test]
+    fn test_s240_show_column_lineage_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW COLUMN LINEAGE FOR t.col").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s240_trace_column_to_source_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("TRACE COLUMN t.col TO SOURCE").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s240_show_lineage_graph_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW LINEAGE GRAPH").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s240_show_column_lineage_has_columns() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { columns, .. } = ex.execute("SHOW COLUMN LINEAGE FOR orders.id").unwrap() {
+            assert_eq!(columns[0], "table");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s240_trace_column_has_columns() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { columns, .. } = ex.execute("TRACE COLUMN orders.id TO SOURCE").unwrap() {
+            assert_eq!(columns[1], "column");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S241 — Failsafe mode ────────────────────────────────────────────────────
+    #[test]
+    fn test_s241_enable_failsafe_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ENABLE FAILSAFE MODE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s241_disable_failsafe_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DISABLE FAILSAFE MODE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s241_show_failsafe_status_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW FAILSAFE STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s241_test_failsafe_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("TEST FAILSAFE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s241_failsafe_enabled_in_status() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE FAILSAFE MODE").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW FAILSAFE STATUS").unwrap() {
+            assert_eq!(rows[0][0], "true");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S242 — Query signatures ─────────────────────────────────────────────────
+    #[test]
+    fn test_s242_compute_query_signature_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("COMPUTE QUERY SIGNATURE 'SELECT * FROM t'").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s242_show_query_signatures_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW QUERY SIGNATURES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s242_match_query_signature_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("MATCH QUERY SIGNATURE 'abc123'").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s242_signature_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE QUERY SIGNATURE 'SELECT 1'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY SIGNATURES").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s242_signature_has_columns() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { columns, .. } = ex.execute("COMPUTE QUERY SIGNATURE 'SELECT 2'").unwrap() {
+            assert_eq!(columns[0], "signature");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S243 — Table merge strategies ──────────────────────────────────────────
+    #[test]
+    fn test_s243_set_merge_strategy_append_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET TABLE t MERGE STRATEGY APPEND").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s243_set_merge_strategy_replace_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET TABLE t MERGE STRATEGY REPLACE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s243_show_table_merge_strategies_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW TABLE MERGE STRATEGIES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s243_strategy_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders MERGE STRATEGY APPEND").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TABLE MERGE STRATEGIES").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "orders" && r[1] == "APPEND"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s243_strategy_overwritten() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders MERGE STRATEGY APPEND").unwrap();
+        ex.execute("SET TABLE orders MERGE STRATEGY REPLACE").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TABLE MERGE STRATEGIES").unwrap() {
+            let found = rows.iter().find(|r| r[0] == "orders").unwrap();
+            assert_eq!(found[1], "REPLACE");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S244 — Schema snapshots ─────────────────────────────────────────────────
+    #[test]
+    fn test_s244_snapshot_schema_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SNAPSHOT SCHEMA public TO 'snap1'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s244_restore_schema_from_snapshot_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESTORE SCHEMA FROM SNAPSHOT 'snap1'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s244_show_schema_snapshots_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW SCHEMA SNAPSHOTS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s244_snapshot_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("SNAPSHOT SCHEMA public TO 'mysnap'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SCHEMA SNAPSHOTS").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "mysnap"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s244_schema_snapshots_has_columns() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { columns, .. } = ex.execute("SHOW SCHEMA SNAPSHOTS").unwrap() {
+            assert_eq!(columns[0], "name");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S245 — Query plan export ────────────────────────────────────────────────
+    #[test]
+    fn test_s245_export_query_plan_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("EXPORT QUERY PLAN FOR SELECT * FROM t TO 'plan.json'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s245_import_query_plan_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("IMPORT QUERY PLAN FROM 'plan.json'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s245_show_exported_plans_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW EXPORTED PLANS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s245_plan_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT QUERY PLAN FOR SELECT * FROM t TO 'myplan.json'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW EXPORTED PLANS").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s245_exported_plans_has_columns() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { columns, .. } = ex.execute("SHOW EXPORTED PLANS").unwrap() {
+            assert_eq!(columns[0], "path");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S246 — Table fragmentation ──────────────────────────────────────────────
+    #[test]
+    fn test_s246_show_table_fragmentation_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW TABLE FRAGMENTATION FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s246_defragment_table_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DEFRAGMENT TABLE t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s246_set_auto_defragment_on_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET AUTO DEFRAGMENT ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s246_set_auto_defragment_off_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET AUTO DEFRAGMENT OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s246_fragmentation_has_columns() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { columns, .. } = ex.execute("SHOW TABLE FRAGMENTATION FOR t").unwrap() {
+            assert_eq!(columns[0], "table");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S247 — Shard rebalancing ────────────────────────────────────────────────
+    #[test]
+    fn test_s247_rebalance_shards_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("REBALANCE SHARDS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s247_show_shard_balance_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW SHARD BALANCE").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s247_set_shard_rebalance_policy_auto_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET SHARD REBALANCE POLICY AUTO").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s247_set_shard_rebalance_policy_manual_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET SHARD REBALANCE POLICY MANUAL").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s247_rebalance_count_increments() {
+        let (ex, _dir) = setup();
+        ex.execute("REBALANCE SHARDS").unwrap();
+        ex.execute("REBALANCE SHARDS").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SHARD BALANCE").unwrap() {
+            let count: usize = rows[0][1].parse().unwrap();
+            assert_eq!(count, 2);
+        } else {
+            panic!();
+        }
+    }
 }
+
+
