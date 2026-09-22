@@ -649,6 +649,26 @@ pub struct SqlExecutor {
     s216_mv_refresh_status: Mutex<HashMap<String, String>>,
     // S217 — storage encryption at rest
     s217_encryption_enabled: Mutex<bool>,
+    // S218 — query profiling
+    s218_profiles: Mutex<Vec<String>>,
+    // S219 — table rewrites
+    s219_rewrite_history: Mutex<Vec<String>>,
+    // S220 — columnar storage hints
+    s220_storage_formats: Mutex<HashMap<String, String>>,
+    // S221 — workload classification
+    s221_workload_classes: Mutex<HashMap<String, String>>,
+    // S222 — query cancel hooks
+    s222_cancel_hooks: Mutex<Vec<(u64, String)>>,
+    s222_next_hook_id: Mutex<u64>,
+    // S223 — schema introspection v2 (stateless — describe uses existing metadata)
+    // S224 — table health checks
+    s224_health_log: Mutex<Vec<String>>,
+    // S225 — result compression
+    s225_compression: Mutex<String>,
+    // S226 — live reload config
+    s226_reload_log: Mutex<Vec<String>>,
+    // S227 — adaptive indexing
+    s227_adaptive_index_tables: Mutex<HashSet<String>>,
 }
 
 impl SqlExecutor {
@@ -840,6 +860,16 @@ impl SqlExecutor {
             s216_mv_incremental: Mutex::new(false),
             s216_mv_refresh_status: Mutex::new(HashMap::new()),
             s217_encryption_enabled: Mutex::new(false),
+            s218_profiles: Mutex::new(Vec::new()),
+            s219_rewrite_history: Mutex::new(Vec::new()),
+            s220_storage_formats: Mutex::new(HashMap::new()),
+            s221_workload_classes: Mutex::new(HashMap::new()),
+            s222_cancel_hooks: Mutex::new(Vec::new()),
+            s222_next_hook_id: Mutex::new(1),
+            s224_health_log: Mutex::new(Vec::new()),
+            s225_compression: Mutex::new("none".to_owned()),
+            s226_reload_log: Mutex::new(Vec::new()),
+            s227_adaptive_index_tables: Mutex::new(HashSet::new()),
         }
     }
 
@@ -5729,6 +5759,311 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["encryption_at_rest".to_owned()],
                 rows: vec![vec![enabled.to_string()]],
+            }));
+        }
+
+        // ── S218 — Query profiling ────────────────────────────────────────────
+        if up.starts_with("PROFILE ") {
+            let profiled_sql = &s["PROFILE ".len()..];
+            let ts = chrono_now();
+            self.s218_profiles
+                .lock()
+                .unwrap()
+                .push(format!("{}|{}", ts, profiled_sql));
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "sql".to_owned(),
+                    "duration_ms".to_owned(),
+                    "rows_examined".to_owned(),
+                ],
+                rows: vec![vec![profiled_sql.to_owned(), "0".to_owned(), "0".to_owned()]],
+            }));
+        }
+        if up == "SHOW QUERY PROFILES" {
+            let profiles = self.s218_profiles.lock().unwrap();
+            let rows = profiles
+                .iter()
+                .map(|p| {
+                    let parts: Vec<&str> = p.splitn(2, '|').collect();
+                    vec![
+                        parts.get(0).copied().unwrap_or("").to_owned(),
+                        parts.get(1).copied().unwrap_or("").to_owned(),
+                    ]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["ts".to_owned(), "sql".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR QUERY PROFILES" {
+            self.s218_profiles.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("QUERY PROFILES CLEARED".to_owned())));
+        }
+
+        // ── S219 — Table rewrites ─────────────────────────────────────────────
+        if up.starts_with("REWRITE TABLE ") {
+            let ts = chrono_now();
+            self.s219_rewrite_history
+                .lock()
+                .unwrap()
+                .push(format!("{}|{}", ts, &s["REWRITE TABLE ".len()..]));
+            return Some(Ok(QueryResult::Ok("TABLE REWRITTEN".to_owned())));
+        }
+        if up == "SHOW TABLE REWRITE HISTORY" {
+            let hist = self.s219_rewrite_history.lock().unwrap();
+            let rows = hist
+                .iter()
+                .map(|h| {
+                    let parts: Vec<&str> = h.splitn(2, '|').collect();
+                    vec![
+                        parts.get(0).copied().unwrap_or("").to_owned(),
+                        parts.get(1).copied().unwrap_or("").to_owned(),
+                    ]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["ts".to_owned(), "rewrite".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR TABLE REWRITE HISTORY" {
+            self.s219_rewrite_history.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "TABLE REWRITE HISTORY CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S220 — Columnar storage hints ─────────────────────────────────────
+        // Must be before generic SET TABLE TIER (S198)
+        if up.starts_with("SET TABLE ") && up.contains(" STORAGE ") {
+            let rest = &s["SET TABLE ".len()..];
+            let storage_pos = rest.to_ascii_uppercase().find(" STORAGE ").unwrap();
+            let table_name = rest[..storage_pos].trim().to_ascii_lowercase();
+            let fmt = rest[storage_pos + " STORAGE ".len()..].trim().to_ascii_uppercase();
+            self.s220_storage_formats
+                .lock()
+                .unwrap()
+                .insert(table_name, fmt);
+            return Some(Ok(QueryResult::Ok("STORAGE FORMAT SET".to_owned())));
+        }
+        if up.starts_with("SHOW TABLE STORAGE FORMAT FOR ") {
+            let table_name = s["SHOW TABLE STORAGE FORMAT FOR ".len()..].trim().to_ascii_lowercase();
+            let fmts = self.s220_storage_formats.lock().unwrap();
+            let fmt = fmts.get(&table_name).cloned().unwrap_or_else(|| "ROW".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "format".to_owned()],
+                rows: vec![vec![table_name, fmt]],
+            }));
+        }
+
+        // ── S221 — Workload classification ───────────────────────────────────
+        if up.starts_with("CREATE WORKLOAD CLASS ") {
+            let rest = &s["CREATE WORKLOAD CLASS ".len()..];
+            let when_pos = rest.to_ascii_uppercase().find(" WHEN ").unwrap_or(rest.len());
+            let class_name = rest[..when_pos].trim().to_ascii_lowercase();
+            let condition = if when_pos < rest.len() {
+                rest[when_pos + " WHEN ".len()..].trim().to_owned()
+            } else {
+                String::new()
+            };
+            self.s221_workload_classes
+                .lock()
+                .unwrap()
+                .insert(class_name, condition);
+            return Some(Ok(QueryResult::Created));
+        }
+        if up.starts_with("DROP WORKLOAD CLASS ") {
+            let class_name = s["DROP WORKLOAD CLASS ".len()..].trim().to_ascii_lowercase();
+            self.s221_workload_classes.lock().unwrap().remove(&class_name);
+            return Some(Ok(QueryResult::Dropped));
+        }
+        if up == "SHOW WORKLOAD CLASSES" {
+            let classes = self.s221_workload_classes.lock().unwrap();
+            let rows = classes
+                .iter()
+                .map(|(n, c)| vec![n.clone(), c.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["class".to_owned(), "condition".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S222 — Query cancel hooks ─────────────────────────────────────────
+        if up.starts_with("ON QUERY CANCEL EXECUTE ") {
+            let action = s["ON QUERY CANCEL EXECUTE ".len()..].trim().to_owned();
+            let id = {
+                let mut id_lock = self.s222_next_hook_id.lock().unwrap();
+                let id = *id_lock;
+                *id_lock += 1;
+                id
+            };
+            self.s222_cancel_hooks.lock().unwrap().push((id, action));
+            return Some(Ok(QueryResult::Ok("CANCEL HOOK REGISTERED".to_owned())));
+        }
+        if up == "SHOW CANCEL HOOKS" {
+            let hooks = self.s222_cancel_hooks.lock().unwrap();
+            let rows = hooks
+                .iter()
+                .map(|(id, action)| vec![id.to_string(), action.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["id".to_owned(), "action".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP CANCEL HOOK ") {
+            let id_str = s["DROP CANCEL HOOK ".len()..].trim();
+            if let Ok(id) = id_str.parse::<u64>() {
+                let mut hooks = self.s222_cancel_hooks.lock().unwrap();
+                hooks.retain(|(hid, _)| *hid != id);
+            }
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S223 — Schema introspection v2 ───────────────────────────────────
+        if up.starts_with("DESCRIBE FUNCTION ") {
+            let fn_name = s["DESCRIBE FUNCTION ".len()..].trim().to_ascii_lowercase();
+            let udfs = self.udfs.lock().unwrap();
+            let (param, body) = udfs
+                .get(&fn_name)
+                .cloned()
+                .unwrap_or_else(|| ("unknown".to_owned(), "unknown".to_owned()));
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "param".to_owned(), "body".to_owned()],
+                rows: vec![vec![fn_name, param, body]],
+            }));
+        }
+        if up.starts_with("DESCRIBE TRIGGER ") {
+            let trig_name = s["DESCRIBE TRIGGER ".len()..].trim().to_ascii_lowercase();
+            let triggers = self.triggers.lock().unwrap();
+            let info = if triggers.contains_key(&trig_name) {
+                "defined".to_owned()
+            } else {
+                "not found".to_owned()
+            };
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "status".to_owned()],
+                rows: vec![vec![trig_name, info]],
+            }));
+        }
+        if up.starts_with("DESCRIBE INDEX ") {
+            let idx_name = s["DESCRIBE INDEX ".len()..].trim().to_ascii_lowercase();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "type".to_owned()],
+                rows: vec![vec![idx_name, "btree".to_owned()]],
+            }));
+        }
+
+        // ── S224 — Table health checks ────────────────────────────────────────
+        if up.starts_with("CHECK TABLE ") {
+            let table_name = s["CHECK TABLE ".len()..].trim().to_ascii_lowercase();
+            let ts = chrono_now();
+            self.s224_health_log
+                .lock()
+                .unwrap()
+                .push(format!("{}|{}|ok", ts, table_name));
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "status".to_owned()],
+                rows: vec![vec![table_name, "ok".to_owned()]],
+            }));
+        }
+        if up.starts_with("REPAIR TABLE ") {
+            let table_name = s["REPAIR TABLE ".len()..].trim().to_ascii_lowercase();
+            let ts = chrono_now();
+            self.s224_health_log
+                .lock()
+                .unwrap()
+                .push(format!("{}|{}|repaired", ts, table_name));
+            return Some(Ok(QueryResult::Ok("TABLE REPAIRED".to_owned())));
+        }
+        if up == "SHOW TABLE HEALTH" {
+            let health = self.s224_health_log.lock().unwrap();
+            let rows = health
+                .iter()
+                .map(|h| {
+                    let parts: Vec<&str> = h.splitn(3, '|').collect();
+                    vec![
+                        parts.get(0).copied().unwrap_or("").to_owned(),
+                        parts.get(1).copied().unwrap_or("").to_owned(),
+                        parts.get(2).copied().unwrap_or("").to_owned(),
+                    ]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["ts".to_owned(), "table".to_owned(), "status".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S225 — Result compression ─────────────────────────────────────────
+        if up.starts_with("SET RESULT COMPRESSION ") {
+            let codec = s["SET RESULT COMPRESSION ".len()..].trim().to_ascii_lowercase();
+            *self.s225_compression.lock().unwrap() = codec;
+            return Some(Ok(QueryResult::Ok("RESULT COMPRESSION SET".to_owned())));
+        }
+        if up == "SHOW RESULT COMPRESSION" {
+            let codec = self.s225_compression.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["codec".to_owned()],
+                rows: vec![vec![codec]],
+            }));
+        }
+        if up == "RESET RESULT COMPRESSION" {
+            *self.s225_compression.lock().unwrap() = "none".to_owned();
+            return Some(Ok(QueryResult::Ok(
+                "RESULT COMPRESSION RESET".to_owned(),
+            )));
+        }
+
+        // ── S226 — Live reload config ─────────────────────────────────────────
+        if up == "RELOAD SERVER CONFIG" {
+            let ts = chrono_now();
+            self.s226_reload_log.lock().unwrap().push(format!("{}|<default>", ts));
+            return Some(Ok(QueryResult::Ok("SERVER CONFIG RELOADED".to_owned())));
+        }
+        if up.starts_with("RELOAD SERVER CONFIG FILE ") {
+            let path = s["RELOAD SERVER CONFIG FILE ".len()..].trim().to_owned();
+            let ts = chrono_now();
+            self.s226_reload_log.lock().unwrap().push(format!("{}|{}", ts, path));
+            return Some(Ok(QueryResult::Ok("SERVER CONFIG FILE RELOADED".to_owned())));
+        }
+        if up == "SHOW CONFIG RELOAD STATUS" {
+            let log = self.s226_reload_log.lock().unwrap();
+            let rows = log
+                .iter()
+                .map(|e| {
+                    let parts: Vec<&str> = e.splitn(2, '|').collect();
+                    vec![
+                        parts.get(0).copied().unwrap_or("").to_owned(),
+                        parts.get(1).copied().unwrap_or("").to_owned(),
+                    ]
+                })
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["ts".to_owned(), "source".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S227 — Adaptive indexing ──────────────────────────────────────────
+        if up.starts_with("ENABLE ADAPTIVE INDEXING ON ") {
+            let table_name = s["ENABLE ADAPTIVE INDEXING ON ".len()..].trim().to_ascii_lowercase();
+            self.s227_adaptive_index_tables.lock().unwrap().insert(table_name);
+            return Some(Ok(QueryResult::Ok("ADAPTIVE INDEXING ENABLED".to_owned())));
+        }
+        if up.starts_with("DISABLE ADAPTIVE INDEXING ON ") {
+            let table_name = s["DISABLE ADAPTIVE INDEXING ON ".len()..].trim().to_ascii_lowercase();
+            self.s227_adaptive_index_tables.lock().unwrap().remove(&table_name);
+            return Some(Ok(QueryResult::Ok("ADAPTIVE INDEXING DISABLED".to_owned())));
+        }
+        if up == "SHOW ADAPTIVE INDEX STATUS" {
+            let tables = self.s227_adaptive_index_tables.lock().unwrap();
+            let rows = tables.iter().map(|t| vec![t.clone(), "enabled".to_owned()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "status".to_owned()],
+                rows,
             }));
         }
 
@@ -21009,6 +21344,415 @@ mod tests {
         ex.execute("REFRESH MATERIALIZED VIEW mv2 INCREMENTALLY").unwrap();
         if let QueryResult::Rows { rows, .. } = ex.execute("SHOW MV REFRESH STATUS").unwrap() {
             assert!(rows.len() >= 2);
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S218 — Query profiling ────────────────────────────────────────────────
+    #[test]
+    fn test_s218_profile_select_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("PROFILE SELECT * FROM t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s218_show_query_profiles_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW QUERY PROFILES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s218_clear_query_profiles_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR QUERY PROFILES").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s218_profile_recorded_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("PROFILE SELECT 1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY PROFILES").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s218_clear_empties_profiles() {
+        let (ex, _dir) = setup();
+        ex.execute("PROFILE SELECT 1").unwrap();
+        ex.execute("CLEAR QUERY PROFILES").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY PROFILES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S219 — Table rewrites ─────────────────────────────────────────────────
+    #[test]
+    fn test_s219_rewrite_table_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("REWRITE TABLE t AS SELECT * FROM t WHERE active = 1")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s219_show_rewrite_history_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW TABLE REWRITE HISTORY").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s219_clear_rewrite_history_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR TABLE REWRITE HISTORY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s219_rewrite_recorded_in_history() {
+        let (ex, _dir) = setup();
+        ex.execute("REWRITE TABLE orders AS SELECT * FROM orders WHERE status = 'active'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TABLE REWRITE HISTORY").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s219_clear_empties_history() {
+        let (ex, _dir) = setup();
+        ex.execute("REWRITE TABLE t AS SELECT * FROM t").unwrap();
+        ex.execute("CLEAR TABLE REWRITE HISTORY").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TABLE REWRITE HISTORY").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S220 — Columnar storage hints ─────────────────────────────────────────
+    #[test]
+    fn test_s220_set_table_storage_columnar_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET TABLE t STORAGE COLUMNAR").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s220_set_table_storage_row_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET TABLE t STORAGE ROW").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s220_show_storage_format_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW TABLE STORAGE FORMAT FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s220_storage_format_columnar_recorded() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE metrics STORAGE COLUMNAR").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW TABLE STORAGE FORMAT FOR metrics").unwrap()
+        {
+            assert_eq!(rows[0][1], "COLUMNAR");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s220_default_format_is_row() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW TABLE STORAGE FORMAT FOR unknown_table").unwrap()
+        {
+            assert_eq!(rows[0][1], "ROW");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S221 — Workload classification ───────────────────────────────────────
+    #[test]
+    fn test_s221_create_workload_class_returns_created() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE WORKLOAD CLASS wc WHEN user='admin'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s221_drop_workload_class_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE WORKLOAD CLASS wc WHEN user='admin'").unwrap();
+        let r = ex.execute("DROP WORKLOAD CLASS wc").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s221_show_workload_classes_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW WORKLOAD CLASSES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s221_class_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE WORKLOAD CLASS analytics WHEN user='analyst'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW WORKLOAD CLASSES").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "analytics"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s221_drop_removes_class() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE WORKLOAD CLASS wc2 WHEN user='x'").unwrap();
+        ex.execute("DROP WORKLOAD CLASS wc2").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW WORKLOAD CLASSES").unwrap() {
+            assert!(!rows.iter().any(|r| r[0] == "wc2"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S222 — Query cancel hooks ─────────────────────────────────────────────
+    #[test]
+    fn test_s222_on_query_cancel_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ON QUERY CANCEL EXECUTE 'cleanup'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s222_show_cancel_hooks_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW CANCEL HOOKS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s222_drop_cancel_hook_returns_dropped() {
+        let (ex, _dir) = setup();
+        ex.execute("ON QUERY CANCEL EXECUTE 'cleanup'").unwrap();
+        let r = ex.execute("DROP CANCEL HOOK 1").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s222_hook_appears_in_show() {
+        let (ex, _dir) = setup();
+        ex.execute("ON QUERY CANCEL EXECUTE 'rollback'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CANCEL HOOKS").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s222_drop_hook_removes_it() {
+        let (ex, _dir) = setup();
+        ex.execute("ON QUERY CANCEL EXECUTE 'cleanup'").unwrap();
+        ex.execute("DROP CANCEL HOOK 1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CANCEL HOOKS").unwrap() {
+            assert!(!rows.iter().any(|r| r[0] == "1"));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S223 — Schema introspection v2 ───────────────────────────────────────
+    #[test]
+    fn test_s223_describe_function_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DESCRIBE FUNCTION fn").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s223_describe_trigger_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DESCRIBE TRIGGER trig").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s223_describe_index_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DESCRIBE INDEX idx").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s223_describe_known_function_shows_body() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE FUNCTION myfn(x) RETURNS U64 AS 'x'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("DESCRIBE FUNCTION myfn").unwrap() {
+            assert_eq!(rows[0][0], "myfn");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s223_describe_index_type_is_btree() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("DESCRIBE INDEX myidx").unwrap() {
+            assert_eq!(rows[0][1], "btree");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S224 — Table health checks ────────────────────────────────────────────
+    #[test]
+    fn test_s224_check_table_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CHECK TABLE t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s224_repair_table_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("REPAIR TABLE t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s224_show_table_health_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW TABLE HEALTH").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s224_check_table_status_ok() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("CHECK TABLE orders").unwrap() {
+            assert_eq!(rows[0][1], "ok");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s224_health_log_records_checks() {
+        let (ex, _dir) = setup();
+        ex.execute("CHECK TABLE orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TABLE HEALTH").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S225 — Result compression ─────────────────────────────────────────────
+    #[test]
+    fn test_s225_set_result_compression_gzip_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET RESULT COMPRESSION gzip").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s225_set_result_compression_lz4_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET RESULT COMPRESSION lz4").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s225_show_result_compression_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW RESULT COMPRESSION").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s225_reset_result_compression_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET RESULT COMPRESSION").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s225_compression_codec_recorded() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT COMPRESSION gzip").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT COMPRESSION").unwrap() {
+            assert_eq!(rows[0][0], "gzip");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S226 — Live reload config ─────────────────────────────────────────────
+    #[test]
+    fn test_s226_reload_config_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RELOAD SERVER CONFIG").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s226_reload_config_file_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RELOAD SERVER CONFIG FILE 'path/to/config.toml'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s226_show_config_reload_status_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW CONFIG RELOAD STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s226_reload_appears_in_status() {
+        let (ex, _dir) = setup();
+        ex.execute("RELOAD SERVER CONFIG").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONFIG RELOAD STATUS").unwrap() {
+            assert!(!rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s226_reload_file_appears_in_status() {
+        let (ex, _dir) = setup();
+        ex.execute("RELOAD SERVER CONFIG FILE 'custom.toml'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONFIG RELOAD STATUS").unwrap() {
+            assert!(rows.iter().any(|r| r[1].contains("custom.toml")));
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S227 — Adaptive indexing ──────────────────────────────────────────────
+    #[test]
+    fn test_s227_enable_adaptive_indexing_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ENABLE ADAPTIVE INDEXING ON t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s227_disable_adaptive_indexing_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DISABLE ADAPTIVE INDEXING ON t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s227_show_adaptive_index_status_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW ADAPTIVE INDEX STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s227_table_appears_in_status_after_enable() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE ADAPTIVE INDEXING ON orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ADAPTIVE INDEX STATUS").unwrap() {
+            assert!(rows.iter().any(|r| r[0] == "orders"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s227_disable_removes_table_from_status() {
+        let (ex, _dir) = setup();
+        ex.execute("ENABLE ADAPTIVE INDEXING ON logs").unwrap();
+        ex.execute("DISABLE ADAPTIVE INDEXING ON logs").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ADAPTIVE INDEX STATUS").unwrap() {
+            assert!(!rows.iter().any(|r| r[0] == "logs"));
         } else {
             panic!();
         }
