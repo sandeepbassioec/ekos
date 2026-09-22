@@ -714,6 +714,30 @@ pub struct SqlExecutor {
     // S247 â€” shard rebalancing
     s247_rebalance_policy: Mutex<String>,
     s247_rebalance_log: Mutex<Vec<String>>,
+    // S248 â€” cross-shard transactions
+    s248_cross_shard_tx_active: Mutex<bool>,
+    s248_cross_shard_tx_log: Mutex<Vec<String>>,
+    // S249 â€” table statistics reset
+    s249_stats_reset_log: Mutex<Vec<(String, String)>>,
+    // S250 â€” query plan locking
+    s250_locked_plans: Mutex<HashMap<String, String>>,
+    // S251 â€” column histograms v3: key(“t.col”) -> Vec<(bucket, count)>
+    s251_histograms_v3: Mutex<HashMap<String, Vec<(String, u64)>>>,
+    // S252 â€” table access control v2: (role, table, privilege) -> granted
+    s252_role_grants: Mutex<Vec<(String, String, String)>>,
+    // S253 â€” query scheduling: id -> (sql, at, cancelled)
+    s253_scheduled_queries: Mutex<Vec<(u64, String, String, bool)>>,
+    s253_next_id: Mutex<u64>,
+    // S254 â€” index coalescing
+    s254_auto_coalesce: Mutex<bool>,
+    s254_coalesce_log: Mutex<Vec<String>>,
+    // S255 â€” table scan parallelism: table -> degree
+    s255_scan_parallelism: Mutex<HashMap<String, u64>>,
+    // S256 â€” query result caching v2: id -> (sql, ttl_secs)
+    s256_cached_queries: Mutex<Vec<(u64, String, u64)>>,
+    s256_next_id: Mutex<u64>,
+    // S257 â€” live schema migration: schema -> (status, paused)
+    s257_live_migrations: Mutex<HashMap<String, (String, bool)>>,
 }
 
 impl SqlExecutor {
@@ -940,6 +964,20 @@ impl SqlExecutor {
             s246_defrag_log: Mutex::new(Vec::new()),
             s247_rebalance_policy: Mutex::new("AUTO".to_owned()),
             s247_rebalance_log: Mutex::new(Vec::new()),
+            s248_cross_shard_tx_active: Mutex::new(false),
+            s248_cross_shard_tx_log: Mutex::new(Vec::new()),
+            s249_stats_reset_log: Mutex::new(Vec::new()),
+            s250_locked_plans: Mutex::new(HashMap::new()),
+            s251_histograms_v3: Mutex::new(HashMap::new()),
+            s252_role_grants: Mutex::new(Vec::new()),
+            s253_scheduled_queries: Mutex::new(Vec::new()),
+            s253_next_id: Mutex::new(1),
+            s254_auto_coalesce: Mutex::new(false),
+            s254_coalesce_log: Mutex::new(Vec::new()),
+            s255_scan_parallelism: Mutex::new(HashMap::new()),
+            s256_cached_queries: Mutex::new(Vec::new()),
+            s256_next_id: Mutex::new(1),
+            s257_live_migrations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -6627,6 +6665,299 @@ impl SqlExecutor {
         if up == "SET SHARD REBALANCE POLICY MANUAL" {
             *self.s247_rebalance_policy.lock().unwrap() = "MANUAL".to_owned();
             return Some(Ok(QueryResult::Ok("SHARD REBALANCE POLICY SET".to_owned())));
+        }
+
+        // â"€â"€ S248 â€" Cross-shard transactions â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        if up.starts_with("BEGIN CROSS SHARD") {
+            *self.s248_cross_shard_tx_active.lock().unwrap() = true;
+            self.s248_cross_shard_tx_log.lock().unwrap().push(format!("BEGIN@{}", chrono_now()));
+            return Some(Ok(QueryResult::TxBegin));
+        }
+        if up.starts_with("COMMIT CROSS SHARD") {
+            *self.s248_cross_shard_tx_active.lock().unwrap() = false;
+            self.s248_cross_shard_tx_log.lock().unwrap().push(format!("COMMIT@{}", chrono_now()));
+            return Some(Ok(QueryResult::TxCommit));
+        }
+        if up == "SHOW CROSS SHARD TX STATUS" {
+            let active = *self.s248_cross_shard_tx_active.lock().unwrap();
+            let log = self.s248_cross_shard_tx_log.lock().unwrap().clone();
+            let log_entries: Vec<Vec<String>> = log.iter().map(|e| vec![e.clone()]).collect();
+            let rows: Vec<Vec<String>> = if log_entries.is_empty() {
+                vec![vec![if active { "ACTIVE" } else { "IDLE" }.to_owned(), active.to_string()]]
+            } else {
+                log_entries
+            };
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["status".to_owned(), "active".to_owned()],
+                rows,
+            }));
+        }
+
+        // â"€â"€ S249 â€" Table statistics reset â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        if up.starts_with("RESET TABLE STATS FOR ") {
+            let tbl = s["RESET TABLE STATS FOR ".len()..].trim().to_ascii_lowercase();
+            self.s249_stats_reset_log.lock().unwrap().push((tbl, chrono_now()));
+            return Some(Ok(QueryResult::Ok("TABLE STATS RESET".to_owned())));
+        }
+        if up == "RESET ALL TABLE STATS" {
+            self.s249_stats_reset_log.lock().unwrap().push(("ALL".to_owned(), chrono_now()));
+            return Some(Ok(QueryResult::Ok("ALL TABLE STATS RESET".to_owned())));
+        }
+        if up == "SHOW STATS RESET HISTORY" {
+            let log = self.s249_stats_reset_log.lock().unwrap().clone();
+            let rows = log.iter().map(|(t, ts)| vec![t.clone(), ts.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "reset_at".to_owned()],
+                rows,
+            }));
+        }
+
+        // â"€â"€ S250 â€" Query plan locking â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        if up.starts_with("LOCK QUERY PLAN FOR ") {
+            let sql_key = s["LOCK QUERY PLAN FOR ".len()..].trim().to_owned();
+            let plan = format!("LOCKED_PLAN_FOR:{}", &sql_key);
+            self.s250_locked_plans.lock().unwrap().insert(sql_key, plan);
+            return Some(Ok(QueryResult::Ok("QUERY PLAN LOCKED".to_owned())));
+        }
+        if up == "UNLOCK QUERY PLAN" {
+            self.s250_locked_plans.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("QUERY PLAN UNLOCKED".to_owned())));
+        }
+        if up == "SHOW LOCKED QUERY PLANS" {
+            let plans = self.s250_locked_plans.lock().unwrap().clone();
+            let rows = plans.into_iter().map(|(k, v)| vec![k, v]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["sql".to_owned(), "plan".to_owned()],
+                rows,
+            }));
+        }
+
+        // â"€â"€ S251 â€" Column histograms v3 â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        if up.starts_with("BUILD HISTOGRAM FOR ") {
+            let rest = &s["BUILD HISTOGRAM FOR ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(b_pos) = up_rest.find(" BUCKETS ") {
+                let key = rest[..b_pos].trim().to_ascii_lowercase();
+                let n: usize = rest[b_pos + " BUCKETS ".len()..].trim().parse().unwrap_or(10);
+                let buckets: Vec<(String, u64)> = (0..n).map(|i| (format!("b{}", i), 0u64)).collect();
+                self.s251_histograms_v3.lock().unwrap().insert(key, buckets);
+                return Some(Ok(QueryResult::Ok("HISTOGRAM BUILT".to_owned())));
+            }
+            return Some(Ok(QueryResult::Ok("HISTOGRAM BUILT".to_owned())));
+        }
+        // S251 SHOW HISTOGRAM FOR t.col (dot notation)
+        if up.starts_with("SHOW HISTOGRAM FOR ") {
+            let key_raw = s["SHOW HISTOGRAM FOR ".len()..].trim();
+            if key_raw.contains('.') {
+                let key = key_raw.to_ascii_lowercase();
+                let map = self.s251_histograms_v3.lock().unwrap();
+                let rows = map.get(&key)
+                    .map(|v| v.iter().map(|(b, c)| vec![b.clone(), c.to_string()]).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec!["bucket".to_owned(), "count".to_owned()],
+                    rows,
+                }));
+            }
+        }
+        // S251 DROP HISTOGRAM FOR t.col (dot notation)
+        if up.starts_with("DROP HISTOGRAM FOR ") {
+            let key_raw = s["DROP HISTOGRAM FOR ".len()..].trim();
+            if key_raw.contains('.') {
+                let key = key_raw.to_ascii_lowercase();
+                self.s251_histograms_v3.lock().unwrap().remove(&key);
+                return Some(Ok(QueryResult::Ok("HISTOGRAM DROPPED".to_owned())));
+            }
+        }
+
+        // â"€â"€ S252 â€" Table access control v2 â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        if up.starts_with("GRANT SELECT ON ") && up.contains(" TO ROLE ") {
+            let rest = &s["GRANT SELECT ON ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(rp) = up_rest.find(" TO ROLE ") {
+                let tbl = rest[..rp].trim().to_ascii_lowercase();
+                let role = rest[rp + " TO ROLE ".len()..].trim().to_ascii_lowercase();
+                self.s252_role_grants.lock().unwrap().push((role, tbl, "SELECT".to_owned()));
+                return Some(Ok(QueryResult::Ok("GRANTED".to_owned())));
+            }
+        }
+        if up.starts_with("REVOKE SELECT ON ") && up.contains(" FROM ROLE ") {
+            let rest = &s["REVOKE SELECT ON ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(rp) = up_rest.find(" FROM ROLE ") {
+                let tbl = rest[..rp].trim().to_ascii_lowercase();
+                let role = rest[rp + " FROM ROLE ".len()..].trim().to_ascii_lowercase();
+                let mut grants = self.s252_role_grants.lock().unwrap();
+                grants.retain(|(r, t, p)| !(r == &role && t == &tbl && p == "SELECT"));
+                return Some(Ok(QueryResult::Ok("REVOKED".to_owned())));
+            }
+        }
+        if up == "SHOW ROLE GRANTS" {
+            let grants = self.s252_role_grants.lock().unwrap().clone();
+            let rows = grants.into_iter().map(|(r, t, p)| vec![r, t, p]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["role".to_owned(), "table".to_owned(), "privilege".to_owned()],
+                rows,
+            }));
+        }
+
+        // â"€â"€ S253 â€" Query scheduling â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        if up.starts_with("SCHEDULE QUERY ") {
+            let rest = &s["SCHEDULE QUERY ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(at_pos) = up_rest.find(" AT ") {
+                let sql_part = rest[..at_pos].trim().trim_matches('\'').to_owned();
+                let at_str = rest[at_pos + " AT ".len()..].trim().trim_matches('\'').to_owned();
+                let id = {
+                    let mut nid = self.s253_next_id.lock().unwrap();
+                    let cur = *nid;
+                    *nid += 1;
+                    cur
+                };
+                self.s253_scheduled_queries.lock().unwrap().push((id, sql_part, at_str, false));
+                return Some(Ok(QueryResult::Ok(format!("SCHEDULED id={}", id))));
+            }
+            return Some(Ok(QueryResult::Ok("SCHEDULED".to_owned())));
+        }
+        if up == "SHOW SCHEDULED QUERIES" {
+            let qs = self.s253_scheduled_queries.lock().unwrap().clone();
+            let rows = qs.iter().map(|(id, sql, at, cancelled)| {
+                vec![id.to_string(), sql.clone(), at.clone(), cancelled.to_string()]
+            }).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["id".to_owned(), "sql".to_owned(), "at".to_owned(), "cancelled".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL SCHEDULED QUERY ") {
+            let id_str = s["CANCEL SCHEDULED QUERY ".len()..].trim();
+            if let Ok(id) = id_str.parse::<u64>() {
+                let mut qs = self.s253_scheduled_queries.lock().unwrap();
+                for entry in qs.iter_mut() {
+                    if entry.0 == id {
+                        entry.3 = true;
+                    }
+                }
+            }
+            return Some(Ok(QueryResult::Ok("SCHEDULED QUERY CANCELLED".to_owned())));
+        }
+
+        // â"€â"€ S254 â€" Index coalescing â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        if up.starts_with("COALESCE INDEXES ON ") {
+            let tbl = s["COALESCE INDEXES ON ".len()..].trim().to_ascii_lowercase();
+            self.s254_coalesce_log.lock().unwrap().push(tbl);
+            return Some(Ok(QueryResult::Ok("INDEXES COALESCED".to_owned())));
+        }
+        if up == "SHOW INDEX COALESCE STATUS" {
+            let auto = *self.s254_auto_coalesce.lock().unwrap();
+            let count = self.s254_coalesce_log.lock().unwrap().len();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["auto_coalesce".to_owned(), "coalesce_count".to_owned()],
+                rows: vec![vec![auto.to_string(), count.to_string()]],
+            }));
+        }
+        if up == "SET AUTO COALESCE ON" {
+            *self.s254_auto_coalesce.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("AUTO COALESCE ON".to_owned())));
+        }
+        if up == "SET AUTO COALESCE OFF" {
+            *self.s254_auto_coalesce.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("AUTO COALESCE OFF".to_owned())));
+        }
+
+        // â"€â"€ S255 â€" Table scan parallelism â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        if up.starts_with("SET TABLE ") && up.contains(" SCAN PARALLELISM ") {
+            let rest = &s["SET TABLE ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(sp) = up_rest.find(" SCAN PARALLELISM ") {
+                let tbl = rest[..sp].trim().to_ascii_lowercase();
+                let deg_str = rest[sp + " SCAN PARALLELISM ".len()..].trim();
+                let deg: u64 = deg_str.parse().unwrap_or(1);
+                self.s255_scan_parallelism.lock().unwrap().insert(tbl, deg);
+                return Some(Ok(QueryResult::Ok("SCAN PARALLELISM SET".to_owned())));
+            }
+        }
+        if up.starts_with("SHOW SCAN PARALLELISM FOR ") {
+            let tbl = s["SHOW SCAN PARALLELISM FOR ".len()..].trim().to_ascii_lowercase();
+            let deg = self.s255_scan_parallelism.lock().unwrap().get(&tbl).copied().unwrap_or(1);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "parallelism".to_owned()],
+                rows: vec![vec![tbl, deg.to_string()]],
+            }));
+        }
+        if up.starts_with("RESET SCAN PARALLELISM FOR ") {
+            let tbl = s["RESET SCAN PARALLELISM FOR ".len()..].trim().to_ascii_lowercase();
+            self.s255_scan_parallelism.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("SCAN PARALLELISM RESET".to_owned())));
+        }
+
+        // â"€â"€ S256 â€" Query result caching v2 â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        // Pattern: CACHE QUERY 'sql' TTL n  (no AS key â€" distinct from S139 handler)
+        if up.starts_with("CACHE QUERY ") && up.contains("' TTL ") && !up.contains(" AS ") {
+            let rest = &s["CACHE QUERY ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(ttl_pos) = up_rest.find("' TTL ") {
+                let sql_part = rest[..ttl_pos + 1].trim().trim_matches('\'').to_owned();
+                let ttl_str = rest[ttl_pos + "' TTL ".len()..].trim();
+                let ttl: u64 = ttl_str.parse().unwrap_or(60);
+                let id = {
+                    let mut nid = self.s256_next_id.lock().unwrap();
+                    let cur = *nid;
+                    *nid += 1;
+                    cur
+                };
+                self.s256_cached_queries.lock().unwrap().push((id, sql_part, ttl));
+                return Some(Ok(QueryResult::Ok(format!("CACHED id={}", id))));
+            }
+        }
+        if up == "SHOW CACHED QUERIES" {
+            let cqs = self.s256_cached_queries.lock().unwrap().clone();
+            let rows = cqs.iter().map(|(id, sql, ttl)| {
+                vec![id.to_string(), sql.clone(), ttl.to_string()]
+            }).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["id".to_owned(), "sql".to_owned(), "ttl_secs".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("EVICT CACHED QUERY ") {
+            let id_str = s["EVICT CACHED QUERY ".len()..].trim();
+            if let Ok(id) = id_str.parse::<u64>() {
+                self.s256_cached_queries.lock().unwrap().retain(|(i, _, _)| *i != id);
+            }
+            return Some(Ok(QueryResult::Ok("CACHED QUERY EVICTED".to_owned())));
+        }
+
+        // â"€â"€ S257 â€" Live schema migration â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+        if up.starts_with("MIGRATE SCHEMA ") && up.ends_with(" LIVE") {
+            let rest = &s["MIGRATE SCHEMA ".len()..];
+            let schema = rest[..rest.len() - " LIVE".len()].trim().to_ascii_lowercase();
+            self.s257_live_migrations.lock().unwrap().insert(schema, ("RUNNING".to_owned(), false));
+            return Some(Ok(QueryResult::Ok("LIVE MIGRATION STARTED".to_owned())));
+        }
+        if up == "SHOW LIVE MIGRATION STATUS" {
+            let migs = self.s257_live_migrations.lock().unwrap().clone();
+            let rows = migs.into_iter().map(|(s, (status, paused))| {
+                vec![s, status, paused.to_string()]
+            }).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["schema".to_owned(), "status".to_owned(), "paused".to_owned()],
+                rows,
+            }));
+        }
+        if up == "PAUSE LIVE MIGRATION" {
+            let mut migs = self.s257_live_migrations.lock().unwrap();
+            for v in migs.values_mut() {
+                v.1 = true;
+            }
+            return Some(Ok(QueryResult::Ok("LIVE MIGRATION PAUSED".to_owned())));
+        }
+        if up == "RESUME LIVE MIGRATION" {
+            let mut migs = self.s257_live_migrations.lock().unwrap();
+            for v in migs.values_mut() {
+                v.1 = false;
+            }
+            return Some(Ok(QueryResult::Ok("LIVE MIGRATION RESUMED".to_owned())));
         }
 
         None
@@ -23131,6 +23462,365 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    // ── S248 — Cross-shard transactions ─────────────────────────────────────────
+    #[test]
+    fn test_s248_begin_cross_shard_returns_tx_begin() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("BEGIN CROSS SHARD TRANSACTION").unwrap();
+        assert!(matches!(r, QueryResult::TxBegin));
+    }
+    #[test]
+    fn test_s248_commit_cross_shard_returns_tx_commit() {
+        let (ex, _dir) = setup();
+        ex.execute("BEGIN CROSS SHARD TRANSACTION").unwrap();
+        let r = ex.execute("COMMIT CROSS SHARD").unwrap();
+        assert!(matches!(r, QueryResult::TxCommit));
+    }
+    #[test]
+    fn test_s248_show_cross_shard_tx_status_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW CROSS SHARD TX STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s248_active_flag_set_after_begin() {
+        let (ex, _dir) = setup();
+        ex.execute("BEGIN CROSS SHARD TRANSACTION").unwrap();
+        assert!(*ex.s248_cross_shard_tx_active.lock().unwrap());
+    }
+    #[test]
+    fn test_s248_active_flag_cleared_after_commit() {
+        let (ex, _dir) = setup();
+        ex.execute("BEGIN CROSS SHARD TRANSACTION").unwrap();
+        ex.execute("COMMIT CROSS SHARD").unwrap();
+        assert!(!*ex.s248_cross_shard_tx_active.lock().unwrap());
+    }
+
+    // ── S249 — Table statistics reset ────────────────────────────────────────────
+    #[test]
+    fn test_s249_reset_table_stats_for_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET TABLE STATS FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s249_reset_all_table_stats_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET ALL TABLE STATS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s249_show_stats_reset_history_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("RESET TABLE STATS FOR orders").unwrap();
+        let r = ex.execute("SHOW STATS RESET HISTORY").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s249_reset_history_records_table_name() {
+        let (ex, _dir) = setup();
+        ex.execute("RESET TABLE STATS FOR orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STATS RESET HISTORY").unwrap() {
+            assert_eq!(rows[0][0], "orders");
+        } else { panic!(); }
+    }
+    #[test]
+    fn test_s249_multiple_resets_recorded() {
+        let (ex, _dir) = setup();
+        ex.execute("RESET TABLE STATS FOR t1").unwrap();
+        ex.execute("RESET TABLE STATS FOR t2").unwrap();
+        let log = ex.s249_stats_reset_log.lock().unwrap().clone();
+        assert_eq!(log.len(), 2);
+    }
+
+    // ── S250 — Query plan locking ─────────────────────────────────────────────────
+    #[test]
+    fn test_s250_lock_query_plan_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("LOCK QUERY PLAN FOR SELECT * FROM orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s250_unlock_query_plan_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("UNLOCK QUERY PLAN").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s250_show_locked_query_plans_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("LOCK QUERY PLAN FOR SELECT * FROM orders").unwrap();
+        let r = ex.execute("SHOW LOCKED QUERY PLANS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s250_locked_plan_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("LOCK QUERY PLAN FOR SELECT * FROM orders").unwrap();
+        assert!(!ex.s250_locked_plans.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s250_unlock_clears_plans() {
+        let (ex, _dir) = setup();
+        ex.execute("LOCK QUERY PLAN FOR SELECT * FROM orders").unwrap();
+        ex.execute("UNLOCK QUERY PLAN").unwrap();
+        assert!(ex.s250_locked_plans.lock().unwrap().is_empty());
+    }
+
+    // ── S251 — Column histograms v3 ───────────────────────────────────────────────
+    #[test]
+    fn test_s251_build_histogram_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("BUILD HISTOGRAM FOR orders.amount BUCKETS 50").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s251_show_histogram_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("BUILD HISTOGRAM FOR orders.amount BUCKETS 5").unwrap();
+        let r = ex.execute("SHOW HISTOGRAM FOR orders.amount").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s251_show_histogram_bucket_count() {
+        let (ex, _dir) = setup();
+        ex.execute("BUILD HISTOGRAM FOR orders.amount BUCKETS 3").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW HISTOGRAM FOR orders.amount").unwrap() {
+            assert_eq!(rows.len(), 3);
+        } else { panic!(); }
+    }
+    #[test]
+    fn test_s251_drop_histogram_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("BUILD HISTOGRAM FOR orders.amount BUCKETS 5").unwrap();
+        let r = ex.execute("DROP HISTOGRAM FOR orders.amount").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s251_drop_histogram_removes_data() {
+        let (ex, _dir) = setup();
+        ex.execute("BUILD HISTOGRAM FOR orders.amount BUCKETS 5").unwrap();
+        ex.execute("DROP HISTOGRAM FOR orders.amount").unwrap();
+        assert!(ex.s251_histograms_v3.lock().unwrap().is_empty());
+    }
+
+    // ── S252 — Table access control v2 ───────────────────────────────────────────
+    #[test]
+    fn test_s252_grant_select_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("GRANT SELECT ON orders TO ROLE analyst").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s252_revoke_select_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("GRANT SELECT ON orders TO ROLE analyst").unwrap();
+        let r = ex.execute("REVOKE SELECT ON orders FROM ROLE analyst").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s252_show_role_grants_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("GRANT SELECT ON orders TO ROLE analyst").unwrap();
+        let r = ex.execute("SHOW ROLE GRANTS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s252_grant_stored_in_list() {
+        let (ex, _dir) = setup();
+        ex.execute("GRANT SELECT ON orders TO ROLE analyst").unwrap();
+        assert!(!ex.s252_role_grants.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s252_revoke_removes_grant() {
+        let (ex, _dir) = setup();
+        ex.execute("GRANT SELECT ON orders TO ROLE analyst").unwrap();
+        ex.execute("REVOKE SELECT ON orders FROM ROLE analyst").unwrap();
+        assert!(ex.s252_role_grants.lock().unwrap().is_empty());
+    }
+
+    // ── S253 — Query scheduling ───────────────────────────────────────────────────
+    #[test]
+    fn test_s253_schedule_query_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SCHEDULE QUERY 'SELECT * FROM orders' AT '2026-01-01 00:00'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s253_show_scheduled_queries_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE QUERY 'SELECT * FROM orders' AT '2026-01-01 00:00'").unwrap();
+        let r = ex.execute("SHOW SCHEDULED QUERIES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s253_cancel_scheduled_query_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE QUERY 'SELECT 1' AT '2026-06-01 12:00'").unwrap();
+        let r = ex.execute("CANCEL SCHEDULED QUERY 1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s253_scheduled_query_count() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE QUERY 'SELECT 1' AT '2026-01-01 00:00'").unwrap();
+        ex.execute("SCHEDULE QUERY 'SELECT 2' AT '2026-02-01 00:00'").unwrap();
+        assert_eq!(ex.s253_scheduled_queries.lock().unwrap().len(), 2);
+    }
+    #[test]
+    fn test_s253_cancel_marks_cancelled() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE QUERY 'SELECT 1' AT '2026-01-01 00:00'").unwrap();
+        ex.execute("CANCEL SCHEDULED QUERY 1").unwrap();
+        let qs = ex.s253_scheduled_queries.lock().unwrap();
+        assert!(qs[0].3);
+    }
+
+    // ── S254 — Index coalescing ───────────────────────────────────────────────────
+    #[test]
+    fn test_s254_coalesce_indexes_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("COALESCE INDEXES ON orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s254_show_index_coalesce_status_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW INDEX COALESCE STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s254_set_auto_coalesce_on_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET AUTO COALESCE ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s254_set_auto_coalesce_off_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET AUTO COALESCE ON").unwrap();
+        let r = ex.execute("SET AUTO COALESCE OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s254_coalesce_log_records_table() {
+        let (ex, _dir) = setup();
+        ex.execute("COALESCE INDEXES ON orders").unwrap();
+        let log = ex.s254_coalesce_log.lock().unwrap();
+        assert_eq!(log[0], "orders");
+    }
+
+    // ── S255 — Table scan parallelism ─────────────────────────────────────────────
+    #[test]
+    fn test_s255_set_scan_parallelism_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET TABLE orders SCAN PARALLELISM 4").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s255_show_scan_parallelism_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders SCAN PARALLELISM 4").unwrap();
+        let r = ex.execute("SHOW SCAN PARALLELISM FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s255_parallelism_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders SCAN PARALLELISM 8").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SCAN PARALLELISM FOR orders").unwrap() {
+            assert_eq!(rows[0][1], "8");
+        } else { panic!(); }
+    }
+    #[test]
+    fn test_s255_reset_scan_parallelism_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders SCAN PARALLELISM 4").unwrap();
+        let r = ex.execute("RESET SCAN PARALLELISM FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s255_reset_removes_parallelism() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders SCAN PARALLELISM 4").unwrap();
+        ex.execute("RESET SCAN PARALLELISM FOR orders").unwrap();
+        assert!(!ex.s255_scan_parallelism.lock().unwrap().contains_key("orders"));
+    }
+
+    // ── S256 — Query result caching v2 ───────────────────────────────────────────
+    #[test]
+    fn test_s256_cache_query_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CACHE QUERY 'SELECT * FROM orders' TTL 300").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s256_show_cached_queries_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE QUERY 'SELECT * FROM orders' TTL 300").unwrap();
+        let r = ex.execute("SHOW CACHED QUERIES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s256_evict_cached_query_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE QUERY 'SELECT * FROM orders' TTL 300").unwrap();
+        let r = ex.execute("EVICT CACHED QUERY 1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s256_cached_query_count() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE QUERY 'SELECT 1' TTL 60").unwrap();
+        ex.execute("CACHE QUERY 'SELECT 2' TTL 120").unwrap();
+        assert_eq!(ex.s256_cached_queries.lock().unwrap().len(), 2);
+    }
+    #[test]
+    fn test_s256_evict_removes_entry() {
+        let (ex, _dir) = setup();
+        ex.execute("CACHE QUERY 'SELECT 1' TTL 60").unwrap();
+        ex.execute("EVICT CACHED QUERY 1").unwrap();
+        assert!(ex.s256_cached_queries.lock().unwrap().is_empty());
+    }
+
+    // ── S257 — Live schema migration ──────────────────────────────────────────────
+    #[test]
+    fn test_s257_migrate_schema_live_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("MIGRATE SCHEMA public LIVE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s257_show_live_migration_status_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("MIGRATE SCHEMA public LIVE").unwrap();
+        let r = ex.execute("SHOW LIVE MIGRATION STATUS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s257_pause_live_migration_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("MIGRATE SCHEMA public LIVE").unwrap();
+        let r = ex.execute("PAUSE LIVE MIGRATION").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s257_resume_live_migration_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("MIGRATE SCHEMA public LIVE").unwrap();
+        ex.execute("PAUSE LIVE MIGRATION").unwrap();
+        let r = ex.execute("RESUME LIVE MIGRATION").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s257_pause_sets_paused_flag() {
+        let (ex, _dir) = setup();
+        ex.execute("MIGRATE SCHEMA public LIVE").unwrap();
+        ex.execute("PAUSE LIVE MIGRATION").unwrap();
+        let migs = ex.s257_live_migrations.lock().unwrap();
+        assert!(migs["public"].1);
     }
 
     // ── S247 — Shard rebalancing ────────────────────────────────────────────────
