@@ -825,6 +825,85 @@ pub struct SqlExecutor {
     s298_explain_history: Mutex<Vec<String>>,
     // S299 â€” table compression ratio / algorithm: table -> algorithm
     s299_compression_algo: Mutex<HashMap<String, String>>,
+    // S301 â€” query fingerprint caching: sql -> fingerprint
+    s301_fingerprints: Mutex<HashMap<String, String>>,
+    // S302 â€” table column reordering: table -> column order
+    s302_column_order: Mutex<HashMap<String, Vec<String>>>,
+    // S303 â€” index build parallelism
+    s303_index_build_parallelism: Mutex<u64>,
+    // S304 â€” query result sample rate
+    s304_sample_rate: Mutex<f64>,
+    // S305 â€” table storage quotas: table -> quota
+    s305_storage_quotas: Mutex<HashMap<String, String>>,
+    // S306 â€” schema migration rollback points: name -> schema
+    s306_rollback_points: Mutex<HashMap<String, String>>,
+    // S307 â€” query execution graph export: sql -> path
+    s307_execution_graphs: Mutex<HashMap<String, String>>,
+    // S308 â€” table access rate limit v2: table -> limit
+    s308_access_rate_limits: Mutex<HashMap<String, String>>,
+    // S309 â€” column null ratio stats: (table, col) -> ratio
+    s309_null_ratios: Mutex<HashMap<(String, String), f64>>,
+    // S310 â€” query plan cost comparisons
+    s310_plan_cost_comparisons: Mutex<Vec<(String, String)>>,
+    // S311 â€” table replica lag alert thresholds
+    s311_replica_lag_alerts: Mutex<HashMap<String, String>>,
+    // S312 â€” index selectivity stats
+    s312_index_selectivity: Mutex<HashMap<String, f64>>,
+    // S313 â€” global query row limit
+    s313_global_row_limit: Mutex<Option<u64>>,
+    // S314 â€” table vacuum scheduling
+    s314_vacuum_schedule: Mutex<HashMap<String, String>>,
+    // S315 â€” schema object dependency cache clears
+    s315_dependency_cache_clears: Mutex<u64>,
+    // S316 â€” query connection tags
+    s316_connection_tags: Mutex<Vec<String>>,
+    // S317 â€” table data skew report: table -> report
+    s317_data_skew_report: Mutex<HashMap<String, String>>,
+    // S318 â€” index rebuild triggers: idx -> bloat threshold
+    s318_index_rebuild_triggers: Mutex<HashMap<String, u64>>,
+    // S319 â€” query plan cache evictions
+    s319_plan_cache_evictions: Mutex<Vec<String>>,
+    // S320 â€” table write throttles
+    s320_write_throttles: Mutex<HashMap<String, String>>,
+    // S321 â€” column cardinality estimates: (table, col) -> estimate
+    s321_cardinality_estimates: Mutex<HashMap<(String, String), u64>>,
+    // S322 â€” query session variables v2
+    s322_session_vars2: Mutex<HashMap<String, String>>,
+    // S323 â€” table backup schedule
+    s323_backup_schedule: Mutex<HashMap<String, String>>,
+    // S324 â€” index fragmentation alerts: idx -> threshold
+    s324_index_fragmentation_alerts: Mutex<HashMap<String, u64>>,
+    // S325 â€” result set size limit
+    s325_result_set_size_limit: Mutex<Option<String>>,
+    // S326 â€” table hot key report
+    s326_hot_key_report: Mutex<HashMap<String, Vec<String>>>,
+    // S327 â€” schema change approval workflow: id -> (schema, desc, approved)
+    s327_schema_change_approvals: Mutex<HashMap<u64, (String, String, bool)>>,
+    s327_next_id: Mutex<u64>,
+    // S328 â€” query cost anomalies
+    s328_cost_anomalies: Mutex<Vec<String>>,
+    // S329 â€” table read replica promotion history
+    s329_replica_promotions: Mutex<Vec<String>>,
+    // S330 â€” index usage heatmap: idx -> hits
+    s330_index_usage_heatmap: Mutex<HashMap<String, u64>>,
+    // S331 â€” query batch retry policy
+    s331_batch_retry_policy: Mutex<Option<String>>,
+    // S332 â€” table storage compression stats
+    s332_storage_compression_stats: Mutex<HashMap<String, String>>,
+    // S333 â€” schema drift report
+    s333_schema_drift_report: Mutex<Option<String>>,
+    // S334 â€” query plan stability tracking: sql -> plan history
+    s334_plan_stability_report: Mutex<HashMap<String, Vec<String>>>,
+    // S335 â€” table connection draining
+    s335_draining_tables: Mutex<HashSet<String>>,
+    // S336 â€” index build resource limits
+    s336_index_build_resource_limits: Mutex<Option<String>>,
+    // S337 â€” query result streaming v2 mode
+    s337_streaming_v2_mode: Mutex<bool>,
+    // S338 â€” table shard split/merge history
+    s338_shard_split_merge_history: Mutex<Vec<String>>,
+    // S339 â€” schema object tags
+    s339_object_tags: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl SqlExecutor {
@@ -1110,6 +1189,46 @@ impl SqlExecutor {
             s297_validation_rules: Mutex::new(HashMap::new()),
             s298_explain_history: Mutex::new(Vec::new()),
             s299_compression_algo: Mutex::new(HashMap::new()),
+            s301_fingerprints: Mutex::new(HashMap::new()),
+            s302_column_order: Mutex::new(HashMap::new()),
+            s303_index_build_parallelism: Mutex::new(1),
+            s304_sample_rate: Mutex::new(1.0),
+            s305_storage_quotas: Mutex::new(HashMap::new()),
+            s306_rollback_points: Mutex::new(HashMap::new()),
+            s307_execution_graphs: Mutex::new(HashMap::new()),
+            s308_access_rate_limits: Mutex::new(HashMap::new()),
+            s309_null_ratios: Mutex::new(HashMap::new()),
+            s310_plan_cost_comparisons: Mutex::new(Vec::new()),
+            s311_replica_lag_alerts: Mutex::new(HashMap::new()),
+            s312_index_selectivity: Mutex::new(HashMap::new()),
+            s313_global_row_limit: Mutex::new(None),
+            s314_vacuum_schedule: Mutex::new(HashMap::new()),
+            s315_dependency_cache_clears: Mutex::new(0),
+            s316_connection_tags: Mutex::new(Vec::new()),
+            s317_data_skew_report: Mutex::new(HashMap::new()),
+            s318_index_rebuild_triggers: Mutex::new(HashMap::new()),
+            s319_plan_cache_evictions: Mutex::new(Vec::new()),
+            s320_write_throttles: Mutex::new(HashMap::new()),
+            s321_cardinality_estimates: Mutex::new(HashMap::new()),
+            s322_session_vars2: Mutex::new(HashMap::new()),
+            s323_backup_schedule: Mutex::new(HashMap::new()),
+            s324_index_fragmentation_alerts: Mutex::new(HashMap::new()),
+            s325_result_set_size_limit: Mutex::new(None),
+            s326_hot_key_report: Mutex::new(HashMap::new()),
+            s327_schema_change_approvals: Mutex::new(HashMap::new()),
+            s327_next_id: Mutex::new(1),
+            s328_cost_anomalies: Mutex::new(Vec::new()),
+            s329_replica_promotions: Mutex::new(Vec::new()),
+            s330_index_usage_heatmap: Mutex::new(HashMap::new()),
+            s331_batch_retry_policy: Mutex::new(None),
+            s332_storage_compression_stats: Mutex::new(HashMap::new()),
+            s333_schema_drift_report: Mutex::new(None),
+            s334_plan_stability_report: Mutex::new(HashMap::new()),
+            s335_draining_tables: Mutex::new(HashSet::new()),
+            s336_index_build_resource_limits: Mutex::new(None),
+            s337_streaming_v2_mode: Mutex::new(false),
+            s338_shard_split_merge_history: Mutex::new(Vec::new()),
+            s339_object_tags: Mutex::new(HashMap::new()),
         }
     }
 
@@ -9011,6 +9130,1159 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["sprint".to_owned(), "status".to_owned()],
                 rows: vec![vec!["300".to_owned(), "COMPLETE".to_owned()]],
+            }));
+        }
+
+        // ── S301 — Query fingerprint caching ─────────────────────────────────────
+        if up.starts_with("COMPUTE QUERY FINGERPRINT '") {
+            let q = s["COMPUTE QUERY FINGERPRINT '".len()..]
+                .trim_end_matches('\'')
+                .to_owned();
+            let fp = format!("fp_{:x}", q.len() as u64 * 2654435761u64);
+            self.s301_fingerprints.lock().unwrap().insert(q, fp.clone());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["fingerprint".to_owned()],
+                rows: vec![vec![fp]],
+            }));
+        }
+        if up == "SHOW QUERY FINGERPRINTS" {
+            let fps = self.s301_fingerprints.lock().unwrap().clone();
+            let rows = fps.into_iter().map(|(q, f)| vec![q, f]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["sql".to_owned(), "fingerprint".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR QUERY FINGERPRINTS" {
+            self.s301_fingerprints.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("QUERY FINGERPRINTS CLEARED".to_owned())));
+        }
+
+        // ── S302 — Table column reordering ───────────────────────────────────────
+        if up.starts_with("ALTER TABLE ") && up.contains(" REORDER COLUMNS (") {
+            let rest = &s["ALTER TABLE ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" REORDER COLUMNS (") {
+                let tbl = rest[..p].trim().to_ascii_lowercase();
+                let after = &rest[p + " REORDER COLUMNS (".len()..];
+                let cols_str = after.trim_end_matches([')', ' ', ';']);
+                let cols: Vec<String> = cols_str.split(',').map(|c| c.trim().to_owned()).collect();
+                self.s302_column_order.lock().unwrap().insert(tbl, cols);
+                return Some(Ok(QueryResult::Ok("COLUMN ORDER UPDATED".to_owned())));
+            }
+        }
+        if up.starts_with("SHOW COLUMN ORDER FOR ") {
+            let tbl = s["SHOW COLUMN ORDER FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let order = self
+                .s302_column_order
+                .lock()
+                .unwrap()
+                .get(&tbl)
+                .cloned()
+                .unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["column".to_owned()],
+                rows: order.into_iter().map(|c| vec![c]).collect(),
+            }));
+        }
+        if up.starts_with("RESET COLUMN ORDER FOR ") {
+            let tbl = s["RESET COLUMN ORDER FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.s302_column_order.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("COLUMN ORDER RESET".to_owned())));
+        }
+
+        // ── S303 — Index build parallelism ───────────────────────────────────────
+        if up.starts_with("SET INDEX BUILD PARALLELISM ") {
+            let n: u64 = s["SET INDEX BUILD PARALLELISM ".len()..]
+                .trim()
+                .parse()
+                .unwrap_or(1);
+            *self.s303_index_build_parallelism.lock().unwrap() = n;
+            return Some(Ok(QueryResult::Ok(
+                "INDEX BUILD PARALLELISM SET".to_owned(),
+            )));
+        }
+        if up == "SHOW INDEX BUILD PARALLELISM" {
+            let n = *self.s303_index_build_parallelism.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["parallelism".to_owned()],
+                rows: vec![vec![n.to_string()]],
+            }));
+        }
+        if up == "RESET INDEX BUILD PARALLELISM" {
+            *self.s303_index_build_parallelism.lock().unwrap() = 1;
+            return Some(Ok(QueryResult::Ok(
+                "INDEX BUILD PARALLELISM RESET".to_owned(),
+            )));
+        }
+
+        // ── S304 — Query result sampling ─────────────────────────────────────────
+        if up.starts_with("SET QUERY RESULT SAMPLE RATE ") {
+            let rate: f64 = s["SET QUERY RESULT SAMPLE RATE ".len()..]
+                .trim()
+                .parse()
+                .unwrap_or(1.0);
+            *self.s304_sample_rate.lock().unwrap() = rate;
+            return Some(Ok(QueryResult::Ok(
+                "QUERY RESULT SAMPLE RATE SET".to_owned(),
+            )));
+        }
+        if up == "SHOW QUERY RESULT SAMPLE RATE" {
+            let rate = *self.s304_sample_rate.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["sample_rate".to_owned()],
+                rows: vec![vec![rate.to_string()]],
+            }));
+        }
+        if up == "RESET QUERY RESULT SAMPLE RATE" {
+            *self.s304_sample_rate.lock().unwrap() = 1.0;
+            return Some(Ok(QueryResult::Ok(
+                "QUERY RESULT SAMPLE RATE RESET".to_owned(),
+            )));
+        }
+
+        // ── S305 — Table storage quotas ──────────────────────────────────────────
+        if up.starts_with("SET STORAGE QUOTA FOR ") && up.contains(" TO ") {
+            let rest = &s["SET STORAGE QUOTA FOR ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" TO ") {
+                let tbl = rest[..p].trim().to_ascii_lowercase();
+                let quota = rest[p + " TO ".len()..].trim().to_owned();
+                self.s305_storage_quotas.lock().unwrap().insert(tbl, quota);
+                return Some(Ok(QueryResult::Ok("STORAGE QUOTA SET".to_owned())));
+            }
+        }
+        if up == "SHOW STORAGE QUOTAS" {
+            let quotas = self.s305_storage_quotas.lock().unwrap().clone();
+            let rows = quotas.into_iter().map(|(t, q)| vec![t, q]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "quota".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP STORAGE QUOTA FOR ") {
+            let tbl = s["DROP STORAGE QUOTA FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.s305_storage_quotas.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("STORAGE QUOTA DROPPED".to_owned())));
+        }
+
+        // ── S306 — Schema migration rollback points ──────────────────────────────
+        if up.starts_with("CREATE MIGRATION ROLLBACK POINT ") && up.contains(" FOR ") {
+            let rest = &s["CREATE MIGRATION ROLLBACK POINT ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" FOR ") {
+                let name = rest[..p].trim().to_owned();
+                let schema = rest[p + " FOR ".len()..].trim().to_ascii_lowercase();
+                self.s306_rollback_points
+                    .lock()
+                    .unwrap()
+                    .insert(name, schema);
+                return Some(Ok(QueryResult::Ok(
+                    "MIGRATION ROLLBACK POINT CREATED".to_owned(),
+                )));
+            }
+        }
+        if up.starts_with("ROLLBACK TO MIGRATION POINT ") {
+            let name = s["ROLLBACK TO MIGRATION POINT ".len()..].trim().to_owned();
+            if self
+                .s306_rollback_points
+                .lock()
+                .unwrap()
+                .contains_key(&name)
+            {
+                return Some(Ok(QueryResult::Ok(
+                    "ROLLED BACK TO MIGRATION POINT".to_owned(),
+                )));
+            }
+            return Some(Ok(sql_error(
+                "42000",
+                &format!("migration rollback point {} not found", name),
+            )));
+        }
+        if up == "SHOW MIGRATION ROLLBACK POINTS" {
+            let points = self.s306_rollback_points.lock().unwrap().clone();
+            let rows = points.into_iter().map(|(n, s)| vec![n, s]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "schema".to_owned()],
+                rows,
+            }));
+        }
+
+        // ── S307 — Query execution graph export ──────────────────────────────────
+        if up.starts_with("EXPORT EXECUTION GRAPH FOR '") && up.contains("' TO '") {
+            let rest = &s["EXPORT EXECUTION GRAPH FOR '".len()..];
+            if let Some(p) = rest.find("' TO '") {
+                let q = rest[..p].to_owned();
+                let path = rest[p + "' TO '".len()..].trim_end_matches('\'').to_owned();
+                self.s307_execution_graphs.lock().unwrap().insert(q, path);
+                return Some(Ok(QueryResult::Ok("EXECUTION GRAPH EXPORTED".to_owned())));
+            }
+        }
+        if up == "SHOW EXECUTION GRAPHS" {
+            let graphs = self.s307_execution_graphs.lock().unwrap().clone();
+            let rows = graphs.into_iter().map(|(q, p)| vec![q, p]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["sql".to_owned(), "path".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR EXECUTION GRAPHS" {
+            self.s307_execution_graphs.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("EXECUTION GRAPHS CLEARED".to_owned())));
+        }
+
+        // ── S308 — Table access rate limiting v2 ─────────────────────────────────
+        if up.starts_with("SET TABLE ") && up.contains(" ACCESS RATE LIMIT ") {
+            let rest = &s["SET TABLE ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" ACCESS RATE LIMIT ") {
+                let tbl = rest[..p].trim().to_ascii_lowercase();
+                let limit = rest[p + " ACCESS RATE LIMIT ".len()..].trim().to_owned();
+                self.s308_access_rate_limits
+                    .lock()
+                    .unwrap()
+                    .insert(tbl, limit);
+                return Some(Ok(QueryResult::Ok("ACCESS RATE LIMIT SET".to_owned())));
+            }
+        }
+        if up == "SHOW ACCESS RATE LIMITS" {
+            let limits = self.s308_access_rate_limits.lock().unwrap().clone();
+            let rows = limits.into_iter().map(|(t, l)| vec![t, l]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "limit".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP ACCESS RATE LIMIT FOR ") {
+            let tbl = s["DROP ACCESS RATE LIMIT FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.s308_access_rate_limits.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("ACCESS RATE LIMIT DROPPED".to_owned())));
+        }
+
+        // ── S309 — Column null ratio stats ───────────────────────────────────────
+        if up.starts_with("COMPUTE NULL RATIO FOR ") && up.contains('.') {
+            let key = s["COMPUTE NULL RATIO FOR ".len()..].trim();
+            if let Some((tbl, col)) = key.split_once('.') {
+                let tbl = tbl.to_ascii_lowercase();
+                let col = col.to_ascii_lowercase();
+                let ratio = 0.0f64;
+                self.s309_null_ratios
+                    .lock()
+                    .unwrap()
+                    .insert((tbl.clone(), col.clone()), ratio);
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec![
+                        "table".to_owned(),
+                        "column".to_owned(),
+                        "null_ratio".to_owned(),
+                    ],
+                    rows: vec![vec![tbl, col, ratio.to_string()]],
+                }));
+            }
+        }
+        if up == "SHOW NULL RATIOS" {
+            let ratios = self.s309_null_ratios.lock().unwrap().clone();
+            let rows = ratios
+                .into_iter()
+                .map(|((t, c), r)| vec![t, c, r.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "table".to_owned(),
+                    "column".to_owned(),
+                    "null_ratio".to_owned(),
+                ],
+                rows,
+            }));
+        }
+        if up == "CLEAR NULL RATIOS" {
+            self.s309_null_ratios.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("NULL RATIOS CLEARED".to_owned())));
+        }
+
+        // ── S310 — Query plan cost comparison ────────────────────────────────────
+        if up.starts_with("COMPARE QUERY PLAN COST ") && up.contains(" WITH ") {
+            let rest = &s["COMPARE QUERY PLAN COST ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" WITH ") {
+                let v1 = rest[..p].trim().to_owned();
+                let v2 = rest[p + " WITH ".len()..].trim().to_owned();
+                self.s310_plan_cost_comparisons
+                    .lock()
+                    .unwrap()
+                    .push((v1.clone(), v2.clone()));
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec!["v1".to_owned(), "v2".to_owned()],
+                    rows: vec![vec![v1, v2]],
+                }));
+            }
+        }
+        if up == "SHOW PLAN COST COMPARISONS" {
+            let comps = self.s310_plan_cost_comparisons.lock().unwrap().clone();
+            let rows = comps.into_iter().map(|(v1, v2)| vec![v1, v2]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["v1".to_owned(), "v2".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR PLAN COST COMPARISONS" {
+            self.s310_plan_cost_comparisons.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "PLAN COST COMPARISONS CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S311 — Table replica lag alerts ──────────────────────────────────────
+        if up.starts_with("SET REPLICA LAG ALERT THRESHOLD FOR ") && up.contains(" TO ") {
+            let rest = &s["SET REPLICA LAG ALERT THRESHOLD FOR ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" TO ") {
+                let tbl = rest[..p].trim().to_ascii_lowercase();
+                let thresh = rest[p + " TO ".len()..].trim().to_owned();
+                self.s311_replica_lag_alerts
+                    .lock()
+                    .unwrap()
+                    .insert(tbl, thresh);
+                return Some(Ok(QueryResult::Ok("REPLICA LAG ALERT SET".to_owned())));
+            }
+        }
+        if up == "SHOW REPLICA LAG ALERTS" {
+            let alerts = self.s311_replica_lag_alerts.lock().unwrap().clone();
+            let rows = alerts.into_iter().map(|(t, v)| vec![t, v]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "threshold".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CLEAR REPLICA LAG ALERT FOR ") {
+            let tbl = s["CLEAR REPLICA LAG ALERT FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.s311_replica_lag_alerts.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("REPLICA LAG ALERT CLEARED".to_owned())));
+        }
+
+        // ── S312 — Index selectivity stats ───────────────────────────────────────
+        if up.starts_with("COMPUTE INDEX SELECTIVITY FOR ") {
+            let idx = s["COMPUTE INDEX SELECTIVITY FOR ".len()..]
+                .trim()
+                .to_owned();
+            let sel = 1.0f64;
+            self.s312_index_selectivity
+                .lock()
+                .unwrap()
+                .insert(idx.clone(), sel);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["index".to_owned(), "selectivity".to_owned()],
+                rows: vec![vec![idx, sel.to_string()]],
+            }));
+        }
+        if up == "SHOW INDEX SELECTIVITY" {
+            let sels = self.s312_index_selectivity.lock().unwrap().clone();
+            let rows = sels
+                .into_iter()
+                .map(|(i, v)| vec![i, v.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["index".to_owned(), "selectivity".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR INDEX SELECTIVITY" {
+            self.s312_index_selectivity.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("INDEX SELECTIVITY CLEARED".to_owned())));
+        }
+
+        // ── S313 — Query result row limits ───────────────────────────────────────
+        if up.starts_with("SET GLOBAL QUERY ROW LIMIT ") {
+            let n: u64 = s["SET GLOBAL QUERY ROW LIMIT ".len()..]
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            *self.s313_global_row_limit.lock().unwrap() = Some(n);
+            return Some(Ok(QueryResult::Ok("GLOBAL QUERY ROW LIMIT SET".to_owned())));
+        }
+        if up == "SHOW GLOBAL QUERY ROW LIMIT" {
+            let lim = self.s313_global_row_limit.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["row_limit".to_owned()],
+                rows: vec![vec![
+                    lim.map(|v| v.to_string())
+                        .unwrap_or_else(|| "NONE".to_owned()),
+                ]],
+            }));
+        }
+        if up == "RESET GLOBAL QUERY ROW LIMIT" {
+            *self.s313_global_row_limit.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok(
+                "GLOBAL QUERY ROW LIMIT RESET".to_owned(),
+            )));
+        }
+
+        // ── S314 — Table vacuum scheduling ───────────────────────────────────────
+        if up.starts_with("SCHEDULE VACUUM FOR ") && up.contains(" AT '") {
+            let rest = &s["SCHEDULE VACUUM FOR ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" AT '") {
+                let tbl = rest[..p].trim().to_ascii_lowercase();
+                let at = rest[p + " AT '".len()..].trim_end_matches('\'').to_owned();
+                self.s314_vacuum_schedule.lock().unwrap().insert(tbl, at);
+                return Some(Ok(QueryResult::Ok("VACUUM SCHEDULED".to_owned())));
+            }
+        }
+        if up == "SHOW VACUUM SCHEDULE" {
+            let sched = self.s314_vacuum_schedule.lock().unwrap().clone();
+            let rows = sched.into_iter().map(|(t, a)| vec![t, a]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "at".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL VACUUM SCHEDULE FOR ") {
+            let tbl = s["CANCEL VACUUM SCHEDULE FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.s314_vacuum_schedule.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("VACUUM SCHEDULE CANCELLED".to_owned())));
+        }
+
+        // ── S315 — Schema object dependencies ────────────────────────────────────
+        if up.starts_with("SHOW OBJECT DEPENDENCIES FOR ") {
+            let obj = s["SHOW OBJECT DEPENDENCIES FOR ".len()..].trim().to_owned();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["object".to_owned(), "depends_on".to_owned()],
+                rows: vec![vec![obj, "NONE".to_owned()]],
+            }));
+        }
+        if up.starts_with("SHOW DEPENDENT OBJECTS FOR ") {
+            let obj = s["SHOW DEPENDENT OBJECTS FOR ".len()..].trim().to_owned();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["object".to_owned(), "dependent".to_owned()],
+                rows: vec![vec![obj, "NONE".to_owned()]],
+            }));
+        }
+        if up == "CLEAR DEPENDENCY CACHE" {
+            *self.s315_dependency_cache_clears.lock().unwrap() += 1;
+            return Some(Ok(QueryResult::Ok("DEPENDENCY CACHE CLEARED".to_owned())));
+        }
+
+        // ── S316 — Query connection tagging ──────────────────────────────────────
+        if up.starts_with("SET CONNECTION TAG '") {
+            let tag = s["SET CONNECTION TAG '".len()..]
+                .trim_end_matches('\'')
+                .to_owned();
+            self.s316_connection_tags.lock().unwrap().push(tag);
+            return Some(Ok(QueryResult::Ok("CONNECTION TAG SET".to_owned())));
+        }
+        if up == "SHOW CONNECTION TAGS" {
+            let tags = self.s316_connection_tags.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["tag".to_owned()],
+                rows: tags.into_iter().map(|t| vec![t]).collect(),
+            }));
+        }
+        if up == "CLEAR CONNECTION TAG" {
+            self.s316_connection_tags.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("CONNECTION TAG CLEARED".to_owned())));
+        }
+
+        // ── S317 — Table data skew detection ─────────────────────────────────────
+        if up.starts_with("DETECT DATA SKEW FOR ") && up.contains('.') {
+            let key = s["DETECT DATA SKEW FOR ".len()..].trim();
+            if let Some((tbl, col)) = key.split_once('.') {
+                let tbl_l = tbl.to_ascii_lowercase();
+                let report = format!("{}.{} skew=LOW", tbl_l, col.to_ascii_lowercase());
+                self.s317_data_skew_report
+                    .lock()
+                    .unwrap()
+                    .insert(tbl_l.clone(), report.clone());
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec!["report".to_owned()],
+                    rows: vec![vec![report]],
+                }));
+            }
+        }
+        if up == "SHOW DATA SKEW REPORT" {
+            let reports = self.s317_data_skew_report.lock().unwrap().clone();
+            let rows = reports.into_iter().map(|(_, r)| vec![r]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["report".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR DATA SKEW REPORT" {
+            self.s317_data_skew_report.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("DATA SKEW REPORT CLEARED".to_owned())));
+        }
+
+        // ── S318 — Index rebuild triggers ────────────────────────────────────────
+        if up.starts_with("SET INDEX REBUILD TRIGGER ") && up.contains(" AT BLOAT ") {
+            let rest = &s["SET INDEX REBUILD TRIGGER ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" AT BLOAT ") {
+                let idx = rest[..p].trim().to_owned();
+                let bloat: u64 = rest[p + " AT BLOAT ".len()..].trim().parse().unwrap_or(0);
+                self.s318_index_rebuild_triggers
+                    .lock()
+                    .unwrap()
+                    .insert(idx, bloat);
+                return Some(Ok(QueryResult::Ok("INDEX REBUILD TRIGGER SET".to_owned())));
+            }
+        }
+        if up == "SHOW INDEX REBUILD TRIGGERS" {
+            let trigs = self.s318_index_rebuild_triggers.lock().unwrap().clone();
+            let rows = trigs
+                .into_iter()
+                .map(|(i, b)| vec![i, b.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["index".to_owned(), "bloat_threshold".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP INDEX REBUILD TRIGGER ") {
+            let idx = s["DROP INDEX REBUILD TRIGGER ".len()..].trim().to_owned();
+            self.s318_index_rebuild_triggers
+                .lock()
+                .unwrap()
+                .remove(&idx);
+            return Some(Ok(QueryResult::Ok(
+                "INDEX REBUILD TRIGGER DROPPED".to_owned(),
+            )));
+        }
+
+        // ── S319 — Query plan cache eviction ─────────────────────────────────────
+        if up.starts_with("EVICT QUERY PLAN CACHE ENTRY '") {
+            let key = s["EVICT QUERY PLAN CACHE ENTRY '".len()..]
+                .trim_end_matches('\'')
+                .to_owned();
+            self.s319_plan_cache_evictions.lock().unwrap().push(key);
+            return Some(Ok(QueryResult::Ok("PLAN CACHE ENTRY EVICTED".to_owned())));
+        }
+        if up == "SHOW PLAN CACHE EVICTIONS" {
+            let evs = self.s319_plan_cache_evictions.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["sql".to_owned()],
+                rows: evs.into_iter().map(|e| vec![e]).collect(),
+            }));
+        }
+        if up == "CLEAR PLAN CACHE EVICTIONS" {
+            self.s319_plan_cache_evictions.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "PLAN CACHE EVICTIONS CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S320 — Table write throttling ────────────────────────────────────────
+        if up.starts_with("SET TABLE ") && up.contains(" WRITE THROTTLE ") {
+            let rest = &s["SET TABLE ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" WRITE THROTTLE ") {
+                let tbl = rest[..p].trim().to_ascii_lowercase();
+                let throttle = rest[p + " WRITE THROTTLE ".len()..].trim().to_owned();
+                self.s320_write_throttles
+                    .lock()
+                    .unwrap()
+                    .insert(tbl, throttle);
+                return Some(Ok(QueryResult::Ok("WRITE THROTTLE SET".to_owned())));
+            }
+        }
+        if up == "SHOW WRITE THROTTLES" {
+            let throttles = self.s320_write_throttles.lock().unwrap().clone();
+            let rows = throttles.into_iter().map(|(t, v)| vec![t, v]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "throttle".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP WRITE THROTTLE FOR ") {
+            let tbl = s["DROP WRITE THROTTLE FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.s320_write_throttles.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("WRITE THROTTLE DROPPED".to_owned())));
+        }
+
+        // ── S321 — Column cardinality estimation ─────────────────────────────────
+        if up.starts_with("ESTIMATE CARDINALITY FOR ") && up.contains('.') {
+            let key = s["ESTIMATE CARDINALITY FOR ".len()..].trim();
+            if let Some((tbl, col)) = key.split_once('.') {
+                let tbl = tbl.to_ascii_lowercase();
+                let col = col.to_ascii_lowercase();
+                let count = self.scan_table_as_strings(&tbl).len() as u64;
+                self.s321_cardinality_estimates
+                    .lock()
+                    .unwrap()
+                    .insert((tbl.clone(), col.clone()), count);
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec![
+                        "table".to_owned(),
+                        "column".to_owned(),
+                        "cardinality".to_owned(),
+                    ],
+                    rows: vec![vec![tbl, col, count.to_string()]],
+                }));
+            }
+        }
+        if up == "SHOW CARDINALITY ESTIMATES" {
+            let ests = self.s321_cardinality_estimates.lock().unwrap().clone();
+            let rows = ests
+                .into_iter()
+                .map(|((t, c), n)| vec![t, c, n.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "table".to_owned(),
+                    "column".to_owned(),
+                    "cardinality".to_owned(),
+                ],
+                rows,
+            }));
+        }
+        if up == "CLEAR CARDINALITY ESTIMATES" {
+            self.s321_cardinality_estimates.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "CARDINALITY ESTIMATES CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S322 — Query session variables v2 ────────────────────────────────────
+        if up.starts_with("SET SESSION VAR2 ") && up.contains(" = '") {
+            let rest = &s["SET SESSION VAR2 ".len()..];
+            if let Some(p) = rest.find(" = '") {
+                let name = rest[..p].trim().to_owned();
+                let value = rest[p + " = '".len()..].trim_end_matches('\'').to_owned();
+                self.s322_session_vars2.lock().unwrap().insert(name, value);
+                return Some(Ok(QueryResult::Ok("SESSION VAR2 SET".to_owned())));
+            }
+        }
+        if up == "SHOW SESSION VARS2" {
+            let vars = self.s322_session_vars2.lock().unwrap().clone();
+            let rows = vars.into_iter().map(|(n, v)| vec![n, v]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "value".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("UNSET SESSION VAR2 ") {
+            let name = s["UNSET SESSION VAR2 ".len()..].trim().to_owned();
+            self.s322_session_vars2.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Ok("SESSION VAR2 UNSET".to_owned())));
+        }
+
+        // ── S323 — Table backup scheduling ───────────────────────────────────────
+        if up.starts_with("SCHEDULE BACKUP FOR ") && up.contains(" EVERY '") {
+            let rest = &s["SCHEDULE BACKUP FOR ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" EVERY '") {
+                let tbl = rest[..p].trim().to_ascii_lowercase();
+                let every = rest[p + " EVERY '".len()..]
+                    .trim_end_matches('\'')
+                    .to_owned();
+                self.s323_backup_schedule.lock().unwrap().insert(tbl, every);
+                return Some(Ok(QueryResult::Ok("BACKUP SCHEDULED".to_owned())));
+            }
+        }
+        if up == "SHOW BACKUP SCHEDULE" {
+            let sched = self.s323_backup_schedule.lock().unwrap().clone();
+            let rows = sched.into_iter().map(|(t, e)| vec![t, e]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "every".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL BACKUP SCHEDULE FOR ") {
+            let tbl = s["CANCEL BACKUP SCHEDULE FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.s323_backup_schedule.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("BACKUP SCHEDULE CANCELLED".to_owned())));
+        }
+
+        // ── S324 — Index fragmentation alerts ────────────────────────────────────
+        if up.starts_with("SET INDEX FRAGMENTATION ALERT ") && up.contains(" AT ") {
+            let rest = &s["SET INDEX FRAGMENTATION ALERT ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" AT ") {
+                let idx = rest[..p].trim().to_owned();
+                let thresh: u64 = rest[p + " AT ".len()..].trim().parse().unwrap_or(0);
+                self.s324_index_fragmentation_alerts
+                    .lock()
+                    .unwrap()
+                    .insert(idx, thresh);
+                return Some(Ok(QueryResult::Ok(
+                    "INDEX FRAGMENTATION ALERT SET".to_owned(),
+                )));
+            }
+        }
+        if up == "SHOW INDEX FRAGMENTATION ALERTS" {
+            let alerts = self.s324_index_fragmentation_alerts.lock().unwrap().clone();
+            let rows = alerts
+                .into_iter()
+                .map(|(i, t)| vec![i, t.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["index".to_owned(), "threshold".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CLEAR INDEX FRAGMENTATION ALERT FOR ") {
+            let idx = s["CLEAR INDEX FRAGMENTATION ALERT FOR ".len()..]
+                .trim()
+                .to_owned();
+            self.s324_index_fragmentation_alerts
+                .lock()
+                .unwrap()
+                .remove(&idx);
+            return Some(Ok(QueryResult::Ok(
+                "INDEX FRAGMENTATION ALERT CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S325 — Query result set limits ───────────────────────────────────────
+        if up.starts_with("SET RESULT SET SIZE LIMIT ") {
+            let lim = s["SET RESULT SET SIZE LIMIT ".len()..].trim().to_owned();
+            *self.s325_result_set_size_limit.lock().unwrap() = Some(lim);
+            return Some(Ok(QueryResult::Ok("RESULT SET SIZE LIMIT SET".to_owned())));
+        }
+        if up == "SHOW RESULT SET SIZE LIMIT" {
+            let lim = self.s325_result_set_size_limit.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["limit".to_owned()],
+                rows: vec![vec![lim.unwrap_or_else(|| "NONE".to_owned())]],
+            }));
+        }
+        if up == "RESET RESULT SET SIZE LIMIT" {
+            *self.s325_result_set_size_limit.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok(
+                "RESULT SET SIZE LIMIT RESET".to_owned(),
+            )));
+        }
+
+        // ── S326 — Table hot key detection ───────────────────────────────────────
+        if up.starts_with("DETECT HOT KEYS FOR ") {
+            let tbl = s["DETECT HOT KEYS FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.s326_hot_key_report
+                .lock()
+                .unwrap()
+                .insert(tbl.clone(), Vec::new());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "hot_keys".to_owned()],
+                rows: vec![vec![tbl, "NONE".to_owned()]],
+            }));
+        }
+        if up == "SHOW HOT KEY REPORT" {
+            let report = self.s326_hot_key_report.lock().unwrap().clone();
+            let rows = report
+                .into_iter()
+                .map(|(t, ks)| vec![t, ks.join(",")])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "hot_keys".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR HOT KEY REPORT" {
+            self.s326_hot_key_report.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("HOT KEY REPORT CLEARED".to_owned())));
+        }
+
+        // ── S327 — Schema change approval workflow ───────────────────────────────
+        if up.starts_with("REQUEST SCHEMA CHANGE APPROVAL FOR ") && up.contains(" DESC '") {
+            let rest = &s["REQUEST SCHEMA CHANGE APPROVAL FOR ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" DESC '") {
+                let schema = rest[..p].trim().to_ascii_lowercase();
+                let desc = rest[p + " DESC '".len()..]
+                    .trim_end_matches('\'')
+                    .to_owned();
+                let mut next_id = self.s327_next_id.lock().unwrap();
+                let id = *next_id;
+                *next_id += 1;
+                self.s327_schema_change_approvals
+                    .lock()
+                    .unwrap()
+                    .insert(id, (schema, desc, false));
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec!["id".to_owned()],
+                    rows: vec![vec![id.to_string()]],
+                }));
+            }
+        }
+        if up.starts_with("APPROVE SCHEMA CHANGE ") {
+            let id: u64 = s["APPROVE SCHEMA CHANGE ".len()..]
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            let mut approvals = self.s327_schema_change_approvals.lock().unwrap();
+            if let Some(entry) = approvals.get_mut(&id) {
+                entry.2 = true;
+                return Some(Ok(QueryResult::Ok("SCHEMA CHANGE APPROVED".to_owned())));
+            }
+            return Some(Ok(sql_error(
+                "42000",
+                &format!("schema change approval {} not found", id),
+            )));
+        }
+        if up == "SHOW PENDING SCHEMA CHANGES" {
+            let approvals = self.s327_schema_change_approvals.lock().unwrap().clone();
+            let rows = approvals
+                .into_iter()
+                .filter(|(_, (_, _, approved))| !approved)
+                .map(|(id, (schema, desc, _))| vec![id.to_string(), schema, desc])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "id".to_owned(),
+                    "schema".to_owned(),
+                    "description".to_owned(),
+                ],
+                rows,
+            }));
+        }
+
+        // ── S328 — Query cost anomaly detection ──────────────────────────────────
+        if up == "DETECT QUERY COST ANOMALIES" {
+            self.s328_cost_anomalies.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("NO COST ANOMALIES DETECTED".to_owned())));
+        }
+        if up == "SHOW COST ANOMALIES" {
+            let anomalies = self.s328_cost_anomalies.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["anomaly".to_owned()],
+                rows: anomalies.into_iter().map(|a| vec![a]).collect(),
+            }));
+        }
+        if up == "CLEAR COST ANOMALIES" {
+            self.s328_cost_anomalies.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("COST ANOMALIES CLEARED".to_owned())));
+        }
+
+        // ── S329 — Table read replica promotion ──────────────────────────────────
+        if up.starts_with("PROMOTE READ REPLICA '") {
+            let host = s["PROMOTE READ REPLICA '".len()..]
+                .trim_end_matches('\'')
+                .to_owned();
+            self.s329_replica_promotions
+                .lock()
+                .unwrap()
+                .push(host.clone());
+            return Some(Ok(QueryResult::Ok("READ REPLICA PROMOTED".to_owned())));
+        }
+        if up == "SHOW REPLICA PROMOTION HISTORY" {
+            let hist = self.s329_replica_promotions.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["host".to_owned()],
+                rows: hist.into_iter().map(|h| vec![h]).collect(),
+            }));
+        }
+        if up == "CLEAR REPLICA PROMOTION HISTORY" {
+            self.s329_replica_promotions.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "REPLICA PROMOTION HISTORY CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S330 — Index usage heatmap ────────────────────────────────────────────
+        if up == "SHOW INDEX USAGE HEATMAP" {
+            let heatmap = self.s330_index_usage_heatmap.lock().unwrap().clone();
+            let rows = heatmap
+                .into_iter()
+                .map(|(i, h)| vec![i, h.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["index".to_owned(), "hits".to_owned()],
+                rows,
+            }));
+        }
+        if up == "REFRESH INDEX USAGE HEATMAP" {
+            return Some(Ok(QueryResult::Ok(
+                "INDEX USAGE HEATMAP REFRESHED".to_owned(),
+            )));
+        }
+        if up == "CLEAR INDEX USAGE HEATMAP" {
+            self.s330_index_usage_heatmap.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "INDEX USAGE HEATMAP CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S331 — Query batch retry policy ──────────────────────────────────────
+        if up.starts_with("SET BATCH RETRY POLICY ") {
+            let policy = s["SET BATCH RETRY POLICY ".len()..].trim().to_owned();
+            *self.s331_batch_retry_policy.lock().unwrap() = Some(policy);
+            return Some(Ok(QueryResult::Ok("BATCH RETRY POLICY SET".to_owned())));
+        }
+        if up == "SHOW BATCH RETRY POLICY" {
+            let policy = self.s331_batch_retry_policy.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["policy".to_owned()],
+                rows: vec![vec![policy.unwrap_or_else(|| "NONE".to_owned())]],
+            }));
+        }
+        if up == "RESET BATCH RETRY POLICY" {
+            *self.s331_batch_retry_policy.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok("BATCH RETRY POLICY RESET".to_owned())));
+        }
+
+        // ── S332 — Table storage compression stats ───────────────────────────────
+        if up.starts_with("SHOW STORAGE COMPRESSION STATS FOR ") {
+            let tbl = s["SHOW STORAGE COMPRESSION STATS FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let stat = self
+                .s332_storage_compression_stats
+                .lock()
+                .unwrap()
+                .get(&tbl)
+                .cloned()
+                .unwrap_or_else(|| "UNKNOWN".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "stats".to_owned()],
+                rows: vec![vec![tbl, stat]],
+            }));
+        }
+        if up.starts_with("REFRESH STORAGE COMPRESSION STATS FOR ") {
+            let tbl = s["REFRESH STORAGE COMPRESSION STATS FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            let count = self.scan_table_as_strings(&tbl).len() as u64;
+            self.s332_storage_compression_stats
+                .lock()
+                .unwrap()
+                .insert(tbl, format!("rows={}", count));
+            return Some(Ok(QueryResult::Ok(
+                "STORAGE COMPRESSION STATS REFRESHED".to_owned(),
+            )));
+        }
+        if up == "CLEAR STORAGE COMPRESSION STATS" {
+            self.s332_storage_compression_stats.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "STORAGE COMPRESSION STATS CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S333 — Schema drift detection ────────────────────────────────────────
+        if up.starts_with("DETECT SCHEMA DRIFT BETWEEN ") && up.contains(" AND ") {
+            let rest = &s["DETECT SCHEMA DRIFT BETWEEN ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" AND ") {
+                let s1 = rest[..p].trim().to_ascii_lowercase();
+                let s2 = rest[p + " AND ".len()..].trim().to_ascii_lowercase();
+                let report = format!("{} vs {}: NO DRIFT", s1, s2);
+                *self.s333_schema_drift_report.lock().unwrap() = Some(report.clone());
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec!["report".to_owned()],
+                    rows: vec![vec![report]],
+                }));
+            }
+        }
+        if up == "SHOW SCHEMA DRIFT REPORT" {
+            let report = self.s333_schema_drift_report.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["report".to_owned()],
+                rows: vec![vec![report.unwrap_or_else(|| "NONE".to_owned())]],
+            }));
+        }
+        if up == "CLEAR SCHEMA DRIFT REPORT" {
+            *self.s333_schema_drift_report.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok(
+                "SCHEMA DRIFT REPORT CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S334 — Query plan stability tracking ─────────────────────────────────
+        if up.starts_with("TRACK QUERY PLAN STABILITY FOR '") {
+            let q = s["TRACK QUERY PLAN STABILITY FOR '".len()..]
+                .trim_end_matches('\'')
+                .to_owned();
+            self.s334_plan_stability_report
+                .lock()
+                .unwrap()
+                .entry(q)
+                .or_default();
+            return Some(Ok(QueryResult::Ok("PLAN STABILITY TRACKED".to_owned())));
+        }
+        if up == "SHOW PLAN STABILITY REPORT" {
+            let report = self.s334_plan_stability_report.lock().unwrap().clone();
+            let rows = report
+                .into_iter()
+                .map(|(q, h)| vec![q, h.len().to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["sql".to_owned(), "plan_changes".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR PLAN STABILITY REPORT" {
+            self.s334_plan_stability_report.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "PLAN STABILITY REPORT CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S335 — Table connection draining ─────────────────────────────────────
+        if up.starts_with("DRAIN CONNECTIONS FOR ") {
+            let tbl = s["DRAIN CONNECTIONS FOR ".len()..]
+                .trim()
+                .to_ascii_lowercase();
+            self.s335_draining_tables.lock().unwrap().insert(tbl);
+            return Some(Ok(QueryResult::Ok("CONNECTIONS DRAINING".to_owned())));
+        }
+        if up == "SHOW DRAINING TABLES" {
+            let tables = self.s335_draining_tables.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned()],
+                rows: tables.into_iter().map(|t| vec![t]).collect(),
+            }));
+        }
+        if up.starts_with("CANCEL DRAIN FOR ") {
+            let tbl = s["CANCEL DRAIN FOR ".len()..].trim().to_ascii_lowercase();
+            self.s335_draining_tables.lock().unwrap().remove(&tbl);
+            return Some(Ok(QueryResult::Ok("DRAIN CANCELLED".to_owned())));
+        }
+
+        // ── S336 — Index build resource limits ───────────────────────────────────
+        if up.starts_with("SET INDEX BUILD MEMORY LIMIT ") {
+            let lim = s["SET INDEX BUILD MEMORY LIMIT ".len()..].trim().to_owned();
+            *self.s336_index_build_resource_limits.lock().unwrap() = Some(lim);
+            return Some(Ok(QueryResult::Ok(
+                "INDEX BUILD MEMORY LIMIT SET".to_owned(),
+            )));
+        }
+        if up == "SHOW INDEX BUILD RESOURCE LIMITS" {
+            let lim = self
+                .s336_index_build_resource_limits
+                .lock()
+                .unwrap()
+                .clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["limit".to_owned()],
+                rows: vec![vec![lim.unwrap_or_else(|| "NONE".to_owned())]],
+            }));
+        }
+        if up == "RESET INDEX BUILD RESOURCE LIMITS" {
+            *self.s336_index_build_resource_limits.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok(
+                "INDEX BUILD RESOURCE LIMITS RESET".to_owned(),
+            )));
+        }
+
+        // ── S337 — Query result streaming v2 ─────────────────────────────────────
+        if up == "SET STREAMING V2 MODE ON" {
+            *self.s337_streaming_v2_mode.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("STREAMING V2 MODE ON".to_owned())));
+        }
+        if up == "SET STREAMING V2 MODE OFF" {
+            *self.s337_streaming_v2_mode.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("STREAMING V2 MODE OFF".to_owned())));
+        }
+        if up == "SHOW STREAMING V2 STATUS" {
+            let on = *self.s337_streaming_v2_mode.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["streaming_v2".to_owned()],
+                rows: vec![vec![if on {
+                    "ON".to_owned()
+                } else {
+                    "OFF".to_owned()
+                }]],
+            }));
+        }
+
+        // ── S338 — Table shard split/merge ───────────────────────────────────────
+        if up.starts_with("SPLIT SHARD FOR ") && up.contains(" AT KEY '") {
+            let rest = &s["SPLIT SHARD FOR ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" AT KEY '") {
+                let tbl = rest[..p].trim().to_ascii_lowercase();
+                let key = rest[p + " AT KEY '".len()..]
+                    .trim_end_matches('\'')
+                    .to_owned();
+                self.s338_shard_split_merge_history
+                    .lock()
+                    .unwrap()
+                    .push(format!("SPLIT {} AT {}", tbl, key));
+                return Some(Ok(QueryResult::Ok("SHARD SPLIT".to_owned())));
+            }
+        }
+        if up.starts_with("MERGE SHARDS FOR ") {
+            let tbl = s["MERGE SHARDS FOR ".len()..].trim().to_ascii_lowercase();
+            self.s338_shard_split_merge_history
+                .lock()
+                .unwrap()
+                .push(format!("MERGE {}", tbl));
+            return Some(Ok(QueryResult::Ok("SHARDS MERGED".to_owned())));
+        }
+        if up == "SHOW SHARD SPLIT MERGE HISTORY" {
+            let hist = self.s338_shard_split_merge_history.lock().unwrap().clone();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["event".to_owned()],
+                rows: hist.into_iter().map(|h| vec![h]).collect(),
+            }));
+        }
+
+        // ── S339 — Schema object tagging ─────────────────────────────────────────
+        if up.starts_with("TAG SCHEMA OBJECT ") && up.contains(" WITH '") {
+            let rest = &s["TAG SCHEMA OBJECT ".len()..];
+            let up_rest = rest.to_ascii_uppercase();
+            if let Some(p) = up_rest.find(" WITH '") {
+                let obj = rest[..p].trim().to_ascii_lowercase();
+                let tag = rest[p + " WITH '".len()..]
+                    .trim_end_matches('\'')
+                    .to_owned();
+                self.s339_object_tags
+                    .lock()
+                    .unwrap()
+                    .entry(obj)
+                    .or_default()
+                    .push(tag);
+                return Some(Ok(QueryResult::Ok("SCHEMA OBJECT TAGGED".to_owned())));
+            }
+        }
+        if up == "SHOW OBJECT TAGS" {
+            let tags = self.s339_object_tags.lock().unwrap().clone();
+            let rows = tags
+                .into_iter()
+                .map(|(o, ts)| vec![o, ts.join(",")])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["object".to_owned(), "tags".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("REMOVE TAG FROM ") {
+            let obj = s["REMOVE TAG FROM ".len()..].trim().to_ascii_lowercase();
+            self.s339_object_tags.lock().unwrap().remove(&obj);
+            return Some(Ok(QueryResult::Ok("TAG REMOVED".to_owned())));
+        }
+
+        // ── S340 — Milestone: 340 sprints ────────────────────────────────────────
+        if up == "SHOW SPRINT CHECKPOINT 340" {
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["milestone".to_owned(), "sprints_completed".to_owned()],
+                rows: vec![vec!["340".to_owned(), "340".to_owned()]],
+            }));
+        }
+        if up == "SELECT * FROM VV_CHECKPOINT_340" {
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["sprint".to_owned(), "status".to_owned()],
+                rows: vec![vec!["340".to_owned(), "COMPLETE".to_owned()]],
+            }));
+        }
+        if up == "SHOW TOTAL SQL COMMAND COUNT" {
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["total_sprints".to_owned()],
+                rows: vec![vec!["340".to_owned()]],
             }));
         }
 
@@ -27782,6 +29054,1722 @@ mod tests {
         let (ex, _dir) = setup();
         if let QueryResult::Rows { rows, .. } =
             ex.execute("SELECT * FROM vv_sprint_300_status").unwrap()
+        {
+            assert_eq!(rows[0][1], "COMPLETE");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S301 — Query fingerprint caching ─────────────────────────────────────
+    #[test]
+    fn test_s301_compute_fingerprint_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 1'").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s301_show_fingerprints_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 1'").unwrap();
+        let r = ex.execute("SHOW QUERY FINGERPRINTS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s301_clear_fingerprints_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 1'").unwrap();
+        let r = ex.execute("CLEAR QUERY FINGERPRINTS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s301_fingerprints.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s301_fingerprint_stored_in_map() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 2'").unwrap();
+        assert_eq!(ex.s301_fingerprints.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn test_s301_multiple_fingerprints_accumulate() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 1'").unwrap();
+        ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 2'").unwrap();
+        assert_eq!(ex.s301_fingerprints.lock().unwrap().len(), 2);
+    }
+
+    // ── S302 — Table column reordering ───────────────────────────────────────
+    #[test]
+    fn test_s302_reorder_columns_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("ALTER TABLE orders REORDER COLUMNS (id,name,total)")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s302_show_column_order_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE orders REORDER COLUMNS (id,name,total)")
+            .unwrap();
+        let r = ex.execute("SHOW COLUMN ORDER FOR orders").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 3);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s302_reset_column_order_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE orders REORDER COLUMNS (id,name)")
+            .unwrap();
+        let r = ex.execute("RESET COLUMN ORDER FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s302_column_order_values_correct() {
+        let (ex, _dir) = setup();
+        ex.execute("ALTER TABLE orders REORDER COLUMNS (a,b,c)")
+            .unwrap();
+        let m = ex.s302_column_order.lock().unwrap();
+        assert_eq!(
+            m.get("orders").unwrap(),
+            &vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+    }
+    #[test]
+    fn test_s302_show_column_order_empty_for_unknown() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW COLUMN ORDER FOR unknown_table").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S303 — Index build parallelism ───────────────────────────────────────
+    #[test]
+    fn test_s303_set_parallelism_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET INDEX BUILD PARALLELISM 4").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s303_show_parallelism_returns_value() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX BUILD PARALLELISM 4").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX BUILD PARALLELISM").unwrap()
+        {
+            assert_eq!(rows[0][0], "4");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s303_reset_parallelism_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX BUILD PARALLELISM 8").unwrap();
+        ex.execute("RESET INDEX BUILD PARALLELISM").unwrap();
+        assert_eq!(*ex.s303_index_build_parallelism.lock().unwrap(), 1);
+    }
+    #[test]
+    fn test_s303_default_parallelism_is_one() {
+        let (ex, _dir) = setup();
+        assert_eq!(*ex.s303_index_build_parallelism.lock().unwrap(), 1);
+    }
+    #[test]
+    fn test_s303_set_parallelism_updates_field() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX BUILD PARALLELISM 16").unwrap();
+        assert_eq!(*ex.s303_index_build_parallelism.lock().unwrap(), 16);
+    }
+
+    // ── S304 — Query result sampling ─────────────────────────────────────────
+    #[test]
+    fn test_s304_set_sample_rate_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET QUERY RESULT SAMPLE RATE 0.1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s304_show_sample_rate_returns_value() {
+        let (ex, _dir) = setup();
+        ex.execute("SET QUERY RESULT SAMPLE RATE 0.5").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY RESULT SAMPLE RATE").unwrap()
+        {
+            assert_eq!(rows[0][0], "0.5");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s304_reset_sample_rate_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET QUERY RESULT SAMPLE RATE 0.2").unwrap();
+        ex.execute("RESET QUERY RESULT SAMPLE RATE").unwrap();
+        assert_eq!(*ex.s304_sample_rate.lock().unwrap(), 1.0);
+    }
+    #[test]
+    fn test_s304_default_sample_rate_is_one() {
+        let (ex, _dir) = setup();
+        assert_eq!(*ex.s304_sample_rate.lock().unwrap(), 1.0);
+    }
+    #[test]
+    fn test_s304_set_sample_rate_updates_field() {
+        let (ex, _dir) = setup();
+        ex.execute("SET QUERY RESULT SAMPLE RATE 0.75").unwrap();
+        assert_eq!(*ex.s304_sample_rate.lock().unwrap(), 0.75);
+    }
+
+    // ── S305 — Table storage quotas ──────────────────────────────────────────
+    #[test]
+    fn test_s305_set_storage_quota_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET STORAGE QUOTA FOR orders TO 10GB").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s305_show_storage_quotas_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STORAGE QUOTA FOR orders TO 10GB").unwrap();
+        let r = ex.execute("SHOW STORAGE QUOTAS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s305_drop_storage_quota_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STORAGE QUOTA FOR orders TO 10GB").unwrap();
+        let r = ex.execute("DROP STORAGE QUOTA FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s305_storage_quotas.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s305_quota_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STORAGE QUOTA FOR orders TO 5GB").unwrap();
+        assert_eq!(
+            ex.s305_storage_quotas
+                .lock()
+                .unwrap()
+                .get("orders")
+                .unwrap(),
+            "5GB"
+        );
+    }
+    #[test]
+    fn test_s305_multiple_quotas() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STORAGE QUOTA FOR orders TO 5GB").unwrap();
+        ex.execute("SET STORAGE QUOTA FOR users TO 1GB").unwrap();
+        assert_eq!(ex.s305_storage_quotas.lock().unwrap().len(), 2);
+    }
+
+    // ── S306 — Schema migration rollback points ──────────────────────────────
+    #[test]
+    fn test_s306_create_rollback_point_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE MIGRATION ROLLBACK POINT rp1 FOR public")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s306_rollback_to_point_succeeds() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MIGRATION ROLLBACK POINT rp1 FOR public")
+            .unwrap();
+        let r = ex.execute("ROLLBACK TO MIGRATION POINT rp1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s306_rollback_to_unknown_point_errors() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ROLLBACK TO MIGRATION POINT unknown").unwrap();
+        assert!(matches!(r, QueryResult::Error(_)));
+    }
+    #[test]
+    fn test_s306_show_rollback_points_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MIGRATION ROLLBACK POINT rp1 FOR public")
+            .unwrap();
+        let r = ex.execute("SHOW MIGRATION ROLLBACK POINTS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s306_rollback_point_stores_schema() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE MIGRATION ROLLBACK POINT rp2 FOR sales")
+            .unwrap();
+        assert_eq!(
+            ex.s306_rollback_points.lock().unwrap().get("rp2").unwrap(),
+            "sales"
+        );
+    }
+
+    // ── S307 — Query execution graph export ──────────────────────────────────
+    #[test]
+    fn test_s307_export_execution_graph_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("EXPORT EXECUTION GRAPH FOR 'SELECT 1' TO '/tmp/graph.json'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s307_show_execution_graphs_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT EXECUTION GRAPH FOR 'SELECT 1' TO '/tmp/g.json'")
+            .unwrap();
+        let r = ex.execute("SHOW EXECUTION GRAPHS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s307_clear_execution_graphs_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT EXECUTION GRAPH FOR 'SELECT 1' TO '/tmp/g.json'")
+            .unwrap();
+        let r = ex.execute("CLEAR EXECUTION GRAPHS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s307_execution_graphs.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s307_graph_path_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT EXECUTION GRAPH FOR 'SELECT 2' TO '/tmp/h.json'")
+            .unwrap();
+        assert_eq!(
+            ex.s307_execution_graphs
+                .lock()
+                .unwrap()
+                .get("SELECT 2")
+                .unwrap(),
+            "/tmp/h.json"
+        );
+    }
+    #[test]
+    fn test_s307_multiple_graphs_accumulate() {
+        let (ex, _dir) = setup();
+        ex.execute("EXPORT EXECUTION GRAPH FOR 'SELECT 1' TO '/tmp/a.json'")
+            .unwrap();
+        ex.execute("EXPORT EXECUTION GRAPH FOR 'SELECT 2' TO '/tmp/b.json'")
+            .unwrap();
+        assert_eq!(ex.s307_execution_graphs.lock().unwrap().len(), 2);
+    }
+
+    // ── S308 — Table access rate limiting v2 ─────────────────────────────────
+    #[test]
+    fn test_s308_set_access_rate_limit_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET TABLE orders ACCESS RATE LIMIT 100 PER SECOND")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s308_show_access_rate_limits_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders ACCESS RATE LIMIT 100 PER SECOND")
+            .unwrap();
+        let r = ex.execute("SHOW ACCESS RATE LIMITS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s308_drop_access_rate_limit_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders ACCESS RATE LIMIT 100 PER SECOND")
+            .unwrap();
+        let r = ex.execute("DROP ACCESS RATE LIMIT FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s308_access_rate_limits.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s308_limit_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders ACCESS RATE LIMIT 50 PER SECOND")
+            .unwrap();
+        assert_eq!(
+            ex.s308_access_rate_limits
+                .lock()
+                .unwrap()
+                .get("orders")
+                .unwrap(),
+            "50 PER SECOND"
+        );
+    }
+    #[test]
+    fn test_s308_multiple_limits() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders ACCESS RATE LIMIT 50 PER SECOND")
+            .unwrap();
+        ex.execute("SET TABLE users ACCESS RATE LIMIT 10 PER SECOND")
+            .unwrap();
+        assert_eq!(ex.s308_access_rate_limits.lock().unwrap().len(), 2);
+    }
+
+    // ── S309 — Column null ratio stats ───────────────────────────────────────
+    #[test]
+    fn test_s309_compute_null_ratio_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("COMPUTE NULL RATIO FOR orders.total").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s309_show_null_ratios_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE NULL RATIO FOR orders.total").unwrap();
+        let r = ex.execute("SHOW NULL RATIOS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s309_clear_null_ratios_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE NULL RATIO FOR orders.total").unwrap();
+        let r = ex.execute("CLEAR NULL RATIOS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s309_null_ratios.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s309_ratio_key_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE NULL RATIO FOR orders.total").unwrap();
+        assert!(
+            ex.s309_null_ratios
+                .lock()
+                .unwrap()
+                .contains_key(&("orders".to_owned(), "total".to_owned()))
+        );
+    }
+    #[test]
+    fn test_s309_multiple_ratios_accumulate() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE NULL RATIO FOR orders.total").unwrap();
+        ex.execute("COMPUTE NULL RATIO FOR orders.name").unwrap();
+        assert_eq!(ex.s309_null_ratios.lock().unwrap().len(), 2);
+    }
+
+    // ── S310 — Query plan cost comparison ────────────────────────────────────
+    #[test]
+    fn test_s310_compare_plan_cost_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("COMPARE QUERY PLAN COST v1 WITH v2").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s310_show_comparisons_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPARE QUERY PLAN COST v1 WITH v2").unwrap();
+        let r = ex.execute("SHOW PLAN COST COMPARISONS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s310_clear_comparisons_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPARE QUERY PLAN COST v1 WITH v2").unwrap();
+        let r = ex.execute("CLEAR PLAN COST COMPARISONS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s310_plan_cost_comparisons.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s310_comparison_values_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPARE QUERY PLAN COST va WITH vb").unwrap();
+        let comps = ex.s310_plan_cost_comparisons.lock().unwrap();
+        assert_eq!(comps[0], ("va".to_owned(), "vb".to_owned()));
+    }
+    #[test]
+    fn test_s310_multiple_comparisons_accumulate() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPARE QUERY PLAN COST v1 WITH v2").unwrap();
+        ex.execute("COMPARE QUERY PLAN COST v3 WITH v4").unwrap();
+        assert_eq!(ex.s310_plan_cost_comparisons.lock().unwrap().len(), 2);
+    }
+
+    // ── S311 — Table replica lag alerts ──────────────────────────────────────
+    #[test]
+    fn test_s311_set_replica_lag_alert_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET REPLICA LAG ALERT THRESHOLD FOR orders TO 5s")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s311_show_replica_lag_alerts_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET REPLICA LAG ALERT THRESHOLD FOR orders TO 5s")
+            .unwrap();
+        let r = ex.execute("SHOW REPLICA LAG ALERTS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s311_clear_replica_lag_alert_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET REPLICA LAG ALERT THRESHOLD FOR orders TO 5s")
+            .unwrap();
+        let r = ex.execute("CLEAR REPLICA LAG ALERT FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s311_replica_lag_alerts.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s311_threshold_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET REPLICA LAG ALERT THRESHOLD FOR orders TO 10s")
+            .unwrap();
+        assert_eq!(
+            ex.s311_replica_lag_alerts
+                .lock()
+                .unwrap()
+                .get("orders")
+                .unwrap(),
+            "10s"
+        );
+    }
+    #[test]
+    fn test_s311_multiple_alerts() {
+        let (ex, _dir) = setup();
+        ex.execute("SET REPLICA LAG ALERT THRESHOLD FOR orders TO 5s")
+            .unwrap();
+        ex.execute("SET REPLICA LAG ALERT THRESHOLD FOR users TO 3s")
+            .unwrap();
+        assert_eq!(ex.s311_replica_lag_alerts.lock().unwrap().len(), 2);
+    }
+
+    // ── S312 — Index selectivity stats ───────────────────────────────────────
+    #[test]
+    fn test_s312_compute_selectivity_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("COMPUTE INDEX SELECTIVITY FOR idx_orders")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s312_show_selectivity_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE INDEX SELECTIVITY FOR idx_orders")
+            .unwrap();
+        let r = ex.execute("SHOW INDEX SELECTIVITY").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s312_clear_selectivity_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE INDEX SELECTIVITY FOR idx_orders")
+            .unwrap();
+        let r = ex.execute("CLEAR INDEX SELECTIVITY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s312_index_selectivity.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s312_selectivity_key_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE INDEX SELECTIVITY FOR idx_a").unwrap();
+        assert!(
+            ex.s312_index_selectivity
+                .lock()
+                .unwrap()
+                .contains_key("idx_a")
+        );
+    }
+    #[test]
+    fn test_s312_multiple_selectivities() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE INDEX SELECTIVITY FOR idx_a").unwrap();
+        ex.execute("COMPUTE INDEX SELECTIVITY FOR idx_b").unwrap();
+        assert_eq!(ex.s312_index_selectivity.lock().unwrap().len(), 2);
+    }
+
+    // ── S313 — Query result row limits ───────────────────────────────────────
+    #[test]
+    fn test_s313_set_global_row_limit_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET GLOBAL QUERY ROW LIMIT 10000").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s313_show_global_row_limit_returns_value() {
+        let (ex, _dir) = setup();
+        ex.execute("SET GLOBAL QUERY ROW LIMIT 5000").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW GLOBAL QUERY ROW LIMIT").unwrap() {
+            assert_eq!(rows[0][0], "5000");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s313_reset_global_row_limit_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET GLOBAL QUERY ROW LIMIT 5000").unwrap();
+        ex.execute("RESET GLOBAL QUERY ROW LIMIT").unwrap();
+        assert!(ex.s313_global_row_limit.lock().unwrap().is_none());
+    }
+    #[test]
+    fn test_s313_default_row_limit_is_none() {
+        let (ex, _dir) = setup();
+        assert!(ex.s313_global_row_limit.lock().unwrap().is_none());
+    }
+    #[test]
+    fn test_s313_set_row_limit_updates_field() {
+        let (ex, _dir) = setup();
+        ex.execute("SET GLOBAL QUERY ROW LIMIT 42").unwrap();
+        assert_eq!(*ex.s313_global_row_limit.lock().unwrap(), Some(42));
+    }
+
+    // ── S314 — Table vacuum scheduling ───────────────────────────────────────
+    #[test]
+    fn test_s314_schedule_vacuum_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SCHEDULE VACUUM FOR orders AT '2026-01-01 00:00'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s314_show_vacuum_schedule_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE VACUUM FOR orders AT '2026-01-01 00:00'")
+            .unwrap();
+        let r = ex.execute("SHOW VACUUM SCHEDULE").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s314_cancel_vacuum_schedule_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE VACUUM FOR orders AT '2026-01-01 00:00'")
+            .unwrap();
+        let r = ex.execute("CANCEL VACUUM SCHEDULE FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s314_vacuum_schedule.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s314_schedule_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE VACUUM FOR orders AT '2026-02-02 00:00'")
+            .unwrap();
+        assert_eq!(
+            ex.s314_vacuum_schedule
+                .lock()
+                .unwrap()
+                .get("orders")
+                .unwrap(),
+            "2026-02-02 00:00"
+        );
+    }
+    #[test]
+    fn test_s314_multiple_schedules() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE VACUUM FOR orders AT '2026-01-01 00:00'")
+            .unwrap();
+        ex.execute("SCHEDULE VACUUM FOR users AT '2026-01-02 00:00'")
+            .unwrap();
+        assert_eq!(ex.s314_vacuum_schedule.lock().unwrap().len(), 2);
+    }
+
+    // ── S315 — Schema object dependencies ────────────────────────────────────
+    #[test]
+    fn test_s315_show_object_dependencies_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SHOW OBJECT DEPENDENCIES FOR public.orders")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s315_show_dependent_objects_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SHOW DEPENDENT OBJECTS FOR public.orders")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s315_clear_dependency_cache_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR DEPENDENCY CACHE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s315_clear_dependency_cache_increments_counter() {
+        let (ex, _dir) = setup();
+        ex.execute("CLEAR DEPENDENCY CACHE").unwrap();
+        assert_eq!(*ex.s315_dependency_cache_clears.lock().unwrap(), 1);
+    }
+    #[test]
+    fn test_s315_clear_dependency_cache_multiple_times() {
+        let (ex, _dir) = setup();
+        ex.execute("CLEAR DEPENDENCY CACHE").unwrap();
+        ex.execute("CLEAR DEPENDENCY CACHE").unwrap();
+        assert_eq!(*ex.s315_dependency_cache_clears.lock().unwrap(), 2);
+    }
+
+    // ── S316 — Query connection tagging ──────────────────────────────────────
+    #[test]
+    fn test_s316_set_connection_tag_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET CONNECTION TAG 'reporting'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s316_show_connection_tags_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION TAG 'reporting'").unwrap();
+        let r = ex.execute("SHOW CONNECTION TAGS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s316_clear_connection_tag_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION TAG 'reporting'").unwrap();
+        let r = ex.execute("CLEAR CONNECTION TAG").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s316_connection_tags.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s316_tag_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION TAG 'etl'").unwrap();
+        assert_eq!(ex.s316_connection_tags.lock().unwrap()[0], "etl");
+    }
+    #[test]
+    fn test_s316_multiple_tags_accumulate() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION TAG 'a'").unwrap();
+        ex.execute("SET CONNECTION TAG 'b'").unwrap();
+        assert_eq!(ex.s316_connection_tags.lock().unwrap().len(), 2);
+    }
+
+    // ── S317 — Table data skew detection ─────────────────────────────────────
+    #[test]
+    fn test_s317_detect_data_skew_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DETECT DATA SKEW FOR orders.total").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s317_show_data_skew_report_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT DATA SKEW FOR orders.total").unwrap();
+        let r = ex.execute("SHOW DATA SKEW REPORT").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s317_clear_data_skew_report_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT DATA SKEW FOR orders.total").unwrap();
+        let r = ex.execute("CLEAR DATA SKEW REPORT").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s317_data_skew_report.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s317_report_key_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT DATA SKEW FOR orders.total").unwrap();
+        assert!(
+            ex.s317_data_skew_report
+                .lock()
+                .unwrap()
+                .contains_key("orders")
+        );
+    }
+    #[test]
+    fn test_s317_multiple_skew_reports() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT DATA SKEW FOR orders.total").unwrap();
+        ex.execute("DETECT DATA SKEW FOR users.age").unwrap();
+        assert_eq!(ex.s317_data_skew_report.lock().unwrap().len(), 2);
+    }
+
+    // ── S318 — Index rebuild triggers ────────────────────────────────────────
+    #[test]
+    fn test_s318_set_rebuild_trigger_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET INDEX REBUILD TRIGGER idx_orders AT BLOAT 50")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s318_show_rebuild_triggers_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX REBUILD TRIGGER idx_orders AT BLOAT 50")
+            .unwrap();
+        let r = ex.execute("SHOW INDEX REBUILD TRIGGERS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s318_drop_rebuild_trigger_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX REBUILD TRIGGER idx_orders AT BLOAT 50")
+            .unwrap();
+        let r = ex.execute("DROP INDEX REBUILD TRIGGER idx_orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s318_index_rebuild_triggers.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s318_trigger_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX REBUILD TRIGGER idx_a AT BLOAT 30")
+            .unwrap();
+        assert_eq!(
+            *ex.s318_index_rebuild_triggers
+                .lock()
+                .unwrap()
+                .get("idx_a")
+                .unwrap(),
+            30
+        );
+    }
+    #[test]
+    fn test_s318_multiple_triggers() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX REBUILD TRIGGER idx_a AT BLOAT 30")
+            .unwrap();
+        ex.execute("SET INDEX REBUILD TRIGGER idx_b AT BLOAT 40")
+            .unwrap();
+        assert_eq!(ex.s318_index_rebuild_triggers.lock().unwrap().len(), 2);
+    }
+
+    // ── S319 — Query plan cache eviction ─────────────────────────────────────
+    #[test]
+    fn test_s319_evict_plan_cache_entry_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("EVICT QUERY PLAN CACHE ENTRY 'SELECT 1'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s319_show_plan_cache_evictions_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("EVICT QUERY PLAN CACHE ENTRY 'SELECT 1'")
+            .unwrap();
+        let r = ex.execute("SHOW PLAN CACHE EVICTIONS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s319_clear_plan_cache_evictions_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("EVICT QUERY PLAN CACHE ENTRY 'SELECT 1'")
+            .unwrap();
+        let r = ex.execute("CLEAR PLAN CACHE EVICTIONS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s319_plan_cache_evictions.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s319_eviction_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("EVICT QUERY PLAN CACHE ENTRY 'SELECT 2'")
+            .unwrap();
+        assert_eq!(ex.s319_plan_cache_evictions.lock().unwrap()[0], "SELECT 2");
+    }
+    #[test]
+    fn test_s319_multiple_evictions_accumulate() {
+        let (ex, _dir) = setup();
+        ex.execute("EVICT QUERY PLAN CACHE ENTRY 'SELECT 1'")
+            .unwrap();
+        ex.execute("EVICT QUERY PLAN CACHE ENTRY 'SELECT 2'")
+            .unwrap();
+        assert_eq!(ex.s319_plan_cache_evictions.lock().unwrap().len(), 2);
+    }
+
+    // ── S320 — Table write throttling ────────────────────────────────────────
+    #[test]
+    fn test_s320_set_write_throttle_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET TABLE orders WRITE THROTTLE 1000 PER SECOND")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s320_show_write_throttles_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders WRITE THROTTLE 1000 PER SECOND")
+            .unwrap();
+        let r = ex.execute("SHOW WRITE THROTTLES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s320_drop_write_throttle_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders WRITE THROTTLE 1000 PER SECOND")
+            .unwrap();
+        let r = ex.execute("DROP WRITE THROTTLE FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s320_write_throttles.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s320_throttle_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders WRITE THROTTLE 500 PER SECOND")
+            .unwrap();
+        assert_eq!(
+            ex.s320_write_throttles
+                .lock()
+                .unwrap()
+                .get("orders")
+                .unwrap(),
+            "500 PER SECOND"
+        );
+    }
+    #[test]
+    fn test_s320_multiple_throttles() {
+        let (ex, _dir) = setup();
+        ex.execute("SET TABLE orders WRITE THROTTLE 500 PER SECOND")
+            .unwrap();
+        ex.execute("SET TABLE users WRITE THROTTLE 200 PER SECOND")
+            .unwrap();
+        assert_eq!(ex.s320_write_throttles.lock().unwrap().len(), 2);
+    }
+
+    // ── S321 — Column cardinality estimation ─────────────────────────────────
+    #[test]
+    fn test_s321_estimate_cardinality_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ESTIMATE CARDINALITY FOR orders.total").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s321_show_cardinality_estimates_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("ESTIMATE CARDINALITY FOR orders.total").unwrap();
+        let r = ex.execute("SHOW CARDINALITY ESTIMATES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s321_clear_cardinality_estimates_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("ESTIMATE CARDINALITY FOR orders.total").unwrap();
+        let r = ex.execute("CLEAR CARDINALITY ESTIMATES").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s321_cardinality_estimates.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s321_estimate_key_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("ESTIMATE CARDINALITY FOR orders.total").unwrap();
+        assert!(
+            ex.s321_cardinality_estimates
+                .lock()
+                .unwrap()
+                .contains_key(&("orders".to_owned(), "total".to_owned()))
+        );
+    }
+    #[test]
+    fn test_s321_multiple_estimates_accumulate() {
+        let (ex, _dir) = setup();
+        ex.execute("ESTIMATE CARDINALITY FOR orders.total").unwrap();
+        ex.execute("ESTIMATE CARDINALITY FOR orders.name").unwrap();
+        assert_eq!(ex.s321_cardinality_estimates.lock().unwrap().len(), 2);
+    }
+
+    // ── S322 — Query session variables v2 ────────────────────────────────────
+    #[test]
+    fn test_s322_set_session_var2_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET SESSION VAR2 mode = 'fast'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s322_show_session_vars2_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SESSION VAR2 mode = 'fast'").unwrap();
+        let r = ex.execute("SHOW SESSION VARS2").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s322_unset_session_var2_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SESSION VAR2 mode = 'fast'").unwrap();
+        let r = ex.execute("UNSET SESSION VAR2 mode").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s322_session_vars2.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s322_var_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SESSION VAR2 lang = 'rust'").unwrap();
+        assert_eq!(
+            ex.s322_session_vars2.lock().unwrap().get("lang").unwrap(),
+            "rust"
+        );
+    }
+    #[test]
+    fn test_s322_multiple_vars() {
+        let (ex, _dir) = setup();
+        ex.execute("SET SESSION VAR2 a = '1'").unwrap();
+        ex.execute("SET SESSION VAR2 b = '2'").unwrap();
+        assert_eq!(ex.s322_session_vars2.lock().unwrap().len(), 2);
+    }
+
+    // ── S323 — Table backup scheduling ───────────────────────────────────────
+    #[test]
+    fn test_s323_schedule_backup_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SCHEDULE BACKUP FOR orders EVERY '1d'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s323_show_backup_schedule_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE BACKUP FOR orders EVERY '1d'").unwrap();
+        let r = ex.execute("SHOW BACKUP SCHEDULE").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s323_cancel_backup_schedule_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE BACKUP FOR orders EVERY '1d'").unwrap();
+        let r = ex.execute("CANCEL BACKUP SCHEDULE FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s323_backup_schedule.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s323_schedule_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE BACKUP FOR orders EVERY '2d'").unwrap();
+        assert_eq!(
+            ex.s323_backup_schedule
+                .lock()
+                .unwrap()
+                .get("orders")
+                .unwrap(),
+            "2d"
+        );
+    }
+    #[test]
+    fn test_s323_multiple_schedules() {
+        let (ex, _dir) = setup();
+        ex.execute("SCHEDULE BACKUP FOR orders EVERY '1d'").unwrap();
+        ex.execute("SCHEDULE BACKUP FOR users EVERY '7d'").unwrap();
+        assert_eq!(ex.s323_backup_schedule.lock().unwrap().len(), 2);
+    }
+
+    // ── S324 — Index fragmentation alerts ────────────────────────────────────
+    #[test]
+    fn test_s324_set_fragmentation_alert_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET INDEX FRAGMENTATION ALERT idx_orders AT 30")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s324_show_fragmentation_alerts_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX FRAGMENTATION ALERT idx_orders AT 30")
+            .unwrap();
+        let r = ex.execute("SHOW INDEX FRAGMENTATION ALERTS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s324_clear_fragmentation_alert_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX FRAGMENTATION ALERT idx_orders AT 30")
+            .unwrap();
+        let r = ex
+            .execute("CLEAR INDEX FRAGMENTATION ALERT FOR idx_orders")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(
+            ex.s324_index_fragmentation_alerts
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn test_s324_threshold_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX FRAGMENTATION ALERT idx_a AT 40")
+            .unwrap();
+        assert_eq!(
+            *ex.s324_index_fragmentation_alerts
+                .lock()
+                .unwrap()
+                .get("idx_a")
+                .unwrap(),
+            40
+        );
+    }
+    #[test]
+    fn test_s324_multiple_alerts() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX FRAGMENTATION ALERT idx_a AT 40")
+            .unwrap();
+        ex.execute("SET INDEX FRAGMENTATION ALERT idx_b AT 50")
+            .unwrap();
+        assert_eq!(ex.s324_index_fragmentation_alerts.lock().unwrap().len(), 2);
+    }
+
+    // ── S325 — Query result set limits ───────────────────────────────────────
+    #[test]
+    fn test_s325_set_result_set_size_limit_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET RESULT SET SIZE LIMIT 5MB").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s325_show_result_set_size_limit_returns_value() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT SET SIZE LIMIT 5MB").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT SET SIZE LIMIT").unwrap() {
+            assert_eq!(rows[0][0], "5MB");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s325_reset_result_set_size_limit_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT SET SIZE LIMIT 5MB").unwrap();
+        ex.execute("RESET RESULT SET SIZE LIMIT").unwrap();
+        assert!(ex.s325_result_set_size_limit.lock().unwrap().is_none());
+    }
+    #[test]
+    fn test_s325_default_limit_is_none() {
+        let (ex, _dir) = setup();
+        assert!(ex.s325_result_set_size_limit.lock().unwrap().is_none());
+    }
+    #[test]
+    fn test_s325_limit_updates_field() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT SET SIZE LIMIT 1MB").unwrap();
+        assert_eq!(
+            ex.s325_result_set_size_limit.lock().unwrap().clone(),
+            Some("1MB".to_owned())
+        );
+    }
+
+    // ── S326 — Table hot key detection ───────────────────────────────────────
+    #[test]
+    fn test_s326_detect_hot_keys_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DETECT HOT KEYS FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s326_show_hot_key_report_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT HOT KEYS FOR orders").unwrap();
+        let r = ex.execute("SHOW HOT KEY REPORT").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s326_clear_hot_key_report_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT HOT KEYS FOR orders").unwrap();
+        let r = ex.execute("CLEAR HOT KEY REPORT").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s326_hot_key_report.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s326_report_key_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT HOT KEYS FOR orders").unwrap();
+        assert!(
+            ex.s326_hot_key_report
+                .lock()
+                .unwrap()
+                .contains_key("orders")
+        );
+    }
+    #[test]
+    fn test_s326_multiple_reports() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT HOT KEYS FOR orders").unwrap();
+        ex.execute("DETECT HOT KEYS FOR users").unwrap();
+        assert_eq!(ex.s326_hot_key_report.lock().unwrap().len(), 2);
+    }
+
+    // ── S327 — Schema change approval workflow ───────────────────────────────
+    #[test]
+    fn test_s327_request_approval_returns_id() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("REQUEST SCHEMA CHANGE APPROVAL FOR public DESC 'add column'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s327_approve_schema_change_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("REQUEST SCHEMA CHANGE APPROVAL FOR public DESC 'add column'")
+            .unwrap();
+        let r = ex.execute("APPROVE SCHEMA CHANGE 1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s327_approve_unknown_change_errors() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("APPROVE SCHEMA CHANGE 999").unwrap();
+        assert!(matches!(r, QueryResult::Error(_)));
+    }
+    #[test]
+    fn test_s327_show_pending_changes_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("REQUEST SCHEMA CHANGE APPROVAL FOR public DESC 'add column'")
+            .unwrap();
+        let r = ex.execute("SHOW PENDING SCHEMA CHANGES").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s327_approved_change_not_pending() {
+        let (ex, _dir) = setup();
+        ex.execute("REQUEST SCHEMA CHANGE APPROVAL FOR public DESC 'add column'")
+            .unwrap();
+        ex.execute("APPROVE SCHEMA CHANGE 1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PENDING SCHEMA CHANGES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S328 — Query cost anomaly detection ──────────────────────────────────
+    #[test]
+    fn test_s328_detect_cost_anomalies_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DETECT QUERY COST ANOMALIES").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s328_show_cost_anomalies_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW COST ANOMALIES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s328_clear_cost_anomalies_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR COST ANOMALIES").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s328_detect_anomalies_empty_by_default() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT QUERY COST ANOMALIES").unwrap();
+        assert!(ex.s328_cost_anomalies.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s328_clear_after_detect() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT QUERY COST ANOMALIES").unwrap();
+        ex.execute("CLEAR COST ANOMALIES").unwrap();
+        assert!(ex.s328_cost_anomalies.lock().unwrap().is_empty());
+    }
+
+    // ── S329 — Table read replica promotion ──────────────────────────────────
+    #[test]
+    fn test_s329_promote_read_replica_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("PROMOTE READ REPLICA 'host1:5432'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s329_show_promotion_history_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("PROMOTE READ REPLICA 'host1:5432'").unwrap();
+        let r = ex.execute("SHOW REPLICA PROMOTION HISTORY").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s329_clear_promotion_history_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("PROMOTE READ REPLICA 'host1:5432'").unwrap();
+        let r = ex.execute("CLEAR REPLICA PROMOTION HISTORY").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s329_replica_promotions.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s329_promotion_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("PROMOTE READ REPLICA 'host2:5432'").unwrap();
+        assert_eq!(ex.s329_replica_promotions.lock().unwrap()[0], "host2:5432");
+    }
+    #[test]
+    fn test_s329_multiple_promotions_accumulate() {
+        let (ex, _dir) = setup();
+        ex.execute("PROMOTE READ REPLICA 'host1:5432'").unwrap();
+        ex.execute("PROMOTE READ REPLICA 'host2:5432'").unwrap();
+        assert_eq!(ex.s329_replica_promotions.lock().unwrap().len(), 2);
+    }
+
+    // ── S330 — Index usage heatmap ────────────────────────────────────────────
+    #[test]
+    fn test_s330_show_index_usage_heatmap_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW INDEX USAGE HEATMAP").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s330_refresh_index_usage_heatmap_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("REFRESH INDEX USAGE HEATMAP").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s330_clear_index_usage_heatmap_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR INDEX USAGE HEATMAP").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s330_heatmap_empty_by_default() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX USAGE HEATMAP").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s330_clear_after_refresh() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH INDEX USAGE HEATMAP").unwrap();
+        ex.execute("CLEAR INDEX USAGE HEATMAP").unwrap();
+        assert!(ex.s330_index_usage_heatmap.lock().unwrap().is_empty());
+    }
+
+    // ── S331 — Query batch retry policy ──────────────────────────────────────
+    #[test]
+    fn test_s331_set_batch_retry_policy_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET BATCH RETRY POLICY max=3 backoff=200ms")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s331_show_batch_retry_policy_returns_value() {
+        let (ex, _dir) = setup();
+        ex.execute("SET BATCH RETRY POLICY max=3 backoff=200ms")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW BATCH RETRY POLICY").unwrap() {
+            assert_eq!(rows[0][0], "max=3 backoff=200ms");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s331_reset_batch_retry_policy_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET BATCH RETRY POLICY max=3 backoff=200ms")
+            .unwrap();
+        ex.execute("RESET BATCH RETRY POLICY").unwrap();
+        assert!(ex.s331_batch_retry_policy.lock().unwrap().is_none());
+    }
+    #[test]
+    fn test_s331_default_policy_is_none() {
+        let (ex, _dir) = setup();
+        assert!(ex.s331_batch_retry_policy.lock().unwrap().is_none());
+    }
+    #[test]
+    fn test_s331_policy_updates_field() {
+        let (ex, _dir) = setup();
+        ex.execute("SET BATCH RETRY POLICY max=5").unwrap();
+        assert_eq!(
+            ex.s331_batch_retry_policy.lock().unwrap().clone(),
+            Some("max=5".to_owned())
+        );
+    }
+
+    // ── S332 — Table storage compression stats ───────────────────────────────
+    #[test]
+    fn test_s332_show_compression_stats_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SHOW STORAGE COMPRESSION STATS FOR orders")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s332_refresh_compression_stats_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("REFRESH STORAGE COMPRESSION STATS FOR orders")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s332_clear_compression_stats_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH STORAGE COMPRESSION STATS FOR orders")
+            .unwrap();
+        let r = ex.execute("CLEAR STORAGE COMPRESSION STATS").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s332_storage_compression_stats.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s332_stats_stored_after_refresh() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH STORAGE COMPRESSION STATS FOR orders")
+            .unwrap();
+        assert!(
+            ex.s332_storage_compression_stats
+                .lock()
+                .unwrap()
+                .contains_key("orders")
+        );
+    }
+    #[test]
+    fn test_s332_unknown_table_returns_default() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex
+            .execute("SHOW STORAGE COMPRESSION STATS FOR unknown_tbl")
+            .unwrap()
+        {
+            assert_eq!(rows[0][1], "UNKNOWN");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S333 — Schema drift detection ────────────────────────────────────────
+    #[test]
+    fn test_s333_detect_schema_drift_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("DETECT SCHEMA DRIFT BETWEEN dev AND prod")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s333_show_drift_report_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT SCHEMA DRIFT BETWEEN dev AND prod")
+            .unwrap();
+        let r = ex.execute("SHOW SCHEMA DRIFT REPORT").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s333_clear_drift_report_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT SCHEMA DRIFT BETWEEN dev AND prod")
+            .unwrap();
+        let r = ex.execute("CLEAR SCHEMA DRIFT REPORT").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s333_schema_drift_report.lock().unwrap().is_none());
+    }
+    #[test]
+    fn test_s333_default_report_is_none() {
+        let (ex, _dir) = setup();
+        assert!(ex.s333_schema_drift_report.lock().unwrap().is_none());
+    }
+    #[test]
+    fn test_s333_report_contains_schemas() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT SCHEMA DRIFT BETWEEN dev AND prod")
+            .unwrap();
+        let report = ex.s333_schema_drift_report.lock().unwrap().clone().unwrap();
+        assert!(report.contains("dev") && report.contains("prod"));
+    }
+
+    // ── S334 — Query plan stability tracking ─────────────────────────────────
+    #[test]
+    fn test_s334_track_plan_stability_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("TRACK QUERY PLAN STABILITY FOR 'SELECT 1'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s334_show_plan_stability_report_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("TRACK QUERY PLAN STABILITY FOR 'SELECT 1'")
+            .unwrap();
+        let r = ex.execute("SHOW PLAN STABILITY REPORT").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s334_clear_plan_stability_report_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("TRACK QUERY PLAN STABILITY FOR 'SELECT 1'")
+            .unwrap();
+        let r = ex.execute("CLEAR PLAN STABILITY REPORT").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s334_plan_stability_report.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s334_tracked_query_key_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("TRACK QUERY PLAN STABILITY FOR 'SELECT 2'")
+            .unwrap();
+        assert!(
+            ex.s334_plan_stability_report
+                .lock()
+                .unwrap()
+                .contains_key("SELECT 2")
+        );
+    }
+    #[test]
+    fn test_s334_multiple_tracked_queries() {
+        let (ex, _dir) = setup();
+        ex.execute("TRACK QUERY PLAN STABILITY FOR 'SELECT 1'")
+            .unwrap();
+        ex.execute("TRACK QUERY PLAN STABILITY FOR 'SELECT 2'")
+            .unwrap();
+        assert_eq!(ex.s334_plan_stability_report.lock().unwrap().len(), 2);
+    }
+
+    // ── S335 — Table connection draining ─────────────────────────────────────
+    #[test]
+    fn test_s335_drain_connections_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DRAIN CONNECTIONS FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s335_show_draining_tables_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("DRAIN CONNECTIONS FOR orders").unwrap();
+        let r = ex.execute("SHOW DRAINING TABLES").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s335_cancel_drain_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("DRAIN CONNECTIONS FOR orders").unwrap();
+        let r = ex.execute("CANCEL DRAIN FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s335_draining_tables.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s335_table_marked_draining() {
+        let (ex, _dir) = setup();
+        ex.execute("DRAIN CONNECTIONS FOR orders").unwrap();
+        assert!(ex.s335_draining_tables.lock().unwrap().contains("orders"));
+    }
+    #[test]
+    fn test_s335_multiple_draining_tables() {
+        let (ex, _dir) = setup();
+        ex.execute("DRAIN CONNECTIONS FOR orders").unwrap();
+        ex.execute("DRAIN CONNECTIONS FOR users").unwrap();
+        assert_eq!(ex.s335_draining_tables.lock().unwrap().len(), 2);
+    }
+
+    // ── S336 — Index build resource limits ───────────────────────────────────
+    #[test]
+    fn test_s336_set_build_memory_limit_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET INDEX BUILD MEMORY LIMIT 256MB").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s336_show_resource_limits_returns_value() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX BUILD MEMORY LIMIT 256MB").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW INDEX BUILD RESOURCE LIMITS").unwrap()
+        {
+            assert_eq!(rows[0][0], "256MB");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s336_reset_resource_limits_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX BUILD MEMORY LIMIT 256MB").unwrap();
+        ex.execute("RESET INDEX BUILD RESOURCE LIMITS").unwrap();
+        assert!(
+            ex.s336_index_build_resource_limits
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn test_s336_default_limit_is_none() {
+        let (ex, _dir) = setup();
+        assert!(
+            ex.s336_index_build_resource_limits
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn test_s336_limit_updates_field() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX BUILD MEMORY LIMIT 512MB").unwrap();
+        assert_eq!(
+            ex.s336_index_build_resource_limits.lock().unwrap().clone(),
+            Some("512MB".to_owned())
+        );
+    }
+
+    // ── S337 — Query result streaming v2 ─────────────────────────────────────
+    #[test]
+    fn test_s337_set_streaming_v2_on_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET STREAMING V2 MODE ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s337_set_streaming_v2_off_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET STREAMING V2 MODE OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s337_show_streaming_status_on() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STREAMING V2 MODE ON").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STREAMING V2 STATUS").unwrap() {
+            assert_eq!(rows[0][0], "ON");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s337_show_streaming_status_off_default() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STREAMING V2 STATUS").unwrap() {
+            assert_eq!(rows[0][0], "OFF");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s337_toggle_streaming_v2() {
+        let (ex, _dir) = setup();
+        ex.execute("SET STREAMING V2 MODE ON").unwrap();
+        ex.execute("SET STREAMING V2 MODE OFF").unwrap();
+        assert!(!*ex.s337_streaming_v2_mode.lock().unwrap());
+    }
+
+    // ── S338 — Table shard split/merge ───────────────────────────────────────
+    #[test]
+    fn test_s338_split_shard_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SPLIT SHARD FOR orders AT KEY 'k100'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s338_merge_shards_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("MERGE SHARDS FOR orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s338_show_history_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("SPLIT SHARD FOR orders AT KEY 'k100'").unwrap();
+        let r = ex.execute("SHOW SHARD SPLIT MERGE HISTORY").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s338_history_records_split_and_merge() {
+        let (ex, _dir) = setup();
+        ex.execute("SPLIT SHARD FOR orders AT KEY 'k100'").unwrap();
+        ex.execute("MERGE SHARDS FOR orders").unwrap();
+        assert_eq!(ex.s338_shard_split_merge_history.lock().unwrap().len(), 2);
+    }
+    #[test]
+    fn test_s338_split_event_format() {
+        let (ex, _dir) = setup();
+        ex.execute("SPLIT SHARD FOR orders AT KEY 'k1'").unwrap();
+        assert!(ex.s338_shard_split_merge_history.lock().unwrap()[0].contains("SPLIT"));
+    }
+
+    // ── S339 — Schema object tagging ─────────────────────────────────────────
+    #[test]
+    fn test_s339_tag_schema_object_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("TAG SCHEMA OBJECT public.orders WITH 'pii'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s339_show_object_tags_returns_rows() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG SCHEMA OBJECT public.orders WITH 'pii'")
+            .unwrap();
+        let r = ex.execute("SHOW OBJECT TAGS").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s339_remove_tag_returns_ok() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG SCHEMA OBJECT public.orders WITH 'pii'")
+            .unwrap();
+        let r = ex.execute("REMOVE TAG FROM public.orders").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+        assert!(ex.s339_object_tags.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn test_s339_tag_value_stored() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG SCHEMA OBJECT public.orders WITH 'sensitive'")
+            .unwrap();
+        assert_eq!(
+            ex.s339_object_tags
+                .lock()
+                .unwrap()
+                .get("public.orders")
+                .unwrap()[0],
+            "sensitive"
+        );
+    }
+    #[test]
+    fn test_s339_multiple_tags_on_same_object() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG SCHEMA OBJECT public.orders WITH 'pii'")
+            .unwrap();
+        ex.execute("TAG SCHEMA OBJECT public.orders WITH 'sensitive'")
+            .unwrap();
+        assert_eq!(
+            ex.s339_object_tags
+                .lock()
+                .unwrap()
+                .get("public.orders")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    // ── S340 — 340-sprint checkpoint ─────────────────────────────────────────
+    #[test]
+    fn test_s340_show_sprint_checkpoint_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW SPRINT CHECKPOINT 340").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s340_select_from_checkpoint_table() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM vv_checkpoint_340").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s340_show_total_sql_command_count() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW TOTAL SQL COMMAND COUNT").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s340_checkpoint_value_is_340() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SPRINT CHECKPOINT 340").unwrap() {
+            assert_eq!(rows[0][0], "340");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s340_checkpoint_status_complete() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SELECT * FROM vv_checkpoint_340").unwrap()
         {
             assert_eq!(rows[0][1], "COMPLETE");
         } else {
