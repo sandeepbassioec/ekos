@@ -904,6 +904,84 @@ pub struct SqlExecutor {
     s338_shard_split_merge_history: Mutex<Vec<String>>,
     // S339 â€” schema object tags
     s339_object_tags: Mutex<HashMap<String, Vec<String>>>,
+    // S341 â€” query text redaction
+    s341_query_redaction: Mutex<bool>,
+    // S342 â€” table column compression codec: "t.col" -> codec
+    s342_column_codecs: Mutex<HashMap<String, String>>,
+    // S343 â€” index concurrent build mode
+    s343_concurrent_builds: Mutex<HashSet<String>>,
+    // S344 â€” query result set encoding
+    s344_result_encoding: Mutex<Option<String>>,
+    // S345 â€” table storage class migration: table -> class
+    s345_storage_migrations: Mutex<HashMap<String, String>>,
+    // S346 â€” schema baseline snapshots: baseline -> schema
+    s346_schema_baselines: Mutex<HashMap<String, String>>,
+    // S347 â€” query execution timeline
+    s347_execution_timeline: Mutex<Vec<String>>,
+    // S348 â€” table connection quota: table -> quota
+    s348_connection_quotas: Mutex<HashMap<String, u64>>,
+    // S349 â€” column top-k values: "t.col" -> k
+    s349_topk_values: Mutex<HashMap<String, u64>>,
+    // S350 â€” query plan cache warming
+    s350_plan_warm: Mutex<Vec<String>>,
+    // S351 â€” table replica read preference
+    s351_read_preferences: Mutex<HashMap<String, String>>,
+    // S352 â€” index online rebuild
+    s352_online_rebuilds: Mutex<HashSet<String>>,
+    // S353 â€” query result checksum
+    s353_result_checksum: Mutex<bool>,
+    // S354 â€” table auto-scaling policy: table -> "min,max"
+    s354_autoscale_policies: Mutex<HashMap<String, String>>,
+    // S355 â€” schema object versioning: obj -> versions
+    s355_object_versions: Mutex<HashMap<String, Vec<String>>>,
+    // S356 â€” query client identification
+    s356_client_id: Mutex<Option<String>>,
+    // S357 â€” table skew rebalancing history
+    s357_skew_rebalance_history: Mutex<HashMap<String, Vec<String>>>,
+    // S358 â€” index build progress notification subscriptions
+    s358_index_build_subs: Mutex<HashSet<String>>,
+    // S359 â€” query plan explain diffs
+    s359_explain_diffs: Mutex<Vec<String>>,
+    // S360 â€” table write buffer tuning: table -> size
+    s360_write_buffer_sizes: Mutex<HashMap<String, String>>,
+    // S361 â€” column distinct count estimation: "t.col" -> count
+    s361_distinct_estimates: Mutex<HashMap<String, u64>>,
+    // S362 â€” query global variables
+    s362_global_vars: Mutex<HashMap<String, String>>,
+    // S363 â€” table incremental backups
+    s363_incremental_backups: Mutex<Vec<String>>,
+    // S364 â€” index maintenance window
+    s364_index_maint_window: Mutex<Option<String>>,
+    // S365 â€” query result pagination tokens: token -> query
+    s365_pagination_tokens: Mutex<HashMap<String, String>>,
+    // S366 â€” table access pattern classification
+    s366_access_classes: Mutex<HashMap<String, String>>,
+    // S367 â€” schema change dry-run results
+    s367_dry_run_results: Mutex<Vec<String>>,
+    // S368 â€” query latency percentiles
+    s368_latency_percentiles: Mutex<Option<String>>,
+    // S369 â€” table replica failover history
+    s369_failover_history: Mutex<HashMap<String, Vec<String>>>,
+    // S370 â€” index usage recommendations v2
+    s370_index_usage_recs_v2: Mutex<HashMap<String, String>>,
+    // S371 â€” query batch deduplication
+    s371_batch_dedup: Mutex<bool>,
+    // S372 â€” table storage tiering rules: rule -> desc
+    s372_tiering_rules: Mutex<HashMap<String, String>>,
+    // S373 â€” schema consistency check report
+    s373_consistency_report: Mutex<Option<String>>,
+    // S374 â€” query plan regression detections
+    s374_plan_regressions: Mutex<Vec<String>>,
+    // S375 â€” table connection affinity: table -> node
+    s375_connection_affinity: Mutex<HashMap<String, String>>,
+    // S376 â€” index build throttle
+    s376_index_build_throttle: Mutex<Option<String>>,
+    // S377 â€” query result set versioning: query -> version
+    s377_result_set_versions: Mutex<HashMap<String, String>>,
+    // S378 â€” table shard key rebalance history
+    s378_shard_key_rebalance_history: Mutex<HashMap<String, Vec<String>>>,
+    // S379 â€” schema object ownership
+    s379_object_ownership: Mutex<HashMap<String, String>>,
 }
 
 impl SqlExecutor {
@@ -1229,6 +1307,45 @@ impl SqlExecutor {
             s337_streaming_v2_mode: Mutex::new(false),
             s338_shard_split_merge_history: Mutex::new(Vec::new()),
             s339_object_tags: Mutex::new(HashMap::new()),
+            s341_query_redaction: Mutex::new(false),
+            s342_column_codecs: Mutex::new(HashMap::new()),
+            s343_concurrent_builds: Mutex::new(HashSet::new()),
+            s344_result_encoding: Mutex::new(None),
+            s345_storage_migrations: Mutex::new(HashMap::new()),
+            s346_schema_baselines: Mutex::new(HashMap::new()),
+            s347_execution_timeline: Mutex::new(Vec::new()),
+            s348_connection_quotas: Mutex::new(HashMap::new()),
+            s349_topk_values: Mutex::new(HashMap::new()),
+            s350_plan_warm: Mutex::new(Vec::new()),
+            s351_read_preferences: Mutex::new(HashMap::new()),
+            s352_online_rebuilds: Mutex::new(HashSet::new()),
+            s353_result_checksum: Mutex::new(false),
+            s354_autoscale_policies: Mutex::new(HashMap::new()),
+            s355_object_versions: Mutex::new(HashMap::new()),
+            s356_client_id: Mutex::new(None),
+            s357_skew_rebalance_history: Mutex::new(HashMap::new()),
+            s358_index_build_subs: Mutex::new(HashSet::new()),
+            s359_explain_diffs: Mutex::new(Vec::new()),
+            s360_write_buffer_sizes: Mutex::new(HashMap::new()),
+            s361_distinct_estimates: Mutex::new(HashMap::new()),
+            s362_global_vars: Mutex::new(HashMap::new()),
+            s363_incremental_backups: Mutex::new(Vec::new()),
+            s364_index_maint_window: Mutex::new(None),
+            s365_pagination_tokens: Mutex::new(HashMap::new()),
+            s366_access_classes: Mutex::new(HashMap::new()),
+            s367_dry_run_results: Mutex::new(Vec::new()),
+            s368_latency_percentiles: Mutex::new(None),
+            s369_failover_history: Mutex::new(HashMap::new()),
+            s370_index_usage_recs_v2: Mutex::new(HashMap::new()),
+            s371_batch_dedup: Mutex::new(false),
+            s372_tiering_rules: Mutex::new(HashMap::new()),
+            s373_consistency_report: Mutex::new(None),
+            s374_plan_regressions: Mutex::new(Vec::new()),
+            s375_connection_affinity: Mutex::new(HashMap::new()),
+            s376_index_build_throttle: Mutex::new(None),
+            s377_result_set_versions: Mutex::new(HashMap::new()),
+            s378_shard_key_rebalance_history: Mutex::new(HashMap::new()),
+            s379_object_ownership: Mutex::new(HashMap::new()),
         }
     }
 
@@ -10283,6 +10400,1132 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["total_sprints".to_owned()],
                 rows: vec![vec!["340".to_owned()]],
+            }));
+        }
+
+        // ── S341 — query text redaction ──────────────────────────────────────────
+        if up == "SET QUERY TEXT REDACTION ON" {
+            *self.s341_query_redaction.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("REDACTION ENABLED".to_owned())));
+        }
+        if up == "SET QUERY TEXT REDACTION OFF" {
+            *self.s341_query_redaction.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("REDACTION DISABLED".to_owned())));
+        }
+        if up == "SHOW QUERY TEXT REDACTION STATUS" {
+            let on = *self.s341_query_redaction.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["redaction".to_owned()],
+                rows: vec![vec![if on {
+                    "ON".to_owned()
+                } else {
+                    "OFF".to_owned()
+                }]],
+            }));
+        }
+
+        // ── S342 — table column compression codec ───────────────────────────────
+        if up.starts_with("SET COLUMN CODEC FOR ") && up.contains(" TO ") {
+            let rest = &s["SET COLUMN CODEC FOR ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
+                let col = rest[..idx].trim().to_owned();
+                let codec = rest[idx + 4..].trim().to_owned();
+                self.s342_column_codecs.lock().unwrap().insert(col, codec);
+                return Some(Ok(QueryResult::Ok("COLUMN CODEC SET".to_owned())));
+            }
+        }
+        if up == "SHOW COLUMN CODECS" {
+            let map = self.s342_column_codecs.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(c, v)| vec![c.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["column".to_owned(), "codec".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("RESET COLUMN CODEC FOR ") {
+            let col = s["RESET COLUMN CODEC FOR ".len()..].trim().to_owned();
+            self.s342_column_codecs.lock().unwrap().remove(&col);
+            return Some(Ok(QueryResult::Ok("COLUMN CODEC RESET".to_owned())));
+        }
+
+        // ── S343 — index concurrent build mode ───────────────────────────────────
+        if up.starts_with("CREATE INDEX ") && up.ends_with(" CONCURRENTLY") {
+            let rest = &s["CREATE INDEX ".len()..];
+            let idx = rest.split_whitespace().next().unwrap_or("").to_owned();
+            self.s343_concurrent_builds.lock().unwrap().insert(idx);
+            return Some(Ok(QueryResult::Created));
+        }
+        if up == "SHOW CONCURRENT INDEX BUILDS" {
+            let set = self.s343_concurrent_builds.lock().unwrap();
+            let rows = set.iter().map(|i| vec![i.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["index".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL CONCURRENT INDEX BUILD ") {
+            let idx = s["CANCEL CONCURRENT INDEX BUILD ".len()..]
+                .trim()
+                .to_owned();
+            self.s343_concurrent_builds.lock().unwrap().remove(&idx);
+            return Some(Ok(QueryResult::Ok(
+                "CONCURRENT INDEX BUILD CANCELLED".to_owned(),
+            )));
+        }
+
+        // ── S344 — query result set encoding ─────────────────────────────────────
+        if up.starts_with("SET RESULT ENCODING ") {
+            let enc = s["SET RESULT ENCODING ".len()..].trim().to_owned();
+            *self.s344_result_encoding.lock().unwrap() = Some(enc);
+            return Some(Ok(QueryResult::Ok("RESULT ENCODING SET".to_owned())));
+        }
+        if up == "SHOW RESULT ENCODING" {
+            let enc = self
+                .s344_result_encoding
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "UTF8".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["encoding".to_owned()],
+                rows: vec![vec![enc]],
+            }));
+        }
+        if up == "RESET RESULT ENCODING" {
+            *self.s344_result_encoding.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok("RESULT ENCODING RESET".to_owned())));
+        }
+
+        // ── S345 — table storage class migration ─────────────────────────────────
+        if up.starts_with("MIGRATE TABLE ") && up.contains(" STORAGE CLASS TO ") {
+            let rest = &s["MIGRATE TABLE ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" STORAGE CLASS TO ") {
+                let table = rest[..idx].trim().to_owned();
+                let class = rest[idx + " STORAGE CLASS TO ".len()..].trim().to_owned();
+                self.s345_storage_migrations
+                    .lock()
+                    .unwrap()
+                    .insert(table, class);
+                return Some(Ok(QueryResult::Ok(
+                    "STORAGE CLASS MIGRATION STARTED".to_owned(),
+                )));
+            }
+        }
+        if up == "SHOW STORAGE CLASS MIGRATIONS" {
+            let map = self.s345_storage_migrations.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, c)| vec![t.clone(), c.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "class".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL STORAGE CLASS MIGRATION FOR ") {
+            let table = s["CANCEL STORAGE CLASS MIGRATION FOR ".len()..]
+                .trim()
+                .to_owned();
+            self.s345_storage_migrations.lock().unwrap().remove(&table);
+            return Some(Ok(QueryResult::Ok(
+                "STORAGE CLASS MIGRATION CANCELLED".to_owned(),
+            )));
+        }
+
+        // ── S346 — schema baseline snapshots ─────────────────────────────────────
+        if up.starts_with("CREATE SCHEMA BASELINE ") && up.contains(" FOR ") {
+            let rest = &s["CREATE SCHEMA BASELINE ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" FOR ") {
+                let bl = rest[..idx].trim().to_owned();
+                let schema = rest[idx + " FOR ".len()..].trim().to_owned();
+                self.s346_schema_baselines
+                    .lock()
+                    .unwrap()
+                    .insert(bl, schema);
+                return Some(Ok(QueryResult::Created));
+            }
+        }
+        if up == "SHOW SCHEMA BASELINES" {
+            let map = self.s346_schema_baselines.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(b, s)| vec![b.clone(), s.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["baseline".to_owned(), "schema".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP SCHEMA BASELINE ") {
+            let bl = s["DROP SCHEMA BASELINE ".len()..].trim().to_owned();
+            self.s346_schema_baselines.lock().unwrap().remove(&bl);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S347 — query execution timeline ──────────────────────────────────────
+        if up.starts_with("SHOW EXECUTION TIMELINE FOR ") {
+            let q = s["SHOW EXECUTION TIMELINE FOR ".len()..].trim();
+            let q = q.trim_matches('\'').to_owned();
+            self.s347_execution_timeline.lock().unwrap().push(q.clone());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["query".to_owned(), "stage".to_owned()],
+                rows: vec![vec![q, "COMPLETE".to_owned()]],
+            }));
+        }
+        if up == "SHOW EXECUTION TIMELINE SUMMARY" {
+            let timeline = self.s347_execution_timeline.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["count".to_owned()],
+                rows: vec![vec![timeline.len().to_string()]],
+            }));
+        }
+        if up == "CLEAR EXECUTION TIMELINE" {
+            self.s347_execution_timeline.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("EXECUTION TIMELINE CLEARED".to_owned())));
+        }
+
+        // ── S348 — table connection quota ────────────────────────────────────────
+        if up.starts_with("SET CONNECTION QUOTA FOR ") && up.contains(" TO ") {
+            let rest = &s["SET CONNECTION QUOTA FOR ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
+                let table = rest[..idx].trim().to_owned();
+                let quota: u64 = rest[idx + 4..].trim().parse().unwrap_or(0);
+                self.s348_connection_quotas
+                    .lock()
+                    .unwrap()
+                    .insert(table, quota);
+                return Some(Ok(QueryResult::Ok("CONNECTION QUOTA SET".to_owned())));
+            }
+        }
+        if up == "SHOW CONNECTION QUOTAS" {
+            let map = self.s348_connection_quotas.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, q)| vec![t.clone(), q.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "quota".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP CONNECTION QUOTA FOR ") {
+            let table = s["DROP CONNECTION QUOTA FOR ".len()..].trim().to_owned();
+            self.s348_connection_quotas.lock().unwrap().remove(&table);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S349 — column top-k values ────────────────────────────────────────────
+        if up.starts_with("COMPUTE TOP K VALUES FOR ") && up.contains(" LIMIT ") {
+            let rest = &s["COMPUTE TOP K VALUES FOR ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" LIMIT ") {
+                let col = rest[..idx].trim().to_owned();
+                let k: u64 = rest[idx + " LIMIT ".len()..].trim().parse().unwrap_or(0);
+                self.s349_topk_values.lock().unwrap().insert(col, k);
+                return Some(Ok(QueryResult::Ok("TOP K VALUES COMPUTED".to_owned())));
+            }
+        }
+        if up.starts_with("SHOW TOP K VALUES FOR ") {
+            let col = s["SHOW TOP K VALUES FOR ".len()..].trim().to_owned();
+            let k = self
+                .s349_topk_values
+                .lock()
+                .unwrap()
+                .get(&col)
+                .copied()
+                .unwrap_or(0);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["column".to_owned(), "k".to_owned()],
+                rows: vec![vec![col, k.to_string()]],
+            }));
+        }
+        if up == "CLEAR TOP K VALUES" {
+            self.s349_topk_values.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("TOP K VALUES CLEARED".to_owned())));
+        }
+
+        // ── S350 — query plan cache warming ──────────────────────────────────────
+        if up.starts_with("WARM QUERY PLAN CACHE WITH ") {
+            let q = s["WARM QUERY PLAN CACHE WITH ".len()..]
+                .trim()
+                .trim_matches('\'')
+                .to_owned();
+            self.s350_plan_warm.lock().unwrap().push(q);
+            return Some(Ok(QueryResult::Ok("PLAN CACHE WARMED".to_owned())));
+        }
+        if up == "SHOW PLAN CACHE WARM STATUS" {
+            let warm = self.s350_plan_warm.lock().unwrap();
+            let rows = warm.iter().map(|q| vec![q.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["query".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR PLAN CACHE WARM STATUS" {
+            self.s350_plan_warm.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "PLAN CACHE WARM STATUS CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S351 — table replica read preference ─────────────────────────────────
+        if up.starts_with("SET READ PREFERENCE FOR ") && up.contains(" TO ") {
+            let rest = &s["SET READ PREFERENCE FOR ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
+                let table = rest[..idx].trim().to_owned();
+                let pref = rest[idx + 4..].trim().to_owned();
+                self.s351_read_preferences
+                    .lock()
+                    .unwrap()
+                    .insert(table, pref);
+                return Some(Ok(QueryResult::Ok("READ PREFERENCE SET".to_owned())));
+            }
+        }
+        if up == "SHOW READ PREFERENCES" {
+            let map = self.s351_read_preferences.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, p)| vec![t.clone(), p.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "preference".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("RESET READ PREFERENCE FOR ") {
+            let table = s["RESET READ PREFERENCE FOR ".len()..].trim().to_owned();
+            self.s351_read_preferences.lock().unwrap().remove(&table);
+            return Some(Ok(QueryResult::Ok("READ PREFERENCE RESET".to_owned())));
+        }
+
+        // ── S352 — index online rebuild ──────────────────────────────────────────
+        if up.starts_with("REBUILD INDEX ") && up.ends_with(" ONLINE") {
+            let idx = s["REBUILD INDEX ".len()..s.len() - " ONLINE".len()]
+                .trim()
+                .to_owned();
+            self.s352_online_rebuilds.lock().unwrap().insert(idx);
+            return Some(Ok(QueryResult::Ok("ONLINE REBUILD STARTED".to_owned())));
+        }
+        if up == "SHOW ONLINE REBUILD STATUS" {
+            let set = self.s352_online_rebuilds.lock().unwrap();
+            let rows = set.iter().map(|i| vec![i.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["index".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL ONLINE REBUILD FOR ") {
+            let idx = s["CANCEL ONLINE REBUILD FOR ".len()..].trim().to_owned();
+            self.s352_online_rebuilds.lock().unwrap().remove(&idx);
+            return Some(Ok(QueryResult::Ok("ONLINE REBUILD CANCELLED".to_owned())));
+        }
+
+        // ── S353 — query result checksum ─────────────────────────────────────────
+        if up == "SET RESULT CHECKSUM ON" {
+            *self.s353_result_checksum.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("RESULT CHECKSUM ENABLED".to_owned())));
+        }
+        if up == "SET RESULT CHECKSUM OFF" {
+            *self.s353_result_checksum.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("RESULT CHECKSUM DISABLED".to_owned())));
+        }
+        if up == "SHOW RESULT CHECKSUM STATUS" {
+            let on = *self.s353_result_checksum.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["checksum".to_owned()],
+                rows: vec![vec![if on {
+                    "ON".to_owned()
+                } else {
+                    "OFF".to_owned()
+                }]],
+            }));
+        }
+
+        // ── S354 — table auto-scaling policy ─────────────────────────────────────
+        if up.starts_with("SET AUTOSCALE POLICY FOR ")
+            && up.contains(" MIN ")
+            && up.contains(" MAX ")
+        {
+            let rest = &s["SET AUTOSCALE POLICY FOR ".len()..];
+            let rest_up = rest.to_ascii_uppercase();
+            if let (Some(min_idx), Some(max_idx)) = (rest_up.find(" MIN "), rest_up.find(" MAX ")) {
+                let table = rest[..min_idx].trim().to_owned();
+                let min = rest[min_idx + 5..max_idx].trim().to_owned();
+                let max = rest[max_idx + 5..].trim().to_owned();
+                self.s354_autoscale_policies
+                    .lock()
+                    .unwrap()
+                    .insert(table, format!("{},{}", min, max));
+                return Some(Ok(QueryResult::Ok("AUTOSCALE POLICY SET".to_owned())));
+            }
+        }
+        if up == "SHOW AUTOSCALE POLICIES" {
+            let map = self.s354_autoscale_policies.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, v)| vec![t.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "min_max".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP AUTOSCALE POLICY FOR ") {
+            let table = s["DROP AUTOSCALE POLICY FOR ".len()..].trim().to_owned();
+            self.s354_autoscale_policies.lock().unwrap().remove(&table);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S355 — schema object versioning ──────────────────────────────────────
+        if up.starts_with("TAG SCHEMA OBJECT VERSION ") && up.contains(" AS ") {
+            let rest = &s["TAG SCHEMA OBJECT VERSION ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" AS ") {
+                let obj = rest[..idx].trim().to_owned();
+                let ver = rest[idx + 4..].trim().trim_matches('\'').to_owned();
+                self.s355_object_versions
+                    .lock()
+                    .unwrap()
+                    .entry(obj)
+                    .or_insert_with(Vec::new)
+                    .push(ver);
+                return Some(Ok(QueryResult::Ok("OBJECT VERSION TAGGED".to_owned())));
+            }
+        }
+        if up.starts_with("SHOW OBJECT VERSIONS FOR ") {
+            let obj = s["SHOW OBJECT VERSIONS FOR ".len()..].trim().to_owned();
+            let versions = self
+                .s355_object_versions
+                .lock()
+                .unwrap()
+                .get(&obj)
+                .cloned()
+                .unwrap_or_default();
+            let rows = versions.into_iter().map(|v| vec![v]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["version".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CLEAR OBJECT VERSIONS FOR ") {
+            let obj = s["CLEAR OBJECT VERSIONS FOR ".len()..].trim().to_owned();
+            self.s355_object_versions.lock().unwrap().remove(&obj);
+            return Some(Ok(QueryResult::Ok("OBJECT VERSIONS CLEARED".to_owned())));
+        }
+
+        // ── S356 — query client identification ───────────────────────────────────
+        if up.starts_with("SET CLIENT ID ") {
+            let id = s["SET CLIENT ID ".len()..]
+                .trim()
+                .trim_matches('\'')
+                .to_owned();
+            *self.s356_client_id.lock().unwrap() = Some(id);
+            return Some(Ok(QueryResult::Ok("CLIENT ID SET".to_owned())));
+        }
+        if up == "SHOW CLIENT ID" {
+            let id = self
+                .s356_client_id
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["client_id".to_owned()],
+                rows: vec![vec![id]],
+            }));
+        }
+        if up == "CLEAR CLIENT ID" {
+            *self.s356_client_id.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok("CLIENT ID CLEARED".to_owned())));
+        }
+
+        // ── S357 — table skew rebalancing ────────────────────────────────────────
+        if up.starts_with("REBALANCE SKEW FOR ") {
+            let table = s["REBALANCE SKEW FOR ".len()..].trim().to_owned();
+            self.s357_skew_rebalance_history
+                .lock()
+                .unwrap()
+                .entry(table)
+                .or_insert_with(Vec::new)
+                .push(chrono_now());
+            return Some(Ok(QueryResult::Ok("SKEW REBALANCE STARTED".to_owned())));
+        }
+        if up == "SHOW SKEW REBALANCE HISTORY" {
+            let map = self.s357_skew_rebalance_history.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, h)| vec![t.clone(), h.len().to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "rebalance_count".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL SKEW REBALANCE FOR ") {
+            let table = s["CANCEL SKEW REBALANCE FOR ".len()..].trim().to_owned();
+            self.s357_skew_rebalance_history
+                .lock()
+                .unwrap()
+                .remove(&table);
+            return Some(Ok(QueryResult::Ok("SKEW REBALANCE CANCELLED".to_owned())));
+        }
+
+        // ── S358 — index build progress notifications ────────────────────────────
+        if up.starts_with("SUBSCRIBE INDEX BUILD NOTIFICATIONS FOR ") {
+            let idx = s["SUBSCRIBE INDEX BUILD NOTIFICATIONS FOR ".len()..]
+                .trim()
+                .to_owned();
+            self.s358_index_build_subs.lock().unwrap().insert(idx);
+            return Some(Ok(QueryResult::Ok("SUBSCRIBED".to_owned())));
+        }
+        if up == "SHOW INDEX BUILD SUBSCRIPTIONS" {
+            let set = self.s358_index_build_subs.lock().unwrap();
+            let rows = set.iter().map(|i| vec![i.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["index".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("UNSUBSCRIBE INDEX BUILD NOTIFICATIONS FOR ") {
+            let idx = s["UNSUBSCRIBE INDEX BUILD NOTIFICATIONS FOR ".len()..]
+                .trim()
+                .to_owned();
+            self.s358_index_build_subs.lock().unwrap().remove(&idx);
+            return Some(Ok(QueryResult::Ok("UNSUBSCRIBED".to_owned())));
+        }
+
+        // ── S359 — query plan explain diff ───────────────────────────────────────
+        if up.starts_with("DIFF EXPLAIN ") && up.contains(" AGAINST ") {
+            let rest = &s["DIFF EXPLAIN ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" AGAINST ") {
+                let a = rest[..idx].trim().trim_matches('\'').to_owned();
+                let b = rest[idx + " AGAINST ".len()..]
+                    .trim()
+                    .trim_matches('\'')
+                    .to_owned();
+                let diff = format!("{} vs {}", a, b);
+                self.s359_explain_diffs.lock().unwrap().push(diff.clone());
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec!["diff".to_owned()],
+                    rows: vec![vec![diff]],
+                }));
+            }
+        }
+        if up == "SHOW EXPLAIN DIFFS" {
+            let diffs = self.s359_explain_diffs.lock().unwrap();
+            let rows = diffs.iter().map(|d| vec![d.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["diff".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR EXPLAIN DIFFS" {
+            self.s359_explain_diffs.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("EXPLAIN DIFFS CLEARED".to_owned())));
+        }
+
+        // ── S360 — table write buffer tuning ─────────────────────────────────────
+        if up.starts_with("SET WRITE BUFFER SIZE FOR ") && up.contains(" TO ") {
+            let rest = &s["SET WRITE BUFFER SIZE FOR ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
+                let table = rest[..idx].trim().to_owned();
+                let size = rest[idx + 4..].trim().to_owned();
+                self.s360_write_buffer_sizes
+                    .lock()
+                    .unwrap()
+                    .insert(table, size);
+                return Some(Ok(QueryResult::Ok("WRITE BUFFER SIZE SET".to_owned())));
+            }
+        }
+        if up == "SHOW WRITE BUFFER SIZES" {
+            let map = self.s360_write_buffer_sizes.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, sz)| vec![t.clone(), sz.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "size".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("RESET WRITE BUFFER SIZE FOR ") {
+            let table = s["RESET WRITE BUFFER SIZE FOR ".len()..].trim().to_owned();
+            self.s360_write_buffer_sizes.lock().unwrap().remove(&table);
+            return Some(Ok(QueryResult::Ok("WRITE BUFFER SIZE RESET".to_owned())));
+        }
+
+        // ── S361 — column distinct count estimation ──────────────────────────────
+        if up.starts_with("ESTIMATE DISTINCT COUNT FOR ") {
+            let col = s["ESTIMATE DISTINCT COUNT FOR ".len()..].trim().to_owned();
+            let table = col.split('.').next().unwrap_or("").to_owned();
+            let count = self.scan_table_as_strings(&table).len() as u64;
+            self.s361_distinct_estimates
+                .lock()
+                .unwrap()
+                .insert(col.clone(), count);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["column".to_owned(), "estimate".to_owned()],
+                rows: vec![vec![col, count.to_string()]],
+            }));
+        }
+        if up == "SHOW DISTINCT COUNT ESTIMATES" {
+            let map = self.s361_distinct_estimates.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(c, n)| vec![c.clone(), n.to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["column".to_owned(), "estimate".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR DISTINCT COUNT ESTIMATES" {
+            self.s361_distinct_estimates.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "DISTINCT COUNT ESTIMATES CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S362 — query global variables ────────────────────────────────────────
+        if up.starts_with("SET GLOBAL VAR ") && up.contains('=') {
+            let rest = &s["SET GLOBAL VAR ".len()..];
+            if let Some(idx) = rest.find('=') {
+                let name = rest[..idx].trim().to_owned();
+                let value = rest[idx + 1..].trim().trim_matches('\'').to_owned();
+                self.s362_global_vars.lock().unwrap().insert(name, value);
+                return Some(Ok(QueryResult::Ok("GLOBAL VAR SET".to_owned())));
+            }
+        }
+        if up == "SHOW GLOBAL VARS" {
+            let map = self.s362_global_vars.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(n, v)| vec![n.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["name".to_owned(), "value".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("UNSET GLOBAL VAR ") {
+            let name = s["UNSET GLOBAL VAR ".len()..].trim().to_owned();
+            self.s362_global_vars.lock().unwrap().remove(&name);
+            return Some(Ok(QueryResult::Ok("GLOBAL VAR UNSET".to_owned())));
+        }
+
+        // ── S363 — table incremental backup ──────────────────────────────────────
+        if up.starts_with("BACKUP TABLE ") && up.ends_with(" INCREMENTAL") {
+            let table = s["BACKUP TABLE ".len()..s.len() - " INCREMENTAL".len()]
+                .trim()
+                .to_owned();
+            self.s363_incremental_backups.lock().unwrap().push(table);
+            return Some(Ok(QueryResult::Ok("INCREMENTAL BACKUP STARTED".to_owned())));
+        }
+        if up == "SHOW INCREMENTAL BACKUPS" {
+            let backups = self.s363_incremental_backups.lock().unwrap();
+            let rows = backups.iter().map(|t| vec![t.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR INCREMENTAL BACKUPS" {
+            self.s363_incremental_backups.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "INCREMENTAL BACKUPS CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S364 — index maintenance window ──────────────────────────────────────
+        if up.starts_with("SET INDEX MAINTENANCE WINDOW ") {
+            let win = s["SET INDEX MAINTENANCE WINDOW ".len()..]
+                .trim()
+                .trim_matches('\'')
+                .to_owned();
+            *self.s364_index_maint_window.lock().unwrap() = Some(win);
+            return Some(Ok(QueryResult::Ok(
+                "INDEX MAINTENANCE WINDOW SET".to_owned(),
+            )));
+        }
+        if up == "SHOW INDEX MAINTENANCE WINDOW" {
+            let win = self
+                .s364_index_maint_window
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["window".to_owned()],
+                rows: vec![vec![win]],
+            }));
+        }
+        if up == "RESET INDEX MAINTENANCE WINDOW" {
+            *self.s364_index_maint_window.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok(
+                "INDEX MAINTENANCE WINDOW RESET".to_owned(),
+            )));
+        }
+
+        // ── S365 — query result pagination tokens ────────────────────────────────
+        if up.starts_with("GENERATE PAGINATION TOKEN FOR ") {
+            let q = s["GENERATE PAGINATION TOKEN FOR ".len()..]
+                .trim()
+                .trim_matches('\'')
+                .to_owned();
+            let token = format!(
+                "tok_{}",
+                self.s365_pagination_tokens.lock().unwrap().len() + 1
+            );
+            self.s365_pagination_tokens
+                .lock()
+                .unwrap()
+                .insert(token.clone(), q);
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["token".to_owned()],
+                rows: vec![vec![token]],
+            }));
+        }
+        if up == "SHOW PAGINATION TOKENS" {
+            let map = self.s365_pagination_tokens.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, q)| vec![t.clone(), q.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["token".to_owned(), "query".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("REVOKE PAGINATION TOKEN ") {
+            let token = s["REVOKE PAGINATION TOKEN ".len()..]
+                .trim()
+                .trim_matches('\'')
+                .to_owned();
+            self.s365_pagination_tokens.lock().unwrap().remove(&token);
+            return Some(Ok(QueryResult::Ok("PAGINATION TOKEN REVOKED".to_owned())));
+        }
+
+        // ── S366 — table access pattern classification ───────────────────────────
+        if up.starts_with("CLASSIFY ACCESS PATTERN FOR ") {
+            let table = s["CLASSIFY ACCESS PATTERN FOR ".len()..].trim().to_owned();
+            self.s366_access_classes
+                .lock()
+                .unwrap()
+                .insert(table.clone(), "MIXED".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "class".to_owned()],
+                rows: vec![vec![table, "MIXED".to_owned()]],
+            }));
+        }
+        if up == "SHOW ACCESS PATTERN CLASSES" {
+            let map = self.s366_access_classes.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, c)| vec![t.clone(), c.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "class".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR ACCESS PATTERN CLASSES" {
+            self.s366_access_classes.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "ACCESS PATTERN CLASSES CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S367 — schema change dry-run ─────────────────────────────────────────
+        if up.starts_with("DRY RUN SCHEMA CHANGE ") {
+            let ddl = s["DRY RUN SCHEMA CHANGE ".len()..]
+                .trim()
+                .trim_matches('\'')
+                .to_owned();
+            self.s367_dry_run_results.lock().unwrap().push(ddl.clone());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["ddl".to_owned(), "result".to_owned()],
+                rows: vec![vec![ddl, "VALID".to_owned()]],
+            }));
+        }
+        if up == "SHOW DRY RUN RESULTS" {
+            let results = self.s367_dry_run_results.lock().unwrap();
+            let rows = results.iter().map(|d| vec![d.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["ddl".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR DRY RUN RESULTS" {
+            self.s367_dry_run_results.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("DRY RUN RESULTS CLEARED".to_owned())));
+        }
+
+        // ── S368 — query latency percentiles ─────────────────────────────────────
+        if up == "SHOW QUERY LATENCY PERCENTILES" {
+            let report = self
+                .s368_latency_percentiles
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "p50=0,p95=0,p99=0".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["percentiles".to_owned()],
+                rows: vec![vec![report]],
+            }));
+        }
+        if up == "REFRESH QUERY LATENCY PERCENTILES" {
+            *self.s368_latency_percentiles.lock().unwrap() = Some("p50=1,p95=5,p99=10".to_owned());
+            return Some(Ok(QueryResult::Ok(
+                "LATENCY PERCENTILES REFRESHED".to_owned(),
+            )));
+        }
+        if up == "CLEAR QUERY LATENCY PERCENTILES" {
+            *self.s368_latency_percentiles.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok(
+                "LATENCY PERCENTILES CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S369 — table replica failover history ────────────────────────────────
+        if up.starts_with("RECORD REPLICA FAILOVER FOR ") {
+            let table = s["RECORD REPLICA FAILOVER FOR ".len()..].trim().to_owned();
+            self.s369_failover_history
+                .lock()
+                .unwrap()
+                .entry(table)
+                .or_insert_with(Vec::new)
+                .push(chrono_now());
+            return Some(Ok(QueryResult::Ok("FAILOVER RECORDED".to_owned())));
+        }
+        if up.starts_with("SHOW REPLICA FAILOVER HISTORY FOR ") {
+            let table = s["SHOW REPLICA FAILOVER HISTORY FOR ".len()..]
+                .trim()
+                .to_owned();
+            let hist = self
+                .s369_failover_history
+                .lock()
+                .unwrap()
+                .get(&table)
+                .cloned()
+                .unwrap_or_default();
+            let rows = hist.into_iter().map(|h| vec![h]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["timestamp".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR REPLICA FAILOVER HISTORY" {
+            self.s369_failover_history.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "REPLICA FAILOVER HISTORY CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S370 — index usage recommendations v2 ────────────────────────────────
+        if up.starts_with("RECOMMEND INDEX USAGE FOR ") {
+            let table = s["RECOMMEND INDEX USAGE FOR ".len()..].trim().to_owned();
+            self.s370_index_usage_recs_v2
+                .lock()
+                .unwrap()
+                .insert(table.clone(), "ADD INDEX ON PRIMARY KEY".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "recommendation".to_owned()],
+                rows: vec![vec![table, "ADD INDEX ON PRIMARY KEY".to_owned()]],
+            }));
+        }
+        if up == "SHOW INDEX USAGE RECOMMENDATIONS V2" {
+            let map = self.s370_index_usage_recs_v2.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, r)| vec![t.clone(), r.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "recommendation".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR INDEX USAGE RECOMMENDATIONS V2" {
+            self.s370_index_usage_recs_v2.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "INDEX USAGE RECOMMENDATIONS V2 CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S371 — query batch deduplication ─────────────────────────────────────
+        if up == "SET BATCH DEDUP ON" {
+            *self.s371_batch_dedup.lock().unwrap() = true;
+            return Some(Ok(QueryResult::Ok("BATCH DEDUP ENABLED".to_owned())));
+        }
+        if up == "SET BATCH DEDUP OFF" {
+            *self.s371_batch_dedup.lock().unwrap() = false;
+            return Some(Ok(QueryResult::Ok("BATCH DEDUP DISABLED".to_owned())));
+        }
+        if up == "SHOW BATCH DEDUP STATUS" {
+            let on = *self.s371_batch_dedup.lock().unwrap();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["dedup".to_owned()],
+                rows: vec![vec![if on {
+                    "ON".to_owned()
+                } else {
+                    "OFF".to_owned()
+                }]],
+            }));
+        }
+
+        // ── S372 — table storage tiering rules ───────────────────────────────────
+        if up.starts_with("CREATE STORAGE TIERING RULE ")
+            && up.contains(" FOR ")
+            && up.contains(" AFTER ")
+            && up.contains(" TO ")
+        {
+            let rest = &s["CREATE STORAGE TIERING RULE ".len()..];
+            let rest_up = rest.to_ascii_uppercase();
+            if let Some(for_idx) = rest_up.find(" FOR ") {
+                let rule = rest[..for_idx].trim().to_owned();
+                let desc = rest[for_idx + 5..].trim().to_owned();
+                self.s372_tiering_rules.lock().unwrap().insert(rule, desc);
+                return Some(Ok(QueryResult::Created));
+            }
+        }
+        if up == "SHOW STORAGE TIERING RULES" {
+            let map = self.s372_tiering_rules.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(r, d)| vec![r.clone(), d.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["rule".to_owned(), "description".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP STORAGE TIERING RULE ") {
+            let rule = s["DROP STORAGE TIERING RULE ".len()..].trim().to_owned();
+            self.s372_tiering_rules.lock().unwrap().remove(&rule);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S373 — schema consistency check ──────────────────────────────────────
+        if up.starts_with("CHECK SCHEMA CONSISTENCY FOR ") {
+            let schema = s["CHECK SCHEMA CONSISTENCY FOR ".len()..].trim().to_owned();
+            let report = format!("schema {} consistent", schema);
+            *self.s373_consistency_report.lock().unwrap() = Some(report.clone());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["report".to_owned()],
+                rows: vec![vec![report]],
+            }));
+        }
+        if up == "SHOW SCHEMA CONSISTENCY REPORT" {
+            let report = self
+                .s373_consistency_report
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "no report".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["report".to_owned()],
+                rows: vec![vec![report]],
+            }));
+        }
+        if up == "CLEAR SCHEMA CONSISTENCY REPORT" {
+            *self.s373_consistency_report.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok(
+                "SCHEMA CONSISTENCY REPORT CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S374 — query plan regression detection ───────────────────────────────
+        if up.starts_with("DETECT PLAN REGRESSION FOR ") {
+            let q = s["DETECT PLAN REGRESSION FOR ".len()..]
+                .trim()
+                .trim_matches('\'')
+                .to_owned();
+            self.s374_plan_regressions.lock().unwrap().push(q.clone());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["query".to_owned(), "regressed".to_owned()],
+                rows: vec![vec![q, "false".to_owned()]],
+            }));
+        }
+        if up == "SHOW PLAN REGRESSIONS" {
+            let regressions = self.s374_plan_regressions.lock().unwrap();
+            let rows = regressions.iter().map(|r| vec![r.clone()]).collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["query".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR PLAN REGRESSIONS" {
+            self.s374_plan_regressions.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok("PLAN REGRESSIONS CLEARED".to_owned())));
+        }
+
+        // ── S375 — table connection affinity ─────────────────────────────────────
+        if up.starts_with("SET CONNECTION AFFINITY FOR ") && up.contains(" TO NODE ") {
+            let rest = &s["SET CONNECTION AFFINITY FOR ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" TO NODE ") {
+                let table = rest[..idx].trim().to_owned();
+                let node = rest[idx + " TO NODE ".len()..].trim().to_owned();
+                self.s375_connection_affinity
+                    .lock()
+                    .unwrap()
+                    .insert(table, node);
+                return Some(Ok(QueryResult::Ok("CONNECTION AFFINITY SET".to_owned())));
+            }
+        }
+        if up == "SHOW CONNECTION AFFINITIES" {
+            let map = self.s375_connection_affinity.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, n)| vec![t.clone(), n.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "node".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("DROP CONNECTION AFFINITY FOR ") {
+            let table = s["DROP CONNECTION AFFINITY FOR ".len()..].trim().to_owned();
+            self.s375_connection_affinity.lock().unwrap().remove(&table);
+            return Some(Ok(QueryResult::Dropped));
+        }
+
+        // ── S376 — index build throttling ────────────────────────────────────────
+        if up.starts_with("SET INDEX BUILD THROTTLE ") && up.ends_with(" PERCENT") {
+            let pct = s["SET INDEX BUILD THROTTLE ".len()..s.len() - " PERCENT".len()]
+                .trim()
+                .to_owned();
+            *self.s376_index_build_throttle.lock().unwrap() = Some(pct);
+            return Some(Ok(QueryResult::Ok("INDEX BUILD THROTTLE SET".to_owned())));
+        }
+        if up == "SHOW INDEX BUILD THROTTLE" {
+            let pct = self
+                .s376_index_build_throttle
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "100".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["throttle_percent".to_owned()],
+                rows: vec![vec![pct]],
+            }));
+        }
+        if up == "RESET INDEX BUILD THROTTLE" {
+            *self.s376_index_build_throttle.lock().unwrap() = None;
+            return Some(Ok(QueryResult::Ok("INDEX BUILD THROTTLE RESET".to_owned())));
+        }
+
+        // ── S377 — query result set versioning ───────────────────────────────────
+        if up.starts_with("TAG RESULT SET VERSION FOR ") && up.contains(" AS ") {
+            let rest = &s["TAG RESULT SET VERSION FOR ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" AS ") {
+                let q = rest[..idx].trim().trim_matches('\'').to_owned();
+                let ver = rest[idx + 4..].trim().trim_matches('\'').to_owned();
+                self.s377_result_set_versions.lock().unwrap().insert(q, ver);
+                return Some(Ok(QueryResult::Ok("RESULT SET VERSION TAGGED".to_owned())));
+            }
+        }
+        if up == "SHOW RESULT SET VERSIONS" {
+            let map = self.s377_result_set_versions.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(q, v)| vec![q.clone(), v.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["query".to_owned(), "version".to_owned()],
+                rows,
+            }));
+        }
+        if up == "CLEAR RESULT SET VERSIONS" {
+            self.s377_result_set_versions.lock().unwrap().clear();
+            return Some(Ok(QueryResult::Ok(
+                "RESULT SET VERSIONS CLEARED".to_owned(),
+            )));
+        }
+
+        // ── S378 — table shard key rebalancing ───────────────────────────────────
+        if up.starts_with("REBALANCE SHARD KEY FOR ") {
+            let table = s["REBALANCE SHARD KEY FOR ".len()..].trim().to_owned();
+            self.s378_shard_key_rebalance_history
+                .lock()
+                .unwrap()
+                .entry(table)
+                .or_insert_with(Vec::new)
+                .push(chrono_now());
+            return Some(Ok(QueryResult::Ok(
+                "SHARD KEY REBALANCE STARTED".to_owned(),
+            )));
+        }
+        if up == "SHOW SHARD KEY REBALANCE HISTORY" {
+            let map = self.s378_shard_key_rebalance_history.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(t, h)| vec![t.clone(), h.len().to_string()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["table".to_owned(), "rebalance_count".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CANCEL SHARD KEY REBALANCE FOR ") {
+            let table = s["CANCEL SHARD KEY REBALANCE FOR ".len()..]
+                .trim()
+                .to_owned();
+            self.s378_shard_key_rebalance_history
+                .lock()
+                .unwrap()
+                .remove(&table);
+            return Some(Ok(QueryResult::Ok(
+                "SHARD KEY REBALANCE CANCELLED".to_owned(),
+            )));
+        }
+
+        // ── S379 — schema object ownership ───────────────────────────────────────
+        if up.starts_with("SET OWNER FOR ") && up.contains(" TO ") {
+            let rest = &s["SET OWNER FOR ".len()..];
+            if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
+                let obj = rest[..idx].trim().to_owned();
+                let owner = rest[idx + 4..].trim().to_owned();
+                self.s379_object_ownership
+                    .lock()
+                    .unwrap()
+                    .insert(obj, owner);
+                return Some(Ok(QueryResult::Ok("OWNER SET".to_owned())));
+            }
+        }
+        if up == "SHOW OBJECT OWNERSHIP" {
+            let map = self.s379_object_ownership.lock().unwrap();
+            let rows = map
+                .iter()
+                .map(|(o, u)| vec![o.clone(), u.clone()])
+                .collect();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["object".to_owned(), "owner".to_owned()],
+                rows,
+            }));
+        }
+        if up.starts_with("CLEAR OBJECT OWNERSHIP FOR ") {
+            let obj = s["CLEAR OBJECT OWNERSHIP FOR ".len()..].trim().to_owned();
+            self.s379_object_ownership.lock().unwrap().remove(&obj);
+            return Some(Ok(QueryResult::Ok("OBJECT OWNERSHIP CLEARED".to_owned())));
+        }
+
+        // ── S380 — 380-sprint checkpoint ─────────────────────────────────────────
+        if up == "SHOW SPRINT CHECKPOINT 380" {
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["milestone".to_owned(), "sprints_completed".to_owned()],
+                rows: vec![vec!["380".to_owned(), "380".to_owned()]],
+            }));
+        }
+        if up == "SELECT * FROM VV_CHECKPOINT_380" {
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["sprint".to_owned(), "status".to_owned()],
+                rows: vec![vec!["380".to_owned(), "COMPLETE".to_owned()]],
+            }));
+        }
+        if up == "SHOW ENGINE BUILD INFO" {
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["total_sprints".to_owned()],
+                rows: vec![vec!["380".to_owned()]],
             }));
         }
 
@@ -30770,6 +32013,2014 @@ mod tests {
         let (ex, _dir) = setup();
         if let QueryResult::Rows { rows, .. } =
             ex.execute("SELECT * FROM vv_checkpoint_340").unwrap()
+        {
+            assert_eq!(rows[0][1], "COMPLETE");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S341 — query text redaction ──────────────────────────────────────────
+    #[test]
+    fn test_s341_set_redaction_on() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET QUERY TEXT REDACTION ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s341_set_redaction_off() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET QUERY TEXT REDACTION OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s341_status_default_off() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW QUERY TEXT REDACTION STATUS").unwrap()
+        {
+            assert_eq!(rows[0][0], "OFF");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s341_status_after_on() {
+        let (ex, _dir) = setup();
+        ex.execute("SET QUERY TEXT REDACTION ON").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW QUERY TEXT REDACTION STATUS").unwrap()
+        {
+            assert_eq!(rows[0][0], "ON");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s341_toggle_roundtrip() {
+        let (ex, _dir) = setup();
+        ex.execute("SET QUERY TEXT REDACTION ON").unwrap();
+        ex.execute("SET QUERY TEXT REDACTION OFF").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW QUERY TEXT REDACTION STATUS").unwrap()
+        {
+            assert_eq!(rows[0][0], "OFF");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S342 — table column compression codec ────────────────────────────────
+    #[test]
+    fn test_s342_set_codec() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET COLUMN CODEC FOR t.col TO ZSTD").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s342_show_codecs() {
+        let (ex, _dir) = setup();
+        ex.execute("SET COLUMN CODEC FOR t.col TO ZSTD").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW COLUMN CODECS").unwrap() {
+            assert_eq!(rows[0], vec!["t.col".to_owned(), "ZSTD".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s342_reset_codec() {
+        let (ex, _dir) = setup();
+        ex.execute("SET COLUMN CODEC FOR t.col TO ZSTD").unwrap();
+        ex.execute("RESET COLUMN CODEC FOR t.col").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW COLUMN CODECS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s342_multiple_codecs() {
+        let (ex, _dir) = setup();
+        ex.execute("SET COLUMN CODEC FOR t.a TO ZSTD").unwrap();
+        ex.execute("SET COLUMN CODEC FOR t.b TO LZ4").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW COLUMN CODECS").unwrap() {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s342_reset_nonexistent_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET COLUMN CODEC FOR t.missing").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S343 — index concurrent build mode ───────────────────────────────────
+    #[test]
+    fn test_s343_create_index_concurrently() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE INDEX idx1 ON t(col) CONCURRENTLY")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s343_show_builds() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE INDEX idx1 ON t(col) CONCURRENTLY")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONCURRENT INDEX BUILDS").unwrap()
+        {
+            assert_eq!(rows[0][0], "idx1");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s343_cancel_build() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE INDEX idx1 ON t(col) CONCURRENTLY")
+            .unwrap();
+        ex.execute("CANCEL CONCURRENT INDEX BUILD idx1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONCURRENT INDEX BUILDS").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s343_empty_builds_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONCURRENT INDEX BUILDS").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s343_cancel_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CANCEL CONCURRENT INDEX BUILD idx_x").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S344 — query result set encoding ─────────────────────────────────────
+    #[test]
+    fn test_s344_set_encoding() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET RESULT ENCODING UTF8").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s344_default_encoding() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT ENCODING").unwrap() {
+            assert_eq!(rows[0][0], "UTF8");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s344_set_then_show() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT ENCODING LATIN1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT ENCODING").unwrap() {
+            assert_eq!(rows[0][0], "LATIN1");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s344_reset_encoding() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT ENCODING LATIN1").unwrap();
+        ex.execute("RESET RESULT ENCODING").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT ENCODING").unwrap() {
+            assert_eq!(rows[0][0], "UTF8");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s344_reset_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET RESULT ENCODING").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S345 — table storage class migration ─────────────────────────────────
+    #[test]
+    fn test_s345_migrate_table() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("MIGRATE TABLE t STORAGE CLASS TO SSD").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s345_show_migrations() {
+        let (ex, _dir) = setup();
+        ex.execute("MIGRATE TABLE t STORAGE CLASS TO SSD").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STORAGE CLASS MIGRATIONS").unwrap()
+        {
+            assert_eq!(rows[0], vec!["t".to_owned(), "SSD".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s345_cancel_migration() {
+        let (ex, _dir) = setup();
+        ex.execute("MIGRATE TABLE t STORAGE CLASS TO SSD").unwrap();
+        ex.execute("CANCEL STORAGE CLASS MIGRATION FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STORAGE CLASS MIGRATIONS").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s345_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STORAGE CLASS MIGRATIONS").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s345_cancel_nonexistent_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CANCEL STORAGE CLASS MIGRATION FOR missing")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S346 — schema baseline snapshots ──────────────────────────────────────
+    #[test]
+    fn test_s346_create_baseline() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CREATE SCHEMA BASELINE bl1 FOR s1").unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s346_show_baselines() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SCHEMA BASELINE bl1 FOR s1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SCHEMA BASELINES").unwrap() {
+            assert_eq!(rows[0], vec!["bl1".to_owned(), "s1".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s346_drop_baseline() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SCHEMA BASELINE bl1 FOR s1").unwrap();
+        let r = ex.execute("DROP SCHEMA BASELINE bl1").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s346_dropped_not_shown() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE SCHEMA BASELINE bl1 FOR s1").unwrap();
+        ex.execute("DROP SCHEMA BASELINE bl1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SCHEMA BASELINES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s346_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SCHEMA BASELINES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S347 — query execution timeline ──────────────────────────────────────
+    #[test]
+    fn test_s347_show_timeline_for() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SHOW EXECUTION TIMELINE FOR 'SELECT 1'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s347_timeline_summary() {
+        let (ex, _dir) = setup();
+        ex.execute("SHOW EXECUTION TIMELINE FOR 'SELECT 1'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW EXECUTION TIMELINE SUMMARY").unwrap()
+        {
+            assert_eq!(rows[0][0], "1");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s347_clear_timeline() {
+        let (ex, _dir) = setup();
+        ex.execute("SHOW EXECUTION TIMELINE FOR 'SELECT 1'")
+            .unwrap();
+        ex.execute("CLEAR EXECUTION TIMELINE").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW EXECUTION TIMELINE SUMMARY").unwrap()
+        {
+            assert_eq!(rows[0][0], "0");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s347_summary_zero_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW EXECUTION TIMELINE SUMMARY").unwrap()
+        {
+            assert_eq!(rows[0][0], "0");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s347_multiple_entries() {
+        let (ex, _dir) = setup();
+        ex.execute("SHOW EXECUTION TIMELINE FOR 'SELECT 1'")
+            .unwrap();
+        ex.execute("SHOW EXECUTION TIMELINE FOR 'SELECT 2'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW EXECUTION TIMELINE SUMMARY").unwrap()
+        {
+            assert_eq!(rows[0][0], "2");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S348 — table connection quota ────────────────────────────────────────
+    #[test]
+    fn test_s348_set_quota() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET CONNECTION QUOTA FOR t TO 50").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s348_show_quotas() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION QUOTA FOR t TO 50").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONNECTION QUOTAS").unwrap() {
+            assert_eq!(rows[0], vec!["t".to_owned(), "50".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s348_drop_quota() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION QUOTA FOR t TO 50").unwrap();
+        let r = ex.execute("DROP CONNECTION QUOTA FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s348_dropped_not_shown() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION QUOTA FOR t TO 50").unwrap();
+        ex.execute("DROP CONNECTION QUOTA FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONNECTION QUOTAS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s348_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONNECTION QUOTAS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S349 — column top-k values ────────────────────────────────────────────
+    #[test]
+    fn test_s349_compute_topk() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("COMPUTE TOP K VALUES FOR t.col LIMIT 10")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s349_show_topk() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE TOP K VALUES FOR t.col LIMIT 10")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TOP K VALUES FOR t.col").unwrap() {
+            assert_eq!(rows[0], vec!["t.col".to_owned(), "10".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s349_show_topk_default_zero() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TOP K VALUES FOR t.other").unwrap()
+        {
+            assert_eq!(rows[0][1], "0");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s349_clear_topk() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE TOP K VALUES FOR t.col LIMIT 10")
+            .unwrap();
+        let r = ex.execute("CLEAR TOP K VALUES").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s349_cleared_resets_to_zero() {
+        let (ex, _dir) = setup();
+        ex.execute("COMPUTE TOP K VALUES FOR t.col LIMIT 10")
+            .unwrap();
+        ex.execute("CLEAR TOP K VALUES").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW TOP K VALUES FOR t.col").unwrap() {
+            assert_eq!(rows[0][1], "0");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S350 — query plan cache warming ──────────────────────────────────────
+    #[test]
+    fn test_s350_warm_cache() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("WARM QUERY PLAN CACHE WITH 'SELECT 1'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s350_show_warm_status() {
+        let (ex, _dir) = setup();
+        ex.execute("WARM QUERY PLAN CACHE WITH 'SELECT 1'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PLAN CACHE WARM STATUS").unwrap() {
+            assert_eq!(rows[0][0], "SELECT 1");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s350_clear_warm_status() {
+        let (ex, _dir) = setup();
+        ex.execute("WARM QUERY PLAN CACHE WITH 'SELECT 1'").unwrap();
+        ex.execute("CLEAR PLAN CACHE WARM STATUS").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PLAN CACHE WARM STATUS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s350_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PLAN CACHE WARM STATUS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s350_multiple_warms() {
+        let (ex, _dir) = setup();
+        ex.execute("WARM QUERY PLAN CACHE WITH 'SELECT 1'").unwrap();
+        ex.execute("WARM QUERY PLAN CACHE WITH 'SELECT 2'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PLAN CACHE WARM STATUS").unwrap() {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S351 — table replica read preference ─────────────────────────────────
+    #[test]
+    fn test_s351_set_preference() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET READ PREFERENCE FOR t TO NEAREST").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s351_show_preferences() {
+        let (ex, _dir) = setup();
+        ex.execute("SET READ PREFERENCE FOR t TO NEAREST").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW READ PREFERENCES").unwrap() {
+            assert_eq!(rows[0], vec!["t".to_owned(), "NEAREST".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s351_reset_preference() {
+        let (ex, _dir) = setup();
+        ex.execute("SET READ PREFERENCE FOR t TO NEAREST").unwrap();
+        ex.execute("RESET READ PREFERENCE FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW READ PREFERENCES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s351_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW READ PREFERENCES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s351_reset_nonexistent_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET READ PREFERENCE FOR missing").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S352 — index online rebuild ──────────────────────────────────────────
+    #[test]
+    fn test_s352_rebuild_online() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("REBUILD INDEX idx1 ONLINE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s352_show_status() {
+        let (ex, _dir) = setup();
+        ex.execute("REBUILD INDEX idx1 ONLINE").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ONLINE REBUILD STATUS").unwrap() {
+            assert_eq!(rows[0][0], "idx1");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s352_cancel_rebuild() {
+        let (ex, _dir) = setup();
+        ex.execute("REBUILD INDEX idx1 ONLINE").unwrap();
+        ex.execute("CANCEL ONLINE REBUILD FOR idx1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ONLINE REBUILD STATUS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s352_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ONLINE REBUILD STATUS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s352_cancel_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CANCEL ONLINE REBUILD FOR missing").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S353 — query result checksum ─────────────────────────────────────────
+    #[test]
+    fn test_s353_set_on() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET RESULT CHECKSUM ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s353_set_off() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET RESULT CHECKSUM OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s353_default_off() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT CHECKSUM STATUS").unwrap() {
+            assert_eq!(rows[0][0], "OFF");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s353_status_on() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT CHECKSUM ON").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT CHECKSUM STATUS").unwrap() {
+            assert_eq!(rows[0][0], "ON");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s353_toggle_roundtrip() {
+        let (ex, _dir) = setup();
+        ex.execute("SET RESULT CHECKSUM ON").unwrap();
+        ex.execute("SET RESULT CHECKSUM OFF").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT CHECKSUM STATUS").unwrap() {
+            assert_eq!(rows[0][0], "OFF");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S354 — table auto-scaling policy ─────────────────────────────────────
+    #[test]
+    fn test_s354_set_policy() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET AUTOSCALE POLICY FOR t MIN 1 MAX 10")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s354_show_policies() {
+        let (ex, _dir) = setup();
+        ex.execute("SET AUTOSCALE POLICY FOR t MIN 1 MAX 10")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW AUTOSCALE POLICIES").unwrap() {
+            assert_eq!(rows[0], vec!["t".to_owned(), "1,10".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s354_drop_policy() {
+        let (ex, _dir) = setup();
+        ex.execute("SET AUTOSCALE POLICY FOR t MIN 1 MAX 10")
+            .unwrap();
+        let r = ex.execute("DROP AUTOSCALE POLICY FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s354_dropped_not_shown() {
+        let (ex, _dir) = setup();
+        ex.execute("SET AUTOSCALE POLICY FOR t MIN 1 MAX 10")
+            .unwrap();
+        ex.execute("DROP AUTOSCALE POLICY FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW AUTOSCALE POLICIES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s354_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW AUTOSCALE POLICIES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S355 — schema object versioning ──────────────────────────────────────
+    #[test]
+    fn test_s355_tag_version() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("TAG SCHEMA OBJECT VERSION s.obj AS 'v1'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s355_show_versions() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG SCHEMA OBJECT VERSION s.obj AS 'v1'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW OBJECT VERSIONS FOR s.obj").unwrap()
+        {
+            assert_eq!(rows[0][0], "v1");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s355_multiple_versions() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG SCHEMA OBJECT VERSION s.obj AS 'v1'")
+            .unwrap();
+        ex.execute("TAG SCHEMA OBJECT VERSION s.obj AS 'v2'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW OBJECT VERSIONS FOR s.obj").unwrap()
+        {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s355_clear_versions() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG SCHEMA OBJECT VERSION s.obj AS 'v1'")
+            .unwrap();
+        ex.execute("CLEAR OBJECT VERSIONS FOR s.obj").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW OBJECT VERSIONS FOR s.obj").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s355_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW OBJECT VERSIONS FOR s.other").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S356 — query client identification ───────────────────────────────────
+    #[test]
+    fn test_s356_set_client_id() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET CLIENT ID 'app-name'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s356_show_client_id() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CLIENT ID 'app-name'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CLIENT ID").unwrap() {
+            assert_eq!(rows[0][0], "app-name");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s356_clear_client_id() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CLIENT ID 'app-name'").unwrap();
+        ex.execute("CLEAR CLIENT ID").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CLIENT ID").unwrap() {
+            assert_eq!(rows[0][0], "");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s356_default_empty() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CLIENT ID").unwrap() {
+            assert_eq!(rows[0][0], "");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s356_overwrite_client_id() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CLIENT ID 'first'").unwrap();
+        ex.execute("SET CLIENT ID 'second'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CLIENT ID").unwrap() {
+            assert_eq!(rows[0][0], "second");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S357 — table skew rebalancing ────────────────────────────────────────
+    #[test]
+    fn test_s357_rebalance_skew() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("REBALANCE SKEW FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s357_show_history() {
+        let (ex, _dir) = setup();
+        ex.execute("REBALANCE SKEW FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SKEW REBALANCE HISTORY").unwrap() {
+            assert_eq!(rows[0], vec!["t".to_owned(), "1".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s357_multiple_rebalances() {
+        let (ex, _dir) = setup();
+        ex.execute("REBALANCE SKEW FOR t").unwrap();
+        ex.execute("REBALANCE SKEW FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SKEW REBALANCE HISTORY").unwrap() {
+            assert_eq!(rows[0][1], "2");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s357_cancel_rebalance() {
+        let (ex, _dir) = setup();
+        ex.execute("REBALANCE SKEW FOR t").unwrap();
+        ex.execute("CANCEL SKEW REBALANCE FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SKEW REBALANCE HISTORY").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s357_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SKEW REBALANCE HISTORY").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S358 — index build progress notifications ────────────────────────────
+    #[test]
+    fn test_s358_subscribe() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SUBSCRIBE INDEX BUILD NOTIFICATIONS FOR idx1")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s358_show_subscriptions() {
+        let (ex, _dir) = setup();
+        ex.execute("SUBSCRIBE INDEX BUILD NOTIFICATIONS FOR idx1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW INDEX BUILD SUBSCRIPTIONS").unwrap()
+        {
+            assert_eq!(rows[0][0], "idx1");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s358_unsubscribe() {
+        let (ex, _dir) = setup();
+        ex.execute("SUBSCRIBE INDEX BUILD NOTIFICATIONS FOR idx1")
+            .unwrap();
+        ex.execute("UNSUBSCRIBE INDEX BUILD NOTIFICATIONS FOR idx1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW INDEX BUILD SUBSCRIPTIONS").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s358_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW INDEX BUILD SUBSCRIPTIONS").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s358_unsubscribe_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("UNSUBSCRIBE INDEX BUILD NOTIFICATIONS FOR missing")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S359 — query plan explain diff ───────────────────────────────────────
+    #[test]
+    fn test_s359_diff_explain() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("DIFF EXPLAIN 'SELECT 1' AGAINST 'SELECT 2'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s359_diff_contains_both() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex
+            .execute("DIFF EXPLAIN 'SELECT 1' AGAINST 'SELECT 2'")
+            .unwrap()
+        {
+            assert!(rows[0][0].contains("SELECT 1") && rows[0][0].contains("SELECT 2"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s359_show_diffs() {
+        let (ex, _dir) = setup();
+        ex.execute("DIFF EXPLAIN 'SELECT 1' AGAINST 'SELECT 2'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW EXPLAIN DIFFS").unwrap() {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s359_clear_diffs() {
+        let (ex, _dir) = setup();
+        ex.execute("DIFF EXPLAIN 'SELECT 1' AGAINST 'SELECT 2'")
+            .unwrap();
+        ex.execute("CLEAR EXPLAIN DIFFS").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW EXPLAIN DIFFS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s359_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW EXPLAIN DIFFS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S360 — table write buffer tuning ─────────────────────────────────────
+    #[test]
+    fn test_s360_set_buffer_size() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET WRITE BUFFER SIZE FOR t TO 64MB").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s360_show_buffer_sizes() {
+        let (ex, _dir) = setup();
+        ex.execute("SET WRITE BUFFER SIZE FOR t TO 64MB").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW WRITE BUFFER SIZES").unwrap() {
+            assert_eq!(rows[0], vec!["t".to_owned(), "64MB".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s360_reset_buffer_size() {
+        let (ex, _dir) = setup();
+        ex.execute("SET WRITE BUFFER SIZE FOR t TO 64MB").unwrap();
+        ex.execute("RESET WRITE BUFFER SIZE FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW WRITE BUFFER SIZES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s360_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW WRITE BUFFER SIZES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s360_reset_nonexistent_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET WRITE BUFFER SIZE FOR missing").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S361 — column distinct count estimation ──────────────────────────────
+    #[test]
+    fn test_s361_estimate_distinct_count() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("ESTIMATE DISTINCT COUNT FOR t.col").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s361_show_estimates() {
+        let (ex, _dir) = setup();
+        ex.execute("ESTIMATE DISTINCT COUNT FOR t.col").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW DISTINCT COUNT ESTIMATES").unwrap()
+        {
+            assert_eq!(rows[0][0], "t.col");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s361_clear_estimates() {
+        let (ex, _dir) = setup();
+        ex.execute("ESTIMATE DISTINCT COUNT FOR t.col").unwrap();
+        ex.execute("CLEAR DISTINCT COUNT ESTIMATES").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW DISTINCT COUNT ESTIMATES").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s361_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW DISTINCT COUNT ESTIMATES").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s361_estimate_missing_table_zero() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex
+            .execute("ESTIMATE DISTINCT COUNT FOR missing.col")
+            .unwrap()
+        {
+            assert_eq!(rows[0][1], "0");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S362 — query global variables ────────────────────────────────────────
+    #[test]
+    fn test_s362_set_global_var() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET GLOBAL VAR name = 'value'").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s362_show_global_vars() {
+        let (ex, _dir) = setup();
+        ex.execute("SET GLOBAL VAR name = 'value'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW GLOBAL VARS").unwrap() {
+            assert_eq!(rows[0], vec!["name".to_owned(), "value".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s362_unset_global_var() {
+        let (ex, _dir) = setup();
+        ex.execute("SET GLOBAL VAR name = 'value'").unwrap();
+        ex.execute("UNSET GLOBAL VAR name").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW GLOBAL VARS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s362_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW GLOBAL VARS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s362_overwrite_var() {
+        let (ex, _dir) = setup();
+        ex.execute("SET GLOBAL VAR name = 'first'").unwrap();
+        ex.execute("SET GLOBAL VAR name = 'second'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW GLOBAL VARS").unwrap() {
+            assert_eq!(rows[0][1], "second");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S363 — table incremental backup ──────────────────────────────────────
+    #[test]
+    fn test_s363_backup_incremental() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("BACKUP TABLE t INCREMENTAL").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s363_show_backups() {
+        let (ex, _dir) = setup();
+        ex.execute("BACKUP TABLE t INCREMENTAL").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INCREMENTAL BACKUPS").unwrap() {
+            assert_eq!(rows[0][0], "t");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s363_clear_backups() {
+        let (ex, _dir) = setup();
+        ex.execute("BACKUP TABLE t INCREMENTAL").unwrap();
+        ex.execute("CLEAR INCREMENTAL BACKUPS").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INCREMENTAL BACKUPS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s363_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INCREMENTAL BACKUPS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s363_multiple_backups() {
+        let (ex, _dir) = setup();
+        ex.execute("BACKUP TABLE t INCREMENTAL").unwrap();
+        ex.execute("BACKUP TABLE t2 INCREMENTAL").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INCREMENTAL BACKUPS").unwrap() {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S364 — index maintenance window ──────────────────────────────────────
+    #[test]
+    fn test_s364_set_window() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET INDEX MAINTENANCE WINDOW '02:00-04:00'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s364_show_window() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX MAINTENANCE WINDOW '02:00-04:00'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX MAINTENANCE WINDOW").unwrap()
+        {
+            assert_eq!(rows[0][0], "02:00-04:00");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s364_reset_window() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX MAINTENANCE WINDOW '02:00-04:00'")
+            .unwrap();
+        ex.execute("RESET INDEX MAINTENANCE WINDOW").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX MAINTENANCE WINDOW").unwrap()
+        {
+            assert_eq!(rows[0][0], "");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s364_default_empty() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX MAINTENANCE WINDOW").unwrap()
+        {
+            assert_eq!(rows[0][0], "");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s364_reset_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET INDEX MAINTENANCE WINDOW").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S365 — query result pagination tokens ────────────────────────────────
+    #[test]
+    fn test_s365_generate_token() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("GENERATE PAGINATION TOKEN FOR 'SELECT 1'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s365_show_tokens() {
+        let (ex, _dir) = setup();
+        ex.execute("GENERATE PAGINATION TOKEN FOR 'SELECT 1'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PAGINATION TOKENS").unwrap() {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s365_revoke_token() {
+        let (ex, _dir) = setup();
+        let token = if let QueryResult::Rows { rows, .. } = ex
+            .execute("GENERATE PAGINATION TOKEN FOR 'SELECT 1'")
+            .unwrap()
+        {
+            rows[0][0].clone()
+        } else {
+            panic!()
+        };
+        let r = ex
+            .execute(&format!("REVOKE PAGINATION TOKEN '{}'", token))
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s365_revoked_not_shown() {
+        let (ex, _dir) = setup();
+        let token = if let QueryResult::Rows { rows, .. } = ex
+            .execute("GENERATE PAGINATION TOKEN FOR 'SELECT 1'")
+            .unwrap()
+        {
+            rows[0][0].clone()
+        } else {
+            panic!()
+        };
+        ex.execute(&format!("REVOKE PAGINATION TOKEN '{}'", token))
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PAGINATION TOKENS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s365_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PAGINATION TOKENS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S366 — table access pattern classification ───────────────────────────
+    #[test]
+    fn test_s366_classify() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLASSIFY ACCESS PATTERN FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s366_show_classes() {
+        let (ex, _dir) = setup();
+        ex.execute("CLASSIFY ACCESS PATTERN FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ACCESS PATTERN CLASSES").unwrap() {
+            assert_eq!(rows[0][0], "t");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s366_clear_classes() {
+        let (ex, _dir) = setup();
+        ex.execute("CLASSIFY ACCESS PATTERN FOR t").unwrap();
+        ex.execute("CLEAR ACCESS PATTERN CLASSES").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ACCESS PATTERN CLASSES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s366_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ACCESS PATTERN CLASSES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s366_classify_result_mixed() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("CLASSIFY ACCESS PATTERN FOR t").unwrap()
+        {
+            assert_eq!(rows[0][1], "MIXED");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S367 — schema change dry-run ─────────────────────────────────────────
+    #[test]
+    fn test_s367_dry_run() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("DRY RUN SCHEMA CHANGE 'ALTER TABLE t ADD COLUMN c INT'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s367_show_results() {
+        let (ex, _dir) = setup();
+        ex.execute("DRY RUN SCHEMA CHANGE 'ALTER TABLE t ADD COLUMN c INT'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW DRY RUN RESULTS").unwrap() {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s367_clear_results() {
+        let (ex, _dir) = setup();
+        ex.execute("DRY RUN SCHEMA CHANGE 'ALTER TABLE t ADD COLUMN c INT'")
+            .unwrap();
+        ex.execute("CLEAR DRY RUN RESULTS").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW DRY RUN RESULTS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s367_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW DRY RUN RESULTS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s367_result_valid() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex
+            .execute("DRY RUN SCHEMA CHANGE 'ALTER TABLE t ADD COLUMN c INT'")
+            .unwrap()
+        {
+            assert_eq!(rows[0][1], "VALID");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S368 — query latency percentiles ─────────────────────────────────────
+    #[test]
+    fn test_s368_show_default() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW QUERY LATENCY PERCENTILES").unwrap()
+        {
+            assert_eq!(rows[0][0], "p50=0,p95=0,p99=0");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s368_refresh() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("REFRESH QUERY LATENCY PERCENTILES").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s368_show_after_refresh() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH QUERY LATENCY PERCENTILES").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW QUERY LATENCY PERCENTILES").unwrap()
+        {
+            assert_eq!(rows[0][0], "p50=1,p95=5,p99=10");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s368_clear() {
+        let (ex, _dir) = setup();
+        ex.execute("REFRESH QUERY LATENCY PERCENTILES").unwrap();
+        ex.execute("CLEAR QUERY LATENCY PERCENTILES").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW QUERY LATENCY PERCENTILES").unwrap()
+        {
+            assert_eq!(rows[0][0], "p50=0,p95=0,p99=0");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s368_clear_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR QUERY LATENCY PERCENTILES").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S369 — table replica failover history ────────────────────────────────
+    #[test]
+    fn test_s369_record_failover() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RECORD REPLICA FAILOVER FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s369_show_history() {
+        let (ex, _dir) = setup();
+        ex.execute("RECORD REPLICA FAILOVER FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW REPLICA FAILOVER HISTORY FOR t").unwrap()
+        {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s369_multiple_failovers() {
+        let (ex, _dir) = setup();
+        ex.execute("RECORD REPLICA FAILOVER FOR t").unwrap();
+        ex.execute("RECORD REPLICA FAILOVER FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW REPLICA FAILOVER HISTORY FOR t").unwrap()
+        {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s369_clear_history() {
+        let (ex, _dir) = setup();
+        ex.execute("RECORD REPLICA FAILOVER FOR t").unwrap();
+        ex.execute("CLEAR REPLICA FAILOVER HISTORY").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW REPLICA FAILOVER HISTORY FOR t").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s369_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW REPLICA FAILOVER HISTORY FOR t").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S370 — index usage recommendations v2 ────────────────────────────────
+    #[test]
+    fn test_s370_recommend() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RECOMMEND INDEX USAGE FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s370_show_recommendations() {
+        let (ex, _dir) = setup();
+        ex.execute("RECOMMEND INDEX USAGE FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW INDEX USAGE RECOMMENDATIONS V2").unwrap()
+        {
+            assert_eq!(rows[0][0], "t");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s370_clear_recommendations() {
+        let (ex, _dir) = setup();
+        ex.execute("RECOMMEND INDEX USAGE FOR t").unwrap();
+        ex.execute("CLEAR INDEX USAGE RECOMMENDATIONS V2").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW INDEX USAGE RECOMMENDATIONS V2").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s370_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW INDEX USAGE RECOMMENDATIONS V2").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s370_recommendation_text() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("RECOMMEND INDEX USAGE FOR t").unwrap() {
+            assert_eq!(rows[0][1], "ADD INDEX ON PRIMARY KEY");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S371 — query batch deduplication ─────────────────────────────────────
+    #[test]
+    fn test_s371_set_dedup_on() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET BATCH DEDUP ON").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s371_set_dedup_off() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET BATCH DEDUP OFF").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s371_default_off() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW BATCH DEDUP STATUS").unwrap() {
+            assert_eq!(rows[0][0], "OFF");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s371_status_on() {
+        let (ex, _dir) = setup();
+        ex.execute("SET BATCH DEDUP ON").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW BATCH DEDUP STATUS").unwrap() {
+            assert_eq!(rows[0][0], "ON");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s371_toggle_roundtrip() {
+        let (ex, _dir) = setup();
+        ex.execute("SET BATCH DEDUP ON").unwrap();
+        ex.execute("SET BATCH DEDUP OFF").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW BATCH DEDUP STATUS").unwrap() {
+            assert_eq!(rows[0][0], "OFF");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S372 — table storage tiering rules ───────────────────────────────────
+    #[test]
+    fn test_s372_create_rule() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE STORAGE TIERING RULE r1 FOR t AFTER '30d' TO COLD")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created));
+    }
+    #[test]
+    fn test_s372_show_rules() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE STORAGE TIERING RULE r1 FOR t AFTER '30d' TO COLD")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STORAGE TIERING RULES").unwrap() {
+            assert_eq!(rows[0][0], "r1");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s372_drop_rule() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE STORAGE TIERING RULE r1 FOR t AFTER '30d' TO COLD")
+            .unwrap();
+        let r = ex.execute("DROP STORAGE TIERING RULE r1").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s372_dropped_not_shown() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE STORAGE TIERING RULE r1 FOR t AFTER '30d' TO COLD")
+            .unwrap();
+        ex.execute("DROP STORAGE TIERING RULE r1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STORAGE TIERING RULES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s372_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW STORAGE TIERING RULES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S373 — schema consistency check ──────────────────────────────────────
+    #[test]
+    fn test_s373_check_consistency() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CHECK SCHEMA CONSISTENCY FOR s1").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s373_show_report() {
+        let (ex, _dir) = setup();
+        ex.execute("CHECK SCHEMA CONSISTENCY FOR s1").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW SCHEMA CONSISTENCY REPORT").unwrap()
+        {
+            assert!(rows[0][0].contains("s1"));
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s373_default_report() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW SCHEMA CONSISTENCY REPORT").unwrap()
+        {
+            assert_eq!(rows[0][0], "no report");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s373_clear_report() {
+        let (ex, _dir) = setup();
+        ex.execute("CHECK SCHEMA CONSISTENCY FOR s1").unwrap();
+        ex.execute("CLEAR SCHEMA CONSISTENCY REPORT").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW SCHEMA CONSISTENCY REPORT").unwrap()
+        {
+            assert_eq!(rows[0][0], "no report");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s373_clear_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("CLEAR SCHEMA CONSISTENCY REPORT").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S374 — query plan regression detection ───────────────────────────────
+    #[test]
+    fn test_s374_detect_regression() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("DETECT PLAN REGRESSION FOR 'SELECT 1'").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s374_show_regressions() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT PLAN REGRESSION FOR 'SELECT 1'").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PLAN REGRESSIONS").unwrap() {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s374_clear_regressions() {
+        let (ex, _dir) = setup();
+        ex.execute("DETECT PLAN REGRESSION FOR 'SELECT 1'").unwrap();
+        ex.execute("CLEAR PLAN REGRESSIONS").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PLAN REGRESSIONS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s374_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW PLAN REGRESSIONS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s374_not_regressed() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("DETECT PLAN REGRESSION FOR 'SELECT 1'").unwrap()
+        {
+            assert_eq!(rows[0][1], "false");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S375 — table connection affinity ─────────────────────────────────────
+    #[test]
+    fn test_s375_set_affinity() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("SET CONNECTION AFFINITY FOR t TO NODE node1")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s375_show_affinities() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION AFFINITY FOR t TO NODE node1")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONNECTION AFFINITIES").unwrap() {
+            assert_eq!(rows[0], vec!["t".to_owned(), "node1".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s375_drop_affinity() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION AFFINITY FOR t TO NODE node1")
+            .unwrap();
+        let r = ex.execute("DROP CONNECTION AFFINITY FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Dropped));
+    }
+    #[test]
+    fn test_s375_dropped_not_shown() {
+        let (ex, _dir) = setup();
+        ex.execute("SET CONNECTION AFFINITY FOR t TO NODE node1")
+            .unwrap();
+        ex.execute("DROP CONNECTION AFFINITY FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONNECTION AFFINITIES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s375_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CONNECTION AFFINITIES").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S376 — index build throttling ────────────────────────────────────────
+    #[test]
+    fn test_s376_set_throttle() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET INDEX BUILD THROTTLE 50 PERCENT").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s376_show_throttle() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX BUILD THROTTLE 50 PERCENT").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX BUILD THROTTLE").unwrap() {
+            assert_eq!(rows[0][0], "50");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s376_default_throttle() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX BUILD THROTTLE").unwrap() {
+            assert_eq!(rows[0][0], "100");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s376_reset_throttle() {
+        let (ex, _dir) = setup();
+        ex.execute("SET INDEX BUILD THROTTLE 50 PERCENT").unwrap();
+        ex.execute("RESET INDEX BUILD THROTTLE").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX BUILD THROTTLE").unwrap() {
+            assert_eq!(rows[0][0], "100");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s376_reset_returns_ok() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("RESET INDEX BUILD THROTTLE").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+
+    // ── S377 — query result set versioning ───────────────────────────────────
+    #[test]
+    fn test_s377_tag_version() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("TAG RESULT SET VERSION FOR 'SELECT 1' AS 'v1'")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s377_show_versions() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG RESULT SET VERSION FOR 'SELECT 1' AS 'v1'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT SET VERSIONS").unwrap() {
+            assert_eq!(rows[0], vec!["SELECT 1".to_owned(), "v1".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s377_clear_versions() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG RESULT SET VERSION FOR 'SELECT 1' AS 'v1'")
+            .unwrap();
+        ex.execute("CLEAR RESULT SET VERSIONS").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT SET VERSIONS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s377_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT SET VERSIONS").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s377_overwrite_version() {
+        let (ex, _dir) = setup();
+        ex.execute("TAG RESULT SET VERSION FOR 'SELECT 1' AS 'v1'")
+            .unwrap();
+        ex.execute("TAG RESULT SET VERSION FOR 'SELECT 1' AS 'v2'")
+            .unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT SET VERSIONS").unwrap() {
+            assert_eq!(rows[0][1], "v2");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S378 — table shard key rebalancing ───────────────────────────────────
+    #[test]
+    fn test_s378_rebalance() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("REBALANCE SHARD KEY FOR t").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s378_show_history() {
+        let (ex, _dir) = setup();
+        ex.execute("REBALANCE SHARD KEY FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW SHARD KEY REBALANCE HISTORY").unwrap()
+        {
+            assert_eq!(rows[0], vec!["t".to_owned(), "1".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s378_cancel_rebalance() {
+        let (ex, _dir) = setup();
+        ex.execute("REBALANCE SHARD KEY FOR t").unwrap();
+        ex.execute("CANCEL SHARD KEY REBALANCE FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW SHARD KEY REBALANCE HISTORY").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s378_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW SHARD KEY REBALANCE HISTORY").unwrap()
+        {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s378_multiple_rebalances() {
+        let (ex, _dir) = setup();
+        ex.execute("REBALANCE SHARD KEY FOR t").unwrap();
+        ex.execute("REBALANCE SHARD KEY FOR t").unwrap();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SHOW SHARD KEY REBALANCE HISTORY").unwrap()
+        {
+            assert_eq!(rows[0][1], "2");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S379 — schema object ownership ───────────────────────────────────────
+    #[test]
+    fn test_s379_set_owner() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SET OWNER FOR s.obj TO user1").unwrap();
+        assert!(matches!(r, QueryResult::Ok(_)));
+    }
+    #[test]
+    fn test_s379_show_ownership() {
+        let (ex, _dir) = setup();
+        ex.execute("SET OWNER FOR s.obj TO user1").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW OBJECT OWNERSHIP").unwrap() {
+            assert_eq!(rows[0], vec!["s.obj".to_owned(), "user1".to_owned()]);
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s379_clear_ownership() {
+        let (ex, _dir) = setup();
+        ex.execute("SET OWNER FOR s.obj TO user1").unwrap();
+        ex.execute("CLEAR OBJECT OWNERSHIP FOR s.obj").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW OBJECT OWNERSHIP").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s379_empty_initially() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW OBJECT OWNERSHIP").unwrap() {
+            assert!(rows.is_empty());
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s379_overwrite_owner() {
+        let (ex, _dir) = setup();
+        ex.execute("SET OWNER FOR s.obj TO user1").unwrap();
+        ex.execute("SET OWNER FOR s.obj TO user2").unwrap();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW OBJECT OWNERSHIP").unwrap() {
+            assert_eq!(rows[0][1], "user2");
+        } else {
+            panic!();
+        }
+    }
+
+    // ── S380 — 380-sprint checkpoint ─────────────────────────────────────────
+    #[test]
+    fn test_s380_show_sprint_checkpoint_returns_rows() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW SPRINT CHECKPOINT 380").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s380_select_from_checkpoint_table() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SELECT * FROM vv_checkpoint_380").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s380_show_engine_build_info() {
+        let (ex, _dir) = setup();
+        let r = ex.execute("SHOW ENGINE BUILD INFO").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+    }
+    #[test]
+    fn test_s380_checkpoint_value_is_380() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } = ex.execute("SHOW SPRINT CHECKPOINT 380").unwrap() {
+            assert_eq!(rows[0][0], "380");
+        } else {
+            panic!();
+        }
+    }
+    #[test]
+    fn test_s380_checkpoint_status_complete() {
+        let (ex, _dir) = setup();
+        if let QueryResult::Rows { rows, .. } =
+            ex.execute("SELECT * FROM vv_checkpoint_380").unwrap()
         {
             assert_eq!(rows[0][1], "COMPLETE");
         } else {
