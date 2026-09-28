@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 use vectorvolt_engine::{
-    ColumnDef, ColumnType, EngineRow, TableRegistry, TableSchema, TxnId, TypedValue,
+    ColumnDef, ColumnType, EngineRow, TableRegistry, TableSchema, TableTxn, TxnId, TxnIntentLog,
+    TypedValue,
 };
 
 use crate::sql::ast::*;
@@ -374,6 +375,15 @@ pub struct SqlExecutor {
     /// the currently active transaction. Kept alongside `txn` (both `None` or
     /// both `Some` together).
     mvcc_txn: Mutex<Option<MvccTxnState>>,
+    /// MVCC Phase 3 — durable cross-table commit intent log. See
+    /// `vectorvolt_engine::txn_intent_log` for the design and the
+    /// idempotency finding behind the two-phase-commit protocol used here.
+    txn_intent_log: TxnIntentLog,
+    /// MVCC Phase 3 — monotonic counter used to build a unique-enough
+    /// `txn_uuid` for each intent-log record (process-local; combined with
+    /// process id + wall clock, collisions are not a correctness concern
+    /// since a duplicate id would just be treated as the same logical txn).
+    txn_uuid_counter: std::sync::atomic::AtomicU64,
     /// S45 â€” in-memory view store.
     views: Mutex<HashMap<String, SelectStmt>>,
     /// S53 â€” savepoint snapshots: name â†’ TxnMap clone at savepoint time.
@@ -1032,10 +1042,19 @@ pub struct SqlExecutor {
 
 impl SqlExecutor {
     pub fn new(registry: Arc<TableRegistry>) -> Self {
+        let intent_log_path = registry.base_dir().join("_txn_intent.log");
+        let txn_intent_log = TxnIntentLog::open(&intent_log_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to open MVCC Phase 3 transaction intent log at {:?}: {e}",
+                intent_log_path
+            )
+        });
         Self {
             registry,
             txn: Mutex::new(None),
             mvcc_txn: Mutex::new(None),
+            txn_intent_log,
+            txn_uuid_counter: std::sync::atomic::AtomicU64::new(0),
             views: Mutex::new(HashMap::new()),
             savepoints: Mutex::new(HashMap::new()),
             query_cache: Mutex::new(HashMap::new()),
@@ -11717,16 +11736,69 @@ impl SqlExecutor {
             }
         }
 
-        for (table, txn_id) in txn_map {
-            let engine = self
-                .registry
-                .get(&table)
-                .map_err(|_| ExecError::TableNotFound(table.clone()))?;
-            engine
-                .commit_txn(txn_id)
+        // MVCC Phase 3 — atomic cross-table commit via a durable intent log.
+        //
+        // Phase A (PREPARE): record which tables/txn ids belong to this
+        // logical commit *before* touching any table, and fsync it. If the
+        // process crashes after this point but before Phase B completes, the
+        // dangling PREPARING record is what `recover_pending_transactions`
+        // uses to finish the job (see `vectorvolt_engine::txn_intent_log`).
+        let tables: Vec<TableTxn> = txn_map
+            .iter()
+            .map(|(table, &txn_id)| TableTxn {
+                table: table.clone(),
+                txn_id,
+            })
+            .collect();
+
+        // A single-table transaction still goes through the same intent-log
+        // path (PREPARE + per-table commit + mark-committed) — the log write
+        // is cheap and this keeps the code path uniform and always tested,
+        // with no behavioral change for the common case.
+        if !tables.is_empty() {
+            let n = self
+                .txn_uuid_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let txn_uuid = format!("{}-{}-{n}", std::process::id(), Self::now_ns());
+            self.txn_intent_log
+                .prepare(&txn_uuid, tables.clone())
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+
+            // Phase B (COMMIT ALL): apply every table's buffered mutations.
+            for (table, txn_id) in &txn_map {
+                let engine = self
+                    .registry
+                    .get(table)
+                    .map_err(|_| ExecError::TableNotFound(table.clone()))?;
+                if let Err(e) = engine.commit_txn(*txn_id) {
+                    // Do NOT write a COMMITTED record — the dangling
+                    // PREPARING record is the source of truth for recovery.
+                    // We deliberately don't try to hand-roll a rollback of
+                    // whatever already committed here: some tables in
+                    // `txn_map` may already be durably committed, and
+                    // "un-committing" them isn't possible — that's the whole
+                    // reason PREPARE happens first.
+                    return Ok(sql_error(
+                        "40003",
+                        &format!(
+                            "cross-table commit failed on table '{table}': {e}; transaction intent {txn_uuid} left pending for recovery"
+                        ),
+                    ));
+                }
+            }
+
+            self.txn_intent_log
+                .mark_committed(&txn_uuid, tables)
                 .map_err(|e| ExecError::Engine(e.to_string()))?;
         }
         Ok(QueryResult::TxCommit)
+    }
+
+    fn now_ns() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
     }
 
     fn exec_rollback(&self) -> Result<QueryResult, ExecError> {
@@ -19046,6 +19118,208 @@ mod tests {
             QueryResult::Error(msg) => assert!(msg.contains("40001"), "{msg}"),
             other => panic!("expected serialization failure, got {other:?}"),
         }
+    }
+
+    // ── MVCC Phase 3 — atomic cross-table commit (intent log) ─────────────
+
+    #[test]
+    fn test_mvcc_phase3_single_table_commit_unchanged_behavior() {
+        // Today's common case: one table, one txn. Must still commit
+        // normally even though it now goes through the intent-log path.
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE p3single (pk U64, v U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        ex.execute("INSERT INTO p3single (pk, v) VALUES (1, 42)")
+            .unwrap();
+        let c = ex.execute("COMMIT").unwrap();
+        assert!(matches!(c, QueryResult::TxCommit));
+
+        let row = ex.execute("SELECT v FROM p3single WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(row), "42");
+
+        // A COMMITTED record should now be the latest for this txn.
+        let records = ex.txn_intent_log.read_all().unwrap();
+        assert!(!records.is_empty());
+        assert!(vectorvolt_engine::find_dangling(&records).is_empty());
+    }
+
+    #[test]
+    fn test_mvcc_phase3_two_table_commit_writes_committed_intent() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE p3a (pk U64, v U64)").unwrap();
+        ex.execute("CREATE TABLE p3b (pk U64, v U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        ex.execute("INSERT INTO p3a (pk, v) VALUES (1, 1)").unwrap();
+        ex.execute("INSERT INTO p3b (pk, v) VALUES (1, 2)").unwrap();
+        let c = ex.execute("COMMIT").unwrap();
+        assert!(matches!(c, QueryResult::TxCommit));
+
+        assert_eq!(
+            select_first_val(ex.execute("SELECT v FROM p3a WHERE pk = 1").unwrap()),
+            "1"
+        );
+        assert_eq!(
+            select_first_val(ex.execute("SELECT v FROM p3b WHERE pk = 1").unwrap()),
+            "2"
+        );
+
+        let records = ex.txn_intent_log.read_all().unwrap();
+        // At least one Preparing + one Committed record for this txn.
+        assert!(records.len() >= 2);
+        assert!(vectorvolt_engine::find_dangling(&records).is_empty());
+        let last = records.last().unwrap();
+        assert_eq!(last.state, vectorvolt_engine::IntentState::Committed);
+        assert_eq!(last.tables.len(), 2);
+    }
+
+    #[test]
+    fn test_mvcc_phase3_partial_failure_leaves_dangling_intent_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
+        let ex = SqlExecutor::new(Arc::clone(&registry));
+        ex.execute("CREATE TABLE p3c (pk U64, v U64)").unwrap();
+        ex.execute("CREATE TABLE p3d (pk U64, v U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        ex.execute("INSERT INTO p3c (pk, v) VALUES (1, 1)").unwrap();
+        ex.execute("INSERT INTO p3d (pk, v) VALUES (1, 2)").unwrap();
+
+        // Force a mid-commit failure the "naturally forceable" way: commit
+        // one table's txn_id out from under the still-open SQL transaction,
+        // so exec_commit's own commit_txn call on it later returns
+        // TxnNotFound.
+        let forced_table = {
+            let guard = ex.txn.lock().unwrap();
+            let map = guard.as_ref().unwrap();
+            if map.contains_key("p3d") {
+                "p3d"
+            } else {
+                "p3c"
+            }
+        };
+        let txn_id = {
+            let guard = ex.txn.lock().unwrap();
+            *guard.as_ref().unwrap().get(forced_table).unwrap()
+        };
+        registry
+            .get(forced_table)
+            .unwrap()
+            .commit_txn(txn_id)
+            .unwrap();
+
+        let result = ex.execute("COMMIT").unwrap();
+        match result {
+            QueryResult::Error(msg) => assert!(msg.contains("40003"), "{msg}"),
+            other => panic!("expected a commit error, got {other:?}"),
+        }
+
+        // The intent log must show a dangling PREPARING record — no
+        // COMMITTED was written since the loop errored partway through.
+        let records = ex.txn_intent_log.read_all().unwrap();
+        let dangling = vectorvolt_engine::find_dangling(&records);
+        assert_eq!(dangling.len(), 1);
+
+        // Recovery rolls forward: the table that was never touched actually
+        // commits now; the one already committed resolves via TxnNotFound.
+        let c = registry.get("p3c").unwrap();
+        let d = registry.get("p3d").unwrap();
+        let actions = vectorvolt_engine::recover_pending_transactions(
+            ex.txn_intent_log.path(),
+            move |name| match name {
+                "p3c" => Some(c.clone()),
+                "p3d" => Some(d.clone()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].resolved_state,
+            vectorvolt_engine::IntentState::Committed
+        );
+
+        assert_eq!(
+            select_first_val(ex.execute("SELECT v FROM p3c WHERE pk = 1").unwrap()),
+            "1"
+        );
+        assert_eq!(
+            select_first_val(ex.execute("SELECT v FROM p3d WHERE pk = 1").unwrap()),
+            "2"
+        );
+
+        // Recovery is itself idempotent.
+        let c2 = registry.get("p3c").unwrap();
+        let d2 = registry.get("p3d").unwrap();
+        let actions2 = vectorvolt_engine::recover_pending_transactions(
+            ex.txn_intent_log.path(),
+            move |name| match name {
+                "p3c" => Some(c2.clone()),
+                "p3d" => Some(d2.clone()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert!(actions2.is_empty());
+    }
+
+    #[test]
+    fn test_mvcc_phase3_recovery_hand_constructed_dangling_record() {
+        // A hand-constructed dangling PREPARING record for 2 tables where
+        // one is already committed and one is not — recovery must complete
+        // it and mark it resolved.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
+        let a = registry
+            .create_table("p3e", vec!["pk".into(), "v".into()])
+            .unwrap();
+        let b = registry
+            .create_table("p3f", vec!["pk".into(), "v".into()])
+            .unwrap();
+
+        let t1 = a.begin();
+        a.insert_txn(t1, 1, vec![1, 111]).unwrap();
+        let t2 = b.begin();
+        b.insert_txn(t2, 1, vec![1, 222]).unwrap();
+
+        // One table already committed before the crash.
+        a.commit_txn(t1).unwrap();
+
+        let log_path = dir.path().join("_txn_intent_manual.log");
+        let log = vectorvolt_engine::TxnIntentLog::open(&log_path).unwrap();
+        log.prepare(
+            "manual-txn",
+            vec![
+                vectorvolt_engine::TableTxn {
+                    table: "p3e".into(),
+                    txn_id: t1,
+                },
+                vectorvolt_engine::TableTxn {
+                    table: "p3f".into(),
+                    txn_id: t2,
+                },
+            ],
+        )
+        .unwrap();
+
+        let actions =
+            vectorvolt_engine::recover_pending_transactions(&log_path, move |name| match name {
+                "p3e" => Some(a.clone()),
+                "p3f" => Some(b.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].resolved_state,
+            vectorvolt_engine::IntentState::Committed
+        );
+        assert_eq!(actions[0].tables_committed.len(), 2);
+
+        let records = vectorvolt_engine::TxnIntentLog::open(&log_path)
+            .unwrap()
+            .read_all()
+            .unwrap();
+        assert!(vectorvolt_engine::find_dangling(&records).is_empty());
     }
 
     // â”€â”€ S62 â€” FTS improvements â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
