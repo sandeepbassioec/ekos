@@ -67,6 +67,7 @@ pub mod snapshot;
 mod sort;
 mod stats;
 mod ttl;
+pub mod txn_intent_log;
 mod update_where;
 pub mod views;
 pub mod vv_config;
@@ -116,6 +117,10 @@ pub use shard_catalog::{ShardCatalog, TableEntry};
 pub use snapshot::SnapshotMeta;
 pub use stats::EngineStats;
 pub use system_profile::SystemProfile;
+pub use txn_intent_log::{
+    IntentRecord, IntentState, RecoveryAction, TableTxn, TxnIntentLog, find_dangling,
+    recover_pending_transactions,
+};
 pub use views::{ViewDefinition, ViewEntry, ViewKind, ViewRegistry};
 pub use vv_config::{
     ConfigDiffEntry, ConfigDiffKind, HalConfig, NetworkConfig, ObservabilityConfig, QueryConfig,
