@@ -34,6 +34,7 @@ use vectorvolt_storage::{
 pub use vectorvolt_wal::WalTip;
 use vectorvolt_wal::{SyncCommitter, SyncStats, WalWriter};
 
+use crate::mvcc::{CommitClock, VersionIndex};
 use crate::routing::select_partition;
 use crate::shard_writer::ShardWriter;
 use crate::{TxnError, TxnResult, ops::Mutation};
@@ -112,6 +113,13 @@ pub struct TxnManager {
     /// separate `.vvsst` files per flush cycle, each with a unique `partition_id`
     /// in the RowDescriptor.
     partition_count: usize,
+    /// MVCC Phase 1: monotonic commit-timestamp source. One per table, shared
+    /// by every write path so commit order and version order agree.
+    clock: CommitClock,
+    /// MVCC Phase 1: per-pk version chains, independent of `pk_index`. Backs
+    /// `get_at`/`scan_at`/`gc_versions_before`; does not affect the current-value
+    /// read path (`get`/`scan`), which is unchanged.
+    version_index: VersionIndex,
 }
 
 impl TxnManager {
@@ -162,6 +170,8 @@ impl TxnManager {
             pending_tombstones: Mutex::new(HashMap::new()),
             in_flight,
             partition_count: 1,
+            clock: CommitClock::new(),
+            version_index: VersionIndex::new(),
         }
     }
 
@@ -230,6 +240,10 @@ impl TxnManager {
         };
         let tip = self.commit(mutation.encode())?;
 
+        // MVCC Phase 1: record this version before anything else observes it.
+        let commit_ts = self.clock.next();
+        self.version_index.push_live(pk, commit_ts, values.clone());
+
         // 2. SecondaryIndex: one entry per non-PK column. Done before the row is
         //    buffered, while `values` is still borrowable.
         {
@@ -288,6 +302,8 @@ impl TxnManager {
         // Apply each row to in-memory structures.
         let mut any_full = false;
         for (pk, values) in rows {
+            let commit_ts = self.clock.next();
+            self.version_index.push_live(pk, commit_ts, values.clone());
             {
                 let mut sec = self.secondary_index.write();
                 for (col_idx, &val) in values.iter().enumerate().skip(1) {
@@ -383,6 +399,57 @@ impl TxnManager {
         Ok(rows)
     }
 
+    // ── MVCC (Phase 1) ───────────────────────────────────────────────────────────
+
+    /// Read `pk` as of `read_ts`: the latest version with `commit_ts <= read_ts`,
+    /// or `None` if it did not exist yet or was deleted by then.
+    ///
+    /// Independent of `pk_index` / `get`: it walks the version chain maintained
+    /// in `version_index`, so it stays correct even after the current value has
+    /// been overwritten, relocated by a flush, or removed by a delete.
+    pub fn get_at(&self, pk: u64, read_ts: u64) -> Option<Vec<u64>> {
+        self.version_index.get_at(pk, read_ts)
+    }
+
+    /// Fix a read snapshot: returns the current commit timestamp. A transaction
+    /// should call this at BEGIN and pass the result to `get_at`/`scan_at` for
+    /// the lifetime of that transaction. (Wiring this into the SQL layer's BEGIN
+    /// is a later step — this just exposes the primitive.)
+    pub fn begin_snapshot(&self) -> u64 {
+        self.clock.current()
+    }
+
+    /// Snapshot-consistent full scan as of `read_ts`.
+    ///
+    /// A pk is included if it had a live (non-tombstoned) version at or before
+    /// `read_ts`, even if it was inserted after the current wall-clock moment's
+    /// pk_index state changed, or has since been deleted or updated further.
+    pub fn scan_at(&self, read_ts: u64) -> Vec<(u64, Vec<u64>)> {
+        self.version_index
+            .visible_pks_at(read_ts)
+            .into_iter()
+            .filter_map(|pk| {
+                self.version_index
+                    .get_at(pk, read_ts)
+                    .map(|values| (pk, values))
+            })
+            .collect()
+    }
+
+    /// Prune version history for `pk` older than `watermark_ts`, always keeping
+    /// at least the newest version with `commit_ts <= watermark_ts` so reads
+    /// exactly at the watermark keep working. Not wired into any automatic
+    /// background GC yet — callers invoke it directly.
+    pub fn gc_versions_before(&self, pk: u64, watermark_ts: u64) {
+        self.version_index.gc_before(pk, watermark_ts);
+    }
+
+    /// Access to the shared commit clock (e.g. to observe `current()` without
+    /// creating a snapshot, or for diagnostics).
+    pub fn commit_clock(&self) -> &crate::mvcc::CommitClock {
+        &self.clock
+    }
+
     // ── DELETE ─────────────────────────────────────────────────────────────────
 
     /// All PKs whose column `col_idx` matches `value` via the SecondaryIndex.
@@ -425,6 +492,12 @@ impl TxnManager {
         let tip = self.commit(Mutation::Delete { pk }.encode())?;
         self.pk_index.write().remove(pk);
         *self.pending_tombstones.lock().entry(home).or_insert(0) += 1;
+
+        // MVCC Phase 1: append a tombstone rather than losing the pre-delete
+        // value — old readers holding an earlier snapshot must still see it.
+        let commit_ts = self.clock.next();
+        self.version_index.push_tombstone(pk, commit_ts);
+
         Ok(tip)
     }
 
@@ -454,6 +527,9 @@ impl TxnManager {
         for (pk, values) in rows {
             // Remove old index entry if present (upsert semantics).
             self.pk_index.write().remove(pk);
+
+            let commit_ts = self.clock.next();
+            self.version_index.push_live(pk, commit_ts, values.clone());
 
             {
                 let mut sec = self.secondary_index.write();
@@ -507,6 +583,8 @@ impl TxnManager {
             for (pk, home) in homes {
                 idx.remove(pk);
                 *tombstones.entry(home).or_insert(0) += 1;
+                let commit_ts = self.clock.next();
+                self.version_index.push_tombstone(pk, commit_ts);
             }
         }
 
@@ -539,6 +617,10 @@ impl TxnManager {
         if self.pk_index.read().get(pk).is_some() {
             self.pk_index.write().remove(pk);
         }
+
+        // MVCC Phase 1.
+        let commit_ts = self.clock.next();
+        self.version_index.push_live(pk, commit_ts, values.clone());
 
         // Secondary index + filter.
         {
@@ -585,6 +667,10 @@ impl TxnManager {
         )?;
         // Tombstone the old descriptor.
         self.pk_index.write().remove(pk);
+        // MVCC Phase 1: append the new version (update never leaves a gap where
+        // the row is invisible — the old version stays reachable via get_at).
+        let commit_ts = self.clock.next();
+        self.version_index.push_live(pk, commit_ts, values.clone());
         // Secondary index + filter.
         {
             let mut sec = self.secondary_index.write();
@@ -1010,6 +1096,11 @@ impl TxnManager {
                 got: values.len(),
             });
         }
+
+        // MVCC Phase 1: WAL replay reconstructs the version chain exactly like a
+        // live insert would have, so a restarted process keeps its history.
+        let commit_ts = self.clock.next();
+        self.version_index.push_live(pk, commit_ts, values.clone());
 
         // SecondaryIndex — one entry per non-PK column.
         {
