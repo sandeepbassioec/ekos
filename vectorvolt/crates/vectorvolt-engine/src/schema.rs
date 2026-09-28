@@ -425,7 +425,9 @@ impl TypedValue {
             }
             // Text and Vector live in sidecars; parse stores a hash/0 placeholder.
             ColumnType::Text => {
-                let hash = s.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+                let hash = s
+                    .bytes()
+                    .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
                 Ok(Self::U64(hash))
             }
             ColumnType::Vector(_) => Ok(Self::U64(0)),

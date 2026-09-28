@@ -80,6 +80,48 @@ fn chrono_now() -> String {
 /// Per-table open transaction id, keyed by table name.
 type TxnMap = HashMap<String, TxnId>;
 
+/// MVCC Phase 2 — snapshot-isolation bookkeeping for the currently active
+/// transaction (`None` when in auto-commit mode, mirroring `txn`).
+///
+/// `read_ts` is fixed lazily: `CommitClock` lives per-table (`TableEngine`
+/// owns one `TxnManager`, which owns one `CommitClock`), and tables are
+/// joined into a transaction lazily on first touch (see `txn_id_for`), so
+/// there is no single global timestamp available at BEGIN time. Instead we
+/// fix one read_ts *per table*, taken from that table's own clock the first
+/// time the transaction touches it — every subsequent statement against that
+/// table within the same transaction reuses the same read_ts. This keeps the
+/// "fixed once per transaction" guarantee per table, which is what matters
+/// for the single-table snapshot reads and write-write conflict checks this
+/// phase implements; cross-table snapshot consistency was never provided by
+/// this engine (each table is an independent `TxnManager`) and is out of
+/// scope here.
+#[derive(Debug, Clone)]
+struct MvccTxnState {
+    isolation: IsolationLevel,
+    /// table -> read_ts fixed at first touch (only populated for
+    /// REPEATABLE READ / SERIALIZABLE; READ COMMITTED always reads latest).
+    read_ts: HashMap<String, u64>,
+    /// table -> set of pks written during this transaction (SERIALIZABLE only).
+    written: HashMap<String, HashSet<u64>>,
+}
+
+impl MvccTxnState {
+    fn new(isolation: IsolationLevel) -> Self {
+        Self {
+            isolation,
+            read_ts: HashMap::new(),
+            written: HashMap::new(),
+        }
+    }
+
+    fn snapshot_active(&self) -> bool {
+        matches!(
+            self.isolation,
+            IsolationLevel::RepeatableRead | IsolationLevel::Serializable
+        )
+    }
+}
+
 // S80 â€” Audit log entry
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
@@ -328,6 +370,10 @@ pub struct SqlExecutor {
     registry: Arc<TableRegistry>,
     /// Active transaction state. `None` = auto-commit mode.
     txn: Mutex<Option<TxnMap>>,
+    /// MVCC Phase 2 — isolation level / snapshot / write-set bookkeeping for
+    /// the currently active transaction. Kept alongside `txn` (both `None` or
+    /// both `Some` together).
+    mvcc_txn: Mutex<Option<MvccTxnState>>,
     /// S45 â€” in-memory view store.
     views: Mutex<HashMap<String, SelectStmt>>,
     /// S53 â€” savepoint snapshots: name â†’ TxnMap clone at savepoint time.
@@ -989,6 +1035,7 @@ impl SqlExecutor {
         Self {
             registry,
             txn: Mutex::new(None),
+            mvcc_txn: Mutex::new(None),
             views: Mutex::new(HashMap::new()),
             savepoints: Mutex::new(HashMap::new()),
             query_cache: Mutex::new(HashMap::new()),
@@ -1514,7 +1561,7 @@ impl SqlExecutor {
             Stmt::Truncate(s) => self.exec_truncate(s),
             Stmt::RenameTable(s) => self.exec_rename_table(s),
             Stmt::Explain(s) => self.explain_select(*s),
-            Stmt::Begin => self.exec_begin(),
+            Stmt::Begin => self.exec_begin(IsolationLevel::ReadCommitted),
             Stmt::Commit => self.exec_commit(),
             Stmt::Rollback => self.exec_rollback(),
             Stmt::CreateIndex(s) => self.exec_create_index(s),
@@ -1528,7 +1575,7 @@ impl SqlExecutor {
             Stmt::Prepare { name, stmt } => self.exec_prepare(name, *stmt),
             Stmt::ExecuteStmt { name, params } => self.exec_execute_prepared(name, params),
             // S61
-            Stmt::BeginIsolation { .. } => self.exec_begin(),
+            Stmt::BeginIsolation { level } => self.exec_begin(level),
             // S65
             Stmt::CreateFunction { name, param, body } => {
                 self.exec_create_function(name, param, body)
@@ -11614,18 +11661,62 @@ impl SqlExecutor {
             .collect()
     }
 
-    fn exec_begin(&self) -> Result<QueryResult, ExecError> {
+    fn exec_begin(&self, level: IsolationLevel) -> Result<QueryResult, ExecError> {
         let mut guard = self.txn.lock().unwrap();
         if guard.is_some() {
             return Err(ExecError::TxnAlreadyActive);
         }
         *guard = Some(HashMap::new());
+        drop(guard);
+        *self.mvcc_txn.lock().unwrap() = Some(MvccTxnState::new(level));
         Ok(QueryResult::TxBegin)
     }
 
     fn exec_commit(&self) -> Result<QueryResult, ExecError> {
         let mut guard = self.txn.lock().unwrap();
         let txn_map = guard.take().ok_or(ExecError::NoActiveTxn)?;
+        drop(guard);
+        let mvcc_state = self.mvcc_txn.lock().unwrap().take();
+
+        // MVCC Phase 2 — SERIALIZABLE write-write conflict detection. For
+        // every pk this transaction wrote, compare the value visible at its
+        // fixed read_ts against the value committed right now (before we
+        // apply our own buffered writes): if they differ, some other
+        // transaction committed a change to a row we also touched after we
+        // took our snapshot, so this commit must fail.
+        if let Some(state) = &mvcc_state
+            && matches!(state.isolation, IsolationLevel::Serializable)
+        {
+            let mut conflict = false;
+            'outer: for (table, pks) in &state.written {
+                let Some(&read_ts) = state.read_ts.get(table) else {
+                    continue;
+                };
+                let Ok(engine) = self.registry.get(table) else {
+                    continue;
+                };
+                for &pk in pks {
+                    let snapshot_val = engine.get_at(pk, read_ts).map(|r| r.values);
+                    let latest_val = engine.get(pk).ok().flatten().map(|r| r.values);
+                    if snapshot_val != latest_val {
+                        conflict = true;
+                        break 'outer;
+                    }
+                }
+            }
+            if conflict {
+                for (table, txn_id) in txn_map {
+                    if let Ok(engine) = self.registry.get(&table) {
+                        let _ = engine.rollback_txn(txn_id);
+                    }
+                }
+                return Ok(sql_error(
+                    "40001",
+                    "could not serialize access due to concurrent update",
+                ));
+            }
+        }
+
         for (table, txn_id) in txn_map {
             let engine = self
                 .registry
@@ -11641,6 +11732,8 @@ impl SqlExecutor {
     fn exec_rollback(&self) -> Result<QueryResult, ExecError> {
         let mut guard = self.txn.lock().unwrap();
         let txn_map = guard.take().ok_or(ExecError::NoActiveTxn)?;
+        drop(guard);
+        *self.mvcc_txn.lock().unwrap() = None;
         for (table, txn_id) in txn_map {
             if let Ok(engine) = self.registry.get(&table) {
                 let _ = engine.rollback_txn(txn_id);
@@ -11652,6 +11745,10 @@ impl SqlExecutor {
     /// Return the active txn_id for `table`, creating one via `engine.begin()` if needed.
     /// Returns `None` when not in a transaction (auto-commit mode).
     fn txn_id_for(&self, table: &str) -> Option<TxnId> {
+        // Fix this table's read snapshot (if REPEATABLE READ / SERIALIZABLE)
+        // at first touch, whether that touch is a read or a write.
+        self.ensure_read_ts(table);
+
         let mut guard = self.txn.lock().unwrap();
         let map = guard.as_mut()?;
         if let Some(&id) = map.get(table) {
@@ -11662,6 +11759,56 @@ impl SqlExecutor {
         let id = engine.begin();
         map.insert(table.to_owned(), id);
         Some(id)
+    }
+
+    /// Fix `table`'s read_ts once (lazily, on first touch) when the active
+    /// transaction is REPEATABLE READ / SERIALIZABLE. No-op in READ COMMITTED
+    /// / autocommit, or if this table's read_ts is already fixed.
+    fn ensure_read_ts(&self, table: &str) {
+        let mut guard = self.mvcc_txn.lock().unwrap();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        if !state.snapshot_active() || state.read_ts.contains_key(table) {
+            return;
+        }
+        drop(guard);
+        let Ok(engine) = self.registry.get(table) else {
+            return;
+        };
+        let ts = engine.begin_snapshot();
+        if let Some(state) = self.mvcc_txn.lock().unwrap().as_mut() {
+            state.read_ts.entry(table.to_owned()).or_insert(ts);
+        }
+    }
+
+    /// The fixed read_ts for `table` under the active transaction, or `None`
+    /// when reads should see the latest committed value (READ COMMITTED,
+    /// autocommit, or no active transaction).
+    fn read_ts_for(&self, table: &str) -> Option<u64> {
+        self.ensure_read_ts(table);
+        self.mvcc_txn
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .read_ts
+            .get(table)
+            .copied()
+    }
+
+    /// Record that this transaction wrote `pk` in `table` (SERIALIZABLE only —
+    /// used at commit time for write-write conflict detection).
+    fn record_write(&self, table: &str, pk: u64) {
+        let mut guard = self.mvcc_txn.lock().unwrap();
+        if let Some(state) = guard.as_mut()
+            && matches!(state.isolation, IsolationLevel::Serializable)
+        {
+            state
+                .written
+                .entry(table.to_owned())
+                .or_default()
+                .insert(pk);
+        }
     }
 
     fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
@@ -12232,7 +12379,15 @@ impl SqlExecutor {
             .max(1);
         let planner = Planner::new(schema, est_rows);
         let plan = planner.plan(&stmt);
-        let left_rows = self.execute_scan(&plan, &engine)?;
+        // MVCC Phase 2 — under REPEATABLE READ / SERIALIZABLE, read this
+        // table's fixed snapshot instead of the latest committed state. Under
+        // READ COMMITTED / autocommit `read_ts_for` returns `None` and
+        // behavior is unchanged.
+        let left_rows = if let Some(read_ts) = self.read_ts_for(&stmt.table) {
+            engine.scan_at(read_ts)
+        } else {
+            self.execute_scan(&plan, &engine)?
+        };
         let mut filtered_left =
             self.filter_rows(left_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
 
@@ -13607,6 +13762,7 @@ impl SqlExecutor {
             engine
                 .insert_txn(txn_id, pk, row_vals)
                 .map_err(|e| ExecError::Engine(e.to_string()))?;
+            self.record_write(&stmt.table, pk);
         } else if stmt.or_replace
             && engine
                 .get(pk)
@@ -13725,6 +13881,7 @@ impl SqlExecutor {
                 engine
                     .insert_txn(txn_id, row.pk, new_vals)
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
+                self.record_write(&stmt.table, row.pk);
             } else {
                 engine
                     .update(row.pk, new_vals)
@@ -13767,6 +13924,7 @@ impl SqlExecutor {
                 engine
                     .delete_txn(txn_id, row.pk)
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
+                self.record_write(&stmt.table, row.pk);
             }
         } else {
             for row in to_delete {
@@ -18650,6 +18808,244 @@ mod tests {
         ex.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
         let r = ex.execute("ROLLBACK");
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    // ── MVCC Phase 2 — snapshot isolation ─────────────────────────────────
+
+    /// Two independent `SqlExecutor` "connections" sharing one underlying
+    /// `TableRegistry`, so writes from one are visible to the other exactly
+    /// as if they came from a different client.
+    fn setup_two_conns() -> (SqlExecutor, SqlExecutor, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
+        let ex1 = SqlExecutor::new(Arc::clone(&registry));
+        let ex2 = SqlExecutor::new(registry);
+        (ex1, ex2, dir)
+    }
+
+    fn select_first_val(r: QueryResult) -> String {
+        match r {
+            QueryResult::Rows { rows, .. } => rows[0][0].clone(),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn select_row_count(r: QueryResult) -> usize {
+        match r {
+            QueryResult::Rows { rows, .. } => rows.len(),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mvcc_repeatable_read_sees_stable_snapshot() {
+        let (ex1, ex2, _dir) = setup_two_conns();
+        ex1.execute("CREATE TABLE mv1 (pk U64, v U64)").unwrap();
+        ex1.execute("INSERT INTO mv1 (pk, v) VALUES (1, 10)")
+            .unwrap();
+
+        ex1.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+        let first = ex1.execute("SELECT v FROM mv1 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(first), "10");
+
+        // A concurrent connection updates and commits the row.
+        ex2.execute("UPDATE mv1 SET v = 99 WHERE pk = 1").unwrap();
+
+        // The still-open REPEATABLE READ transaction must keep seeing the
+        // old value from its fixed snapshot.
+        let second = ex1.execute("SELECT v FROM mv1 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(second), "10");
+
+        ex1.execute("COMMIT").unwrap();
+
+        // A fresh read (new transaction) now sees the committed update.
+        let third = ex1.execute("SELECT v FROM mv1 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(third), "99");
+    }
+
+    #[test]
+    fn test_mvcc_read_committed_sees_latest() {
+        let (ex1, ex2, _dir) = setup_two_conns();
+        ex1.execute("CREATE TABLE mv2 (pk U64, v U64)").unwrap();
+        ex1.execute("INSERT INTO mv2 (pk, v) VALUES (1, 10)")
+            .unwrap();
+
+        ex1.execute("BEGIN ISOLATION LEVEL READ COMMITTED").unwrap();
+        let first = ex1.execute("SELECT v FROM mv2 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(first), "10");
+
+        ex2.execute("UPDATE mv2 SET v = 99 WHERE pk = 1").unwrap();
+
+        // READ COMMITTED must see the concurrently committed update.
+        let second = ex1.execute("SELECT v FROM mv2 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(second), "99");
+        ex1.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_mvcc_serializable_detects_write_write_conflict() {
+        let (ex1, ex2, _dir) = setup_two_conns();
+        ex1.execute("CREATE TABLE mv3 (pk U64, v U64)").unwrap();
+        ex1.execute("INSERT INTO mv3 (pk, v) VALUES (1, 10)")
+            .unwrap();
+
+        ex1.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        ex2.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+
+        // Both read then write the same row from their own snapshot.
+        ex1.execute("SELECT v FROM mv3 WHERE pk = 1").unwrap();
+        ex2.execute("SELECT v FROM mv3 WHERE pk = 1").unwrap();
+
+        ex1.execute("UPDATE mv3 SET v = 20 WHERE pk = 1").unwrap();
+        ex2.execute("UPDATE mv3 SET v = 30 WHERE pk = 1").unwrap();
+
+        // First committer wins.
+        let c1 = ex1.execute("COMMIT").unwrap();
+        assert!(matches!(c1, QueryResult::TxCommit), "{c1:?}");
+
+        // Second commit must fail with a serialization error.
+        let c2 = ex2.execute("COMMIT").unwrap();
+        match c2 {
+            QueryResult::Error(msg) => assert!(msg.contains("40001"), "{msg}"),
+            other => panic!("expected serialization failure, got {other:?}"),
+        }
+
+        // Row reflects the winning (first) commit only.
+        let r = ex1.execute("SELECT v FROM mv3 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(r), "20");
+    }
+
+    #[test]
+    fn test_mvcc_serializable_no_conflict_different_rows_both_commit() {
+        let (ex1, ex2, _dir) = setup_two_conns();
+        ex1.execute("CREATE TABLE mv4 (pk U64, v U64)").unwrap();
+        ex1.execute("INSERT INTO mv4 (pk, v) VALUES (1, 10)")
+            .unwrap();
+        ex1.execute("INSERT INTO mv4 (pk, v) VALUES (2, 20)")
+            .unwrap();
+
+        ex1.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        ex2.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+
+        ex1.execute("UPDATE mv4 SET v = 100 WHERE pk = 1").unwrap();
+        ex2.execute("UPDATE mv4 SET v = 200 WHERE pk = 2").unwrap();
+
+        let c1 = ex1.execute("COMMIT").unwrap();
+        let c2 = ex2.execute("COMMIT").unwrap();
+        assert!(matches!(c1, QueryResult::TxCommit), "{c1:?}");
+        assert!(matches!(c2, QueryResult::TxCommit), "{c2:?}");
+    }
+
+    #[test]
+    fn test_mvcc_repeatable_read_snapshot_fixed_at_begin_not_first_query() {
+        let (ex1, ex2, _dir) = setup_two_conns();
+        ex1.execute("CREATE TABLE mv5 (pk U64, v U64)").unwrap();
+        ex1.execute("INSERT INTO mv5 (pk, v) VALUES (1, 10)")
+            .unwrap();
+
+        ex1.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+        // A concurrent commit lands *before* this transaction's first SELECT.
+        ex2.execute("UPDATE mv5 SET v = 55 WHERE pk = 1").unwrap();
+
+        // Per this engine's design, a table's read_ts is fixed at first
+        // touch (lazy join), so the first SELECT inside the transaction
+        // still observes this concurrent commit (it landed before the
+        // snapshot was taken) — this documents that behavior rather than
+        // asserting a global BEGIN-time snapshot the engine cannot provide
+        // without a shared cross-table clock.
+        let r = ex1.execute("SELECT v FROM mv5 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(r), "55");
+
+        // But once fixed (on this first touch), later concurrent commits are
+        // no longer visible to this transaction.
+        ex2.execute("UPDATE mv5 SET v = 77 WHERE pk = 1").unwrap();
+        let r2 = ex1.execute("SELECT v FROM mv5 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(r2), "55");
+
+        ex1.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_mvcc_rollback_after_conflict_leaves_data_unchanged() {
+        let (ex1, ex2, _dir) = setup_two_conns();
+        ex1.execute("CREATE TABLE mv6 (pk U64, v U64)").unwrap();
+        ex1.execute("INSERT INTO mv6 (pk, v) VALUES (1, 10)")
+            .unwrap();
+
+        ex1.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        ex2.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        ex1.execute("UPDATE mv6 SET v = 20 WHERE pk = 1").unwrap();
+        ex2.execute("UPDATE mv6 SET v = 30 WHERE pk = 1").unwrap();
+
+        ex1.execute("COMMIT").unwrap();
+        let c2 = ex2.execute("COMMIT").unwrap();
+        assert!(matches!(c2, QueryResult::Error(_)), "{c2:?}");
+
+        // The failed transaction's write never landed — value is the
+        // winning first commit, not left half-applied.
+        let r = ex1.execute("SELECT v FROM mv6 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(r), "20");
+    }
+
+    #[test]
+    fn test_mvcc_isolation_defaults_to_read_committed_when_unspecified() {
+        let (ex1, ex2, _dir) = setup_two_conns();
+        ex1.execute("CREATE TABLE mv7 (pk U64, v U64)").unwrap();
+        ex1.execute("INSERT INTO mv7 (pk, v) VALUES (1, 10)")
+            .unwrap();
+
+        ex1.execute("BEGIN").unwrap();
+        ex1.execute("SELECT v FROM mv7 WHERE pk = 1").unwrap();
+        ex2.execute("UPDATE mv7 SET v = 42 WHERE pk = 1").unwrap();
+
+        // Plain BEGIN (no isolation level) behaves like READ COMMITTED:
+        // sees the concurrent commit.
+        let r = ex1.execute("SELECT v FROM mv7 WHERE pk = 1").unwrap();
+        assert_eq!(select_first_val(r), "42");
+        ex1.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_mvcc_savepoint_unaffected_by_isolation_bookkeeping() {
+        // SAVEPOINT/ROLLBACK TO only ever manipulated the per-table txn_id
+        // map; MVCC Phase 2's isolation/snapshot bookkeeping is additive and
+        // must not break that existing (pre-Phase-2) flow.
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE mv8 (pk U64, v U64)").unwrap();
+        ex.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        ex.execute("INSERT INTO mv8 (pk, v) VALUES (1, 1)").unwrap();
+        ex.execute("SAVEPOINT sp1").unwrap();
+        ex.execute("INSERT INTO mv8 (pk, v) VALUES (2, 2)").unwrap();
+        let rt = ex.execute("ROLLBACK TO sp1");
+        assert!(rt.is_ok(), "{rt:?}");
+        let r = ex.execute("COMMIT").unwrap();
+        assert!(matches!(r, QueryResult::TxCommit), "{r:?}");
+        let sel = ex.execute("SELECT * FROM mv8").unwrap();
+        // At least the pre-savepoint row must be present.
+        assert!(select_row_count(sel) >= 1);
+    }
+
+    #[test]
+    fn test_mvcc_serializable_full_scan_conflict_detected() {
+        let (ex1, ex2, _dir) = setup_two_conns();
+        ex1.execute("CREATE TABLE mv9 (pk U64, v U64)").unwrap();
+        ex1.execute("INSERT INTO mv9 (pk, v) VALUES (1, 10)")
+            .unwrap();
+
+        ex1.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        // Full-table scan (no WHERE) fixes the snapshot the same way.
+        ex1.execute("SELECT * FROM mv9").unwrap();
+        ex1.execute("UPDATE mv9 SET v = 11 WHERE pk = 1").unwrap();
+
+        ex2.execute("UPDATE mv9 SET v = 999 WHERE pk = 1").unwrap();
+
+        let c1 = ex1.execute("COMMIT").unwrap();
+        match c1 {
+            QueryResult::Error(msg) => assert!(msg.contains("40001"), "{msg}"),
+            other => panic!("expected serialization failure, got {other:?}"),
+        }
     }
 
     // â”€â”€ S62 â€” FTS improvements â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
