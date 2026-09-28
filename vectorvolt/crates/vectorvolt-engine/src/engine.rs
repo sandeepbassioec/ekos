@@ -1339,4 +1339,37 @@ impl TableEngine {
     pub fn rollback_txn(&self, txn_id: TxnId) -> EngineResult<()> {
         self.mvcc.rollback(txn_id)
     }
+
+    // ── MVCC Phase 2 — snapshot isolation ─────────────────────────────────
+
+    /// Fix a read snapshot on this table: returns the commit timestamp a
+    /// REPEATABLE READ / SERIALIZABLE transaction should hold for the rest of
+    /// its lifetime and pass to `get_at` / `scan_at`.
+    pub fn begin_snapshot(&self) -> u64 {
+        self.txn.begin_snapshot()
+    }
+
+    /// The most recently allocated commit timestamp on this table (used by
+    /// SERIALIZABLE commit-time conflict detection to know what landed since
+    /// a transaction's `read_ts`).
+    pub fn current_commit_ts(&self) -> u64 {
+        self.txn.commit_clock().current()
+    }
+
+    /// Read `pk` as of `read_ts` (snapshot read), independent of the current
+    /// pk_index state.
+    pub fn get_at(&self, pk: u64, read_ts: u64) -> Option<EngineRow> {
+        self.txn
+            .get_at(pk, read_ts)
+            .map(|values| EngineRow { pk, values })
+    }
+
+    /// Snapshot-consistent full scan as of `read_ts`.
+    pub fn scan_at(&self, read_ts: u64) -> Vec<EngineRow> {
+        self.txn
+            .scan_at(read_ts)
+            .into_iter()
+            .map(|(pk, values)| EngineRow { pk, values })
+            .collect()
+    }
 }
