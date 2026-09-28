@@ -48,6 +48,7 @@ impl TableEngine {
         }
 
         let mut results = Vec::new();
+        self.promote_all_pending()?;
         let parts = self.partitions.read();
 
         for reader in parts.values() {

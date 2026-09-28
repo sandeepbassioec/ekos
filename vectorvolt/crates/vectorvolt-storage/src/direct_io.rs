@@ -46,7 +46,11 @@ unsafe impl Sync for AlignedBuf {}
 impl AlignedBuf {
     /// Allocate at least `size` bytes, rounded up to [`DIRECT_ALIGN`], zeroed.
     pub fn new(size: usize) -> Self {
-        let rounded = if size == 0 { DIRECT_ALIGN } else { align_up(size, DIRECT_ALIGN) };
+        let rounded = if size == 0 {
+            DIRECT_ALIGN
+        } else {
+            align_up(size, DIRECT_ALIGN)
+        };
         let layout =
             Layout::from_size_align(rounded, DIRECT_ALIGN).expect("AlignedBuf: layout overflow");
         // SAFETY: layout.size() > 0.
@@ -55,7 +59,11 @@ impl AlignedBuf {
             panic!("AlignedBuf: allocation of {rounded} bytes failed");
         }
         // SAFETY: ptr is non-null.
-        Self { ptr: unsafe { NonNull::new_unchecked(ptr) }, len: rounded, layout }
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            len: rounded,
+            layout,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -136,7 +144,11 @@ impl DirectWriter {
             .truncate(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)?;
-        Ok(Self { file, path: path.to_owned(), pos: 0 })
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+            pos: 0,
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -146,7 +158,11 @@ impl DirectWriter {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(Self { file: io::BufWriter::new(file), path: path.to_owned(), pos: 0 })
+        Ok(Self {
+            file: io::BufWriter::new(file),
+            path: path.to_owned(),
+            pos: 0,
+        })
     }
 
     /// Write a slice.
@@ -179,7 +195,11 @@ impl DirectWriter {
         {
             use std::os::unix::io::AsRawFd;
             let rc = unsafe { libc::fsync(self.file.as_raw_fd()) };
-            if rc != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+            if rc != 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -280,7 +300,8 @@ mod tests {
         let p = tmp_path();
         let mut w = DirectWriter::open(&p).expect("open");
         assert_eq!(w.pos(), 0);
-        w.write_aligned(DirectWriter::aligned_buf(512).as_slice()).expect("write");
+        w.write_aligned(DirectWriter::aligned_buf(512).as_slice())
+            .expect("write");
         assert_eq!(w.pos(), 512);
         let _ = std::fs::remove_file(&p);
     }
@@ -290,7 +311,8 @@ mod tests {
     fn direct_fsync_ok() {
         let p = tmp_path();
         let mut w = DirectWriter::open(&p).expect("open");
-        w.write_aligned(DirectWriter::aligned_buf(512).as_slice()).expect("write");
+        w.write_aligned(DirectWriter::aligned_buf(512).as_slice())
+            .expect("write");
         w.fsync().expect("fsync");
         let _ = std::fs::remove_file(&p);
     }
@@ -312,7 +334,8 @@ mod tests {
         let p = tmp_path();
         let mut w = DirectWriter::open(&p).expect("open");
         for _ in 0..4 {
-            w.write_aligned(DirectWriter::aligned_buf(512).as_slice()).expect("write");
+            w.write_aligned(DirectWriter::aligned_buf(512).as_slice())
+                .expect("write");
         }
         assert_eq!(w.pos(), 2048);
         let _ = std::fs::remove_file(&p);

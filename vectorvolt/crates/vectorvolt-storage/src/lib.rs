@@ -15,9 +15,9 @@
 //! Two CRC32 checksums protect the header and the entire file.
 
 pub mod bitpack;
-pub mod direct_io;
 pub mod column;
 pub mod compaction;
+pub mod direct_io;
 pub mod format;
 pub mod lifecycle;
 pub mod manifest;
@@ -40,7 +40,7 @@ pub use lifecycle::{
 pub use manifest::{Manifest, ManifestEdit, ManifestRecovery};
 pub use partition::MicroPartition;
 pub use prefetch::{AccessPattern, PrefetchAdvisor};
-pub use reader::PartitionReader;
+pub use reader::{PartitionReader, ZonePeek};
 pub use tier::{StorageTier, TierConfig, TierStats, TieredStorageConfig};
 pub use tiered_writer::TieredWriter;
 pub use writer::{Compression, WriteOptions, write_partition, write_partition_with};

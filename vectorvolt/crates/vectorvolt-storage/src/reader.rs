@@ -68,7 +68,96 @@ pub struct PartitionReader {
     col_meta: Vec<ColMeta>,
 }
 
+/// Cheap, file-size-independent zone-map peek (VV-ENG-014).
+///
+/// `PartitionReader::open` performs a full-file CRC32 over every byte and, on
+/// Linux, prefaults every page via `mmap`'s `populate()` — cost proportional to
+/// the whole partition, paid whether or not a single row is ever read from it.
+/// The per-column zone stats (`zone_min`/`zone_max`) live in the column-metadata
+/// section right after the header and schema, so they can be read with a small,
+/// sequential, bounded read — cost proportional to column count, never to row
+/// count or file size.
+///
+/// This only verifies the header CRC (28 bytes), not the full-file CRC, so a
+/// caller that decides — based on the zone map — not to read this partition's
+/// row data never pays for verifying data it will not touch. Any caller that
+/// *does* go on to read row data must still call [`PartitionReader::open`],
+/// which performs the full verification.
+#[derive(Debug, Clone)]
+pub struct ZonePeek {
+    pub file_id: u16,
+    pub partition_id: u16,
+    pub row_count: u32,
+    /// `(min, max)` per column, indexed by column position.
+    pub zones: Vec<(u64, u64)>,
+}
+
 impl PartitionReader {
+    /// Read just enough of `path` to answer zone-map queries — see [`ZonePeek`].
+    pub fn peek_zone_maps(path: &Path) -> StorageResult<ZonePeek> {
+        use std::io::BufReader;
+
+        let file = std::fs::File::open(path)?;
+        let mut r = BufReader::new(file);
+
+        let mut header = [0u8; HEADER_FIXED_SIZE];
+        r.read_exact(&mut header)?;
+        if header[0..8] != MAGIC[..] {
+            return Err(StorageError::InvalidMagic);
+        }
+
+        let mut cur = Cursor::new(&header[8..HEADER_FIXED_SIZE]);
+        let version = cur.read_u32::<LittleEndian>()?;
+        if !(MIN_READABLE_VERSION..=VERSION).contains(&version) {
+            return Err(StorageError::UnsupportedVersion(version));
+        }
+        let file_id = cur.read_u16::<LittleEndian>()?;
+        let partition_id = cur.read_u16::<LittleEndian>()?;
+        let row_count = cur.read_u32::<LittleEndian>()?;
+        let col_count = cur.read_u32::<LittleEndian>()?;
+        let schema_len = cur.read_u32::<LittleEndian>()?;
+        let stored_header_crc = cur.read_u32::<LittleEndian>()?;
+
+        let computed_header_crc = crc32fast::hash(&header[0..28]);
+        if computed_header_crc != stored_header_crc {
+            return Err(StorageError::HeaderCrcMismatch {
+                expected: computed_header_crc,
+                stored: stored_header_crc,
+            });
+        }
+
+        // Schema bytes are irrelevant to a zone-map peek — read and discard.
+        let mut schema_buf = vec![0u8; schema_len as usize];
+        r.read_exact(&mut schema_buf)?;
+
+        let meta_len = (col_count as usize).saturating_mul(COL_META_SIZE);
+        let mut meta_buf = vec![0u8; meta_len];
+        r.read_exact(&mut meta_buf)?;
+        let mut mcur = Cursor::new(&meta_buf[..]);
+        let mut zones = Vec::with_capacity(col_count as usize);
+        for _ in 0..col_count {
+            let _encoding = mcur.read_u8()?;
+            let _bit_width = mcur.read_u8()?;
+            let _compression = mcur.read_u8()?;
+            let mut reserved = [0u8; 5];
+            mcur.read_exact(&mut reserved)?;
+            let _data_offset = mcur.read_u64::<LittleEndian>()?;
+            let _data_byte_len = mcur.read_u64::<LittleEndian>()?;
+            let _uncompressed_len = mcur.read_u64::<LittleEndian>()?;
+            let _first_section_len = mcur.read_u64::<LittleEndian>()?;
+            let zone_min = mcur.read_u64::<LittleEndian>()?;
+            let zone_max = mcur.read_u64::<LittleEndian>()?;
+            zones.push((zone_min, zone_max));
+        }
+
+        Ok(ZonePeek {
+            file_id,
+            partition_id,
+            row_count,
+            zones,
+        })
+    }
+
     /// Open a `.vvsst` file, verify both CRCs, and parse metadata.
     ///
     /// Returns `Err` immediately on magic mismatch, version mismatch,

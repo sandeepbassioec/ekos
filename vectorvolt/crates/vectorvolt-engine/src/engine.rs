@@ -20,7 +20,8 @@ use parking_lot::RwLock;
 use vectorvolt_index::RowDescriptor;
 use vectorvolt_storage::{
     CompactionJob, CompactionStrategy, ManifestEdit, ManifestRecovery, PartitionMeta,
-    PartitionReader, RetentionPlan, RetentionPolicy, VerifyReport, WriteOptions, verify_partitions,
+    PartitionReader, RetentionPlan, RetentionPolicy, VerifyReport, WriteOptions, ZonePeek,
+    verify_partitions,
 };
 pub use vectorvolt_txn::{FlushResult, WalTip};
 use vectorvolt_txn::{Mutation, TxnManager};
@@ -38,6 +39,21 @@ pub struct TableEngine {
     pub(crate) txn: TxnManager,
     /// Flushed partition files keyed by (file_id, partition_id).
     pub(crate) partitions: RwLock<HashMap<(u16, u16), PartitionReader>>,
+    /// Partitions discovered by `sync_partitions` since the last flush that have
+    /// only been zone-map-peeked, not fully opened (VV-ENG-014).
+    ///
+    /// `PartitionReader::open` performs a full-file CRC32 and (on Linux) a full
+    /// `mmap` page prefault — cost proportional to the whole file, paid whether
+    /// or not the partition is ever read. Keeping a newly-flushed partition here
+    /// until a `scan()`'s zone-map filter actually needs its row data (or a
+    /// `get()` addresses it directly) means a partition the filter excludes
+    /// never pays that cost. See `promote_pending`.
+    pub(crate) pending_partitions: RwLock<HashMap<(u16, u16), (PathBuf, ZonePeek)>>,
+    /// Count of `PartitionReader::open` calls triggered by promoting a pending
+    /// partition (i.e. partitions that survived a zone-map filter or were
+    /// addressed directly). Exposed for tests proving zone-pruned partitions are
+    /// never opened; not used for any behavioral decision.
+    pub(crate) partition_opens: std::sync::atomic::AtomicU64,
     pub(crate) partition_dir: PathBuf,
     pub schema: TableSchema,
     /// How `compact` chooses what to merge.
@@ -494,6 +510,8 @@ impl TableEngine {
         let engine = TableEngine {
             txn,
             partitions: RwLock::new(partitions),
+            pending_partitions: RwLock::new(HashMap::new()),
+            partition_opens: std::sync::atomic::AtomicU64::new(0),
             partition_dir,
             schema: typed_schema,
             compaction_strategy: options.compaction_strategy,
@@ -912,6 +930,38 @@ impl TableEngine {
                 results.push(EngineRow { pk, values });
             }
         }
+        drop(parts);
+
+        // Partitions discovered since the last flush that have only been
+        // zone-map-peeked (VV-ENG-014). Prune with the peek's zone stats â€” pure
+        // in-memory metadata, zero file I/O â€” before ever calling
+        // `PartitionReader::open`, so an excluded partition never pays the
+        // full-file CRC / mmap-populate cost that `open` performs.
+        let survivors: Vec<(u16, u16)> = self
+            .pending_partitions
+            .read()
+            .iter()
+            .filter_map(|(key, (_, peek))| {
+                let prune =
+                    matches!(peek.zones.get(col_idx), Some(&(min, max)) if min > hi || max < lo);
+                (!prune).then_some(*key)
+            })
+            .collect();
+
+        for key in survivors {
+            self.promote_pending(key)?;
+            let parts = self.partitions.read();
+            let Some(reader) = parts.get(&key) else {
+                // Removed by a concurrent compaction/retention between the peek
+                // filter and here â€” nothing left to scan.
+                continue;
+            };
+            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
+            for values in reader.materialize_rows(&offsets)? {
+                let pk = values.first().copied().unwrap_or(u64::MAX);
+                results.push(EngineRow { pk, values });
+            }
+        }
 
         Ok(results)
     }
@@ -978,12 +1028,18 @@ impl TableEngine {
         self.do_flush()?;
 
         let mut parts = self.partitions.write();
-        if parts.is_empty() {
+        let mut pending = self.pending_partitions.write();
+        if parts.is_empty() && pending.is_empty() {
             return Ok(None);
         }
 
         // Release every mapping before the executor tries to delete input files.
+        // Pending (peeked-only) partitions hold no mapping, but are cleared too:
+        // the rebuild below re-derives everything from the post-compaction
+        // manifest, so a stale pending entry would either double-count a
+        // survivor or point at a file compaction just deleted.
         parts.clear();
+        pending.clear();
 
         let outcomes = self
             .txn
@@ -1076,6 +1132,8 @@ impl TableEngine {
         let mut parts = self.partitions.write();
         // Same Windows constraint as compaction: a mapped file will not delete.
         parts.clear();
+        // Rebuilt below from the post-retention manifest, same as `compact()`.
+        self.pending_partitions.write().clear();
 
         let removes: Vec<(u16, u16)> = plan
             .delete
@@ -1176,7 +1234,7 @@ impl TableEngine {
         EngineStats {
             rows_buffered: self.txn.row_count_buffered(),
             rows_flushed: self.txn.total_rows_flushed(),
-            partition_count: self.partitions.read().len(),
+            partition_count: self.partitions.read().len() + self.pending_partitions.read().len(),
             schema: self.schema.names(),
             auto_compact_threshold: self.auto_compact_threshold,
         }
@@ -1205,7 +1263,7 @@ impl TableEngine {
     /// call returns `None` and the chain stops there.
     fn maybe_compact(&self) -> EngineResult<()> {
         if let Some(threshold) = self.auto_compact_threshold
-            && self.partitions.read().len() >= threshold
+            && self.partitions.read().len() + self.pending_partitions.read().len() >= threshold
         {
             self.compact()?;
         }
@@ -1220,13 +1278,18 @@ impl TableEngine {
         partition_id: u16,
         row_offset: usize,
     ) -> EngineResult<Vec<u64>> {
+        let key = (file_id, partition_id);
+        // A direct point lookup always needs the real row data, so promote a
+        // pending (peeked-only) partition eagerly rather than making the zone
+        // map decide â€” there is no predicate to prune with here.
+        if !self.partitions.read().contains_key(&key) {
+            self.promote_pending(key)?;
+        }
         let parts = self.partitions.read();
-        let reader = parts
-            .get(&(file_id, partition_id))
-            .ok_or(EngineError::PartitionMissing {
-                file_id,
-                partition_id,
-            })?;
+        let reader = parts.get(&key).ok_or(EngineError::PartitionMissing {
+            file_id,
+            partition_id,
+        })?;
         let col_count = reader.col_count() as usize;
         let mut values = Vec::with_capacity(col_count);
         for c in 0..col_count {
@@ -1235,8 +1298,16 @@ impl TableEngine {
         Ok(values)
     }
 
+    /// Discover new `.vvsst` files and register them as `pending` (VV-ENG-014).
+    ///
+    /// Registration only reads the zone-map peek (header + schema + column
+    /// metadata) — never the row data, never the full-file CRC. The full,
+    /// verified `PartitionReader::open` is deferred to `promote_pending`, called
+    /// only when a scan's zone-map filter cannot exclude the partition, or when
+    /// `get()` addresses it directly.
     fn sync_partitions(&self) -> EngineResult<()> {
-        let mut parts = self.partitions.write();
+        let parts = self.partitions.read();
+        let mut pending = self.pending_partitions.write();
         for entry in std::fs::read_dir(&self.partition_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -1267,16 +1338,81 @@ impl TableEngine {
                 .and_then(|(f, p)| Some((f.parse::<u16>().ok()?, p.parse::<u16>().ok()?)));
 
             if let Some(key) = parsed
-                && parts.contains_key(&key)
+                && (parts.contains_key(&key) || pending.contains_key(&key))
             {
                 continue;
             }
 
-            let reader = PartitionReader::open(&path)?;
-            let key = (reader.file_id(), reader.partition_id());
-            parts.entry(key).or_insert(reader);
+            // Cheap: reads only the header/schema/column-metadata prefix, no
+            // full-file CRC, no mmap page prefault. This is the fix for
+            // VV-ENG-014 â€” a partition a zone-map filter will exclude is
+            // registered here for near-zero cost and never promoted.
+            let peek = PartitionReader::peek_zone_maps(&path)?;
+            let key = (peek.file_id, peek.partition_id);
+            if parts.contains_key(&key) || pending.contains_key(&key) {
+                continue;
+            }
+            pending.entry(key).or_insert((path, peek));
         }
         Ok(())
+    }
+
+    /// Fully open (and verify) the partition named by `key`, moving it from
+    /// `pending_partitions` into `partitions`. A no-op if it is already open or
+    /// unknown to either map.
+    ///
+    /// This is where the cost `sync_partitions` deferred is finally paid — the
+    /// full-file CRC32 and, on Linux, the `mmap` page prefault. Called only for
+    /// partitions a zone-map filter could not exclude, or that `get()` addresses
+    /// directly.
+    fn promote_pending(&self, key: (u16, u16)) -> EngineResult<()> {
+        if self.partitions.read().contains_key(&key) {
+            return Ok(());
+        }
+        let path = {
+            let pending = self.pending_partitions.read();
+            match pending.get(&key) {
+                Some((path, _)) => path.clone(),
+                None => return Ok(()),
+            }
+        };
+        let mut parts = self.partitions.write();
+        // Re-check under the write lock: another thread may have promoted this
+        // key while we were reading `path` above.
+        if parts.contains_key(&key) {
+            self.pending_partitions.write().remove(&key);
+            return Ok(());
+        }
+        let reader = PartitionReader::open(&path)?;
+        self.partition_opens
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        parts.insert(key, reader);
+        self.pending_partitions.write().remove(&key);
+        Ok(())
+    }
+
+    /// Fully open every pending (peeked-only) partition.
+    ///
+    /// Read paths that do not filter by a single column's zone map (aggregates,
+    /// multi-predicate scans, sort, range-delete) cannot use the cheap peek to
+    /// decide anything, so they need every partition genuinely open the way
+    /// `self.partitions` used to guarantee unconditionally. Called at the top of
+    /// those paths to restore that guarantee; `scan()`/`get()` do not call this
+    /// â€” they promote only the partitions their own filter cannot exclude.
+    pub(crate) fn promote_all_pending(&self) -> EngineResult<()> {
+        let keys: Vec<(u16, u16)> = self.pending_partitions.read().keys().copied().collect();
+        for key in keys {
+            self.promote_pending(key)?;
+        }
+        Ok(())
+    }
+
+    /// Number of `PartitionReader::open` calls made to serve a pending
+    /// partition (i.e. one that survived a zone-map filter, or was addressed
+    /// directly by `get()`). Test-observability for VV-ENG-014.
+    pub fn partition_open_count(&self) -> u64 {
+        self.partition_opens
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // â”€â”€ MVCC transaction API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

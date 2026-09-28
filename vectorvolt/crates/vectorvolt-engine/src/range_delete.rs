@@ -55,6 +55,8 @@ impl TableEngine {
             let mut pk_buf: Vec<u64> = Vec::new();
             let mut pks: Vec<u64> = Vec::new();
 
+            self.promote_all_pending()?;
+
             let parts = self.partitions.read();
             for reader in parts.values() {
                 // Zone-prune on filter_col.
