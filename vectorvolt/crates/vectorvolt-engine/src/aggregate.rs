@@ -146,6 +146,7 @@ impl TableEngine {
         let mut counts = vec![0u64; n_buckets];
 
         let mut col_buf = Vec::new();
+        self.promote_all_pending()?;
         let parts = self.partitions.read();
         for reader in parts.values() {
             if let Ok((min, max)) = reader.zone_min_max(col_idx)
@@ -217,6 +218,7 @@ impl TableEngine {
 
         let mut values: Vec<u64> = Vec::new();
         let mut col_buf = Vec::new();
+        self.promote_all_pending()?;
         let parts = self.partitions.read();
         for reader in parts.values() {
             if let Ok((min, max)) = reader.zone_min_max(col_idx)
