@@ -68,16 +68,30 @@ impl TableEngine {
             }
 
             // Decode the first predicate column and collect matching row indices.
+            //
+            // A range predicate on column 0 (the PK, VV-QRY-002.6) skips the
+            // decode entirely: `filter_offsets_pk` binary-searches when this
+            // partition's PK column is sorted (always true post-compaction),
+            // falling back to the identical linear scan otherwise.
             let mut col_buf: Vec<u64> = Vec::new();
             let (first_col, first_lo, first_hi) = predicates[0];
-            reader.decode_column_into(first_col, &mut col_buf)?;
-            let mut candidates: Vec<usize> = col_buf
-                .iter()
-                .enumerate()
-                .filter(|&(_, &v)| v >= first_lo && v <= first_hi)
-                .map(|(i, _)| i)
-                .collect();
-            col_buf.clear();
+            let mut candidates: Vec<usize> = if first_col == 0 {
+                reader
+                    .filter_offsets_pk(first_lo, first_hi)?
+                    .into_iter()
+                    .map(|off| off as usize)
+                    .collect()
+            } else {
+                reader.decode_column_into(first_col, &mut col_buf)?;
+                let candidates = col_buf
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &v)| v >= first_lo && v <= first_hi)
+                    .map(|(i, _)| i)
+                    .collect();
+                col_buf.clear();
+                candidates
+            };
 
             // Narrow candidates against each remaining predicate.
             for &(col_idx, lo, hi) in &predicates[1..] {

@@ -66,6 +66,9 @@ pub struct PartitionReader {
     col_count: u32,
     schema: Vec<String>,
     col_meta: Vec<ColMeta>,
+    /// Cached answer to "is column 0 (the PK) non-decreasing in this file?".
+    /// See [`is_pk_sorted`](Self::is_pk_sorted).
+    pk_sorted: std::sync::OnceLock<bool>,
 }
 
 /// Cheap, file-size-independent zone-map peek (VV-ENG-014).
@@ -307,6 +310,7 @@ impl PartitionReader {
             col_count,
             schema,
             col_meta,
+            pk_sorted: std::sync::OnceLock::new(),
         })
     }
 
@@ -769,6 +773,101 @@ impl PartitionReader {
         let mut out = Vec::new();
         vectorvolt_hal::simd::filter_range(scratch, lo, hi, &mut out);
         Ok(out)
+    }
+
+    /// True if column 0 (the primary key, by convention) is stored
+    /// non-decreasing in this file (VV-QRY-002.6).
+    ///
+    /// Compaction output is always PK-sorted — `compaction::execute_job` builds
+    /// it from a `BTreeMap<u64, _>` on purpose, for exactly this reason. A file
+    /// fresh out of a memtable flush is **not**: `TxnManager::flush` groups
+    /// buffered rows by partition hash and writes each group in drain order,
+    /// with no sort step. The two cases are indistinguishable from the file
+    /// alone — there is no on-disk flag recording which one produced a given
+    /// `.vvsst` — so this checks directly, using the O(1)-per-row point-read
+    /// path (`read_value`), and caches the answer for the lifetime of this
+    /// reader. The first range query on a given partition pays an O(n)
+    /// sequential check; every later one on the same reader is free.
+    pub fn is_pk_sorted(&self) -> StorageResult<bool> {
+        if let Some(&sorted) = self.pk_sorted.get() {
+            return Ok(sorted);
+        }
+        let n = self.row_count as usize;
+        let mut sorted = true;
+        if n > 1 {
+            let mut prev = self.read_value(0, 0)?;
+            for i in 1..n {
+                let v = self.read_value(0, i)?;
+                if v < prev {
+                    sorted = false;
+                    break;
+                }
+                prev = v;
+            }
+        }
+        // A concurrent caller may race and compute the same answer; whichever
+        // `set` loses is a harmless no-op, both computed the same value.
+        let _ = self.pk_sorted.set(sorted);
+        Ok(sorted)
+    }
+
+    /// First row offset `i` in `0..row_count` with `read_value(0, i) >= key`
+    /// (Rust's `partition_point` semantics), assuming column 0 is sorted.
+    fn pk_lower_bound(&self, key: u64) -> StorageResult<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.row_count as usize;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.read_value(0, mid)? < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// First row offset `i` in `0..row_count` with `read_value(0, i) > key`,
+    /// assuming column 0 is sorted.
+    fn pk_upper_bound(&self, key: u64) -> StorageResult<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.row_count as usize;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.read_value(0, mid)? <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// Row offsets where the primary key (column 0) falls in `[lo, hi]`.
+    ///
+    /// This is [`filter_offsets`](Self::filter_offsets) specialised for
+    /// VV-QRY-002.6: when this partition's PK column is sorted (see
+    /// [`is_pk_sorted`](Self::is_pk_sorted)), the matching rows form one
+    /// contiguous run, found via two binary searches — O(log n) comparisons,
+    /// each an O(1) mmap point-read, no column decode at all — instead of
+    /// decoding and predicate-testing every row. When the PK column is not
+    /// sorted (an un-compacted flush), this falls back to the same SIMD
+    /// linear scan `filter_offsets` uses, so the result is identical either
+    /// way; only the cost differs.
+    pub fn filter_offsets_pk(&self, lo: u64, hi: u64) -> StorageResult<Vec<u32>> {
+        if lo > hi {
+            return Ok(Vec::new());
+        }
+        if !self.is_pk_sorted()? {
+            return self.filter_offsets(0, lo, hi);
+        }
+        let n = self.row_count as usize;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let start = self.pk_lower_bound(lo)?;
+        let end = self.pk_upper_bound(hi)?;
+        Ok((start as u32..end as u32).collect())
     }
 
     /// Count rows where column `col_idx` falls in `[lo, hi]`, without allocating a match Vec.
