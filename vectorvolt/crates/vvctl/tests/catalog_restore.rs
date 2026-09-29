@@ -64,6 +64,7 @@ fn serve_args(dir: &TempDir, catalog: bool, restore_catalog: bool) -> ServeArgs 
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        encrypt_at_rest: false,
         metrics_port: 0,
     }
 }

@@ -100,7 +100,11 @@ pub fn run(args: QueryArgs) -> Result<()> {
                     for row in &rows {
                         println!("{}", row.join(" | "));
                     }
-                    println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+                    println!(
+                        "({} row{})",
+                        rows.len(),
+                        if rows.len() == 1 { "" } else { "s" }
+                    );
                 }
                 QueryResult::Affected(n) => println!("Affected {n} row(s)."),
                 other => println!("{other:?}"),

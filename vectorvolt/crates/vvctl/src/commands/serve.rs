@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use vectorvolt_crypto::{EncryptedReader, EncryptedWriter, KeyStore};
 use vectorvolt_engine::{
     CliOverrides, ShardCatalog, SystemProfile, TableEngine, TableRegistry, VvConfig,
     load_config_full,
@@ -182,6 +183,20 @@ pub struct ServeArgs {
     /// policy does not match (boot chain tampered). Requires Linux + TPM 2.0 hardware.
     #[arg(long)]
     pub tpm_unseal: bool,
+
+    /// Encrypt table metadata at rest with AES-256-GCM (`vectorvolt-crypto`, VV-SEC-001/002).
+    ///
+    /// Requires a master key: either unseal one from the TPM with `--tpm-unseal`, or
+    /// export `VECTORVOLT_MASTER_KEY` (64 hex chars, see `vvctl install --gen-key`)
+    /// before starting the server. Fails immediately if neither is present.
+    ///
+    /// Today this covers the table's `schema.txt` metadata file (written/read via
+    /// `vectorvolt_crypto::{EncryptedWriter,EncryptedReader}`). Row data in `.vvsst`
+    /// partitions and WAL segments is NOT yet covered — see VV-SEC-006 follow-up;
+    /// those readers are mmap-based and require a format change to support
+    /// transparent decryption without losing the zero-copy read path.
+    #[arg(long)]
+    pub encrypt_at_rest: bool,
 }
 
 impl Default for ServeArgs {
@@ -213,6 +228,7 @@ impl Default for ServeArgs {
             no_grpc: false,
             metrics_port: 9100,
             tpm_unseal: false,
+            encrypt_at_rest: false,
         }
     }
 }
@@ -234,6 +250,59 @@ pub struct BoundServer {
     pub engine_opts_flush_threshold: usize,
     /// Master VvConfig loaded from `--master-config` (None when flag not used). L123.
     pub master_config: Option<VvConfig>,
+    /// Whether `--encrypt-at-rest` is active (schema metadata encrypted, VV-SEC-006).
+    pub encrypt_at_rest: bool,
+}
+
+/// Resolve the AES-256-GCM master key for `--encrypt-at-rest` from
+/// `VECTORVOLT_MASTER_KEY` (set directly, or by `--tpm-unseal` earlier in
+/// `run()`). Fails with a clear message if neither is present.
+fn resolve_master_key() -> Result<KeyStore> {
+    KeyStore::from_env().map_err(|e| {
+        anyhow::anyhow!(
+            "--encrypt-at-rest requires a master key: {e}. \
+             Set VECTORVOLT_MASTER_KEY (see `vvctl install --gen-key`) or pass --tpm-unseal."
+        )
+    })
+}
+
+/// Read `schema.txt`, transparently decrypting it first when `encrypt` is set.
+fn read_schema_file(path: &std::path::Path, encrypt: bool) -> Result<Vec<String>> {
+    let contents = if encrypt {
+        let key = resolve_master_key()?;
+        let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut reader = EncryptedReader::new(file, &key)
+            .with_context(|| format!("decrypt {}", path.display()))?;
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut s)
+            .with_context(|| format!("read decrypted {}", path.display()))?;
+        s
+    } else {
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?
+    };
+    Ok(contents
+        .lines()
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Write `schema.txt`, transparently encrypting it first when `encrypt` is set.
+fn write_schema_file(path: &std::path::Path, columns: &[String], encrypt: bool) -> Result<()> {
+    let plaintext = columns.join("\n");
+    if encrypt {
+        let key = resolve_master_key()?;
+        let file =
+            std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+        let mut writer = EncryptedWriter::new(file, key);
+        std::io::Write::write_all(&mut writer, plaintext.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+        std::io::Write::flush(&mut writer)
+            .with_context(|| format!("encrypt+flush {}", path.display()))?;
+    } else {
+        std::fs::write(path, plaintext).with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
 }
 
 type ServerBuilder = Box<dyn FnOnce(ServerConfig) -> Result<Server>>;
@@ -269,6 +338,12 @@ fn build_transport_kind(args: &ServeArgs) -> Result<vectorvolt_net::TransportKin
 }
 
 pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
+    if args.encrypt_at_rest && args.multi {
+        bail!(
+            "--encrypt-at-rest is not yet supported with --multi (catalog schemas aren't \
+             routed through schema.txt) — see VV-SEC-006 follow-up"
+        );
+    }
     // ── Master config (VV-CFG-011, L123) — lowest precedence layer ───────────
     let master_config: Option<VvConfig> = if let Some(ref p) = args.master_config {
         let cfg = VvConfig::from_file(p)
@@ -335,12 +410,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         // Single-table (legacy) mode.
         let schema_path = args.dir.join(SCHEMA_FILE);
         let schema: Vec<String> = if schema_path.exists() {
-            std::fs::read_to_string(&schema_path)
-                .with_context(|| format!("read {}", schema_path.display()))?
-                .lines()
-                .map(str::to_owned)
-                .filter(|s| !s.is_empty())
-                .collect()
+            read_schema_file(&schema_path, args.encrypt_at_rest)?
         } else if args.columns.is_empty() {
             bail!(
                 "no table found at {} — pass --columns to create one",
@@ -349,12 +419,16 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         } else {
             std::fs::create_dir_all(&args.dir)
                 .with_context(|| format!("create dir {}", args.dir.display()))?;
-            std::fs::write(&schema_path, args.columns.join("\n"))
-                .with_context(|| "write schema.txt")?;
+            write_schema_file(&schema_path, &args.columns, args.encrypt_at_rest)?;
             eprintln!(
-                "created table at {}  schema: {}",
+                "created table at {}  schema: {}{}",
                 args.dir.display(),
-                args.columns.join(", ")
+                args.columns.join(", "),
+                if args.encrypt_at_rest {
+                    " (schema.txt encrypted at rest)"
+                } else {
+                    ""
+                }
             );
             args.columns.clone()
         };
@@ -439,6 +513,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         catalog,
         engine_opts_flush_threshold: resolved_flush_threshold,
         master_config,
+        encrypt_at_rest: args.encrypt_at_rest,
     })
 }
 
@@ -474,10 +549,24 @@ pub fn run(args: ServeArgs) -> Result<()> {
         catalog,
         engine_opts_flush_threshold,
         master_config,
+        encrypt_at_rest,
     } = bind(&args)?;
 
     let local = server.local_addr()?;
     let stats = server.stats();
+
+    // ── Auth safety check (VV-SEC-006) ───────────────────────────────────────
+    // `--secret` is the real gate here (HMAC-SHA3 challenge-response, enforced in
+    // vectorvolt-net's Server) — vectorvolt-pam is a separate, OS-level SSH PAM
+    // module and is not something the wire-protocol server calls into. Warn loudly
+    // if auth is off and the bind address is not loopback-only.
+    if !auth.is_enabled() && !local.ip().is_loopback() {
+        eprintln!(
+            "WARNING: auth is disabled and the server is bound to a non-loopback \
+             address ({local}) — any client that can reach this port can read and \
+             write data. Pass --secret <hex> to require authentication."
+        );
+    }
 
     // ── Startup banner ────────────────────────────────────────────────────────
     eprintln!("VectorVolt server ready");
@@ -511,6 +600,14 @@ pub fn run(args: ServeArgs) -> Result<()> {
     eprintln!(
         "  tls       : {}",
         if tls_enabled { "enabled" } else { "plaintext" }
+    );
+    eprintln!(
+        "  encrypt   : {}",
+        if encrypt_at_rest {
+            "schema.txt (AES-256-GCM)"
+        } else {
+            "disabled (use --encrypt-at-rest)"
+        }
     );
     eprintln!("  max conns : {}", args.max_connections);
     eprintln!("  flush thr : {} rows", engine_opts_flush_threshold);
