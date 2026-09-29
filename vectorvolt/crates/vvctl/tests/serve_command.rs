@@ -34,6 +34,7 @@ fn make_args(addr: &str) -> ServeArgs {
         tpm_unseal: false,
         encrypt_at_rest: false,
         metrics_port: 0,
+        pgwire_port: None,
     }
 }
 
