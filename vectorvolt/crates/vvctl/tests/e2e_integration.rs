@@ -57,6 +57,7 @@ impl E2EHarness {
             tpm_unseal: false,
             encrypt_at_rest: false,
             metrics_port: 0,
+            pgwire_port: None,
             catalog: false,
             restore_catalog: false,
         };

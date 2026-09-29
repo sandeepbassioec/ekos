@@ -42,6 +42,7 @@ fn base_args(dir: &TempDir) -> ServeArgs {
         tpm_unseal: false,
         encrypt_at_rest: false,
         metrics_port: 0,
+        pgwire_port: None,
     }
 }
 

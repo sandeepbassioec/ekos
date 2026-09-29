@@ -1,4 +1,16 @@
 //! `vvctl reader` — start / stop the PostgreSQL wire protocol server (VV-CLU-019).
+//!
+//! ## Fallback / dev-only path
+//!
+//! This command opens its OWN `TableRegistry` against `--dir`, completely
+//! independent of any `vvctl serve` process that may be running against the
+//! same data directory. Running both at once risks file-lock contention and
+//! data seen by one process but not the other.
+//!
+//! Prefer `vvctl serve --pgwire-port <port>`, which starts a pgwire listener
+//! sharing the SAME `TableRegistry`/engine state as the main wire-protocol,
+//! HTTP, and gRPC listeners in that single process. Keep this standalone
+//! command around for quick local development/testing only.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;

@@ -30,6 +30,7 @@ use vectorvolt_engine::{
 use vectorvolt_http::{HttpServer, HttpServerConfig};
 use vectorvolt_net::tls::ServerTlsConfig;
 use vectorvolt_net::{AuthConfig, Scope, Secret, Server, ServerConfig};
+use vectorvolt_reader::server::{PgConfig, PgServer};
 
 const SCHEMA_FILE: &str = "schema.txt";
 
@@ -197,6 +198,18 @@ pub struct ServeArgs {
     /// transparent decryption without losing the zero-copy read path.
     #[arg(long)]
     pub encrypt_at_rest: bool,
+
+    /// Also start a PostgreSQL wire-protocol (pgwire) listener on this port.
+    ///
+    /// Shares the SAME `TableRegistry` as the wire-protocol/HTTP/gRPC listeners
+    /// started by this process, so data inserted via any listener is visible to
+    /// SQL clients connecting over pgwire (and vice versa). This is the
+    /// integrated way to expose VectorVolt to Postgres-wire clients; prefer it
+    /// over the standalone `vvctl reader start` command, which opens its own
+    /// independent `TableRegistry` against the same data directory and is now a
+    /// fallback/dev-only path (see `commands::reader`). Disabled if omitted.
+    #[arg(long)]
+    pub pgwire_port: Option<u16>,
 }
 
 impl Default for ServeArgs {
@@ -229,6 +242,7 @@ impl Default for ServeArgs {
             metrics_port: 9100,
             tpm_unseal: false,
             encrypt_at_rest: false,
+            pgwire_port: None,
         }
     }
 }
@@ -711,6 +725,43 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eprintln!("  grpc      : disabled");
         None
     };
+
+    // ── pgwire listener (optional) ───────────────────────────────────────────
+    // Shares the same TableRegistry as the wire-protocol/HTTP/gRPC listeners
+    // above (single-table mode wraps the one engine as "default", same as the
+    // HTTP gateway does) so SQL clients over pgwire see the same data as every
+    // other listener in this process — this is what makes `vvctl serve` the
+    // one integrated server for Postgres-wire clients (Gap #2 fix).
+    if let Some(pgwire_port) = args.pgwire_port {
+        let pg_reg: Arc<vectorvolt_engine::TableRegistry> = if let Some(ref reg) = registry {
+            Arc::clone(reg)
+        } else if let Some(ref eng) = engine {
+            Arc::new(vectorvolt_engine::TableRegistry::new_with_default(
+                Arc::clone(eng),
+            ))
+        } else {
+            unreachable!("either registry or engine must be present")
+        };
+        let pgwire_addr: SocketAddr = format!("127.0.0.1:{pgwire_port}").parse().unwrap();
+        let pg_dir = args.dir.clone();
+        std::thread::Builder::new()
+            .name("pgwire-server".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                rt.block_on(async move {
+                    let config = PgConfig::new(pgwire_addr, pg_dir);
+                    let server = PgServer::with_registry(config, pg_reg);
+                    eprintln!("  pgwire    : postgres://{pgwire_addr}");
+                    if let Err(e) = server.serve().await {
+                        eprintln!("pgwire server error: {e}");
+                    }
+                });
+            })
+            .expect("spawn pgwire-server thread");
+    } else {
+        eprintln!("  pgwire    : disabled (use --pgwire-port to enable)");
+    }
 
     // ── Prometheus metrics endpoint (VV-OBS-005) ─────────────────────────────
     if args.metrics_port > 0 {

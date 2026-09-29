@@ -66,6 +66,7 @@ fn serve_args(dir: &TempDir, catalog: bool, restore_catalog: bool) -> ServeArgs 
         tpm_unseal: false,
         encrypt_at_rest: false,
         metrics_port: 0,
+        pgwire_port: None,
     }
 }
 
