@@ -32,6 +32,7 @@ fn make_args(addr: &str) -> ServeArgs {
         grpc_port: 50051,
         no_grpc: false,
         tpm_unseal: false,
+        encrypt_at_rest: false,
         metrics_port: 0,
     }
 }

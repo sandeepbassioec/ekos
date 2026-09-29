@@ -55,6 +55,7 @@ impl E2EHarness {
             grpc_port: 50051,
             no_grpc: false,
             tpm_unseal: false,
+            encrypt_at_rest: false,
             metrics_port: 0,
             catalog: false,
             restore_catalog: false,
