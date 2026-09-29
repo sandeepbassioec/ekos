@@ -923,7 +923,16 @@ impl TableEngine {
             // every column. Now the filter column alone is decoded, the comparison
             // is vectorized, and `materialize_rows` picks late-materialization or a
             // bulk decode based on the match count it can already see.
-            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
+            //
+            // A range scan on the PK column (VV-QRY-002.6) is a further special
+            // case: `filter_offsets_pk` binary-searches instead of scanning when
+            // the partition's PK column is sorted (always true after compaction),
+            // falling back to the same linear scan otherwise.
+            let offsets = if col_idx == 0 {
+                reader.filter_offsets_pk(lo, hi)?
+            } else {
+                reader.filter_offsets(col_idx, lo, hi)?
+            };
             for values in reader.materialize_rows(&offsets)? {
                 // Column 0 is the PK by convention.
                 let pk = values.first().copied().unwrap_or(u64::MAX);
@@ -956,7 +965,11 @@ impl TableEngine {
                 // filter and here â€” nothing left to scan.
                 continue;
             };
-            let offsets = reader.filter_offsets(col_idx, lo, hi)?;
+            let offsets = if col_idx == 0 {
+                reader.filter_offsets_pk(lo, hi)?
+            } else {
+                reader.filter_offsets(col_idx, lo, hi)?
+            };
             for values in reader.materialize_rows(&offsets)? {
                 let pk = values.first().copied().unwrap_or(u64::MAX);
                 results.push(EngineRow { pk, values });
