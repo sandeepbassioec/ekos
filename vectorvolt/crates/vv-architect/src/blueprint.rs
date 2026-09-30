@@ -1,14 +1,16 @@
 //! `vectorvolt-blueprint.toml` — the machine-readable output of a scan.
 //!
 //! Entities + aggregate roots + reference (lookup) entities detected by a
-//! scanner, plus an optional cluster sizing plan (rule engine, present only
-//! when the caller supplied workload estimates — TPS/data volume can't be
-//! inferred from static analysis). Event/projection detection is a later
-//! phase — this struct has room to grow but does not fabricate fields it
-//! can't back with real analysis yet.
+//! scanner, plus domain event candidates (method-name based) and an
+//! optional cluster sizing plan (rule engine, present only when the caller
+//! supplied workload estimates — TPS/data volume can't be inferred from
+//! static analysis). Projection detection is a later phase — this struct has
+//! room to grow but does not fabricate fields it can't back with real
+//! analysis yet.
 
 use serde::Serialize;
 
+use crate::events;
 use crate::rules::SizingPlan;
 use crate::scanner::ScanResult;
 
@@ -25,6 +27,9 @@ pub struct Blueprint {
     /// Every entity name detected, regardless of role — useful for a human
     /// reviewing what the scanner actually found vs. missed.
     pub all_entities: Vec<String>,
+    /// Domain event candidates suggested from method names (e.g. `Order`'s
+    /// `Place()` method -> `OrderPlaced`). See `events.rs`.
+    pub suggested_events: Vec<String>,
     /// Cluster sizing, only present when the caller passed `--tps`/`--data-gb`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sizing: Option<SizingPlan>,
@@ -53,10 +58,12 @@ impl Blueprint {
         reference_entities.sort();
 
         let all_entities: Vec<String> = scan.entities.keys().cloned().collect();
+        let suggested_events = events::detect_events(&scan.entities);
 
         Self {
             aggregate_roots,
             reference_entities,
+            suggested_events,
             all_entities,
             sizing: None,
         }
@@ -96,6 +103,7 @@ mod tests {
             DetectedEntity {
                 name: "Order".to_owned(),
                 references: BTreeSet::new(),
+                methods: BTreeSet::new(),
             },
         );
         scan.entities.insert(
@@ -103,6 +111,7 @@ mod tests {
             DetectedEntity {
                 name: "OrderItem".to_owned(),
                 references: BTreeSet::from(["Order".to_owned()]),
+                methods: BTreeSet::new(),
             },
         );
         let bp = Blueprint::from_scan(&scan);
@@ -147,6 +156,7 @@ mod tests {
                 "OrderItem".to_owned(),
                 "Product".to_owned(),
             ],
+            suggested_events: vec![],
             sizing: None,
         };
         let s = bp.to_toml().unwrap();

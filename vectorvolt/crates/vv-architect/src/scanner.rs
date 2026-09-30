@@ -25,6 +25,11 @@ pub struct DetectedEntity {
     /// Other entity names this entity appears to hold a foreign key to,
     /// e.g. `OrderItem` has field `OrderId` -> references `Order`.
     pub references: BTreeSet<String>,
+    /// Method names found on this entity (C#/Java/TS: in the class body;
+    /// Rust: in an `impl EntityName { ... }` block). Feeds the event
+    /// detector (`events.rs`) — a `Place()` method on `Order` suggests an
+    /// `OrderPlaced` domain event.
+    pub methods: BTreeSet<String>,
 }
 
 /// Result of scanning a directory tree.
@@ -91,6 +96,12 @@ struct LanguageSupport {
     class_body_field: &'static str,
     /// Node kinds inside a class body that declare a field/property.
     field_kinds: &'static [&'static str],
+    /// Node kinds inside a class body that declare a method (checked
+    /// separately from `field_kinds` so a method name can never be
+    /// misread as an FK field). Empty for languages where methods live
+    /// outside the class body (Rust's `impl` blocks — handled separately
+    /// in `collect_rust_impl_methods`).
+    method_kinds: &'static [&'static str],
 }
 // Field-declaration name extraction is per-language (e.g. C#'s
 // `field_declaration` nests the name one level deeper inside a
@@ -183,6 +194,7 @@ fn languages() -> Vec<(&'static str, LanguageSupport)> {
                 class_name_field: "name",
                 class_body_field: "body",
                 field_kinds: &["field_declaration", "property_declaration"],
+                method_kinds: &["method_declaration"],
             },
         ),
         (
@@ -194,6 +206,7 @@ fn languages() -> Vec<(&'static str, LanguageSupport)> {
                 class_name_field: "name",
                 class_body_field: "body",
                 field_kinds: &["field_declaration"],
+                method_kinds: &["method_declaration"],
             },
         ),
         (
@@ -205,6 +218,7 @@ fn languages() -> Vec<(&'static str, LanguageSupport)> {
                 class_name_field: "name",
                 class_body_field: "body",
                 field_kinds: &["public_field_definition"],
+                method_kinds: &["method_definition"],
             },
         ),
         (
@@ -216,6 +230,11 @@ fn languages() -> Vec<(&'static str, LanguageSupport)> {
                 class_name_field: "name",
                 class_body_field: "", // resolved via class_body_of's Go branch
                 field_kinds: &["field_declaration"],
+                // Go methods are top-level `func (r Type) Name(...)` decls,
+                // not inside the struct body — out of scope for this pass
+                // (see collect_rust_impl_methods's Rust equivalent; adding Go
+                // would be a similar but separate second-pass walk).
+                method_kinds: &[],
             },
         ),
         (
@@ -227,6 +246,10 @@ fn languages() -> Vec<(&'static str, LanguageSupport)> {
                 class_name_field: "name",
                 class_body_field: "body",
                 field_kinds: &["field_declaration"],
+                // Rust methods live in a separate `impl EntityName { ... }`
+                // block, not the struct body — collected by a second pass,
+                // see `collect_rust_impl_methods`.
+                method_kinds: &[],
             },
         ),
     ]
@@ -283,6 +306,7 @@ fn walk_classes(
         if let Some(body) = class_body_of(lang_key, node, support) {
             let name = text_of(name_node, src);
             let mut references = BTreeSet::new();
+            let mut methods = BTreeSet::new();
             let mut cursor = body.walk();
             for member in body.children(&mut cursor) {
                 if support.field_kinds.contains(&member.kind()) {
@@ -291,15 +315,61 @@ fn walk_classes(
                             references.insert(target);
                         }
                     }
+                } else if support.method_kinds.contains(&member.kind())
+                    && let Some(method_name) = method_name_of(member, src)
+                {
+                    methods.insert(method_name);
                 }
             }
-            out.push(DetectedEntity { name, references });
+            out.push(DetectedEntity {
+                name,
+                references,
+                methods,
+            });
         }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_classes(lang_key, support, child, src, out);
     }
+}
+
+/// Direct `name` field extraction — works for C#/Java `method_declaration`,
+/// TS `method_definition`, and Rust `impl` block `function_item`, all of
+/// which expose the method name as a direct `name:` field per the grammar.
+fn method_name_of(node: Node, src: &[u8]) -> Option<String> {
+    node.child_by_field_name("name").map(|n| text_of(n, src))
+}
+
+/// Second pass for Rust: methods live in a separate `impl EntityName { ... }`
+/// block, not inside the `struct_item` body, so they can't be picked up by
+/// `walk_classes`'s single top-down traversal the way C#/Java/TS methods
+/// (declared directly in the class body) are.
+fn collect_rust_impl_methods(root: Node, src: &[u8], entities: &mut [DetectedEntity]) {
+    fn walk(node: Node, src: &[u8], entities: &mut [DetectedEntity]) {
+        if node.kind() == "impl_item"
+            && let Some(type_node) = node.child_by_field_name("type")
+        {
+            let type_name = text_of(type_node, src);
+            if let Some(entity) = entities.iter_mut().find(|e| e.name == type_name)
+                && let Some(body) = node.child_by_field_name("body")
+            {
+                let mut cursor = body.walk();
+                for member in body.children(&mut cursor) {
+                    if member.kind() == "function_item"
+                        && let Some(method_name) = method_name_of(member, src)
+                    {
+                        entity.methods.insert(method_name);
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(child, src, entities);
+        }
+    }
+    walk(root, src, entities);
 }
 
 /// Parse a single file's source text with the appropriate grammar (chosen by
@@ -322,6 +392,9 @@ pub fn scan_source(lang_key: &str, text: &str) -> anyhow::Result<Vec<DetectedEnt
         text.as_bytes(),
         &mut out,
     );
+    if lang_key == "rust" {
+        collect_rust_impl_methods(tree.root_node(), text.as_bytes(), &mut out);
+    }
     Ok(out)
 }
 
@@ -356,7 +429,10 @@ pub fn scan_directory(dir: &Path) -> anyhow::Result<ScanResult> {
             result
                 .entities
                 .entry(entity.name.clone())
-                .and_modify(|e| e.references.extend(entity.references.iter().cloned()))
+                .and_modify(|e| {
+                    e.references.extend(entity.references.iter().cloned());
+                    e.methods.extend(entity.methods.iter().cloned());
+                })
                 .or_insert(entity);
         }
     }
@@ -367,6 +443,49 @@ pub fn scan_directory(dir: &Path) -> anyhow::Result<ScanResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_csharp_methods_alongside_fields() {
+        let src = "class Order {\n  public int Id;\n  public void Place() {}\n  public void Ship() {}\n}\n";
+        let found = scan_source("csharp", src).unwrap();
+        let order = found.iter().find(|e| e.name == "Order").unwrap();
+        assert!(order.methods.contains("Place"));
+        assert!(order.methods.contains("Ship"));
+        // A method must never leak into the FK reference set.
+        assert!(order.references.is_empty());
+    }
+
+    #[test]
+    fn detects_java_methods() {
+        let src = "class Order {\n  void ship() {}\n}\n";
+        let found = scan_source("java", src).unwrap();
+        assert!(found[0].methods.contains("ship"));
+    }
+
+    #[test]
+    fn detects_typescript_methods() {
+        let src = "class Order {\n  ship() {}\n}\n";
+        let found = scan_source("typescript", src).unwrap();
+        assert!(found[0].methods.contains("ship"));
+    }
+
+    #[test]
+    fn detects_rust_impl_block_methods() {
+        let src = "struct Order {\n    id: u64,\n}\n\nimpl Order {\n    fn ship(&self) {}\n    fn place(&self) {}\n}\n";
+        let found = scan_source("rust", src).unwrap();
+        let order = found.iter().find(|e| e.name == "Order").unwrap();
+        assert!(order.methods.contains("ship"));
+        assert!(order.methods.contains("place"));
+    }
+
+    #[test]
+    fn rust_impl_block_for_unrelated_type_does_not_attach_methods() {
+        // impl block for a type with no matching struct_item must be a no-op,
+        // not a panic or a spurious entity.
+        let src = "impl SomeExternalTrait for Foo {\n    fn bar(&self) {}\n}\n";
+        let found = scan_source("rust", src).unwrap();
+        assert!(found.is_empty());
+    }
 
     #[test]
     fn detects_go_struct_and_fk_field() {
@@ -483,6 +602,7 @@ public class OrderItem {
             DetectedEntity {
                 name: "Order".to_owned(),
                 references: BTreeSet::new(),
+                methods: BTreeSet::new(),
             },
         );
         result.entities.insert(
@@ -490,6 +610,7 @@ public class OrderItem {
             DetectedEntity {
                 name: "OrderItem".to_owned(),
                 references: BTreeSet::from(["Order".to_owned()]),
+                methods: BTreeSet::new(),
             },
         );
         result.entities.insert(
@@ -497,6 +618,7 @@ public class OrderItem {
             DetectedEntity {
                 name: "Payment".to_owned(),
                 references: BTreeSet::from(["Order".to_owned()]),
+                methods: BTreeSet::new(),
             },
         );
         let roots = result.aggregate_roots();
@@ -515,6 +637,7 @@ public class OrderItem {
             DetectedEntity {
                 name: "Product".to_owned(),
                 references: BTreeSet::new(),
+                methods: BTreeSet::new(),
             },
         );
         result.entities.insert(
@@ -522,6 +645,7 @@ public class OrderItem {
             DetectedEntity {
                 name: "Order".to_owned(),
                 references: BTreeSet::new(),
+                methods: BTreeSet::new(),
             },
         );
         result.entities.insert(
@@ -529,6 +653,7 @@ public class OrderItem {
             DetectedEntity {
                 name: "OrderItem".to_owned(),
                 references: BTreeSet::from(["Order".to_owned(), "Product".to_owned()]),
+                methods: BTreeSet::new(),
             },
         );
         let refs = result.reference_entities();

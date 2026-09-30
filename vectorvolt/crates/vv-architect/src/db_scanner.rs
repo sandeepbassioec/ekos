@@ -52,6 +52,7 @@ pub fn scan_sqlite(path: &Path) -> anyhow::Result<ScanResult> {
             DetectedEntity {
                 name: table.clone(),
                 references,
+                methods: BTreeSet::new(), // methods aren't a DB schema concept
             },
         );
     }
