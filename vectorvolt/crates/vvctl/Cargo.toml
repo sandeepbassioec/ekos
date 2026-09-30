@@ -69,6 +69,7 @@ vectorvolt-tpm      = { workspace = true }
 vectorvolt-otel     = { workspace = true }
 vectorvolt-metrics  = { workspace = true }
 vectorvolt-cluster  = { workspace = true }
+uuid                = { version = "1.11", features = ["v4"] }
 tracing-opentelemetry = { workspace = true }
 clap_complete       = { workspace = true }
 zip                 = { workspace = true }

@@ -45,6 +45,10 @@ fn base_args(dir: &TempDir, encrypt_at_rest: bool) -> ServeArgs {
         encrypt_at_rest,
         metrics_port: 0,
         pgwire_port: None,
+        cluster_bind: None,
+        cluster_seeds: vec![],
+        cluster_node_id: None,
+        cluster_status_port: 7900,
     }
 }
 

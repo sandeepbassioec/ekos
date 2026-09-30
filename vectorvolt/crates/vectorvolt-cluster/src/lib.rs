@@ -3,6 +3,7 @@ pub mod epoch;
 pub mod gossip;
 pub mod membership;
 pub mod node;
+pub mod node_runtime;
 pub mod quorum;
 pub mod raft;
 pub mod ring;

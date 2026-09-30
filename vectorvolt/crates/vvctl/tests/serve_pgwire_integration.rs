@@ -68,6 +68,10 @@ fn start_multi_with_pgwire(
         pgwire_port,
         catalog: false,
         restore_catalog: false,
+        cluster_bind: None,
+        cluster_seeds: vec![],
+        cluster_node_id: None,
+        cluster_status_port: 7900,
     };
 
     let bound = bind(&args).expect("bind");
