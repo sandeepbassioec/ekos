@@ -53,6 +53,10 @@ fn single_table_args(dir: &TempDir) -> ServeArgs {
         encrypt_at_rest: false,
         metrics_port: 0,
         pgwire_port: None,
+        cluster_bind: None,
+        cluster_seeds: vec![],
+        cluster_node_id: None,
+        cluster_status_port: 7900,
     }
 }
 

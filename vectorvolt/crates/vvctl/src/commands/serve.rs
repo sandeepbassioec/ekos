@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use vectorvolt_cluster::node::NodeId;
+use vectorvolt_cluster::node_runtime::{ClusterNode, ClusterStatusServer};
 use vectorvolt_crypto::{EncryptedReader, EncryptedWriter, KeyStore};
 use vectorvolt_engine::{
     CliOverrides, ShardCatalog, SystemProfile, TableEngine, TableRegistry, VvConfig,
@@ -210,6 +212,34 @@ pub struct ServeArgs {
     /// fallback/dev-only path (see `commands::reader`). Disabled if omitted.
     #[arg(long)]
     pub pgwire_port: Option<u16>,
+
+    /// Start a `vectorvolt-cluster` node bound to this address (gossip/Raft
+    /// membership listener) and expose its live status over
+    /// `--cluster-status-port` (Gap #3).
+    ///
+    /// NOTE: `vectorvolt-cluster` does not yet implement wire-level gossip
+    /// transport (see `vectorvolt_cluster::node_runtime` docs), so this
+    /// starts a real, observable node with real membership/gossip state, but
+    /// `--cluster-seeds` peers are recorded as configured-only and are not
+    /// yet reachable over the network. Disabled if omitted.
+    #[arg(long)]
+    pub cluster_bind: Option<SocketAddr>,
+
+    /// Comma-separated seed peer addresses to record for this cluster node
+    /// (see `--cluster-bind`). Purely informational until gossip transport
+    /// exists.
+    #[arg(long, value_delimiter = ',')]
+    pub cluster_seeds: Vec<SocketAddr>,
+
+    /// Explicit node id (UUID) for this cluster node. Auto-generated if
+    /// omitted.
+    #[arg(long)]
+    pub cluster_node_id: Option<String>,
+
+    /// Port to serve `GET /cluster/status` JSON on. Only used when
+    /// `--cluster-bind` is set. Defaults to 7900.
+    #[arg(long, default_value_t = 7900)]
+    pub cluster_status_port: u16,
 }
 
 impl Default for ServeArgs {
@@ -243,6 +273,10 @@ impl Default for ServeArgs {
             tpm_unseal: false,
             encrypt_at_rest: false,
             pgwire_port: None,
+            cluster_bind: None,
+            cluster_seeds: vec![],
+            cluster_node_id: None,
+            cluster_status_port: 7900,
         }
     }
 }
@@ -761,6 +795,50 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .expect("spawn pgwire-server thread");
     } else {
         eprintln!("  pgwire    : disabled (use --pgwire-port to enable)");
+    }
+
+    // ── Cluster node (optional, Gap #3) ──────────────────────────────────────
+    // Starts a real vectorvolt-cluster node (NodeId + MembershipList +
+    // GossipEngine) alongside this single-node server so its state is
+    // observable via GET /cluster/status. See
+    // vectorvolt_cluster::node_runtime for what is and is not real here:
+    // membership/gossip data structures are the genuine ones exercised by
+    // vectorvolt-cluster's own tests, but there is no wire-level gossip
+    // transport yet, so --cluster-seeds peers are recorded as
+    // configured-only, not claimed as discovered/reachable.
+    if let Some(cluster_bind) = args.cluster_bind {
+        let node_id = match args.cluster_node_id.as_deref() {
+            Some(s) => match uuid::Uuid::parse_str(s) {
+                Ok(u) => Some(NodeId(u)),
+                Err(e) => {
+                    eprintln!("invalid --cluster-node-id {s:?}: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let cluster_node = ClusterNode::start(cluster_bind, args.cluster_seeds.clone(), node_id);
+        eprintln!(
+            "  cluster   : node {} on {} ({} configured seed(s))",
+            cluster_node.status().node_id,
+            cluster_bind,
+            args.cluster_seeds.len()
+        );
+        let status_port = args.cluster_status_port;
+        std::thread::Builder::new()
+            .name("cluster-status".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                rt.block_on(async move {
+                    eprintln!("  cluster   : status http://127.0.0.1:{status_port}/cluster/status");
+                    ClusterStatusServer::new(cluster_node)
+                        .serve(status_port)
+                        .await;
+                });
+            })
+            .expect("spawn cluster-status thread");
+    } else {
+        eprintln!("  cluster   : disabled (use --cluster-bind to enable)");
     }
 
     // ── Prometheus metrics endpoint (VV-OBS-005) ─────────────────────────────

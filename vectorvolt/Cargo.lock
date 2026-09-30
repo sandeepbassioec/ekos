@@ -4091,6 +4091,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
  "vectorvolt-chaos",
  "vectorvolt-cluster",
  "vectorvolt-control",
