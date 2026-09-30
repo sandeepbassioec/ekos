@@ -23,6 +23,7 @@ tree-sitter-java = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-rust = "0.24"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 # Python is deferred: its typical field idiom (self.x = ... inside __init__,
 # or dataclass field annotations) doesn't fit the "field declared directly in
 # a class body" shape the other 5 languages share — needs its own detection
