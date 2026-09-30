@@ -25,6 +25,9 @@ pub enum TxnError {
 
     #[error("writer thread shut down unexpectedly")]
     WriterShutdown,
+
+    #[error("WAL encryption error: {0}")]
+    Encryption(String),
 }
 
 pub type TxnResult<T> = Result<T, TxnError>;

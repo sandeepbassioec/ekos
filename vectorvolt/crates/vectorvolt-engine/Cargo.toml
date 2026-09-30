@@ -15,6 +15,7 @@ vectorvolt-storage = { workspace = true }
 vectorvolt-index      = { workspace = true }
 vectorvolt-projection = { workspace = true }
 vectorvolt-vector     = { workspace = true }
+vectorvolt-crypto     = { workspace = true }
 thiserror          = { workspace = true }
 parking_lot        = { workspace = true }
 tokio              = { workspace = true }

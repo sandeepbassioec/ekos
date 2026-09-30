@@ -120,6 +120,13 @@ pub struct TxnManager {
     /// `get_at`/`scan_at`/`gc_versions_before`; does not affect the current-value
     /// read path (`get`/`scan`), which is unchanged.
     version_index: VersionIndex,
+    /// Row-data/WAL encryption at rest (path to production item #1). When
+    /// set, every `Mutation` payload is AES-256-GCM encrypted before it
+    /// reaches the WAL, and must be decrypted before `Mutation::decode` on
+    /// replay (the replay loop lives in `vectorvolt-engine`, not here — see
+    /// `wal_key()` below, which callers use to mirror this same key).
+    /// `None` preserves the existing on-disk format exactly (opt-in only).
+    wal_key: Option<Arc<vectorvolt_crypto::KeyStore>>,
 }
 
 impl TxnManager {
@@ -172,7 +179,25 @@ impl TxnManager {
             partition_count: 1,
             clock: CommitClock::new(),
             version_index: VersionIndex::new(),
+            wal_key: None,
         }
+    }
+
+    /// Opt into WAL/row-data encryption at rest: every mutation payload is
+    /// encrypted before it reaches the WAL. The caller (`TableEngine`) is
+    /// responsible for decrypting `frame.payload` with the same key during
+    /// WAL replay before calling `Mutation::decode` — this manager only
+    /// handles the write side.
+    pub fn with_wal_encryption(mut self, key: Arc<vectorvolt_crypto::KeyStore>) -> Self {
+        self.wal_key = Some(key);
+        self
+    }
+
+    /// The configured encryption key, if any — exposed so `TableEngine` can
+    /// reuse the identical key for WAL-replay decryption without a second
+    /// place to configure it.
+    pub fn wal_key(&self) -> Option<&Arc<vectorvolt_crypto::KeyStore>> {
+        self.wal_key.as_ref()
     }
 
     /// Set the number of logical partitions rows are distributed across on flush.
@@ -206,6 +231,11 @@ impl TxnManager {
     /// with. Group commit removes the scaling penalty, not the device latency.
     #[inline]
     fn commit(&self, payload: Vec<u8>) -> TxnResult<WalTip> {
+        let payload = match &self.wal_key {
+            Some(key) => vectorvolt_crypto::encrypt(key, &payload)
+                .map_err(|e| TxnError::Encryption(format!("payload encrypt failed: {e}")))?,
+            None => payload,
+        };
         if self.sync_on_commit {
             Ok(self.wal.append_and_sync(payload)?)
         } else {

@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use vectorvolt_index::RowDescriptor;
@@ -314,6 +315,35 @@ impl TableEngine {
         data_dir: impl Into<PathBuf>,
         options: EngineOptions,
     ) -> EngineResult<Self> {
+        Self::open_with_key(schema, data_dir, options, None)
+    }
+
+    /// Row-data/WAL encryption at rest (path to production item #1). When
+    /// `key` is set, every mutation payload is AES-256-GCM encrypted before
+    /// it reaches the WAL (write side handled by
+    /// `TxnManager::with_wal_encryption`) and decrypted before
+    /// `Mutation::decode` on replay (this function's own responsibility,
+    /// since replay happens here, not inside `vectorvolt-txn`).
+    ///
+    /// Kept as a separate function from `open_with` rather than adding the
+    /// key to `EngineOptions` — that struct derives `Copy` and is used at
+    /// ~290 call sites across the workspace; adding a non-`Copy` field would
+    /// force `.clone()` everywhere for a feature most callers don't use.
+    pub fn open_with_encryption(
+        schema: Vec<String>,
+        data_dir: impl Into<PathBuf>,
+        options: EngineOptions,
+        key: Arc<vectorvolt_crypto::KeyStore>,
+    ) -> EngineResult<Self> {
+        Self::open_with_key(schema, data_dir, options, Some(key))
+    }
+
+    fn open_with_key(
+        schema: Vec<String>,
+        data_dir: impl Into<PathBuf>,
+        options: EngineOptions,
+        wal_key: Option<Arc<vectorvolt_crypto::KeyStore>>,
+    ) -> EngineResult<Self> {
         let flush_threshold = options.flush_threshold;
         let durability = options.durability;
         let data_dir = data_dir.into();
@@ -353,7 +383,7 @@ impl TableEngine {
         // Start the partition counter past any existing files to avoid overwrites.
         let typed_schema = TableSchema::from_names(&schema);
 
-        let txn = TxnManager::with_starting_partition(
+        let mut txn = TxnManager::with_starting_partition(
             wal,
             schema.clone(),
             &partition_dir,
@@ -361,6 +391,9 @@ impl TableEngine {
             max_partition_id,
         )
         .with_sync_on_commit(durability.sync_on_commit());
+        if let Some(ref key) = wal_key {
+            txn = txn.with_wal_encryption(Arc::clone(key));
+        }
 
         // Rebuild pk_index from existing partition files so reads work across
         // process restarts (Phase 2 crash recovery).
@@ -388,7 +421,19 @@ impl TableEngine {
         let wal_cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
         if let Ok(frames) = WalReader::open(wal_cfg).read_all() {
             for frame in frames {
-                match Mutation::decode(&frame.payload) {
+                // When WAL encryption is enabled, `frame.payload` is ciphertext —
+                // decrypt before attempting to decode it as a Mutation. A decrypt
+                // failure (e.g. a torn frame at the WAL tail from an unclean
+                // shutdown) is treated the same as a decode failure: skip silently,
+                // exactly like the pre-existing `Err(_) => {}` arm below.
+                let decoded = match &wal_key {
+                    Some(key) => vectorvolt_crypto::decrypt(key, &frame.payload).ok(),
+                    None => Some(frame.payload.clone()),
+                };
+                let Some(payload) = decoded else {
+                    continue;
+                };
+                match Mutation::decode(&payload) {
                     Ok(Mutation::Insert { pk, values }) => {
                         if txn.pk_index.read().get(pk).is_none() {
                             let _ = txn.replay_insert(pk, values);
