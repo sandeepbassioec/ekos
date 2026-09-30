@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 vectorvolt-engine = { workspace = true }
+vectorvolt-graph = { workspace = true }
 vectorvolt-hal = { workspace = true }
 vectorvolt-index = { workspace = true }
 vectorvolt-storage = { workspace = true }

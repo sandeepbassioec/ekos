@@ -16,6 +16,7 @@ use crate::sql::lexer::{LexError, Lexer};
 use crate::sql::parser::{ParseError, SqlParser};
 use crate::sql::planner::{PhysicalPlan, Planner};
 use crate::sql::vec_store::{DistanceMetric, VectorStore, parse_vec_literal};
+use vectorvolt_graph::store::GraphStore;
 
 #[derive(Debug, Error)]
 pub enum ExecError {
@@ -492,8 +493,14 @@ pub struct SqlExecutor {
     stream_chunk_size: Mutex<usize>,
     // S126 â€” geospatial: table â†’ col â†’ (lat, lng)
     geo_columns: Mutex<HashMap<String, HashMap<String, (f64, f64)>>>,
-    // S127 â€” graph edges: (from_node, rel_type, to_node)
+    // S127 â€” graph edges: (from_node, rel_type, to_node) â€” in-memory mirror used by MATCH
     graph_edges: Mutex<Vec<(String, String, String)>>,
+    // Gap #4 â€” real persisted graph store (vectorvolt-graph), keyed by hash(name) -> u64 node id.
+    // CREATE/DROP EDGE mirror into this in addition to graph_edges, giving real on-disk
+    // persistence + access to the crate's real cascade-delete algorithm (DELETE NODE ... CASCADE)
+    // and real stats (SHOW GRAPH STATS). MATCH still reads graph_edges for simplicity.
+    graph_store: GraphStore,
+    graph_node_names: Mutex<HashMap<u64, String>>,
     // S128 â€” distributed 2PC
     prepared_txns: Mutex<HashMap<String, Vec<String>>>,
     dist_txn_active: Mutex<Option<String>>,
@@ -1041,6 +1048,52 @@ pub struct SqlExecutor {
 }
 
 impl SqlExecutor {
+    /// Deterministic name -> node-id mapping for the real graph store (Gap #4).
+    /// `DefaultHasher::new()` uses a fixed (non-randomized) seed, so this is stable
+    /// across process restarts within one Rust toolchain build.
+    fn hash_node_name(name: &str) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        name.hash(&mut h);
+        h.finish()
+    }
+
+    fn graph_node_names_path(graph_dir: &std::path::Path) -> std::path::PathBuf {
+        graph_dir.join("node_names.json")
+    }
+
+    fn load_graph_node_names(graph_dir: &std::path::Path) -> HashMap<u64, String> {
+        let path = Self::graph_node_names_path(graph_dir);
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_graph_node_names(&self, graph_dir: &std::path::Path) {
+        let path = Self::graph_node_names_path(graph_dir);
+        if let Ok(json) = serde_json::to_string(&*self.graph_node_names.lock().unwrap())
+            && std::fs::create_dir_all(graph_dir).is_ok()
+        {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    fn graph_dir(&self) -> std::path::PathBuf {
+        self.registry.base_dir().join("_graph")
+    }
+
+    /// Record `name` in the id->name map and intern its deterministic node id.
+    fn graph_intern_node(&self, name: &str) -> u64 {
+        let id = Self::hash_node_name(name);
+        self.graph_node_names
+            .lock()
+            .unwrap()
+            .insert(id, name.to_owned());
+        id
+    }
+
     pub fn new(registry: Arc<TableRegistry>) -> Self {
         let intent_log_path = registry.base_dir().join("_txn_intent.log");
         let txn_intent_log = TxnIntentLog::open(&intent_log_path).unwrap_or_else(|e| {
@@ -1049,6 +1102,11 @@ impl SqlExecutor {
                 intent_log_path
             )
         });
+
+        let graph_dir = registry.base_dir().join("_graph");
+        let graph_store = GraphStore::open(&graph_dir)
+            .unwrap_or_else(|e| panic!("failed to open graph store at {:?}: {e}", graph_dir));
+        let graph_node_names = Mutex::new(Self::load_graph_node_names(&graph_dir));
         Self {
             registry,
             txn: Mutex::new(None),
@@ -1120,6 +1178,8 @@ impl SqlExecutor {
             stream_chunk_size: Mutex::new(100),
             geo_columns: Mutex::new(HashMap::new()),
             graph_edges: Mutex::new(Vec::new()),
+            graph_store,
+            graph_node_names,
             prepared_txns: Mutex::new(HashMap::new()),
             dist_txn_active: Mutex::new(None),
             procedures: Mutex::new(HashMap::new()),
@@ -2487,10 +2547,18 @@ impl SqlExecutor {
             )));
         }
 
-        // S127 â€” CREATE EDGE (node_a)-[:REL_TYPE]->(node_b)
+        // S127 / Gap #4 â€” CREATE EDGE (node_a)-[:REL_TYPE]->(node_b)
+        // Mirrors into the real, persisted vectorvolt-graph GraphStore (hash(name) -> u64 id)
+        // in addition to the in-memory graph_edges Vec that MATCH reads.
         if up.starts_with("CREATE EDGE ") {
             let rest = &s["CREATE EDGE ".len()..];
             if let Some((from, rel, to)) = parse_edge(rest) {
+                let from_id = self.graph_intern_node(&from);
+                let to_id = self.graph_intern_node(&to);
+                if self.graph_store.add_edge(from_id, to_id).is_ok() {
+                    let _ = self.graph_store.save();
+                    self.save_graph_node_names(&self.graph_dir());
+                }
                 self.graph_edges.lock().unwrap().push((from, rel, to));
                 return Some(Ok(QueryResult::Created));
             }
@@ -2499,10 +2567,15 @@ impl SqlExecutor {
             )));
         }
 
-        // S127 â€” DROP EDGE (node_a)-[:REL_TYPE]->(node_b)
+        // S127 / Gap #4 â€” DROP EDGE (node_a)-[:REL_TYPE]->(node_b)
         if up.starts_with("DROP EDGE ") {
             let rest = &s["DROP EDGE ".len()..];
             if let Some((from, rel, to)) = parse_edge(rest) {
+                let from_id = Self::hash_node_name(&from);
+                let to_id = Self::hash_node_name(&to);
+                if self.graph_store.remove_edge(from_id, to_id).is_ok() {
+                    let _ = self.graph_store.save();
+                }
                 self.graph_edges
                     .lock()
                     .unwrap()
@@ -2512,6 +2585,60 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Error(
                 "invalid DROP EDGE syntax".to_owned(),
             )));
+        }
+
+        // Gap #4 â€” DELETE NODE 'name' CASCADE: real cascade-delete via vectorvolt-graph,
+        // removing the node and every node only reachable from it, in the persisted store.
+        if up.starts_with("DELETE NODE ") && up.ends_with(" CASCADE") {
+            let rest = &s["DELETE NODE ".len()..s.len() - " CASCADE".len()];
+            if let Some(name) = parse_single_quoted(rest.trim()) {
+                let id = Self::hash_node_name(&name);
+                match self.graph_store.remove_node(id) {
+                    Ok(deleted_ids) => {
+                        let _ = self.graph_store.save();
+                        let names = self.graph_node_names.lock().unwrap();
+                        let deleted_names: Vec<String> = deleted_ids
+                            .iter()
+                            .map(|id| names.get(id).cloned().unwrap_or_else(|| format!("#{id}")))
+                            .collect();
+                        drop(names);
+                        self.graph_edges.lock().unwrap().retain(|(f, _, t)| {
+                            !deleted_names.contains(f) && !deleted_names.contains(t)
+                        });
+                        return Some(Ok(QueryResult::Rows {
+                            columns: vec!["deleted_node".to_owned()],
+                            rows: deleted_names.into_iter().map(|n| vec![n]).collect(),
+                        }));
+                    }
+                    Err(e) => {
+                        return Some(Ok(QueryResult::Error(format!(
+                            "DELETE NODE CASCADE failed: {e}"
+                        ))));
+                    }
+                }
+            }
+            return Some(Ok(QueryResult::Error(
+                "invalid DELETE NODE ... CASCADE syntax".to_owned(),
+            )));
+        }
+
+        // Gap #4 â€” SHOW GRAPH STATS: real node/edge counts + on-disk size from the
+        // persisted vectorvolt-graph store (proves the store is genuinely durable,
+        // not just an in-memory decoration).
+        if up == "SHOW GRAPH STATS" {
+            let stats = self.graph_store.stats();
+            return Some(Ok(QueryResult::Rows {
+                columns: vec![
+                    "node_count".to_owned(),
+                    "edge_count".to_owned(),
+                    "file_size_bytes".to_owned(),
+                ],
+                rows: vec![vec![
+                    stats.node_count.to_string(),
+                    stats.edge_count.to_string(),
+                    stats.file_size_bytes.to_string(),
+                ]],
+            }));
         }
 
         // S127 â€” MATCH (a)-[r:REL_TYPE]->(b) [WHERE a = 'node'] RETURN a, r, b
@@ -23124,6 +23251,99 @@ mod tests {
         } else {
             panic!("expected rows");
         }
+    }
+
+    // â”€â”€ Gap #4 â€” real vectorvolt-graph store wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    #[test]
+    fn test_gap4_create_edge_persists_in_real_graph_store() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        let stats = ex.graph_store.stats();
+        assert_eq!(stats.edge_count, 1);
+        assert_eq!(stats.node_count, 2);
+    }
+
+    #[test]
+    fn test_gap4_graph_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
+        {
+            let ex = SqlExecutor::new(registry.clone());
+            ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+            ex.execute("CREATE EDGE (Bob)-[:KNOWS]->(Carol)").unwrap();
+        }
+        // New executor over the same registry/dir simulates a process restart.
+        let registry2 =
+            Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
+        let ex2 = SqlExecutor::new(registry2);
+        let stats = ex2.graph_store.stats();
+        assert_eq!(stats.edge_count, 2);
+        assert_eq!(stats.node_count, 3);
+    }
+
+    #[test]
+    fn test_gap4_drop_edge_removes_from_real_graph_store() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        ex.execute("DROP EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        let stats = ex.graph_store.stats();
+        assert_eq!(stats.edge_count, 0);
+    }
+
+    #[test]
+    fn test_gap4_delete_node_cascade_uses_real_algorithm() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        ex.execute("CREATE EDGE (Bob)-[:KNOWS]->(Carol)").unwrap();
+        let r = ex.execute("DELETE NODE 'Bob' CASCADE").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            let deleted: Vec<&String> = rows.iter().map(|row| &row[0]).collect();
+            assert!(deleted.contains(&&"Bob".to_owned()));
+            assert!(deleted.contains(&&"Alice".to_owned()));
+        } else {
+            panic!("expected rows");
+        }
+        let stats = ex.graph_store.stats();
+        assert_eq!(stats.edge_count, 0);
+    }
+
+    #[test]
+    fn test_gap4_delete_node_cascade_cleans_match_cache() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        ex.execute("DELETE NODE 'Bob' CASCADE").unwrap();
+        let r = ex.execute("MATCH (a)-[r]->(b) RETURN a, r, b").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert!(rows.is_empty());
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_gap4_show_graph_stats_reflects_real_store() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        ex.execute("CREATE EDGE (Bob)-[:KNOWS]->(Carol)").unwrap();
+        let r = ex.execute("SHOW GRAPH STATS").unwrap();
+        if let QueryResult::Rows { rows, .. } = r {
+            assert_eq!(rows[0][0], "3"); // node_count
+            assert_eq!(rows[0][1], "2"); // edge_count
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_gap4_delete_node_cascade_unknown_node_is_a_harmless_noop() {
+        // GraphStore::remove_node always reports the target itself (even if it never
+        // existed), but must not error and must not touch unrelated edges.
+        let (ex, _dir) = setup();
+        ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
+        let r = ex.execute("DELETE NODE 'Ghost' CASCADE").unwrap();
+        assert!(matches!(r, QueryResult::Rows { .. }));
+        let stats = ex.graph_store.stats();
+        assert_eq!(stats.edge_count, 1);
     }
 
     // â”€â”€ S128 â€” Distributed 2PC transactions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
