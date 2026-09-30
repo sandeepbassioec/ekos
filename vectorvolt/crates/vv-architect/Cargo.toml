@@ -30,4 +30,5 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # logic, not just another LanguageSupport table row. Add back when tackled.
 
 [dev-dependencies]
+serde_yaml.workspace = true
 tempfile = "3"

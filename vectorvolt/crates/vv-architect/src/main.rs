@@ -23,6 +23,7 @@
 mod blueprint;
 mod db_scanner;
 mod events;
+mod manifests;
 mod report;
 mod rules;
 mod scanner;
@@ -49,7 +50,7 @@ struct Cli {
 /// Optional workload estimates that additionally trigger the cluster sizing
 /// rule engine. Both flags must be given together — sizing needs both an
 /// expected write rate and an expected data volume to mean anything.
-#[derive(Args, Clone, Copy)]
+#[derive(Args, Clone)]
 struct SizingArgs {
     /// Expected peak transactions/sec — enables cluster sizing output.
     #[arg(long, requires = "data_gb")]
@@ -62,6 +63,16 @@ struct SizingArgs {
     /// Replicas per shard in addition to the primary.
     #[arg(long, default_value_t = 2)]
     repl_factor: u32,
+
+    /// When sizing is enabled (--tps/--data-gb given), also write a
+    /// Terraform (AWS EC2) manifest sized from the resulting plan.
+    #[arg(long)]
+    terraform_out: Option<PathBuf>,
+
+    /// When sizing is enabled (--tps/--data-gb given), also write a
+    /// Kubernetes StatefulSet manifest sized from the resulting plan.
+    #[arg(long)]
+    k8s_out: Option<PathBuf>,
 }
 
 impl SizingArgs {
@@ -120,6 +131,28 @@ fn finish(mut bp: Blueprint, sizing: &SizingArgs, output: &PathBuf) -> Result<()
     let toml = bp.to_toml()?;
     std::fs::write(output, &toml).with_context(|| format!("writing {}", output.display()))?;
     println!("Blueprint written to {}", output.display());
+
+    match (&bp.sizing, &sizing.terraform_out, &sizing.k8s_out) {
+        (None, Some(_), _) | (None, _, Some(_)) => {
+            anyhow::bail!(
+                "--terraform-out/--k8s-out require --tps and --data-gb (sizing must run first)"
+            );
+        }
+        (Some(plan), terraform_out, k8s_out) => {
+            if let Some(path) = terraform_out {
+                std::fs::write(path, manifests::render_terraform(plan))
+                    .with_context(|| format!("writing {}", path.display()))?;
+                println!("Terraform manifest written to {}", path.display());
+            }
+            if let Some(path) = k8s_out {
+                std::fs::write(path, manifests::render_k8s(plan))
+                    .with_context(|| format!("writing {}", path.display()))?;
+                println!("Kubernetes manifest written to {}", path.display());
+            }
+        }
+        (None, None, None) => {}
+    }
+
     Ok(())
 }
 
