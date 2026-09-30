@@ -4245,6 +4245,7 @@ dependencies = [
  "clap",
  "rusqlite",
  "serde",
+ "serde_yaml",
  "tempfile",
  "toml",
  "tree-sitter",
