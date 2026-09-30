@@ -89,6 +89,50 @@ impl PgServer {
             });
         }
     }
+
+    /// Serve until `shutdown` resolves, then stop accepting NEW connections and
+    /// return `Ok(())` (Gap #6). Sessions already in flight when shutdown fires
+    /// are spawned tasks that keep running independently to completion — this
+    /// does not additionally wait for them to finish, only stops taking new work.
+    pub async fn serve_until(
+        self,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> std::io::Result<()> {
+        let (listener, addr) = self.bind().await?;
+        Self::accept_loop_until(Arc::clone(&self.registry), listener, addr, shutdown).await
+    }
+
+    /// Same accept-loop as [`serve_until`](Self::serve_until), but takes an
+    /// already-bound listener — lets tests learn the real ephemeral port before
+    /// the loop starts, the same way [`accept_one`](Self::accept_one) does.
+    pub async fn accept_loop_until(
+        registry: Arc<TableRegistry>,
+        listener: TcpListener,
+        addr: SocketAddr,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> std::io::Result<()> {
+        tracing::info!("PgServer listening on {addr}");
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    tracing::debug!("accepted connection from {peer}");
+                    let reg = Arc::clone(&registry);
+                    tokio::spawn(async move {
+                        let mut session = PgSession::new(stream, reg);
+                        if let Err(e) = session.run().await {
+                            tracing::warn!("session error: {e}");
+                        }
+                    });
+                }
+                _ = &mut shutdown => {
+                    tracing::info!("PgServer on {addr} shutting down (no longer accepting new connections)");
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +195,48 @@ mod tests {
         let server = PgServer::new(config).unwrap();
         let (listener, addr) = server.bind().await.unwrap();
         (server, listener, addr)
+    }
+
+    // ── Gap #6: graceful shutdown ────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_accept_loop_until_serves_before_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, listener, addr) = open_server_on_ephemeral(dir.path()).await;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let registry = server.registry.clone();
+        let handle = tokio::spawn(async move {
+            PgServer::accept_loop_until(registry, listener, addr, async {
+                let _ = rx.await;
+            })
+            .await
+        });
+        // A connection made before shutdown fires must still be served.
+        let mut stream = connect_and_startup(addr).await;
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+        assert_eq!(buf[0], b'R'); // AuthOk
+
+        tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_accept_loop_until_stops_accepting_after_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, listener, addr) = open_server_on_ephemeral(dir.path()).await;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let registry = server.registry.clone();
+        // Fire shutdown immediately, before any connection is made.
+        tx.send(()).unwrap();
+        let result = PgServer::accept_loop_until(registry, listener, addr, async {
+            let _ = rx.await;
+        })
+        .await;
+        assert!(result.is_ok());
+        // The listener has been dropped with the accept loop, so a new connect
+        // attempt to the same address must fail (nothing is listening anymore).
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
     }
 
     #[tokio::test]
