@@ -141,6 +141,126 @@ pub fn is_totp_enrolled(username: &str) -> bool {
     load_totp_secret(username).is_some()
 }
 
+// ── Break-glass recovery codes ───────────────────────────────────────────────
+//
+// Deferred requirement: MFA lockout recovery (forgotten TOTP device) needs a
+// break-glass path, since this PAM module is deployed on every node in the
+// cluster. Design, scoped to what this module can actually own:
+//
+//   * One-time, single-use recovery codes generated alongside TOTP enrollment
+//     (the standard GitHub/Google-style pattern), hashed (SHA-256) on disk —
+//     plaintext is shown exactly once, at generation time, never stored.
+//   * Using a code immediately invalidates it and appends an audit entry to
+//     `<user>.recovery.log`, so any break-glass use is traceable.
+//   * Cluster-wide scope: codes are per-node (`/etc/vectorvolt/totp/` is local
+//     storage, same as the TOTP secret itself — this module has no cluster
+//     directory service to sync through). An admin who wants the SAME codes
+//     valid on every node must copy the `.recovery` file to each node after
+//     generating it, or generate+distribute independently per node. This is a
+//     real, honest operational answer proportionate to the current
+//     architecture — it is not a claim of automatic cross-node sync.
+//   * Forgotten Linux password (not just TOTP) is explicitly OUT of scope:
+//     that is verified by pam_unix.so earlier in the PAM stack, before this
+//     module ever runs, and is a standard sysadmin/physical-access recovery
+//     process (single-user mode, recovery console). A PAM module bypassing
+//     OS password recovery would itself be a severe security hole.
+const RECOVERY_CODE_COUNT: usize = 10;
+
+fn recovery_path(username: &str) -> String {
+    format!("{}/{}.recovery", TOTP_DIR, username)
+}
+
+fn recovery_audit_log_path(username: &str) -> String {
+    format!("{}/{}.recovery.log", TOTP_DIR, username)
+}
+
+fn hash_recovery_code(code: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(code.trim().to_ascii_uppercase().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn format_recovery_code(bytes: &[u8; 10]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    hex.as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Generate `RECOVERY_CODE_COUNT` single-use recovery codes for `username`,
+/// persist only their SHA-256 hashes to disk, and return the plaintext codes
+/// so the caller can display them exactly once. Overwrites (invalidates) any
+/// previously generated codes for this user.
+pub fn generate_recovery_codes(username: &str) -> std::io::Result<Vec<String>> {
+    use rand::RngCore;
+    std::fs::create_dir_all(TOTP_DIR)?;
+    let mut rng = rand::thread_rng();
+    let mut codes = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    let mut hashes = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    for _ in 0..RECOVERY_CODE_COUNT {
+        let mut buf = [0u8; 10];
+        rng.fill_bytes(&mut buf);
+        let code = format_recovery_code(&buf);
+        hashes.push(hash_recovery_code(&code));
+        codes.push(code);
+    }
+    std::fs::write(recovery_path(username), hashes.join("\n") + "\n")?;
+    Ok(codes)
+}
+
+/// Verify a recovery code for `username`. On a match the code is immediately
+/// invalidated (single-use) and the use is appended to the per-user audit
+/// log. Returns `true` iff the code was valid and had not been used before.
+pub fn verify_recovery_code(username: &str, code: &str) -> bool {
+    let path = recovery_path(username);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let target = hash_recovery_code(code);
+    let mut remaining: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    let Some(pos) = remaining.iter().position(|h| *h == target) else {
+        return false;
+    };
+    remaining.remove(pos);
+    let new_contents = if remaining.is_empty() {
+        String::new()
+    } else {
+        remaining.join("\n") + "\n"
+    };
+    if std::fs::write(&path, new_contents).is_err() {
+        return false;
+    }
+    log_recovery_code_use(username, remaining.len());
+    true
+}
+
+/// Number of unused recovery codes remaining for `username`.
+pub fn recovery_codes_remaining(username: &str) -> usize {
+    std::fs::read_to_string(recovery_path(username))
+        .map(|c| c.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn log_recovery_code_use(username: &str, remaining: usize) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("ts={ts} action=RECOVERY_CODE_USED user={username} remaining={remaining}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(recovery_audit_log_path(username))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Register a user in the store (for tests / admin tooling).
 pub fn register_user(username: &str, password: &str) {
     user_store()
@@ -371,8 +491,21 @@ pub unsafe extern "C" fn pam_sm_authenticate(
             None => return PAM_AUTH_ERR,
         };
         if !verify_totp(&username, &code) {
-            unsafe { pam_info_msg(pamh, "VectorVolt MFA: invalid OTP — access denied\n") };
-            return PAM_AUTH_ERR;
+            // Fall back to a break-glass recovery code (lost TOTP device).
+            if verify_recovery_code(&username, &code) {
+                let remaining = recovery_codes_remaining(&username);
+                unsafe {
+                    pam_info_msg(
+                        pamh,
+                        &format!(
+                            "\n⚠ VectorVolt MFA: authenticated via RECOVERY CODE (this code is now used up).\n  {remaining} recovery code(s) remaining. Regenerate soon: vv-pam-enroll --regenerate-recovery-codes {username}\n\n"
+                        ),
+                    )
+                };
+            } else {
+                unsafe { pam_info_msg(pamh, "VectorVolt MFA: invalid OTP — access denied\n") };
+                return PAM_AUTH_ERR;
+            }
         }
     } else {
         // ── first login: interactive TOTP enrollment ──────────────────────────
@@ -439,6 +572,27 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                         pamh,
                         "\n✓ MFA enrollment successful! Future logins will require your OTP.\n\n",
                     );
+                    match generate_recovery_codes(&username) {
+                        Ok(codes) => {
+                            pam_info_msg(
+                                pamh,
+                                "⚠ SAVE THESE RECOVERY CODES NOW — shown only once. Each works\n  ONE time if you lose access to your authenticator app:\n\n",
+                            );
+                            for c in &codes {
+                                pam_info_msg(pamh, &format!("    {c}\n"));
+                            }
+                            pam_info_msg(
+                                pamh,
+                                "\nStore them somewhere safe (password manager, printed copy).\nRegenerate anytime with: vv-pam-enroll --regenerate-recovery-codes <user>\n\n",
+                            );
+                        }
+                        Err(_) => {
+                            pam_info_msg(
+                                pamh,
+                                "\nWarning: could not generate recovery codes — you will have no break-glass path if you lose your authenticator.\n\n",
+                            );
+                        }
+                    }
                 },
                 Err(_) => unsafe {
                     pam_info_msg(
@@ -558,5 +712,101 @@ mod tests {
     fn test_s107_session_close_audit() {
         register_user("testclose", "pw");
         assert!(verify_user("testclose"));
+    }
+
+    // ── Break-glass recovery codes ───────────────────────────────────────────
+    // These tests write to the real TOTP_DIR (/etc/vectorvolt/totp), matching
+    // this module's existing hardcoded-path design (no test-injectable dir) —
+    // run as root, e.g. `sudo -E cargo test -p vectorvolt-pam --lib`. Each test
+    // uses a unique username to avoid cross-test interference and cleans up
+    // after itself.
+
+    fn cleanup_recovery(username: &str) {
+        let _ = std::fs::remove_file(recovery_path(username));
+        let _ = std::fs::remove_file(recovery_audit_log_path(username));
+    }
+
+    #[test]
+    fn test_hash_recovery_code_is_deterministic_and_case_insensitive() {
+        let a = hash_recovery_code("ABCD-1234-EF00-9999-0000");
+        let b = hash_recovery_code("abcd-1234-ef00-9999-0000");
+        assert_eq!(a, b);
+        let c = hash_recovery_code("ABCD-1234-EF00-9999-0001");
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_format_recovery_code_shape() {
+        let code = format_recovery_code(&[0u8; 10]);
+        // 10 bytes -> 20 hex chars -> 5 groups of 4, dash-separated.
+        assert_eq!(code, "0000-0000-0000-0000-0000");
+    }
+
+    #[test]
+    fn test_generate_recovery_codes_returns_ten_unique_codes() {
+        let user = "test_recovery_gen_unique";
+        cleanup_recovery(user);
+        let codes = generate_recovery_codes(user).expect("generate recovery codes");
+        assert_eq!(codes.len(), RECOVERY_CODE_COUNT);
+        let unique: std::collections::HashSet<&String> = codes.iter().collect();
+        assert_eq!(unique.len(), RECOVERY_CODE_COUNT);
+        assert_eq!(recovery_codes_remaining(user), RECOVERY_CODE_COUNT);
+        cleanup_recovery(user);
+    }
+
+    #[test]
+    fn test_verify_recovery_code_valid_then_single_use() {
+        let user = "test_recovery_single_use";
+        cleanup_recovery(user);
+        let codes = generate_recovery_codes(user).expect("generate recovery codes");
+        let first = &codes[0];
+        assert!(verify_recovery_code(user, first));
+        assert_eq!(recovery_codes_remaining(user), RECOVERY_CODE_COUNT - 1);
+        // Reusing the same code must fail — it was invalidated on first use.
+        assert!(!verify_recovery_code(user, first));
+        assert_eq!(recovery_codes_remaining(user), RECOVERY_CODE_COUNT - 1);
+        cleanup_recovery(user);
+    }
+
+    #[test]
+    fn test_verify_recovery_code_rejects_unknown_code() {
+        let user = "test_recovery_unknown_code";
+        cleanup_recovery(user);
+        let _codes = generate_recovery_codes(user).expect("generate recovery codes");
+        assert!(!verify_recovery_code(user, "FFFF-FFFF-FFFF-FFFF-FFFF"));
+        assert_eq!(recovery_codes_remaining(user), RECOVERY_CODE_COUNT);
+        cleanup_recovery(user);
+    }
+
+    #[test]
+    fn test_verify_recovery_code_logs_audit_entry() {
+        let user = "test_recovery_audit_log";
+        cleanup_recovery(user);
+        let codes = generate_recovery_codes(user).expect("generate recovery codes");
+        assert!(verify_recovery_code(user, &codes[0]));
+        let log = std::fs::read_to_string(recovery_audit_log_path(user))
+            .expect("audit log should exist after a recovery code is used");
+        assert!(log.contains("RECOVERY_CODE_USED"));
+        assert!(log.contains(user));
+        cleanup_recovery(user);
+    }
+
+    #[test]
+    fn test_regenerate_recovery_codes_invalidates_old_ones() {
+        let user = "test_recovery_regenerate";
+        cleanup_recovery(user);
+        let first_batch = generate_recovery_codes(user).expect("generate recovery codes");
+        let second_batch = generate_recovery_codes(user).expect("regenerate recovery codes");
+        // Old codes from the first batch must no longer verify.
+        assert!(!verify_recovery_code(user, &first_batch[0]));
+        // A code from the fresh batch must still work.
+        assert!(verify_recovery_code(user, &second_batch[0]));
+        cleanup_recovery(user);
+    }
+
+    #[test]
+    fn test_recovery_codes_remaining_zero_when_none_generated() {
+        let user = "test_recovery_never_enrolled_xyz";
+        assert_eq!(recovery_codes_remaining(user), 0);
     }
 }
