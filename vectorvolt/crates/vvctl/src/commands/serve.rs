@@ -565,6 +565,42 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
     })
 }
 
+/// Resolve any cross-table transaction left dangling by a crash between
+/// "PREPARE" and "COMMITTED" in a previous run's intent log, before
+/// accepting new connections. Every SQL-layer listener (HTTP/pgwire) opens
+/// its own `SqlExecutor` pointed at the same registry `base_dir`, so the
+/// intent log path is deterministic here even though `run()` hasn't
+/// constructed a `SqlExecutor` itself. Factored out from `run()` so it's
+/// directly testable against a real registry without spinning up the full
+/// server (threads, sockets, Ctrl-C handler).
+pub fn run_startup_recovery(registry: &Arc<vectorvolt_engine::TableRegistry>) {
+    let intent_log_path = registry.base_dir().join("_txn_intent.log");
+    if !intent_log_path.exists() {
+        return;
+    }
+    match vectorvolt_engine::recover_pending_transactions(&intent_log_path, |table| {
+        registry.get(table).ok()
+    }) {
+        Ok(actions) if !actions.is_empty() => {
+            eprintln!(
+                "Recovered {} dangling cross-table transaction(s) from a previous crash:",
+                actions.len()
+            );
+            for action in &actions {
+                eprintln!(
+                    "  {} -> {:?} (committed: {:?}, failed: {:?})",
+                    action.txn_uuid,
+                    action.resolved_state,
+                    action.tables_committed,
+                    action.tables_failed
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("WARNING: transaction recovery failed: {e}"),
+    }
+}
+
 pub fn run(args: ServeArgs) -> Result<()> {
     // ── TPM unseal (VV-SEC-005) ───────────────────────────────────────────────
     if args.tpm_unseal {
@@ -615,6 +651,18 @@ pub fn run(args: ServeArgs) -> Result<()> {
              write data. Pass --secret <hex> to require authentication."
         );
     }
+
+    // ── MVCC Phase 3 crash recovery ──────────────────────────────────────────
+    let recovery_registry: Arc<vectorvolt_engine::TableRegistry> = if let Some(ref reg) = registry {
+        Arc::clone(reg)
+    } else if let Some(ref eng) = engine {
+        Arc::new(vectorvolt_engine::TableRegistry::new_with_default(
+            Arc::clone(eng),
+        ))
+    } else {
+        unreachable!("either registry or engine must be present")
+    };
+    run_startup_recovery(&recovery_registry);
 
     // ── Startup banner ────────────────────────────────────────────────────────
     eprintln!("VectorVolt server ready");
