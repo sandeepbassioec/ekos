@@ -1,13 +1,15 @@
 //! `vectorvolt-blueprint.toml` — the machine-readable output of a scan.
 //!
-//! Phase 1 scope: entities + aggregate roots + reference (lookup) entities
-//! detected by the code scanner. Cluster/CPU/RAM/shard sizing heuristics
-//! (the rule engine) and event/projection detection are later phases — this
-//! struct has room to grow but does not fabricate fields it can't back with
-//! real analysis yet.
+//! Entities + aggregate roots + reference (lookup) entities detected by a
+//! scanner, plus an optional cluster sizing plan (rule engine, present only
+//! when the caller supplied workload estimates — TPS/data volume can't be
+//! inferred from static analysis). Event/projection detection is a later
+//! phase — this struct has room to grow but does not fabricate fields it
+//! can't back with real analysis yet.
 
 use serde::Serialize;
 
+use crate::rules::SizingPlan;
 use crate::scanner::ScanResult;
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +25,9 @@ pub struct Blueprint {
     /// Every entity name detected, regardless of role — useful for a human
     /// reviewing what the scanner actually found vs. missed.
     pub all_entities: Vec<String>,
+    /// Cluster sizing, only present when the caller passed `--tps`/`--data-gb`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizing: Option<SizingPlan>,
 }
 
 impl Blueprint {
@@ -53,7 +58,23 @@ impl Blueprint {
             aggregate_roots,
             reference_entities,
             all_entities,
+            sizing: None,
         }
+    }
+
+    /// The first aggregate root's name, lowercased + `_id` — a reasonable
+    /// guess at a tenant/customer-scoping partition key when one exists.
+    /// Returns `None` if no aggregate root was detected (the rule engine
+    /// then falls back to "primary key HASH").
+    pub fn suggested_partition_key(&self) -> Option<String> {
+        self.aggregate_roots
+            .first()
+            .map(|r| format!("{}_id", r.name.to_lowercase()))
+    }
+
+    pub fn with_sizing(mut self, sizing: SizingPlan) -> Self {
+        self.sizing = Some(sizing);
+        self
     }
 
     pub fn to_toml(&self) -> anyhow::Result<String> {
@@ -88,6 +109,29 @@ mod tests {
         assert_eq!(bp.aggregate_roots.len(), 1);
         assert_eq!(bp.aggregate_roots[0].name, "Order");
         assert_eq!(bp.aggregate_roots[0].owns, vec!["OrderItem".to_owned()]);
+        assert_eq!(bp.suggested_partition_key().as_deref(), Some("order_id"));
+    }
+
+    #[test]
+    fn suggested_partition_key_is_none_without_aggregate_roots() {
+        let bp = Blueprint::default();
+        assert_eq!(bp.suggested_partition_key(), None);
+    }
+
+    #[test]
+    fn with_sizing_attaches_plan_and_serializes_it() {
+        use crate::rules::{SizingInputs, compute};
+        let bp = Blueprint::default().with_sizing(compute(
+            SizingInputs {
+                estimated_tps: 1000,
+                estimated_data_gb: 10.0,
+                replication_factor: 2,
+            },
+            Some("order_id".to_owned()),
+        ));
+        assert!(bp.sizing.is_some());
+        let toml = bp.to_toml().unwrap();
+        assert!(toml.contains("node_count"));
     }
 
     #[test]
@@ -103,6 +147,7 @@ mod tests {
                 "OrderItem".to_owned(),
                 "Product".to_owned(),
             ],
+            sizing: None,
         };
         let s = bp.to_toml().unwrap();
         assert!(s.contains("Order"));

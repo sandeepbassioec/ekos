@@ -8,6 +8,11 @@ pub fn render(bp: &Blueprint) -> String {
     out.push_str("VectorVolt Architecture Blueprint\n");
     out.push_str("══════════════════════════════════════════════════════\n");
 
+    if let Some(sizing) = &bp.sizing {
+        out.push_str(&crate::rules::render(sizing));
+        out.push('\n');
+    }
+
     out.push_str(&format!(
         "Entities detected: {} ({} aggregate root(s), {} reference entit(y/ies))\n\n",
         bp.all_entities.len(),
@@ -82,6 +87,7 @@ mod tests {
                 "Payment".to_owned(),
                 "Product".to_owned(),
             ],
+            sizing: None,
         };
         let text = render(&bp);
         assert!(text.contains("AggregateRoot: Order"));
@@ -95,5 +101,28 @@ mod tests {
         let text = render(&bp);
         assert!(text.contains("Entities detected: 0"));
         assert!(text.contains("none detected"));
+    }
+
+    #[test]
+    fn render_includes_sizing_block_before_entities_when_present() {
+        use crate::rules::{SizingInputs, compute};
+        let bp = Blueprint::default().with_sizing(compute(
+            SizingInputs {
+                estimated_tps: 1000,
+                estimated_data_gb: 10.0,
+                replication_factor: 2,
+            },
+            None,
+        ));
+        let text = render(&bp);
+        let sizing_pos = text.find("Cluster:").unwrap();
+        let entities_pos = text.find("Entities detected:").unwrap();
+        assert!(sizing_pos < entities_pos);
+    }
+
+    #[test]
+    fn render_omits_sizing_block_when_absent() {
+        let bp = Blueprint::default();
+        assert!(!render(&bp).contains("Cluster:"));
     }
 }
