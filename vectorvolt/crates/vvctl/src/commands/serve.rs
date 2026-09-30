@@ -687,6 +687,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     // ── HTTP gateway (optional) ───────────────────────────────────────────────
     let http_token = args.http_token.clone();
+    // Gap #6: graceful-shutdown signal for the HTTP gateway, fired from the
+    // Ctrl-C handler below so in-flight requests finish instead of being cut
+    // off by an abrupt process exit.
+    let mut http_shutdown: Option<tokio::sync::oneshot::Sender<()>> = None;
     if let Some(http_addr) = args.http_addr {
         // Build a TableRegistry view for the HTTP layer.
         // In multi-table mode reuse the existing registry; in single-table mode
@@ -701,6 +705,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
             } else {
                 unreachable!("either registry or engine must be present")
             };
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        http_shutdown = Some(tx);
         std::thread::Builder::new()
             .name("http-gateway".into())
             .stack_size(8 * 1024 * 1024)
@@ -718,7 +724,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
                                 "  http      : http://{}",
                                 srv.local_addr().unwrap_or(http_addr)
                             );
-                            if let Err(e) = srv.serve().await {
+                            let shutdown = async move {
+                                let _ = rx.await;
+                            };
+                            if let Err(e) = srv.serve_with_shutdown(shutdown).await {
                                 eprintln!("HTTP gateway error: {e}");
                             }
                         }
@@ -766,6 +775,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // HTTP gateway does) so SQL clients over pgwire see the same data as every
     // other listener in this process — this is what makes `vvctl serve` the
     // one integrated server for Postgres-wire clients (Gap #2 fix).
+    // Gap #6: graceful-shutdown signal for the pgwire listener (stop accepting
+    // new connections on Ctrl-C instead of the socket vanishing mid-handshake).
+    let mut pgwire_shutdown: Option<tokio::sync::oneshot::Sender<()>> = None;
     if let Some(pgwire_port) = args.pgwire_port {
         let pg_reg: Arc<vectorvolt_engine::TableRegistry> = if let Some(ref reg) = registry {
             Arc::clone(reg)
@@ -778,6 +790,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
         };
         let pgwire_addr: SocketAddr = format!("127.0.0.1:{pgwire_port}").parse().unwrap();
         let pg_dir = args.dir.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        pgwire_shutdown = Some(tx);
         std::thread::Builder::new()
             .name("pgwire-server".into())
             .stack_size(8 * 1024 * 1024)
@@ -787,7 +801,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
                     let config = PgConfig::new(pgwire_addr, pg_dir);
                     let server = PgServer::with_registry(config, pg_reg);
                     eprintln!("  pgwire    : postgres://{pgwire_addr}");
-                    if let Err(e) = server.serve().await {
+                    let shutdown = async move {
+                        let _ = rx.await;
+                    };
+                    if let Err(e) = server.serve_until(shutdown).await {
                         eprintln!("pgwire server error: {e}");
                     }
                 });
@@ -912,6 +929,15 @@ pub fn run(args: ServeArgs) -> Result<()> {
         shutdown_handle.shutdown();
         if let Some(gtx) = grpc_shutdown.take() {
             let _ = gtx.send(());
+        }
+        // Gap #6: signal the HTTP gateway and pgwire listener too, so they stop
+        // accepting new work (HTTP additionally drains in-flight requests via
+        // axum's graceful shutdown) instead of just vanishing when main() exits.
+        if let Some(htx) = http_shutdown.take() {
+            let _ = htx.send(());
+        }
+        if let Some(ptx) = pgwire_shutdown.take() {
+            let _ = ptx.send(());
         }
     })
     .with_context(|| "install Ctrl-C handler")?;

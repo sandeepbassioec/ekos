@@ -93,6 +93,19 @@ impl HttpServer {
     pub async fn serve(self) -> std::io::Result<()> {
         axum::serve(self.listener, self.app).await
     }
+
+    /// Run until `shutdown` resolves, then stop accepting new connections and
+    /// wait for in-flight requests to finish (axum's own graceful drain) before
+    /// returning `Ok(())` (Gap #6: no listener in `vvctl serve` used to drain on
+    /// shutdown at all).
+    pub async fn serve_with_shutdown(
+        self,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> std::io::Result<()> {
+        axum::serve(self.listener, self.app)
+            .with_graceful_shutdown(shutdown)
+            .await
+    }
 }
 
 /// Middleware that enforces `Authorization: Bearer <token>` when the gateway

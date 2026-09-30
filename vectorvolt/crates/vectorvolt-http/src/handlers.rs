@@ -1661,19 +1661,20 @@ pub async fn sql_handler(
                     message: msg,
                 }),
                 SqlQueryResult::Notice(msg) | SqlQueryResult::Ok(msg) => {
-                    SqlResp::Ok(crate::types::SqlOkResp { ok: true, message: msg })
+                    SqlResp::Ok(crate::types::SqlOkResp {
+                        ok: true,
+                        message: msg,
+                    })
                 }
-                SqlQueryResult::WithNotice { result, notice: _ } => {
-                    match *result {
-                        SqlQueryResult::Rows { columns, rows } => {
-                            SqlResp::Rows(crate::types::SqlRowsResp { columns, rows })
-                        }
-                        other => SqlResp::Ok(crate::types::SqlOkResp {
-                            ok: true,
-                            message: format!("{other:?}"),
-                        }),
+                SqlQueryResult::WithNotice { result, notice: _ } => match *result {
+                    SqlQueryResult::Rows { columns, rows } => {
+                        SqlResp::Rows(crate::types::SqlRowsResp { columns, rows })
                     }
-                }
+                    other => SqlResp::Ok(crate::types::SqlOkResp {
+                        ok: true,
+                        message: format!("{other:?}"),
+                    }),
+                },
             };
             Json(resp).into_response()
         }
