@@ -1,19 +1,24 @@
-//! Language-agnostic entity + foreign-key detector.
+//! Real AST-based entity + foreign-key detector, via tree-sitter.
 //!
-//! Phase 1 scope (honest, not an AST parser): regex-based heuristics over
-//! source text, good enough to find "this looks like an entity" and "this
-//! field looks like a reference to another entity" across common OOP
-//! languages (C#, Java, TypeScript, Python, Go, Rust) without needing a
-//! per-language parser. This will produce false positives/negatives on
-//! unusual code style — that is an accepted, documented limitation of a
-//! text-heuristic scanner, not a claim of full static analysis.
+//! Phase 1 scope: C# and Java (the two languages tree-sitter grammars are
+//! wired for so far). Each language's class declarations and field/property
+//! declarations are walked from the REAL parse tree — not text/regex
+//! heuristics — so nested classes, comments, and string literals containing
+//! the word "class" can't produce false positives, and field types come from
+//! the grammar's own type nodes rather than guesswork.
+//!
+//! Adding another language means adding its tree-sitter grammar crate + one
+//! `LanguageSupport` entry below; the entity/FK detection logic itself is
+//! language-agnostic over the small set of node-kind names each language's
+//! `LanguageSupport` declares.
 
-use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// One detected entity (class/struct) and the field names found "close to"
-/// its definition that look like references to other entities.
+use tree_sitter::{Language, Node, Parser};
+
+/// One detected entity (class) and the field names found inside its body
+/// that look like references to other entities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedEntity {
     pub name: String,
@@ -73,79 +78,179 @@ impl ScanResult {
     }
 }
 
-/// Matches `class Foo`, `struct Foo`, `type Foo struct` (Go), `interface Foo`.
-fn entity_def_regex() -> Regex {
-    Regex::new(r"(?:class|struct|interface)\s+([A-Z][A-Za-z0-9_]*)").unwrap()
+/// Per-language AST node-kind names needed to find classes and their fields.
+/// Adding a language = one more entry here (plus its grammar crate).
+struct LanguageSupport {
+    extensions: &'static [&'static str],
+    language: fn() -> Language,
+    /// Node kind for a class definition (tree-sitter node "kind" string).
+    class_kind: &'static str,
+    /// Field of the class node holding its name identifier.
+    class_name_field: &'static str,
+    /// Field of the class node holding its body block.
+    class_body_field: &'static str,
+    /// Node kinds inside a class body that declare a field/property.
+    field_kinds: &'static [&'static str],
+}
+// Field-declaration name extraction is per-language (e.g. C#'s
+// `field_declaration` nests the name one level deeper inside a
+// `variable_declarator`) — see `field_name_of` below rather than a struct field.
+
+fn field_name_of(lang_key: &str, node: Node, src: &[u8]) -> Vec<String> {
+    match lang_key {
+        "csharp" => {
+            // field_declaration -> variable_declaration -> variable_declarator(s) -> name
+            // property_declaration -> name directly
+            if node.kind() == "property_declaration" {
+                node.child_by_field_name("name")
+                    .map(|n| text_of(n, src))
+                    .into_iter()
+                    .collect()
+            } else {
+                let mut names = Vec::new();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "variable_declaration" {
+                        let mut c2 = child.walk();
+                        for decl in child.children(&mut c2) {
+                            if decl.kind() == "variable_declarator"
+                                && let Some(n) = decl.child_by_field_name("name")
+                            {
+                                names.push(text_of(n, src));
+                            }
+                        }
+                    }
+                }
+                names
+            }
+        }
+        "java" => node
+            .child_by_field_name("declarator")
+            .and_then(|d| d.child_by_field_name("name"))
+            .map(|n| text_of(n, src))
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
-/// Matches a field/property declaration whose name ends in `Id`/`_id`/`ID`,
-/// e.g. `OrderId`, `order_id`, `customer_id`. Captures the referenced entity
-/// name candidate (the part before the Id suffix, PascalCased).
-fn fk_field_regex() -> Regex {
-    Regex::new(r"\b([A-Za-z][A-Za-z0-9]*?)(?:_id|Id|ID)\b").unwrap()
+fn text_of(node: Node, src: &[u8]) -> String {
+    node.utf8_text(src).unwrap_or("").to_owned()
+}
+
+fn languages() -> Vec<(&'static str, LanguageSupport)> {
+    vec![
+        (
+            "csharp",
+            LanguageSupport {
+                extensions: &["cs"],
+                language: || tree_sitter_c_sharp::LANGUAGE.into(),
+                class_kind: "class_declaration",
+                class_name_field: "name",
+                class_body_field: "body",
+                field_kinds: &["field_declaration", "property_declaration"],
+            },
+        ),
+        (
+            "java",
+            LanguageSupport {
+                extensions: &["java"],
+                language: || tree_sitter_java::LANGUAGE.into(),
+                class_kind: "class_declaration",
+                class_name_field: "name",
+                class_body_field: "body",
+                field_kinds: &["field_declaration"],
+            },
+        ),
+    ]
 }
 
 fn to_pascal_case(s: &str) -> String {
-    s.split('_')
-        .filter(|p| !p.is_empty())
-        .map(|part| {
-            let mut c = part.chars();
-            match c.next() {
-                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect()
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+        None => String::new(),
+    }
 }
 
-/// Scan a single source file's text, returning any entity definitions found
-/// and, for each, the FK-looking field names in the ~40 lines following the
-/// definition (a cheap proxy for "fields declared inside this class/struct"
-/// without a real brace-matching parser).
-pub fn scan_source(text: &str) -> Vec<DetectedEntity> {
-    let entity_re = entity_def_regex();
-    let fk_re = fk_field_regex();
-    let lines: Vec<&str> = text.lines().collect();
-
-    let mut defs: Vec<(usize, String)> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if let Some(cap) = entity_re.captures(line) {
-            defs.push((i, cap[1].to_owned()));
-        }
+/// If `field_name` looks like a foreign key (`OrderId`, `orderId`), return the
+/// PascalCase entity name it appears to reference (`Order`).
+fn fk_target_from_field_name(field_name: &str, owner_entity: &str) -> Option<String> {
+    let stripped = field_name
+        .strip_suffix("Id")
+        .or_else(|| field_name.strip_suffix("ID"))?;
+    if stripped.is_empty() {
+        return None;
     }
+    let target = to_pascal_case(stripped);
+    if target == owner_entity {
+        None // e.g. `OrderId` as Order's own PK, not a self-FK
+    } else {
+        Some(target)
+    }
+}
 
-    let mut out = Vec::new();
-    for (idx, (start, name)) in defs.iter().enumerate() {
-        let end = defs
-            .get(idx + 1)
-            .map(|(next_start, _)| *next_start)
-            .unwrap_or(lines.len())
-            .min(start + 60);
-        let body = lines[*start..end].join("\n");
-
+fn walk_classes(
+    lang_key: &str,
+    support: &LanguageSupport,
+    node: Node,
+    src: &[u8],
+    out: &mut Vec<DetectedEntity>,
+) {
+    if node.kind() == support.class_kind
+        && let Some(name_node) = node.child_by_field_name(support.class_name_field)
+    {
+        let name = text_of(name_node, src);
         let mut references = BTreeSet::new();
-        for cap in fk_re.captures_iter(&body) {
-            let base = to_pascal_case(&cap[1]);
-            // Skip self-references and the entity's own name repeated in its Id
-            // field (e.g. `OrderId` inside `Order` itself is a PK, not a FK).
-            if !base.is_empty() && base != *name {
-                references.insert(base);
+        if let Some(body) = node.child_by_field_name(support.class_body_field) {
+            let mut cursor = body.walk();
+            for member in body.children(&mut cursor) {
+                if support.field_kinds.contains(&member.kind()) {
+                    for field_name in field_name_of(lang_key, member, src) {
+                        if let Some(target) = fk_target_from_field_name(&field_name, &name) {
+                            references.insert(target);
+                        }
+                    }
+                }
             }
         }
-
-        out.push(DetectedEntity {
-            name: name.clone(),
-            references,
-        });
+        out.push(DetectedEntity { name, references });
     }
-    out
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_classes(lang_key, support, child, src, out);
+    }
 }
 
-/// Walk `dir` recursively, scan every file with a recognized source
-/// extension, and merge results into one [`ScanResult`]. Entities with the
-/// same name found in multiple files have their reference sets unioned.
+/// Parse a single file's source text with the appropriate grammar (chosen by
+/// `lang_key`), returning every class/entity found.
+pub fn scan_source(lang_key: &str, text: &str) -> anyhow::Result<Vec<DetectedEntity>> {
+    let langs = languages();
+    let Some((_, support)) = langs.iter().find(|(k, _)| *k == lang_key) else {
+        anyhow::bail!("unsupported language key: {lang_key}");
+    };
+    let mut parser = Parser::new();
+    parser.set_language(&(support.language)())?;
+    let tree = parser
+        .parse(text, None)
+        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse source"))?;
+    let mut out = Vec::new();
+    walk_classes(
+        lang_key,
+        support,
+        tree.root_node(),
+        text.as_bytes(),
+        &mut out,
+    );
+    Ok(out)
+}
+
+/// Walk `dir` recursively, parse every file whose extension matches a
+/// supported language's grammar, and merge results into one [`ScanResult`].
+/// Entities with the same name found in multiple files have their reference
+/// sets unioned.
 pub fn scan_directory(dir: &Path) -> anyhow::Result<ScanResult> {
-    const EXTENSIONS: &[&str] = &["cs", "java", "ts", "tsx", "py", "go", "rs"];
+    let langs = languages();
     let mut result = ScanResult::default();
 
     for entry in walkdir::WalkDir::new(dir)
@@ -160,18 +265,19 @@ pub fn scan_directory(dir: &Path) -> anyhow::Result<ScanResult> {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        if !EXTENSIONS.contains(&ext) {
+        let Some((lang_key, _)) = langs.iter().find(|(_, s)| s.extensions.contains(&ext)) else {
             continue;
-        }
+        };
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        for detected in scan_source(&text) {
+        let detected = scan_source(lang_key, &text)?;
+        for entity in detected {
             result
                 .entities
-                .entry(detected.name.clone())
-                .and_modify(|e| e.references.extend(detected.references.iter().cloned()))
-                .or_insert(detected);
+                .entry(entity.name.clone())
+                .and_modify(|e| e.references.extend(entity.references.iter().cloned()))
+                .or_insert(entity);
         }
     }
 
@@ -183,25 +289,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_csharp_class() {
+    fn detects_csharp_class_via_ast() {
         let src = "public class Order {\n  public int Id;\n}\n";
-        let found = scan_source(src);
+        let found = scan_source("csharp", src).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "Order");
     }
 
     #[test]
-    fn detects_rust_struct() {
-        let src = "pub struct Customer {\n  pub id: u64,\n}\n";
-        let found = scan_source(src);
+    fn detects_java_class_via_ast() {
+        let src = "public class Customer {\n  private int id;\n}\n";
+        let found = scan_source("java", src).unwrap();
         assert_eq!(found[0].name, "Customer");
     }
 
     #[test]
-    fn detects_fk_reference_between_entities() {
-        let src =
-            "class Order {\n  int Id;\n}\n\nclass OrderItem {\n  int Id;\n  int OrderId;\n}\n";
-        let found = scan_source(src);
+    fn detects_fk_field_via_real_ast_not_comments_or_strings() {
+        let src = r#"
+public class Order {
+    public int Id;
+}
+
+// class OrderFake should NOT be detected — it's a comment
+public class OrderItem {
+    public int Id;
+    public int OrderId; // references Order
+    public string Note = "class NotAClass";
+}
+"#;
+        let found = scan_source("csharp", src).unwrap();
+        assert_eq!(
+            found.len(),
+            2,
+            "comment and string must not be parsed as classes"
+        );
         let order_item = found.iter().find(|e| e.name == "OrderItem").unwrap();
         assert!(order_item.references.contains("Order"));
         let order = found.iter().find(|e| e.name == "Order").unwrap();
@@ -209,18 +330,36 @@ mod tests {
     }
 
     #[test]
-    fn snake_case_fk_field_is_pascal_cased_for_matching() {
-        let src = "class Payment {\n  int id;\n  int order_id;\n}\n";
-        let found = scan_source(src);
+    fn detects_csharp_property_declaration_fk() {
+        let src = "public class Order {\n  public int Id { get; set; }\n}\n\npublic class Payment {\n  public int OrderId { get; set; }\n}\n";
+        let found = scan_source("csharp", src).unwrap();
+        let payment = found.iter().find(|e| e.name == "Payment").unwrap();
+        assert!(payment.references.contains("Order"));
+    }
+
+    #[test]
+    fn detects_java_camelcase_fk_field() {
+        let src = "public class Payment {\n  private int orderId;\n}\n";
+        let found = scan_source("java", src).unwrap();
         assert!(found[0].references.contains("Order"));
     }
 
     #[test]
     fn self_referencing_id_field_is_not_a_reference() {
         // Order's own `OrderId` (its PK) must not count as a self-FK.
-        let src = "class Order {\n  int OrderId;\n}\n";
-        let found = scan_source(src);
+        let src = "public class Order {\n  public int OrderId;\n}\n";
+        let found = scan_source("csharp", src).unwrap();
         assert!(found[0].references.is_empty());
+    }
+
+    #[test]
+    fn nested_class_is_still_detected() {
+        // A real AST walk (unlike a text-window heuristic) correctly handles
+        // nesting instead of getting confused by brace/indentation depth.
+        let src = "public class Outer {\n  public class Inner {\n    public int OuterId;\n  }\n}\n";
+        let found = scan_source("csharp", src).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|e| e.name == "Inner"));
     }
 
     #[test]
@@ -280,18 +419,21 @@ mod tests {
             },
         );
         let refs = result.reference_entities();
-        // Product is referenced by OrderItem, so it's NOT a pure reference
-        // entity by this definition — only truly isolated entities qualify.
         assert!(!refs.contains(&"Order"));
+        assert!(!refs.contains(&"Product")); // referenced by OrderItem
     }
 
     #[test]
-    fn scan_directory_merges_entities_across_files() {
+    fn scan_directory_merges_entities_across_files_and_languages() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("order.cs"), "class Order {\n  int Id;\n}\n").unwrap();
         std::fs::write(
-            dir.path().join("order_item.cs"),
-            "class OrderItem {\n  int OrderId;\n}\n",
+            dir.path().join("Order.cs"),
+            "public class Order {\n  public int Id;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("OrderItem.java"),
+            "public class OrderItem {\n  private int orderId;\n}\n",
         )
         .unwrap();
         std::fs::write(dir.path().join("readme.txt"), "not source code").unwrap();
