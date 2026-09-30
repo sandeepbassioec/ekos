@@ -34,6 +34,7 @@ members = [
     "crates/vectorvolt-semantic",
     "crates/vectorvolt-events",
     "crates/vectorvolt-pam",
+    "crates/vv-architect",
 ]
 resolver = "2"
 
