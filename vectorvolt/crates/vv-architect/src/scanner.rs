@@ -130,12 +130,46 @@ fn field_name_of(lang_key: &str, node: Node, src: &[u8]) -> Vec<String> {
             .map(|n| text_of(n, src))
             .into_iter()
             .collect(),
+        // Go/Rust field_declaration and TS public_field_definition all carry
+        // the field name directly on a `name` field of the member node.
+        "go" | "rust" | "typescript" => node
+            .child_by_field_name("name")
+            .map(|n| text_of(n, src))
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     }
 }
 
 fn text_of(node: Node, src: &[u8]) -> String {
     node.utf8_text(src).unwrap_or("").to_owned()
+}
+
+/// Resolve the member-bearing "body" node for a class/struct definition.
+/// Most languages expose this as a direct child field (`support.class_body_field`),
+/// but Go nests it one level deeper: `type_spec` -> `type: struct_type` ->
+/// `field_declaration_list`. Returns `None` for a Go `type_spec` that is a
+/// plain type alias (e.g. `type UserID int`), not a struct.
+fn class_body_of<'a>(
+    lang_key: &str,
+    node: Node<'a>,
+    support: &LanguageSupport,
+) -> Option<Node<'a>> {
+    match lang_key {
+        "go" => {
+            let struct_type = node.child_by_field_name("type")?;
+            if struct_type.kind() != "struct_type" {
+                return None;
+            }
+            // `field_declaration_list` is an unnamed positional child of
+            // struct_type in this grammar, not addressable by field name.
+            let mut cursor = struct_type.walk();
+            struct_type
+                .children(&mut cursor)
+                .find(|c| c.kind() == "field_declaration_list")
+        }
+        _ => node.child_by_field_name(support.class_body_field),
+    }
 }
 
 fn languages() -> Vec<(&'static str, LanguageSupport)> {
@@ -162,22 +196,64 @@ fn languages() -> Vec<(&'static str, LanguageSupport)> {
                 field_kinds: &["field_declaration"],
             },
         ),
+        (
+            "typescript",
+            LanguageSupport {
+                extensions: &["ts", "tsx"],
+                language: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                class_kind: "class_declaration",
+                class_name_field: "name",
+                class_body_field: "body",
+                field_kinds: &["public_field_definition"],
+            },
+        ),
+        (
+            "go",
+            LanguageSupport {
+                extensions: &["go"],
+                language: || tree_sitter_go::LANGUAGE.into(),
+                class_kind: "type_spec",
+                class_name_field: "name",
+                class_body_field: "", // resolved via class_body_of's Go branch
+                field_kinds: &["field_declaration"],
+            },
+        ),
+        (
+            "rust",
+            LanguageSupport {
+                extensions: &["rs"],
+                language: || tree_sitter_rust::LANGUAGE.into(),
+                class_kind: "struct_item",
+                class_name_field: "name",
+                class_body_field: "body",
+                field_kinds: &["field_declaration"],
+            },
+        ),
     ]
 }
 
+/// PascalCase-ify a possibly snake_case identifier fragment (`order` -> `Order`,
+/// `order_line` -> `OrderLine`) — needed for Rust/Go's snake_case field
+/// convention (`order_id`) as well as C#/Java/TS camelCase (`orderId`).
 fn to_pascal_case(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
-        None => String::new(),
-    }
+    s.split('_')
+        .filter(|p| !p.is_empty())
+        .map(|part| {
+            let mut c = part.chars();
+            match c.next() {
+                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 /// If `field_name` looks like a foreign key (`OrderId`, `orderId`), return the
 /// PascalCase entity name it appears to reference (`Order`).
 fn fk_target_from_field_name(field_name: &str, owner_entity: &str) -> Option<String> {
     let stripped = field_name
-        .strip_suffix("Id")
+        .strip_suffix("_id")
+        .or_else(|| field_name.strip_suffix("Id"))
         .or_else(|| field_name.strip_suffix("ID"))?;
     if stripped.is_empty() {
         return None;
@@ -200,9 +276,13 @@ fn walk_classes(
     if node.kind() == support.class_kind
         && let Some(name_node) = node.child_by_field_name(support.class_name_field)
     {
-        let name = text_of(name_node, src);
-        let mut references = BTreeSet::new();
-        if let Some(body) = node.child_by_field_name(support.class_body_field) {
+        // Every real class/struct in these grammars has a body node (even if
+        // empty) — `None` only happens for Go's non-struct `type_spec` (a
+        // plain type alias like `type UserID int`), which must NOT be
+        // reported as an entity.
+        if let Some(body) = class_body_of(lang_key, node, support) {
+            let name = text_of(name_node, src);
+            let mut references = BTreeSet::new();
             let mut cursor = body.walk();
             for member in body.children(&mut cursor) {
                 if support.field_kinds.contains(&member.kind()) {
@@ -213,8 +293,8 @@ fn walk_classes(
                     }
                 }
             }
+            out.push(DetectedEntity { name, references });
         }
-        out.push(DetectedEntity { name, references });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -287,6 +367,39 @@ pub fn scan_directory(dir: &Path) -> anyhow::Result<ScanResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_go_struct_and_fk_field() {
+        let src = "type Order struct {\n\tID int\n}\n\ntype OrderItem struct {\n\tOrderID int\n}\n";
+        let found = scan_source("go", src).unwrap();
+        let order_item = found.iter().find(|e| e.name == "OrderItem").unwrap();
+        assert!(order_item.references.contains("Order"));
+    }
+
+    #[test]
+    fn go_type_alias_is_not_an_entity() {
+        // `type UserID int` is a type alias, not a struct — must not appear.
+        let src = "type UserID int\n\ntype Order struct {\n\tID int\n}\n";
+        let found = scan_source("go", src).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "Order");
+    }
+
+    #[test]
+    fn detects_rust_struct_and_snake_case_fk_field() {
+        let src = "pub struct Order {\n    pub id: u64,\n}\n\npub struct OrderItem {\n    pub order_id: u64,\n}\n";
+        let found = scan_source("rust", src).unwrap();
+        let order_item = found.iter().find(|e| e.name == "OrderItem").unwrap();
+        assert!(order_item.references.contains("Order"));
+    }
+
+    #[test]
+    fn detects_typescript_class_and_fk_field() {
+        let src = "class Order {\n  id: number;\n}\n\nclass OrderItem {\n  orderId: number;\n}\n";
+        let found = scan_source("typescript", src).unwrap();
+        let order_item = found.iter().find(|e| e.name == "OrderItem").unwrap();
+        assert!(order_item.references.contains("Order"));
+    }
 
     #[test]
     fn detects_csharp_class_via_ast() {
