@@ -44,6 +44,14 @@ pub fn render(bp: &Blueprint) -> String {
         ));
     }
 
+    if !bp.suggested_events.is_empty() {
+        out.push('\n');
+        out.push_str("Events suggested:\n");
+        for event in &bp.suggested_events {
+            out.push_str(&format!("  {event}\n"));
+        }
+    }
+
     let unclassified: Vec<&String> = bp
         .all_entities
         .iter()
@@ -87,6 +95,7 @@ mod tests {
                 "Payment".to_owned(),
                 "Product".to_owned(),
             ],
+            suggested_events: vec![],
             sizing: None,
         };
         let text = render(&bp);

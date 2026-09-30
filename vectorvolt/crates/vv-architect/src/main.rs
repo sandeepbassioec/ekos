@@ -22,6 +22,7 @@
 
 mod blueprint;
 mod db_scanner;
+mod events;
 mod report;
 mod rules;
 mod scanner;
