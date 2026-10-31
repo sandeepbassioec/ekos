@@ -158,7 +158,7 @@ impl Read for XdpStream {
                     std::hint::spin_loop();
                 }
                 Err(e) => {
-                    return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                    return Err(io::Error::other(e.to_string()));
                 }
             }
         }
@@ -171,7 +171,7 @@ impl Write for XdpStream {
         const FRAME_IDX: u32 = 0;
         self.driver
             .send(FRAME_IDX, buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(buf.len())
     }
 
