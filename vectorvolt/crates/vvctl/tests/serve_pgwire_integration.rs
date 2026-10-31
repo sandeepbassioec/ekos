@@ -122,6 +122,35 @@ async fn connect_and_startup(addr: SocketAddr) -> TcpStream {
     stream
 }
 
+/// Read whole backend messages until ReadyForQuery ('Z'), returning every byte
+/// received. A single `read()` is not guaranteed to return a whole reply.
+async fn read_until_ready(stream: &mut TcpStream) -> Vec<u8> {
+    let mut all = Vec::new();
+    let mut pos = 0;
+    let mut chunk = [0u8; 4096];
+    loop {
+        while all.len() >= pos + 5 {
+            let tag = all[pos];
+            let len = i32::from_be_bytes(all[pos + 1..pos + 5].try_into().unwrap()) as usize;
+            if all.len() < pos + 1 + len {
+                break;
+            }
+            pos += 1 + len;
+            if tag == b'Z' {
+                return all;
+            }
+        }
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .expect("timed out waiting for ReadyForQuery")
+            .unwrap();
+        if n == 0 {
+            return all;
+        }
+        all.extend_from_slice(&chunk[..n]);
+    }
+}
+
 fn make_query_msg(sql: &str) -> Vec<u8> {
     let payload = format!("{sql}\0");
     let len = 4 + payload.len();
@@ -155,17 +184,16 @@ fn pgwire_listener_shares_registry_with_wire_protocol_server() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let found = rt.block_on(async move {
         let mut stream = connect_and_startup(pgwire_addr).await;
-        let mut buf = vec![0u8; 4096];
-        let _ = stream.read(&mut buf).await.unwrap(); // auth-ok + ready-for-query
+        read_until_ready(&mut stream).await; // auth-ok ... ready-for-query
 
         stream
             .write_all(&make_query_msg("SELECT * FROM shared"))
             .await
             .unwrap();
-        let mut resp = vec![0u8; 4096];
-        let n = stream.read(&mut resp).await.unwrap();
-        let text = String::from_utf8_lossy(&resp[..n]);
-        resp[..n].contains(&b'T') && text.contains("99")
+        let resp = read_until_ready(&mut stream).await;
+        let text = String::from_utf8_lossy(&resp);
+        eprintln!("pgwire reply: {text:?}");
+        resp.contains(&b'T') && text.contains("99")
     });
 
     shutdown();
