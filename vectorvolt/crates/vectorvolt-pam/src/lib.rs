@@ -769,6 +769,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_generate_recovery_codes_returns_ten_unique_codes() {
         let user = "test_recovery_gen_unique";
         cleanup_recovery(user);
@@ -781,6 +782,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_verify_recovery_code_valid_then_single_use() {
         let user = "test_recovery_single_use";
         cleanup_recovery(user);
@@ -795,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_verify_recovery_code_rejects_unknown_code() {
         let user = "test_recovery_unknown_code";
         cleanup_recovery(user);
@@ -805,6 +808,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_verify_recovery_code_logs_audit_entry() {
         let user = "test_recovery_audit_log";
         cleanup_recovery(user);
@@ -818,6 +822,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_regenerate_recovery_codes_invalidates_old_ones() {
         let user = "test_recovery_regenerate";
         cleanup_recovery(user);
