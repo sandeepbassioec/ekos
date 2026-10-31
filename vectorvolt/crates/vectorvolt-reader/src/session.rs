@@ -6,10 +6,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use vectorvolt_engine::{EngineOptions, TableRegistry};
 
+use subtle::ConstantTimeEq;
+
 use crate::wire::{
-    FrontendMsg, decode_frontend, decode_startup, encode_auth_ok, encode_command_complete,
-    encode_data_row, encode_error_response, encode_param_status, encode_ready_for_query,
-    encode_row_description,
+    FrontendMsg, decode_frontend, decode_startup, encode_auth_cleartext_password, encode_auth_ok,
+    encode_command_complete, encode_data_row, encode_error_response, encode_fatal_error,
+    encode_param_status, encode_ready_for_query, encode_row_description,
 };
 use vectorvolt_query::sql::executor::{QueryResult, SqlExecutor};
 
@@ -26,32 +28,116 @@ pub enum SessionState {
     Done,
 }
 
+/// Largest startup / password message accepted before authentication.
+const MAX_STARTUP_LEN: usize = 10_000;
+
 /// A single client session over a `TcpStream`.
 pub struct PgSession {
     stream: TcpStream,
     executor: SqlExecutor,
+    /// Required password (cleartext-password auth); `None` = no auth.
+    password: Option<String>,
     state: SessionState,
 }
 
 impl PgSession {
-    pub fn new(stream: TcpStream, registry: Arc<TableRegistry>) -> Self {
+    /// Create a session. `executor` should be a per-connection session of the
+    /// server's shared executor ([`SqlExecutor::new_session`]) so security
+    /// state is server-wide while transactions stay per connection.
+    pub fn new(stream: TcpStream, executor: SqlExecutor, password: Option<String>) -> Self {
         Self {
             stream,
-            executor: SqlExecutor::new(registry),
+            executor,
+            password,
             state: SessionState::Startup,
         }
+    }
+
+    /// Send a FATAL error and end the session (the caller drops the stream).
+    /// Write errors are ignored: the peer may already have gone away.
+    async fn fail(&mut self, code: &str, msg: &str) -> std::io::Result<()> {
+        self.state = SessionState::Done;
+        let _ = self.stream.write_all(&encode_fatal_error(code, msg)).await;
+        let _ = self.stream.flush().await;
+        Ok(())
+    }
+
+    /// Read one length-prefixed pre-auth message (`with_type` = has a type
+    /// byte). Returns `None` on EOF or an out-of-range length.
+    async fn read_preauth(&mut self, with_type: bool) -> std::io::Result<Option<Vec<u8>>> {
+        let hdr = if with_type { 5 } else { 4 };
+        let mut buf = vec![0u8; hdr];
+        if let Err(e) = self.stream.read_exact(&mut buf).await {
+            return if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
+        let len = i32::from_be_bytes([buf[hdr - 4], buf[hdr - 3], buf[hdr - 2], buf[hdr - 1]]);
+        let len = match usize::try_from(len) {
+            Ok(l) if (4..=MAX_STARTUP_LEN).contains(&l) => l,
+            _ => return Ok(None),
+        };
+        buf.resize(hdr + len - 4, 0);
+        if let Err(e) = self.stream.read_exact(&mut buf[hdr..]).await {
+            return if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
+        Ok(Some(buf))
     }
 
     /// Drive the session to completion.
     pub async fn run(&mut self) -> std::io::Result<()> {
         // ── startup ────────────────────────────────────────────────────────────
-        let mut buf = vec![0u8; 4096];
-        let n = self.stream.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(());
+        // Decode startup message (no type byte). Anything unparseable, or a
+        // protocol other than 3.x, is rejected and the connection closed.
+        let Some(mut buf) = self.read_preauth(false).await? else {
+            return self.fail("08P01", "invalid startup packet").await;
+        };
+        if buf.len() < 8 {
+            return self.fail("08P01", "invalid startup packet").await;
         }
-        // Decode startup message (no type byte)
-        let _ = decode_startup(&buf[..n]); // ignore parse errors for now
+        // SSLRequest / GSSENCRequest: encryption is not offered ('N'); the
+        // client then sends the real startup message in plaintext.
+        let code = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        if buf.len() == 8 && (code == 80_877_103 || code == 80_877_104) {
+            self.stream.write_all(b"N").await?;
+            let Some(next) = self.read_preauth(false).await? else {
+                return self.fail("08P01", "invalid startup packet").await;
+            };
+            buf = next;
+        }
+        match decode_startup(&buf) {
+            Ok(FrontendMsg::Startup { major: 3, .. }) => {}
+            _ => {
+                return self
+                    .fail("08P01", "invalid startup packet or unsupported protocol")
+                    .await;
+            }
+        }
+
+        // ── authentication ───────────────────────────────────────────────────
+        if let Some(expected) = self.password.clone() {
+            self.stream
+                .write_all(&encode_auth_cleartext_password())
+                .await?;
+            let supplied = match self.read_preauth(true).await? {
+                Some(msg) => match decode_frontend(&msg) {
+                    Ok(FrontendMsg::Password(pw)) => Some(pw),
+                    _ => None,
+                },
+                None => None,
+            };
+            let ok =
+                supplied.is_some_and(|pw| bool::from(pw.as_bytes().ct_eq(expected.as_bytes())));
+            if !ok {
+                return self.fail("28P01", "password authentication failed").await;
+            }
+        }
 
         // Send auth ok + params + ready
         self.stream.write_all(&encode_auth_ok()).await?;
@@ -87,8 +173,8 @@ impl PgSession {
                     self.stream.write_all(&encode_ready_for_query()).await?;
                     self.state = SessionState::Idle;
                 }
-                FrontendMsg::Startup { .. } => {
-                    // Unexpected second startup
+                FrontendMsg::Startup { .. } | FrontendMsg::Password(_) => {
+                    // Unexpected second startup / stray password message
                     break;
                 }
             }

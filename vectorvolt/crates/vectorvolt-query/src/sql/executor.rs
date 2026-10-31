@@ -16,6 +16,7 @@ use crate::sql::lexer::{LexError, Lexer};
 use crate::sql::parser::{ParseError, SqlParser};
 use crate::sql::planner::{PhysicalPlan, Planner};
 use crate::sql::vec_store::{DistanceMetric, VectorStore, parse_vec_literal};
+use vectorvolt_crypto::KeyStore;
 use vectorvolt_graph::store::GraphStore;
 
 #[derive(Debug, Error)]
@@ -370,6 +371,15 @@ pub struct QueryStat {
     pub rows: u64,
 }
 
+/// SQL statement executor.
+///
+/// Server-wide security and catalog state (views, UDFs, triggers, RLS
+/// policies, masks, grants, table tokens, rate limits, read-only mode,
+/// column-encryption metadata and key, audit log) lives behind
+/// `Arc<Mutex<..>>` and is shared by every executor created with
+/// [`SqlExecutor::new_session`]. Everything else — the active transaction,
+/// savepoints, prepared statements, cursors, session token/variables — is
+/// per executor, i.e. per connection.
 pub struct SqlExecutor {
     registry: Arc<TableRegistry>,
     /// Active transaction state. `None` = auto-commit mode.
@@ -388,7 +398,7 @@ pub struct SqlExecutor {
     /// since a duplicate id would just be treated as the same logical txn).
     txn_uuid_counter: std::sync::atomic::AtomicU64,
     /// S45 â€” in-memory view store.
-    views: Mutex<HashMap<String, SelectStmt>>,
+    views: Arc<Mutex<HashMap<String, SelectStmt>>>,
     /// S53 â€” savepoint snapshots: name â†’ TxnMap clone at savepoint time.
     savepoints: Mutex<HashMap<String, TxnMap>>,
     /// S56 â€” query result cache: sql â†’ (columns, rows).
@@ -397,34 +407,35 @@ pub struct SqlExecutor {
     /// S57 â€” prepared statements: name â†’ Stmt.
     prepared: Mutex<HashMap<String, Stmt>>,
     /// S59 â€” per-column defaults: table â†’ Vec<Option<LitVal>> (indexed by col position).
-    col_defaults: Mutex<HashMap<String, Vec<Option<LitVal>>>>,
+    col_defaults: Arc<Mutex<HashMap<String, Vec<Option<LitVal>>>>>,
     /// S59 â€” per-column CHECK constraints: table â†’ Vec<Option<String>>.
-    col_checks: Mutex<HashMap<String, Vec<Option<String>>>>,
+    col_checks: Arc<Mutex<HashMap<String, Vec<Option<String>>>>>,
     /// S60 â€” foreign keys: table â†’ Vec<(col, ref_table, ref_col)>.
     #[allow(clippy::type_complexity)]
-    foreign_keys: Mutex<HashMap<String, Vec<(String, String, String)>>>,
+    foreign_keys: Arc<Mutex<HashMap<String, Vec<(String, String, String)>>>>,
     /// S65 â€” user-defined functions: name â†’ (param, body).
-    pub(crate) udfs: Mutex<HashMap<String, (String, String)>>,
+    pub(crate) udfs: Arc<Mutex<HashMap<String, (String, String)>>>,
     /// S66 â€” triggers: name â†’ TriggerDef.
-    pub(crate) triggers: Mutex<HashMap<String, TriggerDef>>,
+    pub(crate) triggers: Arc<Mutex<HashMap<String, TriggerDef>>>,
     /// S71 â€” per-query stats
     query_stats: Mutex<HashMap<String, QueryStat>>,
     /// S75 â€” materialized views: name â†’ (query, cached rows)
     #[allow(clippy::type_complexity)]
-    mat_views: Mutex<HashMap<String, (SelectStmt, Vec<Vec<String>>)>>,
+    mat_views: Arc<Mutex<HashMap<String, (SelectStmt, Vec<Vec<String>>)>>>,
     // S78 â€” RLS policies: policy_name â†’ (table, expr)
-    policies: Mutex<HashMap<String, (String, Expr)>>,
+    policies: Arc<Mutex<HashMap<String, (String, Expr)>>>,
     // S79 â€” column masks: (table, col) â†’ mask_val
-    masks: Mutex<HashMap<(String, String), String>>,
+    masks: Arc<Mutex<HashMap<(String, String), String>>>,
     // S80 â€” audit log
-    audit_log: Mutex<Vec<AuditEntry>>,
+    audit_log: Arc<Mutex<Vec<AuditEntry>>>,
     // S81 â€” session token + per-table required tokens
     session_token: Mutex<Option<String>>,
-    table_tokens: Mutex<HashMap<String, String>>,
+    table_tokens: Arc<Mutex<HashMap<String, String>>>,
     // S82 â€” rate limits: table â†’ (limit, count, window_start)
-    rate_limits: Mutex<HashMap<String, (u64, u64, std::time::Instant)>>,
+    #[allow(clippy::type_complexity)]
+    rate_limits: Arc<Mutex<HashMap<String, (u64, u64, std::time::Instant)>>>,
     // S83 â€” IP allowlist
-    allowed_ips: Mutex<HashSet<String>>,
+    allowed_ips: Arc<Mutex<HashSet<String>>>,
     // S84 â€” TLS cert/key paths
     tls_cert_path: Mutex<Option<String>>,
     tls_key_path: Mutex<Option<String>>,
@@ -436,7 +447,7 @@ pub struct SqlExecutor {
     // S88 â€” replication slots
     replication_slots: Mutex<HashMap<String, ReplicationSlot>>,
     // S90 â€” read-only mode
-    read_only: Mutex<bool>,
+    read_only: Arc<Mutex<bool>>,
     // S92 â€” WAL archive
     archive_path: Mutex<Option<String>>,
     archive_count: Mutex<u64>,
@@ -511,7 +522,7 @@ pub struct SqlExecutor {
     prepared_txns: Mutex<HashMap<String, Vec<String>>>,
     dist_txn_active: Mutex<Option<String>>,
     // S129 â€” stored procedures
-    procedures: Mutex<HashMap<String, Vec<String>>>,
+    procedures: Arc<Mutex<HashMap<String, Vec<String>>>>,
     // S130 â€” user-defined types
     user_types: Mutex<HashMap<String, (String, String)>>,
     // S131 â€” array store: key â†’ Vec<String>
@@ -541,8 +552,8 @@ pub struct SqlExecutor {
     // S141 â€” logical replication filters
     repl_filters: Mutex<HashMap<String, String>>,
     // S142 â€” column encryption
-    encrypted_cols: Mutex<HashMap<String, String>>,
-    encrypted_values: Mutex<HashMap<String, String>>,
+    encrypted_cols: Arc<Mutex<HashMap<String, String>>>,
+    encrypted_values: Arc<Mutex<HashMap<String, String>>>,
     // S143 â€” row compression hints
     table_compression: Mutex<HashMap<String, String>>,
     // S144 â€” query routing rules
@@ -583,8 +594,8 @@ pub struct SqlExecutor {
     tenants: Mutex<HashSet<String>>,
     current_tenant: Mutex<Option<String>>,
     // S159 â€” data masking policies: policy_name â†’ (table_col, mask_expr)
-    mask_policies: Mutex<HashMap<String, (String, String)>>,
-    applied_masks: Mutex<HashMap<String, String>>,
+    mask_policies: Arc<Mutex<HashMap<String, (String, String)>>>,
+    applied_masks: Arc<Mutex<HashMap<String, String>>>,
     // S160 â€” query timeout
     query_timeout_ms: Mutex<Option<u64>>,
     // S161 â€” parallel DDL
@@ -655,7 +666,7 @@ pub struct SqlExecutor {
     s188_pipelines: Mutex<HashMap<String, String>>,
     s188_pipeline_running: Mutex<HashSet<String>>,
     // S189 â€” column encryption v2: (table.col) -> key
-    s189_encrypted_cols: Mutex<HashMap<String, String>>,
+    s189_encrypted_cols: Arc<Mutex<HashMap<String, String>>>,
     // S190 â€” table federation: ft_name -> (host:port, remote_table)
     s190_foreign_tables: Mutex<HashMap<String, (String, String)>>,
     // S191 â€” change data streams: cs_name -> table
@@ -795,7 +806,7 @@ pub struct SqlExecutor {
     // S251 â€” column histograms v3: key(“t.col”) -> Vec<(bucket, count)>
     s251_histograms_v3: Mutex<HashMap<String, Vec<(String, u64)>>>,
     // S252 â€” table access control v2: (role, table, privilege) -> granted
-    s252_role_grants: Mutex<Vec<(String, String, String)>>,
+    s252_role_grants: Arc<Mutex<Vec<(String, String, String)>>>,
     // S253 â€” query scheduling: id -> (sql, at, cancelled)
     s253_scheduled_queries: Mutex<Vec<(u64, String, String, bool)>>,
     s253_next_id: Mutex<u64>,
@@ -857,7 +868,7 @@ pub struct SqlExecutor {
     // S280 â€” index defrag scheduling: idx -> at
     s280_defrag_schedule: Mutex<HashMap<String, String>>,
     // S281 â€” query result masking: (table, col) -> pattern
-    s281_result_masks: Mutex<HashMap<(String, String), String>>,
+    s281_result_masks: Arc<Mutex<HashMap<(String, String), String>>>,
     // S282 â€” table replication lag threshold
     s282_repl_lag_threshold: Mutex<Option<u64>>,
     // S283 â€” connection idle timeout
@@ -1053,6 +1064,9 @@ pub struct SqlExecutor {
     s378_shard_key_rebalance_history: Mutex<HashMap<String, Vec<String>>>,
     // S379 â€” schema object ownership
     s379_object_ownership: Mutex<HashMap<String, String>>,
+    // S142 — AES-256-GCM key for column encryption (set via
+    // `set_column_encryption_key`; `None` = column encryption disabled)
+    column_key: Arc<Mutex<Option<Arc<KeyStore>>>>,
 }
 
 impl SqlExecutor {
@@ -1121,30 +1135,30 @@ impl SqlExecutor {
             mvcc_txn: Mutex::new(None),
             txn_intent_log,
             txn_uuid_counter: std::sync::atomic::AtomicU64::new(0),
-            views: Mutex::new(HashMap::new()),
+            views: Arc::new(Mutex::new(HashMap::new())),
             savepoints: Mutex::new(HashMap::new()),
             query_cache: Mutex::new(HashMap::new()),
             prepared: Mutex::new(HashMap::new()),
-            col_defaults: Mutex::new(HashMap::new()),
-            col_checks: Mutex::new(HashMap::new()),
-            foreign_keys: Mutex::new(HashMap::new()),
-            udfs: Mutex::new(HashMap::new()),
-            triggers: Mutex::new(HashMap::new()),
+            col_defaults: Arc::new(Mutex::new(HashMap::new())),
+            col_checks: Arc::new(Mutex::new(HashMap::new())),
+            foreign_keys: Arc::new(Mutex::new(HashMap::new())),
+            udfs: Arc::new(Mutex::new(HashMap::new())),
+            triggers: Arc::new(Mutex::new(HashMap::new())),
             query_stats: Mutex::new(HashMap::new()),
-            mat_views: Mutex::new(HashMap::new()),
-            policies: Mutex::new(HashMap::new()),
-            masks: Mutex::new(HashMap::new()),
-            audit_log: Mutex::new(Vec::new()),
+            mat_views: Arc::new(Mutex::new(HashMap::new())),
+            policies: Arc::new(Mutex::new(HashMap::new())),
+            masks: Arc::new(Mutex::new(HashMap::new())),
+            audit_log: Arc::new(Mutex::new(Vec::new())),
             session_token: Mutex::new(None),
-            table_tokens: Mutex::new(HashMap::new()),
-            rate_limits: Mutex::new(HashMap::new()),
-            allowed_ips: Mutex::new(HashSet::new()),
+            table_tokens: Arc::new(Mutex::new(HashMap::new())),
+            rate_limits: Arc::new(Mutex::new(HashMap::new())),
+            allowed_ips: Arc::new(Mutex::new(HashSet::new())),
             tls_cert_path: Mutex::new(None),
             tls_key_path: Mutex::new(None),
             bound_portals: Mutex::new(HashMap::new()),
             warnings_enabled: Mutex::new(false),
             replication_slots: Mutex::new(HashMap::new()),
-            read_only: Mutex::new(false),
+            read_only: Arc::new(Mutex::new(false)),
             archive_path: Mutex::new(None),
             archive_count: Mutex::new(0),
             slow_query_threshold_ms: Mutex::new(None),
@@ -1190,7 +1204,7 @@ impl SqlExecutor {
             graph_node_names,
             prepared_txns: Mutex::new(HashMap::new()),
             dist_txn_active: Mutex::new(None),
-            procedures: Mutex::new(HashMap::new()),
+            procedures: Arc::new(Mutex::new(HashMap::new())),
             user_types: Mutex::new(HashMap::new()),
             array_store: Mutex::new(HashMap::new()),
             jsonpath_cache: Mutex::new(HashMap::new()),
@@ -1207,8 +1221,8 @@ impl SqlExecutor {
             ttl_cache: Mutex::new(HashMap::new()),
             dist_locks: Mutex::new(HashMap::new()),
             repl_filters: Mutex::new(HashMap::new()),
-            encrypted_cols: Mutex::new(HashMap::new()),
-            encrypted_values: Mutex::new(HashMap::new()),
+            encrypted_cols: Arc::new(Mutex::new(HashMap::new())),
+            encrypted_values: Arc::new(Mutex::new(HashMap::new())),
             table_compression: Mutex::new(HashMap::new()),
             routing_rules: Mutex::new(HashMap::new()),
             schedules: Mutex::new(HashMap::new()),
@@ -1231,8 +1245,8 @@ impl SqlExecutor {
             live_config: Mutex::new(HashMap::new()),
             tenants: Mutex::new(HashSet::new()),
             current_tenant: Mutex::new(None),
-            mask_policies: Mutex::new(HashMap::new()),
-            applied_masks: Mutex::new(HashMap::new()),
+            mask_policies: Arc::new(Mutex::new(HashMap::new())),
+            applied_masks: Arc::new(Mutex::new(HashMap::new())),
             query_timeout_ms: Mutex::new(None),
             parallel_ddl_degree: Mutex::new(1),
             parallel_ddl_log: Mutex::new(Vec::new()),
@@ -1271,7 +1285,7 @@ impl SqlExecutor {
             s187_running_queries: Mutex::new(HashMap::new()),
             s188_pipelines: Mutex::new(HashMap::new()),
             s188_pipeline_running: Mutex::new(HashSet::new()),
-            s189_encrypted_cols: Mutex::new(HashMap::new()),
+            s189_encrypted_cols: Arc::new(Mutex::new(HashMap::new())),
             s190_foreign_tables: Mutex::new(HashMap::new()),
             s191_change_streams: Mutex::new(HashMap::new()),
             s192_result_ttl: Mutex::new(None),
@@ -1347,7 +1361,7 @@ impl SqlExecutor {
             s249_stats_reset_log: Mutex::new(Vec::new()),
             s250_locked_plans: Mutex::new(HashMap::new()),
             s251_histograms_v3: Mutex::new(HashMap::new()),
-            s252_role_grants: Mutex::new(Vec::new()),
+            s252_role_grants: Arc::new(Mutex::new(Vec::new())),
             s253_scheduled_queries: Mutex::new(Vec::new()),
             s253_next_id: Mutex::new(1),
             s254_auto_coalesce: Mutex::new(false),
@@ -1380,7 +1394,7 @@ impl SqlExecutor {
             s278_schema_locks: Mutex::new(HashSet::new()),
             s279_growth_predictions: Mutex::new(HashMap::new()),
             s280_defrag_schedule: Mutex::new(HashMap::new()),
-            s281_result_masks: Mutex::new(HashMap::new()),
+            s281_result_masks: Arc::new(Mutex::new(HashMap::new())),
             s282_repl_lag_threshold: Mutex::new(None),
             s283_idle_timeout_ms: Mutex::new(None),
             s284_archival_tiers: Mutex::new(HashMap::new()),
@@ -1480,7 +1494,118 @@ impl SqlExecutor {
             s377_result_set_versions: Mutex::new(HashMap::new()),
             s378_shard_key_rebalance_history: Mutex::new(HashMap::new()),
             s379_object_ownership: Mutex::new(HashMap::new()),
+            column_key: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Create a new executor for another connection to the same server.
+    ///
+    /// The new executor shares this one's registry and all server-wide
+    /// security/catalog state (see the struct docs), so restrictions set on
+    /// one connection apply to every other connection and survive reconnects.
+    /// Transaction state and other session-local fields start fresh.
+    pub fn new_session(&self) -> Self {
+        let mut s = Self::new(Arc::clone(&self.registry));
+        s.views = Arc::clone(&self.views);
+        s.udfs = Arc::clone(&self.udfs);
+        s.triggers = Arc::clone(&self.triggers);
+        s.procedures = Arc::clone(&self.procedures);
+        s.mat_views = Arc::clone(&self.mat_views);
+        s.col_defaults = Arc::clone(&self.col_defaults);
+        s.col_checks = Arc::clone(&self.col_checks);
+        s.foreign_keys = Arc::clone(&self.foreign_keys);
+        s.policies = Arc::clone(&self.policies);
+        s.masks = Arc::clone(&self.masks);
+        s.audit_log = Arc::clone(&self.audit_log);
+        s.table_tokens = Arc::clone(&self.table_tokens);
+        s.rate_limits = Arc::clone(&self.rate_limits);
+        s.allowed_ips = Arc::clone(&self.allowed_ips);
+        s.read_only = Arc::clone(&self.read_only);
+        s.s252_role_grants = Arc::clone(&self.s252_role_grants);
+        s.mask_policies = Arc::clone(&self.mask_policies);
+        s.applied_masks = Arc::clone(&self.applied_masks);
+        s.s281_result_masks = Arc::clone(&self.s281_result_masks);
+        s.encrypted_cols = Arc::clone(&self.encrypted_cols);
+        s.encrypted_values = Arc::clone(&self.encrypted_values);
+        s.s189_encrypted_cols = Arc::clone(&self.s189_encrypted_cols);
+        s.column_key = Arc::clone(&self.column_key);
+        s
+    }
+
+    /// S142 — configure the AES-256-GCM key used by column encryption
+    /// (`INSERT ENCRYPTED` / `SELECT DECRYPT`). Shared with every session
+    /// created via [`new_session`](Self::new_session).
+    pub fn set_column_encryption_key(&self, key: KeyStore) {
+        *self.column_key.lock().unwrap() = Some(Arc::new(key));
+    }
+
+    /// S142 — the configured column key, or a clear error if none is set.
+    fn require_column_key(&self) -> Result<Arc<KeyStore>, ExecError> {
+        self.column_key.lock().unwrap().clone().ok_or_else(|| {
+            ExecError::Engine(
+                "column encryption key not configured (SqlExecutor::set_column_encryption_key)"
+                    .to_owned(),
+            )
+        })
+    }
+
+    /// S142 — require a configured key and, when the column was registered
+    /// (CREATE ENCRYPTED COLUMN / ALTER TABLE .. ENCRYPT COLUMN), that the
+    /// statement's `KEY` names the key id registered for it.
+    fn check_column_key_id(
+        &self,
+        table: &str,
+        col: &str,
+        key_id: &str,
+    ) -> Result<Arc<KeyStore>, ExecError> {
+        let key = self.require_column_key()?;
+        if let Some(registered) = self
+            .encrypted_cols
+            .lock()
+            .unwrap()
+            .get(&format!("{table}.{col}"))
+            && registered != key_id
+        {
+            return Err(ExecError::Engine(format!(
+                "key '{key_id}' is not the key registered for encrypted column {table}.{col}"
+            )));
+        }
+        Ok(key)
+    }
+
+    /// S142 — AES-256-GCM seal one cell value. The plaintext is prefixed with
+    /// its `table.col.pk` address so a ciphertext copied to another cell fails
+    /// to open. Returns hex(magic || nonce || ciphertext+tag).
+    fn seal_cell(
+        key: &KeyStore,
+        table: &str,
+        col: &str,
+        pk: &str,
+        plaintext: &str,
+    ) -> Result<String, ExecError> {
+        let framed = format!("{table}.{col}.{pk}\0{plaintext}");
+        vectorvolt_crypto::encrypt(key, framed.as_bytes())
+            .map(hex::encode)
+            .map_err(|e| ExecError::Engine(format!("column encryption failed: {e}")))
+    }
+
+    /// S142 — inverse of [`seal_cell`](Self::seal_cell).
+    fn open_cell(
+        key: &KeyStore,
+        table: &str,
+        col: &str,
+        pk: &str,
+        stored: &str,
+    ) -> Result<String, ExecError> {
+        let fail = || ExecError::Engine(format!("cannot decrypt {table}.{col} pk {pk}"));
+        let blob = hex::decode(stored).map_err(|_| fail())?;
+        let framed = vectorvolt_crypto::decrypt(key, &blob).map_err(|_| fail())?;
+        let framed = String::from_utf8(framed).map_err(|_| fail())?;
+        let prefix = format!("{table}.{col}.{pk}\0");
+        framed
+            .strip_prefix(&prefix)
+            .map(str::to_owned)
+            .ok_or_else(fail)
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, ExecError> {
@@ -1692,6 +1817,13 @@ impl SqlExecutor {
                 table,
                 using_expr,
             } => {
+                let engine = self
+                    .registry
+                    .get(&table)
+                    .map_err(|_| ExecError::TableNotFound(table.clone()))?;
+                if let Err(msg) = Self::validate_policy_expr(&using_expr, &engine.schema, &table) {
+                    return Ok(sql_error("0A000", &msg));
+                }
                 self.policies
                     .lock()
                     .unwrap()
@@ -3480,6 +3612,9 @@ impl SqlExecutor {
                         parts[0].to_ascii_lowercase(),
                         parts[1].to_ascii_lowercase()
                     );
+                    if let Err(e) = self.require_column_key() {
+                        return Some(Err(e));
+                    }
                     self.encrypted_cols.lock().unwrap().insert(key, hint);
                     return Some(Ok(QueryResult::Created));
                 }
@@ -3487,6 +3622,9 @@ impl SqlExecutor {
         }
         if up.starts_with("INSERT ENCRYPTED INTO ") {
             // INSERT ENCRYPTED INTO table_name col_name KEY 'key' VALUE 'plaintext' PK pk
+            // The value is sealed with AES-256-GCM under the executor's
+            // configured column key; `KEY` names the key id registered for
+            // the column. Stored as hex(magic || nonce || ciphertext+tag).
             let rest = &s["INSERT ENCRYPTED INTO ".len()..];
             let up_rest = rest.to_ascii_uppercase();
             if let (Some(key_pos), Some(val_pos), Some(pk_pos)) = (
@@ -3496,20 +3634,27 @@ impl SqlExecutor {
             ) {
                 let tc = rest[..key_pos].trim();
                 let parts: Vec<&str> = tc.splitn(2, ' ').collect();
+                let key_id = rest[key_pos + " KEY '".len()..]
+                    .split('\'')
+                    .next()
+                    .unwrap_or("");
                 let after_val = &rest[val_pos + " VALUE '".len()..];
                 if let Some(end_val) = after_val.find('\'') {
                     let plaintext = &after_val[..end_val];
                     let after_pk = &rest[pk_pos + "' PK ".len()..];
                     // find pk after the VALUE quote end
                     let pk = after_pk.split_whitespace().last().unwrap_or("0").to_owned();
-                    let encrypted: String = plaintext.chars().rev().collect();
                     if parts.len() == 2 {
-                        let map_key = format!(
-                            "{}.{}.{}",
-                            parts[0].to_ascii_lowercase(),
-                            parts[1].to_ascii_lowercase(),
-                            pk
-                        );
+                        let tbl = parts[0].to_ascii_lowercase();
+                        let col = parts[1].to_ascii_lowercase();
+                        let sealed = self
+                            .check_column_key_id(&tbl, &col, key_id)
+                            .and_then(|key| Self::seal_cell(&key, &tbl, &col, &pk, plaintext));
+                        let encrypted = match sealed {
+                            Ok(v) => v,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        let map_key = format!("{tbl}.{col}.{pk}");
                         self.encrypted_values
                             .lock()
                             .unwrap()
@@ -3529,12 +3674,24 @@ impl SqlExecutor {
                 let up_after = after_from.to_ascii_uppercase();
                 if let Some(key_pos) = up_after.find(" KEY ") {
                     let table_name = after_from[..key_pos].trim().to_ascii_lowercase();
+                    let key_id = after_from[key_pos + " KEY ".len()..]
+                        .trim_start()
+                        .trim_start_matches('\'')
+                        .split('\'')
+                        .next()
+                        .unwrap_or("");
                     let pk = rest[pk_pos + " PK ".len()..].trim().to_owned();
+                    let key = match self.check_column_key_id(&table_name, &col_name, key_id) {
+                        Ok(k) => k,
+                        Err(e) => return Some(Err(e)),
+                    };
                     let map_key = format!("{}.{}.{}", table_name, col_name, pk);
                     let vals = self.encrypted_values.lock().unwrap();
                     if let Some(encrypted) = vals.get(&map_key) {
-                        let decrypted: String = encrypted.chars().rev().collect();
-                        return Some(Ok(QueryResult::Ok(decrypted)));
+                        return Some(
+                            Self::open_cell(&key, &table_name, &col_name, &pk, encrypted)
+                                .map(QueryResult::Ok),
+                        );
                     }
                     return Some(Ok(QueryResult::Ok("NOT FOUND".to_owned())));
                 }
@@ -5801,6 +5958,9 @@ impl SqlExecutor {
             && up.contains(" WITH KEY ")
         {
             // ALTER TABLE t ENCRYPT COLUMN col WITH KEY 'k'
+            if let Err(e) = self.require_column_key() {
+                return Some(Err(e));
+            }
             let parts: Vec<&str> = sql.split_whitespace().collect();
             // [ALTER, TABLE, t, ENCRYPT, COLUMN, col, WITH, KEY, 'k']
             if parts.len() >= 9 {
@@ -12045,32 +12205,139 @@ impl SqlExecutor {
         }
     }
 
-    fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
-        // S83 â€” check client IP (empty allowlist = allow all)
-        // IP check is structural only; actual enforcement is done via check_access_allowed()
-
-        // S81 â€” auth check
-        if let Some(required) = self.table_tokens.lock().unwrap().get(&stmt.table).cloned() {
+    /// S81/S82 — per-table token auth and rate limit. Applied to every read
+    /// and write path (SELECT, INSERT/UPSERT, INSERT ... SELECT, UPDATE,
+    /// DELETE, TRUNCATE, COPY FROM). Returns the error result to send back
+    /// when access is denied.
+    fn check_table_access(&self, table: &str) -> Option<QueryResult> {
+        // S81 — auth check
+        if let Some(required) = self.table_tokens.lock().unwrap().get(table).cloned() {
             let sess = self.session_token.lock().unwrap().clone();
             if sess.as_deref() != Some(&required) {
-                return Ok(sql_error("28000", "auth required"));
+                return Some(sql_error("28000", "auth required"));
             }
         }
 
-        // S82 â€” rate limit check
-        {
-            let mut limits = self.rate_limits.lock().unwrap();
-            if let Some(entry) = limits.get_mut(&stmt.table) {
-                let elapsed = entry.2.elapsed().as_secs_f64();
-                if elapsed > 1.0 {
-                    entry.1 = 0;
-                    entry.2 = std::time::Instant::now();
-                }
-                entry.1 += 1;
-                if entry.1 > entry.0 {
-                    return Ok(sql_error("HY000", "rate limit exceeded"));
-                }
+        // S82 — rate limit check
+        let mut limits = self.rate_limits.lock().unwrap();
+        if let Some(entry) = limits.get_mut(table) {
+            let elapsed = entry.2.elapsed().as_secs_f64();
+            if elapsed > 1.0 {
+                entry.1 = 0;
+                entry.2 = std::time::Instant::now();
             }
+            entry.1 += 1;
+            if entry.1 > entry.0 {
+                return Some(sql_error("HY000", "rate limit exceeded"));
+            }
+        }
+        None
+    }
+
+    /// S78 — apply every RLS policy defined on `table` (policies are
+    /// restrictive: a row must satisfy all of them). Used by SELECT (including
+    /// the right side of joins), UPDATE and DELETE so a statement can never
+    /// read or modify a row the policies hide.
+    fn apply_rls(
+        &self,
+        rows: Vec<EngineRow>,
+        schema: &TableSchema,
+        table: &str,
+    ) -> Result<Vec<EngineRow>, ExecError> {
+        let pol_exprs: Vec<Expr> = self
+            .policies
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|(tbl, _)| tbl == table)
+            .map(|(_, expr)| expr.clone())
+            .collect();
+        let mut rows = rows;
+        for pol_expr in pol_exprs {
+            rows = self.filter_rows(rows, Some(&pol_expr), schema, table)?;
+        }
+        Ok(rows)
+    }
+
+    /// S78 — validate a CREATE POLICY predicate. Only self-contained row
+    /// predicates over existing columns of `table` are accepted; anything the
+    /// row filter cannot evaluate per row (subqueries, placeholders, full-text
+    /// MATCH, unknown columns) is rejected so a stored policy always applies.
+    fn validate_policy_expr(expr: &Expr, schema: &TableSchema, table: &str) -> Result<(), String> {
+        fn col_ok(c: &str, schema: &TableSchema) -> Result<(), String> {
+            schema
+                .find(c)
+                .map(|_| ())
+                .ok_or_else(|| format!("unknown column '{c}' in policy expression"))
+        }
+        fn value(e: &Expr, schema: &TableSchema, table: &str) -> Result<(), String> {
+            match e {
+                Expr::Col(c) => col_ok(c, schema),
+                Expr::QualifiedCol { table: t, col } => {
+                    if t != table {
+                        return Err(format!("policy expression references other table '{t}'"));
+                    }
+                    col_ok(col, schema)
+                }
+                Expr::Lit(_) => Ok(()),
+                Expr::Arith { left, right, .. } => {
+                    value(left, schema, table)?;
+                    value(right, schema, table)
+                }
+                Expr::ScalarFn { arg, .. } => value(arg, schema, table),
+                Expr::Cast { expr, .. } => value(expr, schema, table),
+                Expr::Coalesce { args } | Expr::StrFunc { args, .. } => {
+                    args.iter().try_for_each(|a| value(a, schema, table))
+                }
+                Expr::Case { branches, else_val } => {
+                    for (c, v) in branches {
+                        pred(c, schema, table)?;
+                        value(v, schema, table)?;
+                    }
+                    else_val
+                        .as_deref()
+                        .map_or(Ok(()), |v| value(v, schema, table))
+                }
+                Expr::DateExtract { expr, .. } => value(expr, schema, table),
+                Expr::JsonGet { expr, .. } | Expr::JsonGetText { expr, .. } => {
+                    value(expr, schema, table)
+                }
+                other => Err(format!("unsupported value in policy expression: {other:?}")),
+            }
+        }
+        fn pred(e: &Expr, schema: &TableSchema, table: &str) -> Result<(), String> {
+            match e {
+                Expr::BinOp {
+                    op: BinOp::And | BinOp::Or,
+                    left,
+                    right,
+                } => {
+                    pred(left, schema, table)?;
+                    pred(right, schema, table)
+                }
+                Expr::BinOp { left, right, .. } => {
+                    value(left, schema, table)?;
+                    value(right, schema, table)
+                }
+                Expr::In { col, .. }
+                | Expr::Between { col, .. }
+                | Expr::IsNull { col, .. }
+                | Expr::Like { col, .. } => col_ok(col, schema),
+                other => Err(format!(
+                    "unsupported policy expression (must be a row predicate): {other:?}"
+                )),
+            }
+        }
+        pred(expr, schema, table)
+    }
+
+    fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
+        // S83 — check client IP (empty allowlist = allow all)
+        // IP check is structural only; actual enforcement is done via check_access_allowed()
+
+        // S81/S82 — token auth + rate limit
+        if let Some(denied) = self.check_table_access(&stmt.table) {
+            return Ok(denied);
         }
 
         // S80 â€” virtual table vv_audit_log
@@ -12626,20 +12893,7 @@ impl SqlExecutor {
             self.filter_rows(left_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
 
         // S78 â€” apply RLS policies for this table
-        {
-            let pol_map: Vec<(String, Expr)> = self
-                .policies
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, (tbl, _))| tbl == &stmt.table)
-                .map(|(_, (_, expr))| (stmt.table.clone(), expr.clone()))
-                .collect();
-            for (_, pol_expr) in pol_map {
-                filtered_left =
-                    self.filter_rows(filtered_left, Some(&pol_expr), schema, &stmt.table)?;
-            }
-        }
+        filtered_left = self.apply_rls(filtered_left, schema, &stmt.table)?;
 
         // â”€â”€ JOIN path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if !stmt.joins.is_empty() {
@@ -13452,7 +13706,9 @@ impl SqlExecutor {
                 .iter()
                 .map(|c| c.name.clone())
                 .collect();
-            let right_rows = self.scan_live(&right_engine)?;
+            // S78 — RLS applies to joined tables too
+            let right_rows =
+                self.apply_rls(self.scan_live(&right_engine)?, right_schema, &join.table)?;
             let right_col_count = right_schema.col_count();
 
             // Find join key index in right table
@@ -13579,6 +13835,10 @@ impl SqlExecutor {
     }
 
     fn exec_insert_select(&self, stmt: InsertSelectStmt) -> Result<QueryResult, ExecError> {
+        // S81/S82 — the target table is checked here, the source by exec_select
+        if let Some(denied) = self.check_table_access(&stmt.table) {
+            return Ok(denied);
+        }
         let result = self.exec_select(*stmt.select)?;
         let (src_cols, src_rows) = match result {
             QueryResult::Rows { columns, rows } => (columns, rows),
@@ -13785,6 +14045,10 @@ impl SqlExecutor {
     }
 
     fn exec_truncate(&self, stmt: TruncateStmt) -> Result<QueryResult, ExecError> {
+        // S81/S82 — token auth + rate limit
+        if let Some(denied) = self.check_table_access(&stmt.table) {
+            return Ok(denied);
+        }
         let engine = self
             .registry
             .get(&stmt.table)
@@ -13831,6 +14095,10 @@ impl SqlExecutor {
     fn exec_insert(&self, stmt: InsertStmt) -> Result<QueryResult, ExecError> {
         if *self.read_only.lock().unwrap() {
             return Ok(sql_error("25006", "read-only transaction"));
+        }
+        // S81/S82 — token auth + rate limit apply to writes too
+        if let Some(denied) = self.check_table_access(&stmt.table) {
+            return Ok(denied);
         }
         let engine = self
             .registry
@@ -14089,6 +14357,10 @@ impl SqlExecutor {
         if *self.read_only.lock().unwrap() {
             return Ok(sql_error("25006", "read-only transaction"));
         }
+        // S81/S82 — token auth + rate limit apply to writes too
+        if let Some(denied) = self.check_table_access(&stmt.table) {
+            return Ok(denied);
+        }
         let engine = self
             .registry
             .get(&stmt.table)
@@ -14098,6 +14370,8 @@ impl SqlExecutor {
         let all_rows = self.scan_live(&engine)?;
         let to_update =
             self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
+        // S78 — only rows visible under the table's RLS policies may be updated
+        let to_update = self.apply_rls(to_update, schema, &stmt.table)?;
         let count = to_update.len() as u64;
 
         for row in to_update {
@@ -14139,6 +14413,10 @@ impl SqlExecutor {
         if *self.read_only.lock().unwrap() {
             return Ok(sql_error("25006", "read-only transaction"));
         }
+        // S81/S82 — token auth + rate limit apply to writes too
+        if let Some(denied) = self.check_table_access(&stmt.table) {
+            return Ok(denied);
+        }
         let engine = self
             .registry
             .get(&stmt.table)
@@ -14151,6 +14429,8 @@ impl SqlExecutor {
 
         let to_delete =
             self.filter_rows(all_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
+        // S78 — only rows visible under the table's RLS policies may be deleted
+        let to_delete = self.apply_rls(to_delete, schema, &stmt.table)?;
         let count = to_delete.len() as u64;
 
         if let Some(txn_id) = self.txn_id_for(&stmt.table) {
@@ -15381,6 +15661,10 @@ impl SqlExecutor {
         path: String,
         has_header: bool,
     ) -> Result<QueryResult, ExecError> {
+        // S81/S82 — token auth + rate limit (covers COPY FROM STDIN too)
+        if let Some(denied) = self.check_table_access(&table) {
+            return Ok(denied);
+        }
         // S104 â€” COPY FROM STDIN with inline tab-delimited data
         if let Some(data) = path.strip_prefix("__STDIN__:") {
             return self.exec_copy_from_stdin(table, data.to_owned());
@@ -16000,6 +16284,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
         (SqlExecutor::new(registry), dir)
+    }
+
+    /// `setup()` plus a configured column-encryption key (S142/S189).
+    fn setup_with_key() -> (SqlExecutor, tempfile::TempDir) {
+        let (ex, dir) = setup();
+        ex.set_column_encryption_key(vectorvolt_crypto::KeyStore::generate().unwrap());
+        (ex, dir)
     }
 
     #[test]
@@ -20609,6 +20900,78 @@ mod tests {
         assert_eq!(rows.len(), 1); // only val=50 passes both
     }
 
+    fn row_count(r: QueryResult) -> usize {
+        match r {
+            QueryResult::Rows { rows, .. } => rows.len(),
+            QueryResult::WithNotice { result, .. } => row_count(*result),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_s78_policy_limits_update_and_delete() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (2, 0)").unwrap();
+        ex.execute("CREATE POLICY p1 ON t USING (val > 5)").unwrap();
+        // Hidden row pk=2 must not be updated or deleted.
+        let r = ex.execute("UPDATE t SET val = 7").unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)), "{r:?}");
+        let r = ex.execute("DELETE FROM t WHERE pk = 2").unwrap();
+        assert!(matches!(r, QueryResult::Affected(0)), "{r:?}");
+        ex.execute("DROP POLICY p1 ON t").unwrap();
+        let r = ex.execute("SELECT * FROM t WHERE pk = 2").unwrap();
+        let rows = match r {
+            QueryResult::Rows { rows, .. } => rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], "0"); // untouched by the UPDATE
+    }
+
+    #[test]
+    fn test_s78_policy_applies_to_join_right_side() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE a (pk U64, bid U64)").unwrap();
+        ex.execute("CREATE TABLE b (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO a (pk, bid) VALUES (1, 1)").unwrap();
+        ex.execute("INSERT INTO a (pk, bid) VALUES (2, 2)").unwrap();
+        ex.execute("INSERT INTO b (pk, val) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("INSERT INTO b (pk, val) VALUES (2, 0)").unwrap();
+        let before = row_count(
+            ex.execute("SELECT * FROM a INNER JOIN b ON bid = pk")
+                .unwrap(),
+        );
+        assert_eq!(before, 2);
+        ex.execute("CREATE POLICY pb ON b USING (val > 5)").unwrap();
+        let after = row_count(
+            ex.execute("SELECT * FROM a INNER JOIN b ON bid = pk")
+                .unwrap(),
+        );
+        assert_eq!(after, 1);
+    }
+
+    #[test]
+    fn test_s78_unsupported_policy_expr_rejected() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        for bad in [
+            "CREATE POLICY p1 ON t USING (nosuchcol > 5)",
+            "CREATE POLICY p2 ON t USING (pk IN (SELECT pk FROM t))",
+        ] {
+            let r = ex.execute(bad);
+            assert!(!matches!(r, Ok(QueryResult::Created)), "{bad}: {r:?}");
+        }
+        assert!(ex.policies.lock().unwrap().is_empty());
+        assert!(
+            ex.execute("CREATE POLICY p3 ON missing USING (val > 5)")
+                .is_err()
+        );
+    }
+
     // â”€â”€ S79 â€” Column masking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s79_create_mask() {
@@ -20794,6 +21157,39 @@ mod tests {
     }
 
     #[test]
+    fn test_s81_require_token_blocks_writes() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, val) VALUES (1, 1)").unwrap();
+        ex.execute("CREATE TABLE src (pk U64, val U64)").unwrap();
+        ex.execute("INSERT INTO src (pk, val) VALUES (9, 9)")
+            .unwrap();
+        ex.execute("REQUIRE TOKEN 'secret' ON t").unwrap();
+        for sql in [
+            "INSERT INTO t (pk, val) VALUES (2, 2)",
+            "INSERT INTO t (pk, val) VALUES (1, 5) ON CONFLICT DO UPDATE SET val = 5",
+            "INSERT INTO t SELECT * FROM src",
+            "UPDATE t SET val = 3",
+            "DELETE FROM t",
+        ] {
+            match ex.execute(sql) {
+                Ok(QueryResult::Error(msg)) => assert!(msg.contains("28000"), "{sql}: {msg}"),
+                other => panic!("{sql}: expected auth error, got {other:?}"),
+            }
+        }
+        // Nothing changed.
+        ex.execute("SET SESSION TOKEN 'secret'").unwrap();
+        let r = ex.execute("SELECT * FROM t").unwrap();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows, vec![vec!["1", "1"]]),
+            other => panic!("{other:?}"),
+        }
+        // With the token, writes are allowed.
+        let r = ex.execute("UPDATE t SET val = 3").unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)), "{r:?}");
+    }
+
+    #[test]
     fn test_s81_no_token_required() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
@@ -20834,6 +21230,21 @@ mod tests {
         assert!(matches!(r3, QueryResult::Error(_)));
         if let QueryResult::Error(msg) = r3 {
             assert!(msg.contains("rate limit"));
+        }
+    }
+
+    #[test]
+    fn test_s82_rate_limit_counts_writes() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
+        ex.execute("SET RATE LIMIT ON t TO 2 PER SECOND").unwrap();
+        let r1 = ex.execute("INSERT INTO t (pk, val) VALUES (1, 1)").unwrap();
+        let r2 = ex.execute("UPDATE t SET val = 2").unwrap();
+        assert!(!matches!(r1, QueryResult::Error(_)));
+        assert!(!matches!(r2, QueryResult::Error(_)));
+        match ex.execute("DELETE FROM t").unwrap() {
+            QueryResult::Error(msg) => assert!(msg.contains("rate limit"), "{msg}"),
+            other => panic!("expected rate limit error, got {other:?}"),
         }
     }
 
@@ -21226,6 +21637,43 @@ mod tests {
         let r = ex.execute("SET READ ONLY").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
         assert!(*ex.read_only.lock().unwrap());
+    }
+
+    #[test]
+    fn test_a4_new_session_shares_security_state_not_txn() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
+        ex.execute("INSERT INTO t (pk, v) VALUES (2, 0)").unwrap();
+        let s1 = ex.new_session();
+        let s2 = ex.new_session();
+        s1.execute("CREATE POLICY p ON t USING (v > 5)").unwrap();
+        match s2.execute("SELECT * FROM t").unwrap() {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        // Session tokens and transactions stay per session.
+        s1.execute("REQUIRE TOKEN 'tk' ON t").unwrap();
+        s1.execute("SET SESSION TOKEN 'tk'").unwrap();
+        assert!(!matches!(
+            s1.execute("SELECT * FROM t").unwrap(),
+            QueryResult::Error(_)
+        ));
+        assert!(matches!(
+            s2.execute("SELECT * FROM t").unwrap(),
+            QueryResult::Error(_)
+        ));
+        s1.execute("DROP REQUIRE TOKEN ON t").unwrap();
+        s1.execute("BEGIN").unwrap();
+        assert!(s2.execute("COMMIT").is_err());
+        s1.execute("ROLLBACK").unwrap();
+        s2.execute("SET READ ONLY").unwrap();
+        assert!(matches!(
+            ex.new_session()
+                .execute("INSERT INTO t (pk, v) VALUES (3, 30)")
+                .unwrap(),
+            QueryResult::Error(_)
+        ));
     }
 
     #[test]
@@ -24251,7 +24699,7 @@ mod tests {
     // â”€â”€ S142 â€” Column encryption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s142_create_encrypted_column() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         let r = ex
             .execute("CREATE ENCRYPTED COLUMN users ssn KEY HINT 'master-key-1'")
             .unwrap();
@@ -24260,7 +24708,7 @@ mod tests {
 
     #[test]
     fn test_s142_show_encrypted_columns() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         ex.execute("CREATE ENCRYPTED COLUMN customers card KEY HINT 'k1'")
             .unwrap();
         let r = ex.execute("SHOW ENCRYPTED COLUMNS").unwrap();
@@ -24274,7 +24722,7 @@ mod tests {
 
     #[test]
     fn test_s142_insert_encrypted() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         ex.execute("CREATE ENCRYPTED COLUMN emp salary KEY HINT 'hk'")
             .unwrap();
         let r = ex
@@ -24285,7 +24733,7 @@ mod tests {
 
     #[test]
     fn test_s142_select_decrypt() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         ex.execute("CREATE ENCRYPTED COLUMN emp salary KEY HINT 'hk'")
             .unwrap();
         ex.execute("INSERT ENCRYPTED INTO emp salary KEY 'hk' VALUE 'hello' PK 2")
@@ -24302,7 +24750,7 @@ mod tests {
 
     #[test]
     fn test_s142_decrypt_not_found() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         let r = ex
             .execute("SELECT DECRYPT col FROM tbl KEY 'k' PK 999")
             .unwrap();
@@ -24311,6 +24759,85 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn test_s142_ciphertext_is_aes_gcm_not_plaintext() {
+        let (ex, _dir) = setup_with_key();
+        ex.execute("CREATE ENCRYPTED COLUMN emp salary KEY HINT 'hk'")
+            .unwrap();
+        ex.execute("INSERT ENCRYPTED INTO emp salary KEY 'hk' VALUE 'hello' PK 2")
+            .unwrap();
+        let stored = ex
+            .encrypted_values
+            .lock()
+            .unwrap()
+            .get("emp.salary.2")
+            .cloned()
+            .unwrap();
+        assert_ne!(stored, "hello");
+        assert_ne!(stored, "olleh"); // the old string-reversal "cipher"
+        let blob = hex::decode(&stored).unwrap();
+        // magic(4) + nonce(12) + tag(16) + framed plaintext
+        assert!(blob.len() >= 32 + "emp.salary.2\0hello".len());
+        assert_eq!(&blob[..4], b"VVE1");
+    }
+
+    #[test]
+    fn test_s142_requires_configured_key() {
+        let (ex, _dir) = setup();
+        assert!(
+            ex.execute("CREATE ENCRYPTED COLUMN emp salary KEY HINT 'hk'")
+                .is_err()
+        );
+        let err = ex
+            .execute("INSERT ENCRYPTED INTO emp salary KEY 'hk' VALUE 'x' PK 1")
+            .unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
+        assert!(
+            ex.execute("SELECT DECRYPT salary FROM emp KEY 'hk' PK 1")
+                .is_err()
+        );
+        assert!(
+            ex.execute("ALTER TABLE emp ENCRYPT COLUMN salary WITH KEY 'k'")
+                .is_err()
+        );
+        assert!(ex.encrypted_values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_s142_wrong_key_id_or_key_rejected() {
+        let (ex, _dir) = setup_with_key();
+        ex.execute("CREATE ENCRYPTED COLUMN emp salary KEY HINT 'hk'")
+            .unwrap();
+        ex.execute("INSERT ENCRYPTED INTO emp salary KEY 'hk' VALUE 'hello' PK 2")
+            .unwrap();
+        assert!(
+            ex.execute("SELECT DECRYPT salary FROM emp KEY 'other' PK 2")
+                .is_err()
+        );
+        // A different master key cannot open the stored ciphertext.
+        ex.set_column_encryption_key(vectorvolt_crypto::KeyStore::generate().unwrap());
+        assert!(
+            ex.execute("SELECT DECRYPT salary FROM emp KEY 'hk' PK 2")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_s142_ciphertext_bound_to_cell() {
+        let (ex, _dir) = setup_with_key();
+        ex.execute("INSERT ENCRYPTED INTO emp salary KEY 'hk' VALUE 'a' PK 1")
+            .unwrap();
+        let v1 = ex.encrypted_values.lock().unwrap()["emp.salary.1"].clone();
+        ex.encrypted_values
+            .lock()
+            .unwrap()
+            .insert("emp.salary.2".to_owned(), v1);
+        assert!(
+            ex.execute("SELECT DECRYPT salary FROM emp KEY 'hk' PK 2")
+                .is_err()
+        );
     }
 
     // â”€â”€ S143 â€” Row compression hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -26667,7 +27194,7 @@ mod tests {
     // â”€â”€ S189 â€” Column encryption v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
     fn test_s189_encrypt_column_returns_ok() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         let r = ex
             .execute("ALTER TABLE users ENCRYPT COLUMN ssn WITH KEY 'mykey'")
             .unwrap();
@@ -26675,7 +27202,7 @@ mod tests {
     }
     #[test]
     fn test_s189_decrypt_column_returns_ok() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         ex.execute("ALTER TABLE users ENCRYPT COLUMN ssn WITH KEY 'mykey'")
             .unwrap();
         let r = ex.execute("ALTER TABLE users DECRYPT COLUMN ssn").unwrap();
@@ -26683,7 +27210,7 @@ mod tests {
     }
     #[test]
     fn test_s189_show_encrypted_columns_returns_rows() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         ex.execute("ALTER TABLE users ENCRYPT COLUMN ssn WITH KEY 'mykey'")
             .unwrap();
         let r = ex.execute("SHOW ENCRYPTED COLUMNS").unwrap();
@@ -26691,7 +27218,7 @@ mod tests {
     }
     #[test]
     fn test_s189_encrypted_columns_appear_in_show() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         ex.execute("ALTER TABLE users ENCRYPT COLUMN email WITH KEY 'k2'")
             .unwrap();
         if let QueryResult::Rows { rows, .. } = ex.execute("SHOW ENCRYPTED COLUMNS").unwrap() {
@@ -26702,7 +27229,7 @@ mod tests {
     }
     #[test]
     fn test_s189_decrypt_removes_from_show() {
-        let (ex, _dir) = setup();
+        let (ex, _dir) = setup_with_key();
         ex.execute("ALTER TABLE t1 ENCRYPT COLUMN c1 WITH KEY 'k'")
             .unwrap();
         ex.execute("ALTER TABLE t1 DECRYPT COLUMN c1").unwrap();

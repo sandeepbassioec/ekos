@@ -8,6 +8,7 @@ license.workspace   = true
 repository.workspace = true
 
 [dependencies]
+subtle = { workspace = true }
 vectorvolt-engine  = { workspace = true }
 vectorvolt-query   = { workspace = true }
 axum       = { workspace = true }

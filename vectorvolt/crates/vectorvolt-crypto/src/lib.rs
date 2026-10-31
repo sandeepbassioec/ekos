@@ -16,7 +16,7 @@ pub mod key_store;
 
 pub use dac::{DacReport, ensure_system_user, harden_data_dir};
 pub use encrypted_io::{EncryptedReader, EncryptedWriter};
-pub use encryptor::{decrypt, encrypt};
+pub use encryptor::{decrypt, encrypt, is_encrypted};
 pub use error::{CryptoError, CryptoResult};
 pub use hardening::harden;
 pub use key_store::{KEY_LEN, KeyStore};

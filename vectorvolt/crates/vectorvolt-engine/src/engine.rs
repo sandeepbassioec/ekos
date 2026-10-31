@@ -527,19 +527,46 @@ impl TableEngine {
         // rest of the log: torn tails were already cut back by `WalWriter::open`,
         // so anything still undecodable here is real corruption (PP-02).
         // Payloads that are not mutations (legacy flush strings, snapshot
-        // markers) and frames that do not decrypt are skipped, as before.
+        // markers) are skipped.
+        //
+        // An encrypted frame must decrypt. A wrong key, a tampered frame, or
+        // opening an encrypted table without its key stops the open with
+        // `WalDecrypt` instead of silently dropping the rows (A8 / PP-52).
+        // Plaintext frames (markers, and frames written before encryption was
+        // turned on) are read as they are.
+        // With a key, the log must still match its keyed tail seal: this is
+        // what catches a truncated or rewritten WAL that still chains (PP-38).
+        if let Some(key) = &wal_key {
+            let seal_key = vectorvolt_wal::seal::derive_seal_key(key.as_bytes());
+            vectorvolt_wal::seal::verify_seal(&wal_dir, &seal_key)?;
+        }
         let mut final_state: HashMap<u64, Option<Vec<u64>>> = HashMap::new();
+        let mut decrypt_err: Option<EngineError> = None;
         let wal_cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
         WalReader::open(wal_cfg).scan(vectorvolt_wal::WalCursor::beginning(), |frame| {
             if frame.sequence <= replay_after {
                 return true;
             }
-            let payload = match &wal_key {
-                Some(key) => match vectorvolt_crypto::decrypt(key, &frame.payload) {
+            let payload = if vectorvolt_crypto::is_encrypted(&frame.payload) {
+                let Some(key) = &wal_key else {
+                    decrypt_err = Some(EngineError::WalDecrypt {
+                        seq: frame.sequence,
+                        reason: "frame is encrypted but no key was provided".into(),
+                    });
+                    return false;
+                };
+                match vectorvolt_crypto::decrypt(key, &frame.payload) {
                     Ok(p) => p,
-                    Err(_) => return true,
-                },
-                None => frame.payload,
+                    Err(e) => {
+                        decrypt_err = Some(EngineError::WalDecrypt {
+                            seq: frame.sequence,
+                            reason: e.to_string(),
+                        });
+                        return false;
+                    }
+                }
+            } else {
+                frame.payload
             };
             match Mutation::decode(&payload) {
                 Ok(Mutation::Insert { pk, values })
@@ -573,6 +600,9 @@ impl TableEngine {
             }
             true
         })?;
+        if let Some(e) = decrypt_err {
+            return Err(e);
+        }
 
         for (pk, state) in final_state {
             let current = txn.pk_index.read().get(pk);

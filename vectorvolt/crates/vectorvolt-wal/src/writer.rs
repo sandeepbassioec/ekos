@@ -192,6 +192,11 @@ impl WalWriter {
         self.inner.lock().segment.flush()
     }
 
+    /// Directory this writer's segments live in.
+    pub fn dir(&self) -> std::path::PathBuf {
+        self.inner.lock().config.dir.clone()
+    }
+
     /// Current chain tip (sequence + hash).
     pub fn tip(&self) -> WalTip {
         let g = self.inner.lock();

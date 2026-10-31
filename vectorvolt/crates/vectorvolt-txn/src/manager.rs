@@ -127,6 +127,10 @@ pub struct TxnManager {
     /// `wal_key()` below, which callers use to mirror this same key).
     /// `None` preserves the existing on-disk format exactly (opt-in only).
     wal_key: Option<Arc<vectorvolt_crypto::KeyStore>>,
+    /// MAC key for the WAL tail seal (PP-38), derived from `wal_key`. With it,
+    /// every synced commit records the sealed tip, and the highest sequence
+    /// sealed so far is kept here so concurrent commits never move it back.
+    seal: Option<([u8; 32], Mutex<u64>)>,
     /// `fsync` each partition file (and its directory) before it is published.
     durable_flush: bool,
     /// Held shared by every mutation from its WAL append until its in-memory
@@ -186,6 +190,7 @@ impl TxnManager {
             clock: CommitClock::new(),
             version_index: VersionIndex::new(),
             wal_key: None,
+            seal: None,
             durable_flush: true,
             apply_gate: RwLock::new(()),
         }
@@ -216,8 +221,23 @@ impl TxnManager {
     /// WAL replay before calling `Mutation::decode` — this manager only
     /// handles the write side.
     pub fn with_wal_encryption(mut self, key: Arc<vectorvolt_crypto::KeyStore>) -> Self {
+        let seal_key = vectorvolt_wal::seal::derive_seal_key(key.as_bytes());
+        self.seal = Some((seal_key, Mutex::new(0)));
         self.wal_key = Some(key);
         self
+    }
+
+    /// Record `tip` in the WAL tail seal. Only called for synced frames, so
+    /// the seal never points past what is durable.
+    fn seal_tip(&self, tip: &WalTip) -> TxnResult<()> {
+        if let Some((key, sealed)) = &self.seal {
+            let mut sealed = sealed.lock();
+            if tip.sequence > *sealed {
+                vectorvolt_wal::seal::write_seal(&self.wal.wal().dir(), key, tip)?;
+                *sealed = tip.sequence;
+            }
+        }
+        Ok(())
     }
 
     /// The configured encryption key, if any — exposed so `TableEngine` can
@@ -264,7 +284,9 @@ impl TxnManager {
             None => payload,
         };
         if self.sync_on_commit {
-            Ok(self.wal.append_and_sync(payload)?)
+            let tip = self.wal.append_and_sync(payload)?;
+            self.seal_tip(&tip)?;
+            Ok(tip)
         } else {
             Ok(self.wal.append(payload)?)
         }
@@ -278,7 +300,9 @@ impl TxnManager {
     /// and are written unencrypted so `WalReader::scan_snapshot_markers` can
     /// still find them; replay ignores them because they are not mutations.
     pub fn append_marker(&self, payload: Vec<u8>) -> TxnResult<WalTip> {
-        Ok(self.wal.append_and_sync(payload)?)
+        let tip = self.wal.append_and_sync(payload)?;
+        self.seal_tip(&tip)?;
+        Ok(tip)
     }
 
     /// Group-commit counters: commits, `fsync`s issued, and commits served by

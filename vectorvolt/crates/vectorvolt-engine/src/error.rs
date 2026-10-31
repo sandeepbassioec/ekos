@@ -16,6 +16,9 @@ pub enum EngineError {
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("WAL frame {seq} could not be decrypted: {reason}")]
+    WalDecrypt { seq: u64, reason: String },
+
     #[error("partition ({file_id},{partition_id}) not registered in catalog")]
     PartitionMissing { file_id: u16, partition_id: u16 },
 

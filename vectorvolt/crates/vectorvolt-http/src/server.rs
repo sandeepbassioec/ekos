@@ -122,7 +122,11 @@ async fn auth_middleware(
                 .headers()
                 .get("Authorization")
                 .and_then(|v| v.to_str().ok())
-                .map(|v| v == format!("Bearer {expected}"))
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|presented| {
+                    use subtle::ConstantTimeEq;
+                    bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
+                })
                 .unwrap_or(false);
             if !ok {
                 return (

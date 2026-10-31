@@ -205,3 +205,21 @@ fn create_table_on_reopened_registry() {
     names.sort();
     assert_eq!(names, vec!["first", "second"]);
 }
+
+/// If schema.txt cannot be removed, drop_table fails and the table stays
+/// registered, instead of dropping it in memory and resurrecting it on restart.
+#[test]
+fn drop_table_failure_keeps_table_registered() {
+    let tmp = TempDir::new().unwrap();
+    let reg = TableRegistry::new(tmp.path(), opts());
+    reg.create_table("users", schema(&["id"])).unwrap();
+
+    // Replace schema.txt with a non-empty directory so remove_file fails.
+    let schema_path = tmp.path().join("users").join(SCHEMA_FILE);
+    std::fs::remove_file(&schema_path).unwrap();
+    std::fs::create_dir(&schema_path).unwrap();
+    std::fs::write(schema_path.join("blocker"), b"x").unwrap();
+
+    assert!(reg.drop_table("users").is_err());
+    assert!(reg.get("users").is_ok(), "table must stay registered");
+}

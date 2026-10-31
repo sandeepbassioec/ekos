@@ -11,8 +11,11 @@
 //!   success: `{"ok":true,"type":"ok"}\n`
 //!   error:   `{"ok":false,"error":"..."}\n`
 //!
-//! Each TCP connection gets its own [`SqlExecutor`], so transactions are
-//! per-connection — BEGIN on one connection is invisible to another.
+//! Each TCP connection gets its own session executor (via
+//! [`SqlExecutor::new_session`]), so transactions are per-connection — BEGIN
+//! on one connection is invisible to another. Server-wide security state
+//! (RLS policies, table tokens, read-only mode, masks, grants, views, ...)
+//! is shared by all connections, so it cannot be reset by reconnecting.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -28,17 +31,29 @@ use crate::sql::executor::{QueryResult, SqlExecutor};
 
 /// A multi-threaded SQL-over-TCP server (plain and TLS).
 ///
-/// Each accepted connection runs on its own OS thread with a dedicated
-/// [`SqlExecutor`] (no shared per-connection state).  The underlying
-/// [`TableRegistry`] *is* shared across connections — it is already
-/// `Arc`-wrapped and internally synchronised.
+/// Each accepted connection runs on its own OS thread with a session
+/// executor derived from one shared root [`SqlExecutor`]: per-connection
+/// transaction state, shared security/catalog state. The underlying
+/// [`TableRegistry`] is shared too — it is already `Arc`-wrapped and
+/// internally synchronised.
 pub struct SqlTcpServer {
-    registry: Arc<TableRegistry>,
+    executor: Arc<SqlExecutor>,
 }
 
 impl SqlTcpServer {
     pub fn new(registry: Arc<TableRegistry>) -> Self {
-        Self { registry }
+        Self::with_executor(Arc::new(SqlExecutor::new(registry)))
+    }
+
+    /// Serve connections from sessions of an existing executor, sharing its
+    /// security state (e.g. one configured with a column-encryption key).
+    pub fn with_executor(executor: Arc<SqlExecutor>) -> Self {
+        Self { executor }
+    }
+
+    /// The shared root executor whose state every connection sees.
+    pub fn executor(&self) -> &Arc<SqlExecutor> {
+        &self.executor
     }
 
     /// Bind to `addr` and start accepting plain-TCP connections.
@@ -47,14 +62,14 @@ impl SqlTcpServer {
     /// (useful for ephemeral-port tests).
     pub fn listen<A: ToSocketAddrs>(&self, addr: A) -> std::io::Result<TcpListener> {
         let listener = TcpListener::bind(addr)?;
-        let registry = Arc::clone(&self.registry);
+        let root = Arc::clone(&self.executor);
         let listener_clone = listener.try_clone()?;
         thread::spawn(move || {
             for stream in listener_clone.incoming() {
                 match stream {
                     Ok(s) => {
-                        let reg = Arc::clone(&registry);
-                        thread::spawn(move || handle_plain(s, reg));
+                        let root = Arc::clone(&root);
+                        thread::spawn(move || handle_plain(s, root));
                     }
                     Err(_) => break,
                 }
@@ -70,15 +85,15 @@ impl SqlTcpServer {
         tls_config: Arc<rustls::ServerConfig>,
     ) -> std::io::Result<TcpListener> {
         let listener = TcpListener::bind(addr)?;
-        let registry = Arc::clone(&self.registry);
+        let root = Arc::clone(&self.executor);
         let listener_clone = listener.try_clone()?;
         thread::spawn(move || {
             for stream in listener_clone.incoming() {
                 match stream {
                     Ok(s) => {
-                        let reg = Arc::clone(&registry);
+                        let root = Arc::clone(&root);
                         let cfg = Arc::clone(&tls_config);
-                        thread::spawn(move || handle_tls(s, reg, cfg));
+                        thread::spawn(move || handle_tls(s, root, cfg));
                     }
                     Err(_) => break,
                 }
@@ -90,8 +105,8 @@ impl SqlTcpServer {
 
 // ── Connection handlers ───────────────────────────────────────────────────────
 
-fn handle_plain(stream: TcpStream, registry: Arc<TableRegistry>) {
-    let executor = SqlExecutor::new(registry);
+fn handle_plain(stream: TcpStream, root: Arc<SqlExecutor>) {
+    let executor = root.new_session();
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
@@ -113,16 +128,12 @@ fn handle_plain(stream: TcpStream, registry: Arc<TableRegistry>) {
     }
 }
 
-fn handle_tls(
-    stream: TcpStream,
-    registry: Arc<TableRegistry>,
-    tls_config: Arc<rustls::ServerConfig>,
-) {
+fn handle_tls(stream: TcpStream, root: Arc<SqlExecutor>, tls_config: Arc<rustls::ServerConfig>) {
     let conn = match rustls::ServerConnection::new(tls_config) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let executor = SqlExecutor::new(registry);
+    let executor = root.new_session();
     let tls_stream = rustls::StreamOwned::new(conn, stream);
     let mut reader = BufReader::new(tls_stream);
     loop {
@@ -315,6 +326,39 @@ mod tests {
         s1.query("COMMIT").unwrap();
         let r2_after = s2.query("SELECT pk FROM shared WHERE pk = 7").unwrap();
         assert_eq!(r2_after["rows"].as_array().unwrap().len(), 1);
+    }
+
+    // A4 — security state is server-wide: a restriction set on one
+    // connection still applies to other (and later) connections.
+    #[test]
+    fn test_a4_read_only_survives_reconnect() {
+        let (_srv, listener, _dir) = start_server();
+        let mut s1 = session(&listener);
+        s1.query("CREATE TABLE ro (pk U64, v U64)").unwrap();
+        s1.query("SET READ ONLY").unwrap();
+        drop(s1);
+        let mut s2 = session(&listener);
+        let r = s2.query("INSERT INTO ro (pk, v) VALUES (1, 1)").unwrap();
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].as_str().unwrap().contains("25006"));
+    }
+
+    #[test]
+    fn test_a4_policy_applies_to_other_connections() {
+        let (_srv, listener, _dir) = start_server();
+        let mut s1 = session(&listener);
+        s1.query("CREATE TABLE rls (pk U64, v U64)").unwrap();
+        s1.query("INSERT INTO rls (pk, v) VALUES (1, 10)").unwrap();
+        s1.query("INSERT INTO rls (pk, v) VALUES (2, 0)").unwrap();
+        s1.query("CREATE POLICY p ON rls USING (v > 5)").unwrap();
+        let mut s2 = session(&listener);
+        let r = s2.query("SELECT * FROM rls").unwrap();
+        assert_eq!(r["rows"].as_array().unwrap().len(), 1, "{r}");
+        let mut s3 = session(&listener);
+        let r = s3.query("REQUIRE TOKEN 'tk' ON rls").unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        let r = s2.query("SELECT * FROM rls").unwrap();
+        assert_eq!(r["ok"], false, "{r}");
     }
 
     // ── TLS helpers (S36) ─────────────────────────────────────────────────────
