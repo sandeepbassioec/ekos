@@ -24,6 +24,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use vectorvolt_engine::TableRegistry;
 
+/// One table's share of a commit: `(pk, Some(values))` puts, `(pk, None)` deletes.
+type BatchOps = Vec<(u64, Option<Vec<u64>>)>;
+
 /// One buffered operation inside a multi-table transaction.
 #[derive(Debug, Clone)]
 pub struct MultiTxnOp {
@@ -96,7 +99,7 @@ impl MultiTxnRegistry {
 
         // Group by table, keeping staging order (a later op on the same pk wins
         // because a batch is applied in order).
-        let mut per_table: Vec<(String, Vec<(u64, Option<Vec<u64>>)>)> = Vec::new();
+        let mut per_table: Vec<(String, BatchOps)> = Vec::new();
         for op in ops {
             match per_table.iter_mut().find(|(t, _)| *t == op.table) {
                 Some((_, v)) => v.push((op.pk, op.values)),

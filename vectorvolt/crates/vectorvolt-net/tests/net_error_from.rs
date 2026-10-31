@@ -60,7 +60,7 @@ fn net_error_display_nonempty() {
 }
 #[test]
 fn io_error_message_preserved() {
-    let e = NetError::from(std::io::Error::new(std::io::ErrorKind::Other, "custom"));
+    let e = NetError::from(std::io::Error::other("custom"));
     assert!(format!("{e}").contains("I/O"));
 }
 #[test]

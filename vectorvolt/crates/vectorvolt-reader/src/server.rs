@@ -138,9 +138,9 @@ impl PgServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{FrontendMsg, decode_frontend, encode_param_status, encode_ready_for_query};
+
     use bytes::BufMut;
-    use std::path::PathBuf;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn connect_and_startup(addr: SocketAddr) -> tokio::net::TcpStream {
@@ -150,32 +150,10 @@ mod tests {
         let len = 4 + 4 + params.len();
         let mut buf = bytes::BytesMut::new();
         buf.put_i32(len as i32);
-        buf.put_i32((3 << 16) | 0i32); // version 3.0
+        buf.put_i32(3 << 16); // version 3.0
         buf.put(params.as_ref());
         stream.write_all(&buf).await.unwrap();
         stream
-    }
-
-    async fn read_until_ready(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
-        let mut all = Vec::new();
-        let mut tmp = [0u8; 4096];
-        loop {
-            let n = stream.read(&mut tmp).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            all.extend_from_slice(&tmp[..n]);
-            // Check if we have a ReadyForQuery ('Z') at the end
-            if all.last().copied() == Some(b'I') && all.len() >= 6 {
-                if let Some(pos) = all.windows(1).rposition(|w| w == [b'Z']) {
-                    if pos + 5 < all.len() || (all.len() > 4 && all[all.len() - 6] == b'Z') {
-                        break;
-                    }
-                }
-            }
-            break; // read once is enough for simple tests
-        }
-        all
     }
 
     fn make_query_msg(sql: &str) -> Vec<u8> {

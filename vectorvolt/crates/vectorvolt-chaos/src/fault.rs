@@ -70,7 +70,9 @@ impl FaultInjector {
     pub fn should_delay(&self) -> Option<Duration> {
         let ops = self.op_counter.load(Ordering::Relaxed);
         for (fault, active) in &self.faults {
-            if active.load(Ordering::Relaxed) && let Fault::Delay { min_ms, max_ms } = fault {
+            if active.load(Ordering::Relaxed)
+                && let Fault::Delay { min_ms, max_ms } = fault
+            {
                 let range = max_ms - min_ms + 1;
                 let ms = min_ms + lcg(self.rng_seed, ops) % range;
                 return Some(Duration::from_millis(ms));
@@ -83,7 +85,9 @@ impl FaultInjector {
     pub fn should_drop(&self) -> bool {
         let ops = self.op_counter.load(Ordering::Relaxed);
         for (fault, active) in &self.faults {
-            if active.load(Ordering::Relaxed) && let Fault::PacketLoss { probability } = fault {
+            if active.load(Ordering::Relaxed)
+                && let Fault::PacketLoss { probability } = fault
+            {
                 let r = lcg_f64(self.rng_seed.wrapping_add(1), ops);
                 return r < *probability;
             }
@@ -95,7 +99,9 @@ impl FaultInjector {
     pub fn should_corrupt(&self) -> bool {
         let ops = self.op_counter.load(Ordering::Relaxed);
         for (fault, active) in &self.faults {
-            if active.load(Ordering::Relaxed) && let Fault::Corrupt { probability } = fault {
+            if active.load(Ordering::Relaxed)
+                && let Fault::Corrupt { probability } = fault
+            {
                 let r = lcg_f64(self.rng_seed.wrapping_add(2), ops);
                 return r < *probability;
             }
@@ -154,7 +160,10 @@ mod tests {
     #[test]
     fn add_delay_fault() {
         let mut inj = FaultInjector::new(1);
-        inj.add_fault(Fault::Delay { min_ms: 1, max_ms: 10 });
+        inj.add_fault(Fault::Delay {
+            min_ms: 1,
+            max_ms: 10,
+        });
         let d = inj.should_delay().expect("expected Some(delay)");
         assert!(d.as_millis() >= 1 && d.as_millis() <= 10);
     }
@@ -162,7 +171,10 @@ mod tests {
     #[test]
     fn should_delay_returns_duration() {
         let mut inj = FaultInjector::new(7);
-        inj.add_fault(Fault::Delay { min_ms: 5, max_ms: 5 });
+        inj.add_fault(Fault::Delay {
+            min_ms: 5,
+            max_ms: 5,
+        });
         let d = inj.should_delay().unwrap();
         assert_eq!(d, Duration::from_millis(5));
     }

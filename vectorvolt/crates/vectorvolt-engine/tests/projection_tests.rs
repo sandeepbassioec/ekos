@@ -12,7 +12,7 @@ struct LastValueReducer {
 }
 
 impl LastValueReducer {
-    fn new(name: &str) -> Box<dyn Reducer> {
+    fn boxed(name: &str) -> Box<dyn Reducer> {
         Box::new(Self {
             name: name.to_string(),
             rows: HashMap::new(),
@@ -64,7 +64,7 @@ fn no_projections_by_default() {
 fn attach_projection_registers() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(LastValueReducer::new("lv"));
+    eng.attach_projection(LastValueReducer::boxed("lv"));
     assert_eq!(eng.projection_count(), 1);
 }
 
@@ -72,7 +72,7 @@ fn attach_projection_registers() {
 fn detach_projection_removes() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(LastValueReducer::new("lv"));
+    eng.attach_projection(LastValueReducer::boxed("lv"));
     assert!(eng.detach_projection("lv"));
     assert_eq!(eng.projection_count(), 0);
 }
@@ -88,7 +88,7 @@ fn detach_missing_returns_false() {
 fn insert_fans_to_projection() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(LastValueReducer::new("lv"));
+    eng.attach_projection(LastValueReducer::boxed("lv"));
     eng.insert(1, vec![1, 42]).unwrap();
     let snap = eng.query_projection("lv").unwrap();
     assert_eq!(snap.len(), 1);
@@ -99,7 +99,7 @@ fn insert_fans_to_projection() {
 fn delete_fans_to_projection() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(LastValueReducer::new("lv"));
+    eng.attach_projection(LastValueReducer::boxed("lv"));
     eng.insert(1, vec![1, 10]).unwrap();
     eng.delete(1).unwrap();
     let snap = eng.query_projection("lv").unwrap();
@@ -117,8 +117,8 @@ fn query_projection_unknown_name_is_none() {
 fn multiple_projections_all_receive_mutations() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(LastValueReducer::new("p1"));
-    eng.attach_projection(LastValueReducer::new("p2"));
+    eng.attach_projection(LastValueReducer::boxed("p1"));
+    eng.attach_projection(LastValueReducer::boxed("p2"));
     eng.insert(7, vec![7, 77]).unwrap();
     assert_eq!(eng.query_projection("p1").unwrap().len(), 1);
     assert_eq!(eng.query_projection("p2").unwrap().len(), 1);
@@ -128,8 +128,8 @@ fn multiple_projections_all_receive_mutations() {
 fn projection_names_sorted() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(LastValueReducer::new("z"));
-    eng.attach_projection(LastValueReducer::new("a"));
+    eng.attach_projection(LastValueReducer::boxed("z"));
+    eng.attach_projection(LastValueReducer::boxed("a"));
     let names = eng.projection_names();
     assert_eq!(names, vec!["a", "z"]);
 }
@@ -138,7 +138,7 @@ fn projection_names_sorted() {
 fn multiple_inserts_all_visible() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(LastValueReducer::new("lv"));
+    eng.attach_projection(LastValueReducer::boxed("lv"));
     for i in 0..5u64 {
         eng.insert(i, vec![i, i * 2]).unwrap();
     }
@@ -150,7 +150,7 @@ fn multiple_inserts_all_visible() {
 fn projection_survives_flush() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(LastValueReducer::new("lv"));
+    eng.attach_projection(LastValueReducer::boxed("lv"));
     for i in 0..3u64 {
         eng.insert(i, vec![i, i]).unwrap();
     }
@@ -164,10 +164,10 @@ fn projection_survives_flush() {
 fn detach_then_insert_not_seen() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(LastValueReducer::new("lv"));
+    eng.attach_projection(LastValueReducer::boxed("lv"));
     eng.insert(1, vec![1, 1]).unwrap();
     eng.detach_projection("lv");
-    eng.attach_projection(LastValueReducer::new("lv"));
+    eng.attach_projection(LastValueReducer::boxed("lv"));
     // after re-attach: fresh reducer, previous insert not visible
     let snap = eng.query_projection("lv").unwrap();
     assert!(snap.is_empty());
@@ -178,7 +178,7 @@ fn insert_before_attach_not_seen() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
     eng.insert(1, vec![1, 1]).unwrap();
-    eng.attach_projection(LastValueReducer::new("lv"));
+    eng.attach_projection(LastValueReducer::boxed("lv"));
     let snap = eng.query_projection("lv").unwrap();
     assert!(
         snap.is_empty(),

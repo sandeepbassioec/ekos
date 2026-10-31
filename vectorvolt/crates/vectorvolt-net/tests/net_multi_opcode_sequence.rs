@@ -4,7 +4,7 @@ use vectorvolt_net::protocol::{OpCode, Request};
 
 #[test]
 fn ping_then_get_opcodes() {
-    let ops = vec![Request::Ping, Request::Get { pk: 1 }];
+    let ops = [Request::Ping, Request::Get { pk: 1 }];
     let codes: Vec<OpCode> = ops.iter().map(|r| r.opcode()).collect();
     assert_eq!(codes[0], OpCode::Ping);
     assert_eq!(codes[1], OpCode::Get);

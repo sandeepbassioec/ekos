@@ -60,9 +60,10 @@ mod inner {
             // SAFETY: The SQE references `data` which is live for the duration
             // of this function call; we submit and wait synchronously before returning.
             unsafe {
-                self.ring.submission().push(&write_e).map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "io_uring SQ full")
-                })?;
+                self.ring
+                    .submission()
+                    .push(&write_e)
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
             }
             self.ring.submit_and_wait(1)?;
 
@@ -86,9 +87,10 @@ mod inner {
             let sync_e = opcode::Fsync::new(fd).build().user_data(0x2);
             // SAFETY: SQE has no data pointer; safe to submit.
             unsafe {
-                self.ring.submission().push(&sync_e).map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "io_uring SQ full")
-                })?;
+                self.ring
+                    .submission()
+                    .push(&sync_e)
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
             }
             self.ring.submit_and_wait(1)?;
             let cqe = self
@@ -97,7 +99,11 @@ mod inner {
                 .next()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring: no CQE"))?;
             let result = cqe.result();
-            if result < 0 { Err(io::Error::from_raw_os_error(-result)) } else { Ok(()) }
+            if result < 0 {
+                Err(io::Error::from_raw_os_error(-result))
+            } else {
+                Ok(())
+            }
         }
 
         /// Current write position.
@@ -132,7 +138,10 @@ mod inner {
                 .create(true)
                 .truncate(true)
                 .open(path)?;
-            Ok(Self { writer: BufWriter::new(file), pos: 0 })
+            Ok(Self {
+                writer: BufWriter::new(file),
+                pos: 0,
+            })
         }
 
         pub fn append(&mut self, data: &[u8]) -> io::Result<u64> {
@@ -241,7 +250,10 @@ mod tests {
         w.fsync().expect("fsync");
         w.close().expect("close");
         let mut buf = Vec::new();
-        std::fs::File::open(&p).unwrap().read_to_end(&mut buf).unwrap();
+        std::fs::File::open(&p)
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
         assert_eq!(&buf, b"vectorvolt");
         let _ = std::fs::remove_file(&p);
     }
@@ -313,7 +325,10 @@ mod tests {
         w.fsync().expect("fsync");
         w.close().expect("close");
         let mut read = Vec::new();
-        std::fs::File::open(&p).unwrap().read_to_end(&mut read).unwrap();
+        std::fs::File::open(&p)
+            .unwrap()
+            .read_to_end(&mut read)
+            .unwrap();
         assert_eq!(read, payload);
         let _ = std::fs::remove_file(&p);
     }

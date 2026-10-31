@@ -28,7 +28,11 @@ impl WorkflowEngine {
             std::collections::HashMap::new()
         };
         let next_id = store.keys().copied().max().unwrap_or(0) + 1;
-        Ok(Self { path, store: Arc::new(RwLock::new(store)), next_id: AtomicU64::new(next_id) })
+        Ok(Self {
+            path,
+            store: Arc::new(RwLock::new(store)),
+            next_id: AtomicU64::new(next_id),
+        })
     }
 
     fn persist(&self) -> WorkflowResult<()> {
@@ -51,7 +55,12 @@ impl WorkflowEngine {
                 depends_on: deps,
             })
             .collect();
-        let wf = Workflow { id, name: name.to_string(), steps: wf_steps, state: WorkflowState::Created };
+        let wf = Workflow {
+            id,
+            name: name.to_string(),
+            steps: wf_steps,
+            state: WorkflowState::Created,
+        };
         self.store.write().insert(id, wf);
         self.persist()?;
         Ok(id)
@@ -73,8 +82,14 @@ impl WorkflowEngine {
     /// If all steps are completed, the workflow transitions to `Completed`.
     pub fn complete_step(&self, workflow_id: u64, step_id: u64) -> WorkflowResult<()> {
         let mut store = self.store.write();
-        let wf = store.get_mut(&workflow_id).ok_or(WorkflowError::NotFound(workflow_id))?;
-        let step = wf.steps.iter_mut().find(|s| s.id == step_id).ok_or(WorkflowError::StepNotFound(step_id))?;
+        let wf = store
+            .get_mut(&workflow_id)
+            .ok_or(WorkflowError::NotFound(workflow_id))?;
+        let step = wf
+            .steps
+            .iter_mut()
+            .find(|s| s.id == step_id)
+            .ok_or(WorkflowError::StepNotFound(step_id))?;
         step.state = StepState::Completed;
         let all_done = wf.steps.iter().all(|s| s.state == StepState::Completed);
         if all_done {
@@ -87,8 +102,14 @@ impl WorkflowEngine {
     /// Mark step `step_id` as `Failed`.  The workflow also transitions to `Failed`.
     pub fn fail_step(&self, workflow_id: u64, step_id: u64, reason: &str) -> WorkflowResult<()> {
         let mut store = self.store.write();
-        let wf = store.get_mut(&workflow_id).ok_or(WorkflowError::NotFound(workflow_id))?;
-        let step = wf.steps.iter_mut().find(|s| s.id == step_id).ok_or(WorkflowError::StepNotFound(step_id))?;
+        let wf = store
+            .get_mut(&workflow_id)
+            .ok_or(WorkflowError::NotFound(workflow_id))?;
+        let step = wf
+            .steps
+            .iter_mut()
+            .find(|s| s.id == step_id)
+            .ok_or(WorkflowError::StepNotFound(step_id))?;
         step.state = StepState::Failed(reason.to_string());
         wf.state = WorkflowState::Failed;
         drop(store);
@@ -104,13 +125,18 @@ impl WorkflowEngine {
     pub fn ready_steps(&self, id: u64) -> WorkflowResult<Vec<u64>> {
         let store = self.store.read();
         let wf = store.get(&id).ok_or(WorkflowError::NotFound(id))?;
-        let completed: std::collections::HashSet<u64> =
-            wf.steps.iter().filter(|s| s.state == StepState::Completed).map(|s| s.id).collect();
+        let completed: std::collections::HashSet<u64> = wf
+            .steps
+            .iter()
+            .filter(|s| s.state == StepState::Completed)
+            .map(|s| s.id)
+            .collect();
         let ready = wf
             .steps
             .iter()
             .filter(|s| {
-                s.state == StepState::Pending && s.depends_on.iter().all(|dep| completed.contains(dep))
+                s.state == StepState::Pending
+                    && s.depends_on.iter().all(|dep| completed.contains(dep))
             })
             .map(|s| s.id)
             .collect();

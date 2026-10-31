@@ -15,6 +15,7 @@ use vectorvolt_engine::TableEngine;
 use crate::TxnState;
 
 // Generated protobuf + tonic stubs.
+#[allow(clippy::result_large_err)]
 pub mod proto {
     tonic::include_proto!("vectorvolt");
 }

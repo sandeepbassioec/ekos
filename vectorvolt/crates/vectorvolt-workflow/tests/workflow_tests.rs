@@ -11,7 +11,9 @@ fn setup() -> (WorkflowEngine, TempDir) {
 #[test]
 fn create_workflow() {
     let (engine, _dir) = setup();
-    let id = engine.create("test", vec![("step1".into(), vec![])]).unwrap();
+    let id = engine
+        .create("test", vec![("step1".into(), vec![])])
+        .unwrap();
     assert!(id >= 1);
 }
 
@@ -118,12 +120,15 @@ fn diamond_dag_step3_ready_after_step2() {
     //          -> s2 -> s3
     // Actually simpler diamond: s0 -> s1, s0 -> s2, {s1,s2} -> s3
     let id = engine
-        .create("diamond", vec![
-            ("s0".into(), vec![]),
-            ("s1".into(), vec![0]),
-            ("s2".into(), vec![0]),
-            ("s3".into(), vec![1, 2]),
-        ])
+        .create(
+            "diamond",
+            vec![
+                ("s0".into(), vec![]),
+                ("s1".into(), vec![0]),
+                ("s2".into(), vec![0]),
+                ("s3".into(), vec![1, 2]),
+            ],
+        )
         .unwrap();
     engine.start(id).unwrap();
     engine.complete_step(id, 0).unwrap();

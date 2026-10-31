@@ -1079,7 +1079,10 @@ mod linux_hugepage_tests {
     fn linux_hugepage_graceful_fallback() {
         // HugePageBuf always falls back to regular mmap on failure — never panics
         let result = HugePageBuf::alloc(4096);
-        assert!(result.is_ok(), "must succeed via regular fallback: {result:?}");
+        assert!(
+            result.is_ok(),
+            "must succeed via regular fallback: {result:?}"
+        );
     }
 
     // 13 — buf is Send+Sync (compile-time assertion)

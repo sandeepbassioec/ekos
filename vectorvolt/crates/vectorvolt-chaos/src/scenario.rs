@@ -27,7 +27,9 @@ pub struct ChaosSchedule {
 impl ChaosSchedule {
     /// Create an empty schedule.
     pub fn new() -> Self {
-        Self { scenarios: Vec::new() }
+        Self {
+            scenarios: Vec::new(),
+        }
     }
 
     /// Append a scenario that fires when the operation counter reaches `op`.
@@ -38,7 +40,10 @@ impl ChaosSchedule {
 
     /// Return the first scenario scheduled at exactly `op`, if any.
     pub fn scenario_at(&self, op: u64) -> Option<&Scenario> {
-        self.scenarios.iter().find(|(o, _)| *o == op).map(|(_, s)| s)
+        self.scenarios
+            .iter()
+            .find(|(o, _)| *o == op)
+            .map(|(_, s)| s)
     }
 }
 
@@ -76,7 +81,13 @@ mod tests {
         let sched = ChaosSchedule::new()
             .at(1, Scenario::LeaderCrash)
             .at(5, Scenario::DiskFull { node_id: 2 })
-            .at(10, Scenario::ClockSkew { node_id: 1, skew_ms: -50 });
+            .at(
+                10,
+                Scenario::ClockSkew {
+                    node_id: 1,
+                    skew_ms: -50,
+                },
+            );
         assert!(sched.scenario_at(1).is_some());
         assert!(sched.scenario_at(5).is_some());
         assert!(sched.scenario_at(10).is_some());

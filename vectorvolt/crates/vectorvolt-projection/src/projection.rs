@@ -79,7 +79,7 @@ mod tests {
     }
 
     impl LastValueReducer {
-        fn new(name: &str) -> Box<dyn Reducer> {
+        fn boxed(name: &str) -> Box<dyn Reducer> {
             Box::new(Self {
                 name: name.to_string(),
                 rows: HashMap::new(),
@@ -120,14 +120,14 @@ mod tests {
     #[test]
     fn attach_adds_reducer() {
         let mut store = ProjectionStore::new();
-        store.attach(LastValueReducer::new("test"));
+        store.attach(LastValueReducer::boxed("test"));
         assert_eq!(store.len(), 1);
     }
 
     #[test]
     fn detach_removes_reducer() {
         let mut store = ProjectionStore::new();
-        store.attach(LastValueReducer::new("test"));
+        store.attach(LastValueReducer::boxed("test"));
         assert!(store.detach("test"));
         assert!(store.is_empty());
     }
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn fan_out_insert_visible_in_snapshot() {
         let mut store = ProjectionStore::new();
-        store.attach(LastValueReducer::new("r"));
+        store.attach(LastValueReducer::boxed("r"));
         store.fan_out(&Mutation::Insert {
             pk: 1,
             values: vec![10, 20],
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn fan_out_delete_removes_from_snapshot() {
         let mut store = ProjectionStore::new();
-        store.attach(LastValueReducer::new("r"));
+        store.attach(LastValueReducer::boxed("r"));
         store.fan_out(&Mutation::Insert {
             pk: 1,
             values: vec![10],
@@ -173,8 +173,8 @@ mod tests {
     #[test]
     fn projection_names_sorted() {
         let mut store = ProjectionStore::new();
-        store.attach(LastValueReducer::new("z"));
-        store.attach(LastValueReducer::new("a"));
+        store.attach(LastValueReducer::boxed("z"));
+        store.attach(LastValueReducer::boxed("a"));
         let names = store.projection_names();
         assert_eq!(names, vec!["a", "z"]);
     }
@@ -182,8 +182,8 @@ mod tests {
     #[test]
     fn fan_out_to_multiple_reducers() {
         let mut store = ProjectionStore::new();
-        store.attach(LastValueReducer::new("r1"));
-        store.attach(LastValueReducer::new("r2"));
+        store.attach(LastValueReducer::boxed("r1"));
+        store.attach(LastValueReducer::boxed("r2"));
         store.fan_out(&Mutation::Insert {
             pk: 5,
             values: vec![99],
@@ -195,12 +195,12 @@ mod tests {
     #[test]
     fn attach_replaces_existing() {
         let mut store = ProjectionStore::new();
-        store.attach(LastValueReducer::new("r"));
+        store.attach(LastValueReducer::boxed("r"));
         store.fan_out(&Mutation::Insert {
             pk: 1,
             values: vec![1],
         });
-        store.attach(LastValueReducer::new("r")); // fresh reducer
+        store.attach(LastValueReducer::boxed("r")); // fresh reducer
         let snap = store.query("r").unwrap();
         assert!(snap.is_empty(), "replaced reducer should start fresh");
     }
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn upsert_updates_existing() {
         let mut store = ProjectionStore::new();
-        store.attach(LastValueReducer::new("r"));
+        store.attach(LastValueReducer::boxed("r"));
         store.fan_out(&Mutation::Insert {
             pk: 1,
             values: vec![10],
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn multiple_inserts_separate_rows() {
         let mut store = ProjectionStore::new();
-        store.attach(LastValueReducer::new("r"));
+        store.attach(LastValueReducer::boxed("r"));
         for i in 0..5u64 {
             store.fan_out(&Mutation::Insert {
                 pk: i,

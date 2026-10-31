@@ -245,10 +245,11 @@ fn normalize_sql(sql: &str) -> String {
 
 fn parse_single_quoted(s: &str) -> Option<String> {
     let s = s.trim();
-    if s.starts_with('\'') && s.len() >= 2 {
-        if let Some(end) = s[1..].find('\'') {
-            return Some(s[1..end + 1].to_owned());
-        }
+    if s.starts_with('\'')
+        && s.len() >= 2
+        && let Some(end) = s[1..].find('\'')
+    {
+        return Some(s[1..end + 1].to_owned());
     }
     None
 }
@@ -298,15 +299,15 @@ fn parse_edge(s: &str) -> Option<(String, String, String)> {
 }
 
 fn parse_match_rel_type(sql: &str) -> Option<String> {
-    if let Some(bracket_start) = sql.find('[') {
-        if let Some(bracket_end) = sql[bracket_start..].find(']') {
-            let inner = &sql[bracket_start + 1..bracket_start + bracket_end];
-            if let Some(colon) = inner.find(':') {
-                return Some(inner[colon + 1..].trim().to_owned());
-            }
-            // bare [r] â€” wildcard
-            return None;
+    if let Some(bracket_start) = sql.find('[')
+        && let Some(bracket_end) = sql[bracket_start..].find(']')
+    {
+        let inner = &sql[bracket_start + 1..bracket_start + bracket_end];
+        if let Some(colon) = inner.find(':') {
+            return Some(inner[colon + 1..].trim().to_owned());
         }
+        // bare [r] â€” wildcard
+        return None;
     }
     None
 }
@@ -335,13 +336,11 @@ fn extract_dml_table(sql: &str, op: &str) -> Option<String> {
         "DELETE" => " FROM ",
         _ => return None,
     };
-    let start = if op == "UPDATE" { 0 } else { 0 };
     let pos = if op == "UPDATE" {
         up.find(keyword).map(|p| p + keyword.len())
     } else {
         up.find(keyword).map(|p| p + keyword.len())
     };
-    let _ = start;
     if let Some(p) = pos {
         let rest = sql[p..].trim();
         let end = rest
@@ -476,6 +475,7 @@ pub struct SqlExecutor {
     // S117 â€” resource groups
     resource_groups: Mutex<HashMap<String, ResourceGroup>>,
     // S118 â€” event log: table â†’ [(ts_ms, event_type, payload_json)]
+    #[allow(clippy::type_complexity)]
     event_log: Mutex<HashMap<String, Vec<(u64, String, String)>>>,
     // S119 â€” read models: model_name â†’ (source_table, event_type_filter)
     read_models: Mutex<HashMap<String, (String, String)>>,
@@ -483,9 +483,11 @@ pub struct SqlExecutor {
     #[allow(clippy::type_complexity)]
     time_travel_log: Mutex<HashMap<String, Vec<(u64, Vec<Vec<String>>)>>>,
     // S121 â€” change feed: table â†’ [(op, row_json, ts)]
+    #[allow(clippy::type_complexity)]
     change_feed: Mutex<HashMap<String, Vec<(String, String, String)>>>,
     change_feed_enabled: Mutex<HashSet<String>>,
     // S122 â€” bloom indexes: index_name â†’ (table, col, values)
+    #[allow(clippy::type_complexity)]
     bloom_indexes: Mutex<HashMap<String, (String, String, HashSet<String>)>>,
     // S123 â€” columnar storage hint
     columnar_tables: Mutex<HashSet<String>>,
@@ -495,6 +497,7 @@ pub struct SqlExecutor {
     // S125 â€” query result streaming
     stream_chunk_size: Mutex<usize>,
     // S126 â€” geospatial: table â†’ col â†’ (lat, lng)
+    #[allow(clippy::type_complexity)]
     geo_columns: Mutex<HashMap<String, HashMap<String, (f64, f64)>>>,
     // S127 â€” graph edges: (from_node, rel_type, to_node) â€” in-memory mirror used by MATCH
     graph_edges: Mutex<Vec<(String, String, String)>>,
@@ -613,6 +616,7 @@ pub struct SqlExecutor {
     bloom_filter_indexes: Mutex<HashMap<String, (String, String)>>,
     // S173 â€” result streaming settings
     streaming_enabled: Mutex<bool>,
+    #[allow(dead_code)]
     stream_chunk_size_v2: Mutex<usize>,
     // S174 â€” read replica routing: host â†’ weight
     read_replicas: Mutex<Vec<String>>,
@@ -629,6 +633,7 @@ pub struct SqlExecutor {
     // S179 â€” constraint validation
     s179_constraints: Mutex<HashMap<String, (String, bool)>>, // name -> (table, enabled)
     // S180 â€” table sampling (state: active method)
+    #[allow(dead_code)]
     s180_sample_method: Mutex<String>,
     // S181 â€” column groups: grp_name -> (table, Vec<col>)
     s181_col_groups: Mutex<HashMap<String, (String, Vec<String>)>>,
@@ -2126,7 +2131,7 @@ impl SqlExecutor {
             drop(log);
             let rows: Vec<Vec<String>> = events
                 .iter()
-                .filter(|(_, et, _)| type_filter.as_ref().map_or(true, |f| et == f))
+                .filter(|(_, et, _)| type_filter.as_ref().is_none_or(|f| et == f))
                 .map(|(ts, et, payload)| vec![ts.to_string(), et.clone(), payload.clone()])
                 .collect();
             return Some(Ok(QueryResult::Rows {
@@ -2434,7 +2439,7 @@ impl SqlExecutor {
             let chunks = if chunk_size == 0 || total == 0 {
                 0usize
             } else {
-                (total + chunk_size - 1) / chunk_size
+                total.div_ceil(chunk_size)
             };
             return Some(Ok(QueryResult::Ok(format!(
                 "STREAM: {} chunks of {} rows",
@@ -2454,21 +2459,21 @@ impl SqlExecutor {
                     let up_rest2 = rest2.to_ascii_uppercase();
                     if let Some(vals_pos) = up_rest2.find("VALUES") {
                         let vals_str = rest2[vals_pos + "VALUES".len()..].trim();
-                        if vals_str.starts_with('(') {
-                            if let Some(end) = vals_str[1..].find(')') {
-                                let coords = &vals_str[1..end + 1];
-                                let parts: Vec<&str> = coords.split(',').collect();
-                                if parts.len() == 2 {
-                                    let lat: f64 = parts[0].trim().parse().unwrap_or(0.0);
-                                    let lng: f64 = parts[1].trim().parse().unwrap_or(0.0);
-                                    self.geo_columns
-                                        .lock()
-                                        .unwrap()
-                                        .entry(table_name)
-                                        .or_default()
-                                        .insert(col_name, (lat, lng));
-                                    return Some(Ok(QueryResult::Affected(1)));
-                                }
+                        if vals_str.starts_with('(')
+                            && let Some(end) = vals_str[1..].find(')')
+                        {
+                            let coords = &vals_str[1..end + 1];
+                            let parts: Vec<&str> = coords.split(',').collect();
+                            if parts.len() == 2 {
+                                let lat: f64 = parts[0].trim().parse().unwrap_or(0.0);
+                                let lng: f64 = parts[1].trim().parse().unwrap_or(0.0);
+                                self.geo_columns
+                                    .lock()
+                                    .unwrap()
+                                    .entry(table_name)
+                                    .or_default()
+                                    .insert(col_name, (lat, lng));
+                                return Some(Ok(QueryResult::Affected(1)));
                             }
                         }
                     }
@@ -2652,8 +2657,8 @@ impl SqlExecutor {
             let rows: Vec<Vec<String>> = edges
                 .iter()
                 .filter(|(from, rel, _)| {
-                    rel_filter.as_ref().map_or(true, |r| rel == r)
-                        && node_filter.as_ref().map_or(true, |n| from == n)
+                    rel_filter.as_ref().is_none_or(|r| rel == r)
+                        && node_filter.as_ref().is_none_or(|n| from == n)
                 })
                 .map(|(from, rel, to)| vec![from.clone(), rel.clone(), to.clone()])
                 .collect();
@@ -2912,9 +2917,7 @@ impl SqlExecutor {
                         .trim_start_matches(':')
                         .trim_start_matches('"')
                         .trim_start();
-                    let end = after
-                        .find(|c| c == '"' || c == '}' || c == ',')
-                        .unwrap_or(after.len());
+                    let end = after.find(['"', '}', ',']).unwrap_or(after.len());
                     after[..end].trim_matches('"').to_owned()
                 } else {
                     String::new()
@@ -3498,12 +3501,7 @@ impl SqlExecutor {
                     let plaintext = &after_val[..end_val];
                     let after_pk = &rest[pk_pos + "' PK ".len()..];
                     // find pk after the VALUE quote end
-                    let pk = after_pk
-                        .trim()
-                        .split_whitespace()
-                        .last()
-                        .unwrap_or("0")
-                        .to_owned();
+                    let pk = after_pk.split_whitespace().last().unwrap_or("0").to_owned();
                     let encrypted: String = plaintext.chars().rev().collect();
                     if parts.len() == 2 {
                         let map_key = format!(
@@ -3874,7 +3872,7 @@ impl SqlExecutor {
             let name = self.pool_name.lock().unwrap().clone().unwrap_or_default();
             let size = *self.pool_size.lock().unwrap();
             let active = *self.pool_active.lock().unwrap();
-            let avail = if size >= active { size - active } else { 0 };
+            let avail = size.saturating_sub(active);
             return Some(Ok(QueryResult::Rows {
                 columns: vec![
                     "pool_name".into(),
@@ -3986,21 +3984,21 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             let store = self.version_store.lock().unwrap();
-            if let Some(versions) = store.get(&tbl) {
-                if let Some(latest) = versions.iter().filter(|(_, to, _)| *to == u64::MAX).last() {
-                    return Some(Ok(QueryResult::Rows {
-                        columns: vec![
-                            "version_from".into(),
-                            "version_to".into(),
-                            "row_json".into(),
-                        ],
-                        rows: vec![vec![
-                            latest.0.to_string(),
-                            latest.1.to_string(),
-                            latest.2.clone(),
-                        ]],
-                    }));
-                }
+            if let Some(versions) = store.get(&tbl)
+                && let Some(latest) = versions.iter().rfind(|(_, to, _)| *to == u64::MAX)
+            {
+                return Some(Ok(QueryResult::Rows {
+                    columns: vec![
+                        "version_from".into(),
+                        "version_to".into(),
+                        "row_json".into(),
+                    ],
+                    rows: vec![vec![
+                        latest.0.to_string(),
+                        latest.1.to_string(),
+                        latest.2.clone(),
+                    ]],
+                }));
             }
             return Some(Ok(QueryResult::Rows {
                 columns: vec![
@@ -4215,21 +4213,19 @@ impl SqlExecutor {
             }
         }
 
-        if up.contains(" TABLESAMPLE SYSTEM(") {
-            if let Some(from_pos) = up.find(" FROM ") {
-                let after_from = sql[from_pos + " FROM ".len()..].trim();
-                if let Some(sample_pos) =
-                    after_from.to_ascii_uppercase().find(" TABLESAMPLE SYSTEM(")
-                {
-                    let tbl = after_from[..sample_pos].trim().to_ascii_lowercase();
-                    let pct_start = sample_pos + " TABLESAMPLE SYSTEM(".len();
-                    let pct_end = after_from[pct_start..].find(')').unwrap_or(0) + pct_start;
-                    let pct = after_from[pct_start..pct_end].trim();
-                    return Some(Ok(QueryResult::Ok(format!(
-                        "SAMPLE: {}% of {} rows",
-                        pct, tbl
-                    ))));
-                }
+        if up.contains(" TABLESAMPLE SYSTEM(")
+            && let Some(from_pos) = up.find(" FROM ")
+        {
+            let after_from = sql[from_pos + " FROM ".len()..].trim();
+            if let Some(sample_pos) = after_from.to_ascii_uppercase().find(" TABLESAMPLE SYSTEM(") {
+                let tbl = after_from[..sample_pos].trim().to_ascii_lowercase();
+                let pct_start = sample_pos + " TABLESAMPLE SYSTEM(".len();
+                let pct_end = after_from[pct_start..].find(')').unwrap_or(0) + pct_start;
+                let pct = after_from[pct_start..pct_end].trim();
+                return Some(Ok(QueryResult::Ok(format!(
+                    "SAMPLE: {}% of {} rows",
+                    pct, tbl
+                ))));
             }
         }
 
@@ -4366,7 +4362,7 @@ impl SqlExecutor {
             // COMPUTE HISTOGRAM FOR table_name col_name BUCKETS n
             let rest = &sql["COMPUTE HISTOGRAM FOR ".len()..];
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() >= 4 && parts[2].to_ascii_uppercase() == "BUCKETS" {
+            if parts.len() >= 4 && parts[2].eq_ignore_ascii_case("BUCKETS") {
                 let tbl = parts[0].to_ascii_lowercase();
                 let col = parts[1].to_ascii_lowercase();
                 let n: usize = parts[3].parse().unwrap_or(10);
@@ -4493,12 +4489,12 @@ impl SqlExecutor {
             if let Some(key_end) = rest.find('\'') {
                 let key = rest[..key_end].to_owned();
                 let after_key = rest[key_end + 1..].trim();
-                if let Some(val_part) = after_key.strip_prefix("VALUE '") {
-                    if let Some(val_end) = val_part.find('\'') {
-                        let val = val_part[..val_end].to_owned();
-                        self.live_config.lock().unwrap().insert(key, val);
-                        return Some(Ok(QueryResult::Ok("CONFIG SET".to_owned())));
-                    }
+                if let Some(val_part) = after_key.strip_prefix("VALUE '")
+                    && let Some(val_end) = val_part.find('\'')
+                {
+                    let val = val_part[..val_end].to_owned();
+                    self.live_config.lock().unwrap().insert(key, val);
+                    return Some(Ok(QueryResult::Ok("CONFIG SET".to_owned())));
                 }
             }
         }
@@ -4721,16 +4717,14 @@ impl SqlExecutor {
             if let Some(par_pos) = parts
                 .iter()
                 .position(|p| p.eq_ignore_ascii_case("PARALLEL"))
+                && let Some(deg_str) = parts.get(par_pos + 1)
+                && let Ok(deg) = deg_str.parse::<usize>()
             {
-                if let Some(deg_str) = parts.get(par_pos + 1) {
-                    if let Ok(deg) = deg_str.parse::<usize>() {
-                        let table = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
-                        let col = parts.get(5).copied().unwrap_or("").to_ascii_lowercase();
-                        let entry = format!("ADD COLUMN {}.{} degree={}", table, col, deg);
-                        self.parallel_ddl_log.lock().unwrap().push(entry);
-                        return Some(Ok(QueryResult::Ok(format!("PARALLEL DDL: degree {}", deg))));
-                    }
-                }
+                let table = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
+                let col = parts.get(5).copied().unwrap_or("").to_ascii_lowercase();
+                let entry = format!("ADD COLUMN {}.{} degree={}", table, col, deg);
+                self.parallel_ddl_log.lock().unwrap().push(entry);
+                return Some(Ok(QueryResult::Ok(format!("PARALLEL DDL: degree {}", deg))));
             }
         }
         if up.starts_with("CREATE INDEX ") && up.contains(" PARALLEL ") {
@@ -4738,18 +4732,16 @@ impl SqlExecutor {
             if let Some(par_pos) = parts
                 .iter()
                 .position(|p| p.eq_ignore_ascii_case("PARALLEL"))
+                && let Some(deg_str) = parts.get(par_pos + 1)
+                && let Ok(deg) = deg_str.parse::<usize>()
             {
-                if let Some(deg_str) = parts.get(par_pos + 1) {
-                    if let Ok(deg) = deg_str.parse::<usize>() {
-                        let idx = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
-                        let entry = format!("CREATE INDEX {} degree={}", idx, deg);
-                        self.parallel_ddl_log.lock().unwrap().push(entry);
-                        return Some(Ok(QueryResult::Ok(format!(
-                            "PARALLEL INDEX: degree {}",
-                            deg
-                        ))));
-                    }
-                }
+                let idx = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
+                let entry = format!("CREATE INDEX {} degree={}", idx, deg);
+                self.parallel_ddl_log.lock().unwrap().push(entry);
+                return Some(Ok(QueryResult::Ok(format!(
+                    "PARALLEL INDEX: degree {}",
+                    deg
+                ))));
             }
         }
         if up.starts_with("SET DEFAULT PARALLEL DEGREE ") {
@@ -5719,11 +5711,11 @@ impl SqlExecutor {
         // â”€â”€ S187 â€” Live query kill â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("KILL QUERY ") && up != "KILL ALL QUERIES" {
             let parts: Vec<&str> = s.split_whitespace().collect();
-            if let Some(id_str) = parts.get(2) {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    self.s187_running_queries.lock().unwrap().remove(&id);
-                    return Some(Ok(QueryResult::Ok(format!("QUERY KILLED: {}", id))));
-                }
+            if let Some(id_str) = parts.get(2)
+                && let Ok(id) = id_str.parse::<u64>()
+            {
+                self.s187_running_queries.lock().unwrap().remove(&id);
+                return Some(Ok(QueryResult::Ok(format!("QUERY KILLED: {}", id))));
             }
             return Some(Ok(QueryResult::Ok("QUERY KILLED".to_owned())));
         }
@@ -5889,7 +5881,7 @@ impl SqlExecutor {
             // CREATE CHANGE STREAM cs ON t
             let rest = &sql[21..];
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() >= 3 && parts[1].to_ascii_uppercase() == "ON" {
+            if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("ON") {
                 let cs_name = parts[0].to_ascii_lowercase();
                 let tbl = parts[2].to_ascii_lowercase();
                 self.s191_change_streams
@@ -6166,10 +6158,10 @@ impl SqlExecutor {
             let args = sql[23..].trim().to_ascii_lowercase();
             // parse retries=N delay=Nms
             for part in args.split_whitespace() {
-                if let Some(v) = part.strip_prefix("retries=") {
-                    if let Ok(n) = v.parse::<u64>() {
-                        *self.s199_retry_retries.lock().unwrap() = n;
-                    }
+                if let Some(v) = part.strip_prefix("retries=")
+                    && let Ok(n) = v.parse::<u64>()
+                {
+                    *self.s199_retry_retries.lock().unwrap() = n;
                 }
                 if let Some(v) = part.strip_prefix("delay=") {
                     let v = v.trim_end_matches("ms");
@@ -6540,7 +6532,7 @@ impl SqlExecutor {
                     .lock()
                     .unwrap()
                     .entry(child)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(parent);
             }
             return Some(Ok(QueryResult::Ok("PARENT ADDED".to_owned())));
@@ -6784,7 +6776,7 @@ impl SqlExecutor {
                 .map(|p| {
                     let parts: Vec<&str> = p.splitn(2, '|').collect();
                     vec![
-                        parts.get(0).copied().unwrap_or("").to_owned(),
+                        parts.first().copied().unwrap_or("").to_owned(),
                         parts.get(1).copied().unwrap_or("").to_owned(),
                     ]
                 })
@@ -6816,7 +6808,7 @@ impl SqlExecutor {
                 .map(|h| {
                     let parts: Vec<&str> = h.splitn(2, '|').collect();
                     vec![
-                        parts.get(0).copied().unwrap_or("").to_owned(),
+                        parts.first().copied().unwrap_or("").to_owned(),
                         parts.get(1).copied().unwrap_or("").to_owned(),
                     ]
                 })
@@ -6999,7 +6991,7 @@ impl SqlExecutor {
                 .map(|h| {
                     let parts: Vec<&str> = h.splitn(3, '|').collect();
                     vec![
-                        parts.get(0).copied().unwrap_or("").to_owned(),
+                        parts.first().copied().unwrap_or("").to_owned(),
                         parts.get(1).copied().unwrap_or("").to_owned(),
                         parts.get(2).copied().unwrap_or("").to_owned(),
                     ]
@@ -7058,7 +7050,7 @@ impl SqlExecutor {
                 .map(|e| {
                     let parts: Vec<&str> = e.splitn(2, '|').collect();
                     vec![
-                        parts.get(0).copied().unwrap_or("").to_owned(),
+                        parts.first().copied().unwrap_or("").to_owned(),
                         parts.get(1).copied().unwrap_or("").to_owned(),
                     ]
                 })
@@ -7814,7 +7806,7 @@ impl SqlExecutor {
         // â"€â"€ S250 â€" Query plan locking â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         if up.starts_with("LOCK QUERY PLAN FOR ") {
             let sql_key = s["LOCK QUERY PLAN FOR ".len()..].trim().to_owned();
-            let plan = format!("LOCKED_PLAN_FOR:{}", &sql_key);
+            let plan = format!("LOCKED_PLAN_FOR:{}", sql_key);
             self.s250_locked_plans.lock().unwrap().insert(sql_key, plan);
             return Some(Ok(QueryResult::Ok("QUERY PLAN LOCKED".to_owned())));
         }
@@ -8236,32 +8228,33 @@ impl SqlExecutor {
         }
 
         // â”€â”€ S261 â€" Column expression indexes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        if up.starts_with("CREATE INDEX ") && up.contains(" ON ") {
-            if let (Some(op), Some(cp)) = (s.find('('), s.rfind(')')) {
-                let expr = s[op + 1..cp].trim();
-                if op < cp
-                    && (expr.contains('+')
-                        || expr.contains('-')
-                        || expr.contains('*')
-                        || expr.contains('/'))
-                {
-                    let rest = &s["CREATE INDEX ".len()..];
-                    let up_rest = rest.to_ascii_uppercase();
-                    if let Some(onp) = up_rest.find(" ON ") {
-                        let idx_name = rest[..onp].trim().to_ascii_lowercase();
-                        let tbl_part = rest[onp + " ON ".len()..].trim();
-                        let tbl = tbl_part
-                            .split('(')
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_ascii_lowercase();
-                        self.s261_expr_indexes
-                            .lock()
-                            .unwrap()
-                            .insert(idx_name, (tbl, expr.to_owned()));
-                        return Some(Ok(QueryResult::Ok("EXPRESSION INDEX CREATED".to_owned())));
-                    }
+        if up.starts_with("CREATE INDEX ")
+            && up.contains(" ON ")
+            && let (Some(op), Some(cp)) = (s.find('('), s.rfind(')'))
+        {
+            let expr = s[op + 1..cp].trim();
+            if op < cp
+                && (expr.contains('+')
+                    || expr.contains('-')
+                    || expr.contains('*')
+                    || expr.contains('/'))
+            {
+                let rest = &s["CREATE INDEX ".len()..];
+                let up_rest = rest.to_ascii_uppercase();
+                if let Some(onp) = up_rest.find(" ON ") {
+                    let idx_name = rest[..onp].trim().to_ascii_lowercase();
+                    let tbl_part = rest[onp + " ON ".len()..].trim();
+                    let tbl = tbl_part
+                        .split('(')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    self.s261_expr_indexes
+                        .lock()
+                        .unwrap()
+                        .insert(idx_name, (tbl, expr.to_owned()));
+                    return Some(Ok(QueryResult::Ok("EXPRESSION INDEX CREATED".to_owned())));
                 }
             }
         }
@@ -8632,24 +8625,24 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             let mut entries: Vec<(String, u64)> = Vec::new();
-            if let Some((tbl, col)) = key.split_once('.') {
-                if let Ok(engine) = self.registry.get(tbl) {
-                    let col_idx = engine
-                        .schema
-                        .columns()
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(col));
-                    if let Some(ci) = col_idx {
-                        let rows_data = self.scan_table_as_strings(tbl);
-                        let mut counts: HashMap<String, u64> = HashMap::new();
-                        for row in &rows_data {
-                            if let Some(v) = row.get(ci) {
-                                *counts.entry(v.clone()).or_insert(0) += 1;
-                            }
+            if let Some((tbl, col)) = key.split_once('.')
+                && let Ok(engine) = self.registry.get(tbl)
+            {
+                let col_idx = engine
+                    .schema
+                    .columns()
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col));
+                if let Some(ci) = col_idx {
+                    let rows_data = self.scan_table_as_strings(tbl);
+                    let mut counts: HashMap<String, u64> = HashMap::new();
+                    for row in &rows_data {
+                        if let Some(v) = row.get(ci) {
+                            *counts.entry(v.clone()).or_insert(0) += 1;
                         }
-                        entries = counts.into_iter().collect();
-                        entries.sort();
                     }
+                    entries = counts.into_iter().collect();
+                    entries.sort();
                 }
             }
             self.s274_value_dist.lock().unwrap().insert(key, entries);
@@ -9925,7 +9918,7 @@ impl SqlExecutor {
         }
         if up == "SHOW DATA SKEW REPORT" {
             let reports = self.s317_data_skew_report.lock().unwrap().clone();
-            let rows = reports.into_iter().map(|(_, r)| vec![r]).collect();
+            let rows = reports.into_values().map(|r| vec![r]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["report".to_owned()],
                 rows,
@@ -10984,7 +10977,7 @@ impl SqlExecutor {
                     .lock()
                     .unwrap()
                     .entry(obj)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(ver);
                 return Some(Ok(QueryResult::Ok("OBJECT VERSION TAGGED".to_owned())));
             }
@@ -11043,7 +11036,7 @@ impl SqlExecutor {
                 .lock()
                 .unwrap()
                 .entry(table)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(chrono_now());
             return Some(Ok(QueryResult::Ok("SKEW REBALANCE STARTED".to_owned())));
         }
@@ -11390,7 +11383,7 @@ impl SqlExecutor {
                 .lock()
                 .unwrap()
                 .entry(table)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(chrono_now());
             return Some(Ok(QueryResult::Ok("FAILOVER RECORDED".to_owned())));
         }
@@ -11645,7 +11638,7 @@ impl SqlExecutor {
                 .lock()
                 .unwrap()
                 .entry(table)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(chrono_now());
             return Some(Ok(QueryResult::Ok(
                 "SHARD KEY REBALANCE STARTED".to_owned(),

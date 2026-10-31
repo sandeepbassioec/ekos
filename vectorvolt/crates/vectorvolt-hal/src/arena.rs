@@ -41,8 +41,7 @@ impl BumpArena {
         if size == 0 {
             return Some(self.base); // zero-size, return stable address
         }
-        let aligned = align_up(self.base as usize + self.offset, align)
-            - self.base as usize;
+        let aligned = align_up(self.base as usize + self.offset, align) - self.base as usize;
         let end = aligned.checked_add(size)?;
         if end > self.capacity {
             return None;

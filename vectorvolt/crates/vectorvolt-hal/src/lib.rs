@@ -49,9 +49,9 @@
 
 pub mod affinity;
 pub mod arena;
-pub mod numa;
 pub mod cache;
 pub mod memory;
+pub mod numa;
 pub mod prefetch;
 pub mod simd;
 pub mod timer;
@@ -64,16 +64,16 @@ pub use affinity::{
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use affinity::{available_cores, get_thread_affinity, pin_thread_to_core};
+pub use arena::BumpArena;
 pub use cache::{CACHE_LINE, CacheAligned, CachePadded};
 pub use memory::{
     HUGE_PAGE_SIZE, HugePageBuf, HugePageError, LocalNumaArena, MlockError, MlockGuard,
     mlock_range, munlock_range, prefetch_populate,
 };
+pub use numa::{NumaNode as NumaNodeInfo, NumaTopology};
 pub use prefetch::{Locality, prefetch, prefetch_ahead, prefetch_write};
 pub use simd::SimdTier;
 pub use timer::{CycleTimer, Stopwatch, cycles};
-pub use arena::BumpArena;
-pub use numa::{NumaNode as NumaNodeInfo, NumaTopology};
 pub use topology::{CacheHierarchy, CoreClass, CoreRoleMap, CpuTopology, LogicalCore, NumaNode};
 pub use wait::{Blocking, BoxedWaitStrategy, BusySpin, WaitStrategy, Yielding, boxed};
 

@@ -41,7 +41,7 @@ fn layer_builds_after_init() {
 fn no_otlp_endpoint_is_noop() {
     let provider = build_provider(None, "noop-svc");
     // A noop provider should shut down cleanly (returns ())
-    provider.shutdown();
+    let _ = provider.shutdown();
 }
 
 #[test]
@@ -49,7 +49,7 @@ fn no_otlp_endpoint_is_noop() {
 fn non_otlp_build_with_endpoint_returns_noop() {
     // Without the `otlp` feature, endpoint is ignored and a noop provider is returned.
     let provider = build_provider(Some("http://localhost:4317"), "svc");
-    provider.shutdown();
+    let _ = provider.shutdown();
 }
 
 #[test]

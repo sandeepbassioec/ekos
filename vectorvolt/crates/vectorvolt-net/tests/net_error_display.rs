@@ -69,7 +69,7 @@ fn tls_display() {
 }
 #[test]
 fn io_from() {
-    let io = std::io::Error::new(std::io::ErrorKind::Other, "io");
+    let io = std::io::Error::other("io");
     let e = NetError::from(io);
     let s = format!("{e}");
     assert!(!s.is_empty());

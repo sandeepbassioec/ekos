@@ -66,7 +66,13 @@ impl Ledger {
     /// Post a debit/credit pair.  The debit account is debited (balance
     /// decreases) and the credit account is credited (balance increases).
     /// Returns the new entry id.
-    pub fn post(&self, debit: u64, credit: u64, amount_cents: i64, desc: &str) -> LedgerResult<u64> {
+    pub fn post(
+        &self,
+        debit: u64,
+        credit: u64,
+        amount_cents: i64,
+        desc: &str,
+    ) -> LedgerResult<u64> {
         // Validate both accounts exist.
         if self.accounts.get(debit)?.is_none() {
             return Err(LedgerError::AccountNotFound(debit));

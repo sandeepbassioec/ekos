@@ -271,7 +271,7 @@ mod tests {
     fn test_decode_startup_basic() {
         // Build a startup message
         let mut buf = BytesMut::new();
-        let version: i32 = (3 << 16) | 0; // 3.0
+        let version: i32 = 3 << 16; // 3.0
         // We'll write: len(4) version(4) "user\0alice\0\0"
         let params = b"user\0alice\0\0";
         let len = 4 + 4 + params.len();
