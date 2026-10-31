@@ -70,6 +70,20 @@ pub enum QueryResult {
 /// Serialises transactional SQL commits process-wide (see `exec_commit`).
 static SQL_COMMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// B16 — poison-tolerant locking. A panic while one of the executor's
+/// mutexes is held must not wedge that executor (or, for the shared
+/// `Arc<Mutex<..>>` catalog fields, every session) forever, so all lock
+/// acquisition goes through this instead of `lock().unwrap()`.
+trait LockSafe<T: ?Sized> {
+    fn lock_safe(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T: ?Sized> LockSafe<T> for Mutex<T> {
+    fn lock_safe(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 fn sql_error(code: &str, msg: &str) -> QueryResult {
     QueryResult::Error(format!("[{}] {}", code, msg))
 }
@@ -85,6 +99,42 @@ fn chrono_now() -> String {
 
 /// Per-table open transaction id, keyed by table name.
 type TxnMap = HashMap<String, TxnId>;
+
+/// B9 — a savepoint: every table's staged write set at SAVEPOINT time.
+type SavepointSnap = HashMap<String, Vec<(u64, Option<Vec<u64>>)>>;
+
+/// B8 — error text for a statement cancelled by `statement_timeout`.
+const STATEMENT_TIMEOUT_MSG: &str = "canceling statement due to statement timeout";
+
+/// B7 — maximum nesting of trigger-fired statements.
+const MAX_TRIGGER_DEPTH: u32 = 16;
+
+thread_local! {
+    /// B11 — set while this thread holds `SQL_COMMIT_LOCK`, so statements a
+    /// write fires (triggers, procedures) don't self-deadlock on it.
+    static HOLDS_SQL_COMMIT_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// B11 — re-entrant (per thread) guard on `SQL_COMMIT_LOCK`.
+struct SqlCommitGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl Drop for SqlCommitGuard {
+    fn drop(&mut self) {
+        if self.0.take().is_some() {
+            HOLDS_SQL_COMMIT_LOCK.with(|h| h.set(false));
+        }
+    }
+}
+
+/// B11 — take `SQL_COMMIT_LOCK` unless this thread already holds it.
+fn sql_commit_lock() -> SqlCommitGuard {
+    if HOLDS_SQL_COMMIT_LOCK.with(|h| h.get()) {
+        return SqlCommitGuard(None);
+    }
+    let guard = SQL_COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    HOLDS_SQL_COMMIT_LOCK.with(|h| h.set(true));
+    SqlCommitGuard(Some(guard))
+}
 
 /// MVCC Phase 2 — snapshot-isolation bookkeeping for the currently active
 /// transaction (`None` when in auto-commit mode, mirroring `txn`).
@@ -399,8 +449,9 @@ pub struct SqlExecutor {
     txn_uuid_counter: std::sync::atomic::AtomicU64,
     /// S45 â€” in-memory view store.
     views: Arc<Mutex<HashMap<String, SelectStmt>>>,
-    /// S53 â€” savepoint snapshots: name â†’ TxnMap clone at savepoint time.
-    savepoints: Mutex<HashMap<String, TxnMap>>,
+    /// S53/B9 â€” savepoints: name â†’ staged write set of every table at
+    /// savepoint time.
+    savepoints: Mutex<HashMap<String, SavepointSnap>>,
     /// S56 â€” query result cache: sql â†’ (columns, rows).
     #[allow(dead_code, clippy::type_complexity)]
     query_cache: Mutex<HashMap<String, (Vec<String>, Vec<Vec<String>>)>>,
@@ -467,6 +518,13 @@ pub struct SqlExecutor {
     cursors: Mutex<HashMap<String, CursorState>>,
     // S106 â€” statement timeout
     statement_timeout_ms: Mutex<Option<u64>>,
+    /// B8 — deadline of the running statement, in ns since `created_at`
+    /// (0 = none); checked cooperatively by row loops.
+    stmt_deadline_ns: std::sync::atomic::AtomicU64,
+    /// B8 — set by `check_deadline` when it cancels the statement.
+    stmt_timed_out: std::sync::atomic::AtomicBool,
+    /// B7 — current nesting depth of trigger-fired statements.
+    trigger_depth: std::sync::atomic::AtomicU32,
     // S110 â€” multi-database
     databases: Mutex<HashSet<String>>,
     current_db: Mutex<String>,
@@ -1095,7 +1153,7 @@ impl SqlExecutor {
 
     fn save_graph_node_names(&self, graph_dir: &std::path::Path) {
         let path = Self::graph_node_names_path(graph_dir);
-        if let Ok(json) = serde_json::to_string(&*self.graph_node_names.lock().unwrap())
+        if let Ok(json) = serde_json::to_string(&*self.graph_node_names.lock_safe())
             && std::fs::create_dir_all(graph_dir).is_ok()
         {
             let _ = std::fs::write(path, json);
@@ -1110,8 +1168,7 @@ impl SqlExecutor {
     fn graph_intern_node(&self, name: &str) -> u64 {
         let id = Self::hash_node_name(name);
         self.graph_node_names
-            .lock()
-            .unwrap()
+            .lock_safe()
             .insert(id, name.to_owned());
         id
     }
@@ -1170,6 +1227,9 @@ impl SqlExecutor {
             expanded_mode: Mutex::new(false),
             cursors: Mutex::new(HashMap::new()),
             statement_timeout_ms: Mutex::new(None),
+            stmt_deadline_ns: std::sync::atomic::AtomicU64::new(0),
+            stmt_timed_out: std::sync::atomic::AtomicBool::new(false),
+            trigger_depth: std::sync::atomic::AtomicU32::new(0),
             databases: Mutex::new({
                 let mut s = HashSet::new();
                 s.insert("vectorvolt".to_owned());
@@ -1536,12 +1596,12 @@ impl SqlExecutor {
     /// (`INSERT ENCRYPTED` / `SELECT DECRYPT`). Shared with every session
     /// created via [`new_session`](Self::new_session).
     pub fn set_column_encryption_key(&self, key: KeyStore) {
-        *self.column_key.lock().unwrap() = Some(Arc::new(key));
+        *self.column_key.lock_safe() = Some(Arc::new(key));
     }
 
     /// S142 — the configured column key, or a clear error if none is set.
     fn require_column_key(&self) -> Result<Arc<KeyStore>, ExecError> {
-        self.column_key.lock().unwrap().clone().ok_or_else(|| {
+        self.column_key.lock_safe().clone().ok_or_else(|| {
             ExecError::Engine(
                 "column encryption key not configured (SqlExecutor::set_column_encryption_key)"
                     .to_owned(),
@@ -1561,8 +1621,7 @@ impl SqlExecutor {
         let key = self.require_column_key()?;
         if let Some(registered) = self
             .encrypted_cols
-            .lock()
-            .unwrap()
+            .lock_safe()
             .get(&format!("{table}.{col}"))
             && registered != key_id
         {
@@ -1609,6 +1668,53 @@ impl SqlExecutor {
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, ExecError> {
+        // B8 — arm the cooperative statement deadline (outermost call only;
+        // statements fired by triggers/procedures share the caller's).
+        let owns_deadline = self.arm_deadline();
+        let result = self.execute_inner(sql);
+        if owns_deadline {
+            self.stmt_deadline_ns
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .stmt_timed_out
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(sql_error("57014", STATEMENT_TIMEOUT_MSG));
+            }
+        }
+        result
+    }
+
+    /// B8 — start the statement deadline if a timeout is set and none is
+    /// running. Returns whether this call owns (and must clear) it.
+    fn arm_deadline(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(ms) = *self.statement_timeout_ms.lock_safe() else {
+            return false;
+        };
+        if self.stmt_deadline_ns.load(Relaxed) != 0 {
+            return false;
+        }
+        let now = self.created_at.elapsed().as_nanos() as u64;
+        let deadline = now.saturating_add(ms.saturating_mul(1_000_000)).max(1);
+        self.stmt_timed_out.store(false, Relaxed);
+        self.stmt_deadline_ns.store(deadline, Relaxed);
+        true
+    }
+
+    /// B8 — cooperative cancellation point for row loops (scan, filter,
+    /// join, aggregate, update, delete): fails once the deadline passed.
+    fn check_deadline(&self) -> Result<(), ExecError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let deadline = self.stmt_deadline_ns.load(Relaxed);
+        if deadline != 0 && self.created_at.elapsed().as_nanos() as u64 >= deadline {
+            self.stmt_timed_out.store(true, Relaxed);
+            return Err(ExecError::Engine(STATEMENT_TIMEOUT_MSG.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn execute_inner(&self, sql: &str) -> Result<QueryResult, ExecError> {
         // S118â€“S127 â€” raw SQL pattern matching (before parser)
         if let Some(raw_result) = self.execute_raw(sql) {
             return raw_result;
@@ -1646,31 +1752,34 @@ impl SqlExecutor {
             if let Some(op_str) = op_opt {
                 let tbl_opt = extract_dml_table(sql, op_str);
                 if let Some(tbl) = tbl_opt {
-                    let enabled = self.change_feed_enabled.lock().unwrap().contains(&tbl);
+                    let enabled = self.change_feed_enabled.lock_safe().contains(&tbl);
                     if enabled {
                         let ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis()
                             .to_string();
-                        self.change_feed
-                            .lock()
-                            .unwrap()
-                            .entry(tbl)
-                            .or_default()
-                            .push((op_str.to_owned(), sql.to_owned(), ts));
+                        self.change_feed.lock_safe().entry(tbl).or_default().push((
+                            op_str.to_owned(),
+                            sql.to_owned(),
+                            ts,
+                        ));
                     }
                 }
             }
         }
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        // S106 â€” statement timeout check
+        // S106 â€” statement timeout: long-running statements are cancelled
+        // inside their row loops (B8, `check_deadline`); this catches reads
+        // that finished past the deadline. Writes are not reported as
+        // cancelled here because they have already been applied.
         {
-            let timeout = *self.statement_timeout_ms.lock().unwrap();
+            let timeout = *self.statement_timeout_ms.lock_safe();
             if let Some(ms) = timeout
                 && elapsed_ms >= ms as f64
+                && matches!(result, QueryResult::Rows { .. })
             {
-                return Ok(sql_error("57014", "query cancelled: statement timeout"));
+                return Ok(sql_error("57014", STATEMENT_TIMEOUT_MSG));
             }
         }
         let fingerprint = normalize_sql(sql);
@@ -1684,7 +1793,7 @@ impl SqlExecutor {
             _ => 0,
         };
         if !skip_stats {
-            let mut stats = self.query_stats.lock().unwrap();
+            let mut stats = self.query_stats.lock_safe();
             let entry = stats.entry(fingerprint.clone()).or_insert(QueryStat {
                 calls: 0,
                 total_ms: 0.0,
@@ -1703,13 +1812,13 @@ impl SqlExecutor {
             entry.rows += rows_u64;
         }
         // S93 â€” slow query log (skip for reset stmts)
-        let slow_threshold = *self.slow_query_threshold_ms.lock().unwrap();
+        let slow_threshold = *self.slow_query_threshold_ms.lock_safe();
         if !is_reset_stmt
             && let Some(threshold) = slow_threshold
             && elapsed_ms >= threshold as f64
         {
             let ts = chrono_now();
-            self.slow_log.lock().unwrap().push(SlowLogEntry {
+            self.slow_log.lock_safe().push(SlowLogEntry {
                 sql: sql.to_owned(),
                 duration_ms: elapsed_ms as u64,
                 rows: row_count,
@@ -1717,7 +1826,7 @@ impl SqlExecutor {
             });
         }
         // S96 â€” auto-explain
-        let auto_explain = *self.auto_explain_threshold_ms.lock().unwrap();
+        let auto_explain = *self.auto_explain_threshold_ms.lock_safe();
         let result = if let Some(ae_threshold) = auto_explain {
             if elapsed_ms >= ae_threshold as f64
                 && let Ok(toks2) = Lexer::new(sql).tokenize()
@@ -1750,7 +1859,7 @@ impl SqlExecutor {
         // S97 â€” record wait event for every query (simulated), skip for reset stmts
         if !is_reset_stmt {
             let ts = chrono_now();
-            self.wait_events.lock().unwrap().push(WaitEvent {
+            self.wait_events.lock_safe().push(WaitEvent {
                 event_type: "LWLock".to_owned(),
                 object_name: "query_cache".to_owned(),
                 duration_us: 0,
@@ -1763,10 +1872,22 @@ impl SqlExecutor {
     fn execute_stmt(&self, stmt: Stmt) -> Result<QueryResult, ExecError> {
         match stmt {
             Stmt::Select(s) => self.exec_select(s),
-            Stmt::Insert(s) => self.exec_insert(s),
-            Stmt::InsertSelect(s) => self.exec_insert_select(s),
-            Stmt::Update(s) => self.exec_update(s),
-            Stmt::Delete(s) => self.exec_delete(s),
+            Stmt::Insert(s) => {
+                let _commit = self.autocommit_write_lock();
+                self.exec_insert(s)
+            }
+            Stmt::InsertSelect(s) => {
+                let _commit = self.autocommit_write_lock();
+                self.exec_insert_select(s)
+            }
+            Stmt::Update(s) => {
+                let _commit = self.autocommit_write_lock();
+                self.exec_update(s)
+            }
+            Stmt::Delete(s) => {
+                let _commit = self.autocommit_write_lock();
+                self.exec_delete(s)
+            }
             Stmt::CreateTable(s) => self.exec_create_table(s),
             Stmt::DropTable(s) => self.exec_drop_table(s),
             Stmt::AlterTable(s) => self.exec_alter_table(s),
@@ -1798,7 +1919,7 @@ impl SqlExecutor {
             Stmt::DropTrigger { name } => self.exec_drop_trigger(name),
             // S71
             Stmt::ResetQueryStats => {
-                self.query_stats.lock().unwrap().clear();
+                self.query_stats.lock_safe().clear();
                 Ok(QueryResult::Affected(0))
             }
             // S74
@@ -1824,14 +1945,11 @@ impl SqlExecutor {
                 if let Err(msg) = Self::validate_policy_expr(&using_expr, &engine.schema, &table) {
                     return Ok(sql_error("0A000", &msg));
                 }
-                self.policies
-                    .lock()
-                    .unwrap()
-                    .insert(name, (table, using_expr));
+                self.policies.lock_safe().insert(name, (table, using_expr));
                 Ok(QueryResult::Created)
             }
             Stmt::DropPolicy { name, .. } => {
-                self.policies.lock().unwrap().remove(&name);
+                self.policies.lock_safe().remove(&name);
                 Ok(QueryResult::Dropped)
             }
             // S79 â€” column masking
@@ -1841,7 +1959,7 @@ impl SqlExecutor {
                 col,
                 mask_val,
             } => {
-                self.masks.lock().unwrap().insert((table, col), mask_val);
+                self.masks.lock_safe().insert((table, col), mask_val);
                 Ok(QueryResult::Created)
             }
             Stmt::DropMask { name } => {
@@ -1853,53 +1971,51 @@ impl SqlExecutor {
                 // The test drops by name stored at create time; we'll use a separate nameâ†’key map.
                 // Since we don't have that here, just succeed (drop by table.col via name).
                 let _ = name; // handled via masks cleanup
-                self.masks.lock().unwrap().clear(); // crude but passes the drop test
+                self.masks.lock_safe().clear(); // crude but passes the drop test
                 Ok(QueryResult::Dropped)
             }
             // S80 â€” audit log truncate
             Stmt::TruncateAuditLog => {
-                self.audit_log.lock().unwrap().clear();
+                self.audit_log.lock_safe().clear();
                 Ok(QueryResult::Affected(0))
             }
             // S81 â€” token auth
             Stmt::SetSessionToken { token } => {
-                *self.session_token.lock().unwrap() = Some(token);
+                *self.session_token.lock_safe() = Some(token);
                 Ok(QueryResult::Affected(0))
             }
             Stmt::RequireToken { table, token } => {
-                self.table_tokens.lock().unwrap().insert(table, token);
+                self.table_tokens.lock_safe().insert(table, token);
                 Ok(QueryResult::Affected(0))
             }
             Stmt::DropRequireToken { table } => {
-                self.table_tokens.lock().unwrap().remove(&table);
+                self.table_tokens.lock_safe().remove(&table);
                 Ok(QueryResult::Affected(0))
             }
             // S82 â€” rate limiting
             Stmt::SetRateLimit { table, n } => {
                 self.rate_limits
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(table, (n, 0, std::time::Instant::now()));
                 Ok(QueryResult::Affected(0))
             }
             Stmt::DropRateLimit { table } => {
-                self.rate_limits.lock().unwrap().remove(&table);
+                self.rate_limits.lock_safe().remove(&table);
                 Ok(QueryResult::Affected(0))
             }
             // S83 â€” IP allowlist
             Stmt::AddAllowedIp { ip } => {
-                self.allowed_ips.lock().unwrap().insert(ip);
+                self.allowed_ips.lock_safe().insert(ip);
                 Ok(QueryResult::Affected(0))
             }
             Stmt::RemoveAllowedIp { ip } => {
-                self.allowed_ips.lock().unwrap().remove(&ip);
+                self.allowed_ips.lock_safe().remove(&ip);
                 Ok(QueryResult::Affected(0))
             }
             Stmt::ShowAllowedIps => {
                 let ips: Vec<Vec<String>> = self
                     .allowed_ips
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .iter()
                     .map(|ip| vec![ip.clone()])
                     .collect();
@@ -1913,18 +2029,18 @@ impl SqlExecutor {
                 cert_path,
                 key_path,
             } => {
-                *self.tls_cert_path.lock().unwrap() = Some(cert_path);
-                *self.tls_key_path.lock().unwrap() = Some(key_path);
+                *self.tls_cert_path.lock_safe() = Some(cert_path);
+                *self.tls_key_path.lock_safe() = Some(key_path);
                 Ok(QueryResult::Ok("cert rotation scheduled".to_owned()))
             }
             // S87 â€” warnings
             Stmt::SetWarnings(on) => {
-                *self.warnings_enabled.lock().unwrap() = on;
+                *self.warnings_enabled.lock_safe() = on;
                 Ok(QueryResult::Affected(0))
             }
             // S88 â€” replication slots
             Stmt::CreateReplicationSlot { name, temporary } => {
-                self.replication_slots.lock().unwrap().insert(
+                self.replication_slots.lock_safe().insert(
                     name.clone(),
                     ReplicationSlot {
                         name,
@@ -1935,12 +2051,12 @@ impl SqlExecutor {
                 Ok(QueryResult::Created)
             }
             Stmt::DropReplicationSlot { name } => {
-                self.replication_slots.lock().unwrap().remove(&name);
+                self.replication_slots.lock_safe().remove(&name);
                 Ok(QueryResult::Dropped)
             }
             Stmt::StartReplication { slot, .. } => {
-                let log = self.audit_log.lock().unwrap().clone();
-                let mut slot_guard = self.replication_slots.lock().unwrap();
+                let log = self.audit_log.lock_safe().clone();
+                let mut slot_guard = self.replication_slots.lock_safe();
                 if let Some(s) = slot_guard.get_mut(&slot) {
                     s.lsn += log.len() as u64;
                 }
@@ -1966,31 +2082,31 @@ impl SqlExecutor {
             }
             // S90 â€” read-only mode
             Stmt::SetReadOnly => {
-                *self.read_only.lock().unwrap() = true;
+                *self.read_only.lock_safe() = true;
                 Ok(QueryResult::Affected(0))
             }
             Stmt::SetReadWrite => {
-                *self.read_only.lock().unwrap() = false;
+                *self.read_only.lock_safe() = false;
                 Ok(QueryResult::Affected(0))
             }
             // S91 â€” failover
             Stmt::PromoteStandby => {
-                *self.read_only.lock().unwrap() = false;
+                *self.read_only.lock_safe() = false;
                 Ok(QueryResult::Ok("promoted to primary".to_owned()))
             }
             Stmt::DemotePrimary => {
-                *self.read_only.lock().unwrap() = true;
+                *self.read_only.lock_safe() = true;
                 Ok(QueryResult::Ok("demoted to standby".to_owned()))
             }
             // S92 â€” WAL archive
             Stmt::SetArchivePath { path } => {
-                *self.archive_path.lock().unwrap() = Some(path);
+                *self.archive_path.lock_safe() = Some(path);
                 Ok(QueryResult::Affected(0))
             }
             Stmt::ArchiveNow => {
-                let path_opt = self.archive_path.lock().unwrap().clone();
+                let path_opt = self.archive_path.lock_safe().clone();
                 if let Some(ref path) = path_opt {
-                    let mut count = self.archive_count.lock().unwrap();
+                    let mut count = self.archive_count.lock_safe();
                     let filename = format!("{}/wal_segment_{}.bin", path, *count);
                     let _ = std::fs::create_dir_all(path);
                     let _ = std::fs::write(&filename, b"WAL_SEGMENT");
@@ -2001,13 +2117,8 @@ impl SqlExecutor {
                 }
             }
             Stmt::ShowArchiveStatus => {
-                let path = self
-                    .archive_path
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or_default();
-                let count = *self.archive_count.lock().unwrap();
+                let path = self.archive_path.lock_safe().clone().unwrap_or_default();
+                let count = *self.archive_count.lock_safe();
                 Ok(QueryResult::Rows {
                     columns: vec![
                         "path".to_owned(),
@@ -2019,21 +2130,21 @@ impl SqlExecutor {
             }
             // S93 â€” slow query threshold
             Stmt::SetSlowQueryThreshold { ms } => {
-                *self.slow_query_threshold_ms.lock().unwrap() = Some(ms);
+                *self.slow_query_threshold_ms.lock_safe() = Some(ms);
                 Ok(QueryResult::Affected(0))
             }
             Stmt::TruncateSlowLog => {
-                self.slow_log.lock().unwrap().clear();
+                self.slow_log.lock_safe().clear();
                 Ok(QueryResult::Affected(0))
             }
             // S96 â€” auto-explain threshold
             Stmt::SetAutoExplainThreshold { ms } => {
-                *self.auto_explain_threshold_ms.lock().unwrap() = Some(ms);
+                *self.auto_explain_threshold_ms.lock_safe() = Some(ms);
                 Ok(QueryResult::Affected(0))
             }
             // S97 â€” reset wait events
             Stmt::ResetWaitEvents => {
-                self.wait_events.lock().unwrap().clear();
+                self.wait_events.lock_safe().clear();
                 Ok(QueryResult::Affected(0))
             }
             // S98 â€” flamegraph export
@@ -2048,7 +2159,7 @@ impl SqlExecutor {
             Stmt::CloseCursor { name } => self.exec_close_cursor(&name),
             // S106 â€” statement timeout
             Stmt::SetStatementTimeout { ms } => {
-                *self.statement_timeout_ms.lock().unwrap() = Some(ms);
+                *self.statement_timeout_ms.lock_safe() = Some(ms);
                 Ok(QueryResult::Affected(0))
             }
             // S108 â€” systemd integration
@@ -2069,22 +2180,21 @@ impl SqlExecutor {
             Stmt::ShutdownImmediate => Ok(QueryResult::Ok("immediate shutdown".to_owned())),
             // S110 â€” multi-database
             Stmt::CreateDatabase { name } => {
-                self.databases.lock().unwrap().insert(name);
+                self.databases.lock_safe().insert(name);
                 Ok(QueryResult::Created)
             }
             Stmt::DropDatabase { name } => {
-                self.databases.lock().unwrap().remove(&name);
+                self.databases.lock_safe().remove(&name);
                 Ok(QueryResult::Dropped)
             }
             Stmt::UseDatabase { name } => {
-                *self.current_db.lock().unwrap() = name;
+                *self.current_db.lock_safe() = name;
                 Ok(QueryResult::Affected(0))
             }
             Stmt::ShowDatabases => {
                 let dbs: Vec<Vec<String>> = self
                     .databases
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .iter()
                     .map(|d| vec![d.clone()])
                     .collect();
@@ -2095,22 +2205,21 @@ impl SqlExecutor {
             }
             // S111 â€” schema namespacing
             Stmt::CreateSchema { name } => {
-                self.schemas.lock().unwrap().insert(name);
+                self.schemas.lock_safe().insert(name);
                 Ok(QueryResult::Created)
             }
             Stmt::DropSchema { name } => {
-                self.schemas.lock().unwrap().remove(&name);
+                self.schemas.lock_safe().remove(&name);
                 Ok(QueryResult::Dropped)
             }
             Stmt::SetSearchPath { schema } => {
-                *self.search_path.lock().unwrap() = schema;
+                *self.search_path.lock_safe() = schema;
                 Ok(QueryResult::Affected(0))
             }
             Stmt::ShowSchemas => {
                 let schemas: Vec<Vec<String>> = self
                     .schemas
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .iter()
                     .map(|s| vec![s.clone()])
                     .collect();
@@ -2127,8 +2236,7 @@ impl SqlExecutor {
                 range_to,
             } => {
                 self.partitions
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(name, (parent, range_from, range_to));
                 Ok(QueryResult::Created)
             }
@@ -2138,11 +2246,11 @@ impl SqlExecutor {
             Stmt::Analyze { table } => self.exec_analyze(table),
             // S116 â€” connection limits
             Stmt::SetMaxConnections { n } => {
-                *self.max_connections.lock().unwrap() = n;
+                *self.max_connections.lock_safe() = n;
                 Ok(QueryResult::Affected(0))
             }
             Stmt::ShowMaxConnections => {
-                let max = *self.max_connections.lock().unwrap();
+                let max = *self.max_connections.lock_safe();
                 Ok(QueryResult::Rows {
                     columns: vec!["max_connections".to_owned()],
                     rows: vec![vec![max.to_string()]],
@@ -2154,7 +2262,7 @@ impl SqlExecutor {
                 cpu_pct,
                 memory_mb,
             } => {
-                self.resource_groups.lock().unwrap().insert(
+                self.resource_groups.lock_safe().insert(
                     name,
                     ResourceGroup {
                         cpu_pct,
@@ -2165,7 +2273,7 @@ impl SqlExecutor {
                 Ok(QueryResult::Created)
             }
             Stmt::DropResourceGroup { name } => {
-                self.resource_groups.lock().unwrap().remove(&name);
+                self.resource_groups.lock_safe().remove(&name);
                 Ok(QueryResult::Dropped)
             }
             Stmt::AlterResourceGroup {
@@ -2173,7 +2281,7 @@ impl SqlExecutor {
                 cpu_pct,
                 memory_mb,
             } => {
-                let mut groups = self.resource_groups.lock().unwrap();
+                let mut groups = self.resource_groups.lock_safe();
                 if let Some(rg) = groups.get_mut(&name) {
                     if let Some(c) = cpu_pct {
                         rg.cpu_pct = c;
@@ -2190,7 +2298,7 @@ impl SqlExecutor {
                 }
             }
             Stmt::AssignUserToGroup { user, group } => {
-                let mut groups = self.resource_groups.lock().unwrap();
+                let mut groups = self.resource_groups.lock_safe();
                 if let Some(rg) = groups.get_mut(&group) {
                     if !rg.users.contains(&user) {
                         rg.users.push(user);
@@ -2231,8 +2339,7 @@ impl SqlExecutor {
                                     .unwrap_or_default()
                                     .as_millis() as u64;
                                 self.event_log
-                                    .lock()
-                                    .unwrap()
+                                    .lock_safe()
                                     .entry(table_name)
                                     .or_default()
                                     .push((ts, evt_type, payload));
@@ -2258,7 +2365,7 @@ impl SqlExecutor {
             } else {
                 (rest.trim().to_ascii_lowercase(), None)
             };
-            let log = self.event_log.lock().unwrap();
+            let log = self.event_log.lock_safe();
             let events = log.get(&table_name).cloned().unwrap_or_default();
             drop(log);
             let rows: Vec<Vec<String>> = events
@@ -2292,8 +2399,7 @@ impl SqlExecutor {
                     (after_from.trim().to_ascii_lowercase(), String::new())
                 };
                 self.read_models
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(model_name, (table_name, event_type));
                 return Some(Ok(QueryResult::Created));
             }
@@ -2307,7 +2413,7 @@ impl SqlExecutor {
             let model_name = s["SELECT * FROM READ MODEL ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let models = self.read_models.lock().unwrap();
+            let models = self.read_models.lock_safe();
             let entry = models.get(&model_name).cloned();
             drop(models);
             let columns = vec![
@@ -2316,7 +2422,7 @@ impl SqlExecutor {
                 "payload".to_owned(),
             ];
             if let Some((table_name, event_type_filter)) = entry {
-                let log = self.event_log.lock().unwrap();
+                let log = self.event_log.lock_safe();
                 let events = log.get(&table_name).cloned().unwrap_or_default();
                 drop(log);
                 let rows = events
@@ -2335,7 +2441,7 @@ impl SqlExecutor {
         // S119 â€” DROP READ MODEL model_name
         if up.starts_with("DROP READ MODEL ") {
             let model_name = s["DROP READ MODEL ".len()..].trim().to_ascii_lowercase();
-            self.read_models.lock().unwrap().remove(&model_name);
+            self.read_models.lock_safe().remove(&model_name);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -2348,8 +2454,7 @@ impl SqlExecutor {
                 .unwrap_or_default()
                 .as_millis() as u64;
             self.time_travel_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(table_name)
                 .or_default()
                 .push((ts, rows));
@@ -2365,7 +2470,7 @@ impl SqlExecutor {
                     .to_ascii_lowercase();
                 let ts_str = s[as_of_pos + " AS OF TIMESTAMP ".len()..].trim();
                 let target_ts: u64 = ts_str.parse().unwrap_or(0);
-                let log = self.time_travel_log.lock().unwrap();
+                let log = self.time_travel_log.lock_safe();
                 let columns = vec!["row_data".to_owned()];
                 if let Some(snapshots) = log.get(&table_name) {
                     let closest = snapshots.iter().min_by_key(|(ts, _)| {
@@ -2394,7 +2499,7 @@ impl SqlExecutor {
             let table_name = s["ENABLE CHANGE FEED ON ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.change_feed_enabled.lock().unwrap().insert(table_name);
+            self.change_feed_enabled.lock_safe().insert(table_name);
             return Some(Ok(QueryResult::Affected(0)));
         }
 
@@ -2403,7 +2508,7 @@ impl SqlExecutor {
             let table_name = s["DISABLE CHANGE FEED ON ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.change_feed_enabled.lock().unwrap().remove(&table_name);
+            self.change_feed_enabled.lock_safe().remove(&table_name);
             return Some(Ok(QueryResult::Affected(0)));
         }
 
@@ -2412,7 +2517,7 @@ impl SqlExecutor {
             let table_name = s["SELECT * FROM CHANGES OF ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let feed = self.change_feed.lock().unwrap();
+            let feed = self.change_feed.lock_safe();
             let entries = feed.get(&table_name).cloned().unwrap_or_default();
             drop(feed);
             let rows = entries
@@ -2437,7 +2542,7 @@ impl SqlExecutor {
                     let col_part = &table_col[paren_pos + 1..];
                     let col_name = col_part.trim_end_matches(')').trim().to_ascii_lowercase();
                     let values = self.collect_col_values(&table_name, &col_name);
-                    self.bloom_indexes.lock().unwrap().insert(
+                    self.bloom_indexes.lock_safe().insert(
                         idx_name,
                         (table_name, col_name, values.into_iter().collect()),
                     );
@@ -2452,7 +2557,7 @@ impl SqlExecutor {
         // S122 â€” DROP BLOOM INDEX idx_name
         if up.starts_with("DROP BLOOM INDEX ") {
             let idx_name = s["DROP BLOOM INDEX ".len()..].trim().to_ascii_lowercase();
-            self.bloom_indexes.lock().unwrap().remove(&idx_name);
+            self.bloom_indexes.lock_safe().remove(&idx_name);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -2466,7 +2571,7 @@ impl SqlExecutor {
                 let col_name = s[wp + " WHERE ".len()..bm_pos].trim().to_ascii_lowercase();
                 let after_bm = s[bm_pos + " BLOOM_MATCH ".len()..].trim();
                 if let Some(value) = parse_single_quoted(after_bm) {
-                    let indexes = self.bloom_indexes.lock().unwrap();
+                    let indexes = self.bloom_indexes.lock_safe();
                     let bloom_hit = indexes.values().any(|(tbl, col, vals)| {
                         tbl == &table_name && col == &col_name && vals.contains(&value)
                     });
@@ -2495,7 +2600,7 @@ impl SqlExecutor {
             let up_rest = rest.to_ascii_uppercase();
             if let Some(pos) = up_rest.find(" STORE COLUMNAR") {
                 let table_name = rest[..pos].trim().to_ascii_lowercase();
-                self.columnar_tables.lock().unwrap().insert(table_name);
+                self.columnar_tables.lock_safe().insert(table_name);
                 return Some(Ok(QueryResult::Affected(0)));
             }
         }
@@ -2506,7 +2611,7 @@ impl SqlExecutor {
             let up_rest = rest.to_ascii_uppercase();
             if let Some(pos) = up_rest.find(" STORE ROW") {
                 let table_name = rest[..pos].trim().to_ascii_lowercase();
-                self.columnar_tables.lock().unwrap().remove(&table_name);
+                self.columnar_tables.lock_safe().remove(&table_name);
                 return Some(Ok(QueryResult::Affected(0)));
             }
         }
@@ -2516,7 +2621,7 @@ impl SqlExecutor {
             let table_name = s["SHOW STORAGE FORMAT FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let fmt = if self.columnar_tables.lock().unwrap().contains(&table_name) {
+            let fmt = if self.columnar_tables.lock_safe().contains(&table_name) {
                 "COLUMNAR"
             } else {
                 "ROW"
@@ -2529,14 +2634,14 @@ impl SqlExecutor {
             let rest = s["SET ADAPTIVE QUERY EXECUTION ".len()..]
                 .trim()
                 .to_ascii_uppercase();
-            *self.aqe_enabled.lock().unwrap() = rest == "ON";
+            *self.aqe_enabled.lock_safe() = rest == "ON";
             return Some(Ok(QueryResult::Affected(0)));
         }
 
         // S124 â€” SHOW AQE STATUS
         if up.trim() == "SHOW AQE STATUS" {
-            let enabled = *self.aqe_enabled.lock().unwrap();
-            let stats_count = self.aqe_stats.lock().unwrap().len();
+            let enabled = *self.aqe_enabled.lock_safe();
+            let stats_count = self.aqe_stats.lock_safe().len();
             let status = if enabled { "enabled" } else { "disabled" };
             return Some(Ok(QueryResult::Ok(format!(
                 "AQE: {} ({} stats)",
@@ -2548,7 +2653,7 @@ impl SqlExecutor {
         if up.starts_with("SET STREAM CHUNK SIZE ") {
             let n_str = s["SET STREAM CHUNK SIZE ".len()..].trim();
             if let Ok(n) = n_str.parse::<usize>() {
-                *self.stream_chunk_size.lock().unwrap() = n;
+                *self.stream_chunk_size.lock_safe() = n;
                 return Some(Ok(QueryResult::Affected(0)));
             }
             return Some(Ok(QueryResult::Error("invalid chunk size".to_owned())));
@@ -2556,7 +2661,7 @@ impl SqlExecutor {
 
         // S125 â€” SHOW STREAM CONFIG
         if up.trim() == "SHOW STREAM CONFIG" {
-            let chunk_size = *self.stream_chunk_size.lock().unwrap();
+            let chunk_size = *self.stream_chunk_size.lock_safe();
             return Some(Ok(QueryResult::Ok(format!("chunk_size={}", chunk_size))));
         }
 
@@ -2567,7 +2672,7 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let rows = self.scan_table_as_strings(&table_name);
             let total = rows.len();
-            let chunk_size = *self.stream_chunk_size.lock().unwrap();
+            let chunk_size = *self.stream_chunk_size.lock_safe();
             let chunks = if chunk_size == 0 || total == 0 {
                 0usize
             } else {
@@ -2600,8 +2705,7 @@ impl SqlExecutor {
                                 let lat: f64 = parts[0].trim().parse().unwrap_or(0.0);
                                 let lng: f64 = parts[1].trim().parse().unwrap_or(0.0);
                                 self.geo_columns
-                                    .lock()
-                                    .unwrap()
+                                    .lock_safe()
                                     .entry(table_name)
                                     .or_default()
                                     .insert(col_name, (lat, lng));
@@ -2625,7 +2729,7 @@ impl SqlExecutor {
                 if parts.len() == 2 {
                     let (at, ac) = split_table_col(parts[0].trim());
                     let (bt, bc) = split_table_col(parts[1].trim());
-                    let geo = self.geo_columns.lock().unwrap();
+                    let geo = self.geo_columns.lock_safe();
                     let p1 = geo
                         .get(&at)
                         .and_then(|m| m.get(&ac))
@@ -2662,7 +2766,7 @@ impl SqlExecutor {
                         let lat: f64 = parts[1].trim().parse().unwrap_or(0.0);
                         let lng: f64 = parts[2].trim().parse().unwrap_or(0.0);
                         let radius: f64 = parts[3].trim().parse().unwrap_or(0.0);
-                        let geo = self.geo_columns.lock().unwrap();
+                        let geo = self.geo_columns.lock_safe();
                         let point = geo.get(&table_name).and_then(|m| m.get(&col_name)).copied();
                         drop(geo);
                         let columns = vec!["row_data".to_owned()];
@@ -2699,7 +2803,7 @@ impl SqlExecutor {
                     let _ = self.graph_store.save();
                     self.save_graph_node_names(&self.graph_dir());
                 }
-                self.graph_edges.lock().unwrap().push((from, rel, to));
+                self.graph_edges.lock_safe().push((from, rel, to));
                 return Some(Ok(QueryResult::Created));
             }
             return Some(Ok(QueryResult::Error(
@@ -2717,8 +2821,7 @@ impl SqlExecutor {
                     let _ = self.graph_store.save();
                 }
                 self.graph_edges
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .retain(|(f, r, t)| !(f == &from && r == &rel && t == &to));
                 return Some(Ok(QueryResult::Dropped));
             }
@@ -2736,13 +2839,13 @@ impl SqlExecutor {
                 match self.graph_store.remove_node(id) {
                     Ok(deleted_ids) => {
                         let _ = self.graph_store.save();
-                        let names = self.graph_node_names.lock().unwrap();
+                        let names = self.graph_node_names.lock_safe();
                         let deleted_names: Vec<String> = deleted_ids
                             .iter()
                             .map(|id| names.get(id).cloned().unwrap_or_else(|| format!("#{id}")))
                             .collect();
                         drop(names);
-                        self.graph_edges.lock().unwrap().retain(|(f, _, t)| {
+                        self.graph_edges.lock_safe().retain(|(f, _, t)| {
                             !deleted_names.contains(f) && !deleted_names.contains(t)
                         });
                         return Some(Ok(QueryResult::Rows {
@@ -2783,7 +2886,7 @@ impl SqlExecutor {
 
         // S127 â€” MATCH (a)-[r:REL_TYPE]->(b) [WHERE a = 'node'] RETURN a, r, b
         if up.starts_with("MATCH ") {
-            let edges = self.graph_edges.lock().unwrap().clone();
+            let edges = self.graph_edges.lock_safe().clone();
             let rel_filter = parse_match_rel_type(s);
             let node_filter = parse_match_where(s);
             let rows: Vec<Vec<String>> = edges
@@ -2805,27 +2908,27 @@ impl SqlExecutor {
             let txn_id = s["BEGIN DISTRIBUTED TRANSACTION ".len()..]
                 .trim()
                 .to_owned();
-            *self.dist_txn_active.lock().unwrap() = Some(txn_id);
+            *self.dist_txn_active.lock_safe() = Some(txn_id);
             return Some(Ok(QueryResult::TxBegin));
         }
         if up.starts_with("PREPARE TRANSACTION ") {
             let txn_id = s["PREPARE TRANSACTION ".len()..].trim().to_owned();
             let stmts: Vec<String> = vec![];
-            self.prepared_txns.lock().unwrap().insert(txn_id, stmts);
+            self.prepared_txns.lock_safe().insert(txn_id, stmts);
             return Some(Ok(QueryResult::Ok("PREPARE TRANSACTION".to_owned())));
         }
         if up.starts_with("COMMIT PREPARED ") {
             let txn_id = s["COMMIT PREPARED ".len()..].trim().to_owned();
-            self.prepared_txns.lock().unwrap().remove(&txn_id);
+            self.prepared_txns.lock_safe().remove(&txn_id);
             return Some(Ok(QueryResult::Ok("COMMIT PREPARED".to_owned())));
         }
         if up.starts_with("ROLLBACK PREPARED ") {
             let txn_id = s["ROLLBACK PREPARED ".len()..].trim().to_owned();
-            self.prepared_txns.lock().unwrap().remove(&txn_id);
+            self.prepared_txns.lock_safe().remove(&txn_id);
             return Some(Ok(QueryResult::Ok("ROLLBACK PREPARED".to_owned())));
         }
         if up == "SHOW PREPARED TRANSACTIONS" {
-            let map = self.prepared_txns.lock().unwrap();
+            let map = self.prepared_txns.lock_safe();
             let rows: Vec<Vec<String>> = map
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.len().to_string()])
@@ -2854,14 +2957,14 @@ impl SqlExecutor {
                     .map(|s| s.trim().to_owned())
                     .filter(|s| !s.is_empty())
                     .collect();
-                self.procedures.lock().unwrap().insert(proc_name, body);
+                self.procedures.lock_safe().insert(proc_name, body);
                 return Some(Ok(QueryResult::Created));
             }
         }
         if up.starts_with("CALL ") {
             let rest = s["CALL ".len()..].trim();
             let proc_name = rest.trim_end_matches("()").trim().to_ascii_lowercase();
-            let body = self.procedures.lock().unwrap().get(&proc_name).cloned();
+            let body = self.procedures.lock_safe().get(&proc_name).cloned();
             if let Some(stmts) = body {
                 let mut last = QueryResult::Affected(0);
                 for stmt in &stmts {
@@ -2878,11 +2981,11 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP PROCEDURE ") {
             let proc_name = s["DROP PROCEDURE ".len()..].trim().to_ascii_lowercase();
-            self.procedures.lock().unwrap().remove(&proc_name);
+            self.procedures.lock_safe().remove(&proc_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW PROCEDURES" {
-            let map = self.procedures.lock().unwrap();
+            let map = self.procedures.lock_safe();
             let rows: Vec<Vec<String>> = map.keys().map(|k| vec![k.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["procedure_name".to_owned()],
@@ -2898,8 +3001,7 @@ impl SqlExecutor {
                 let type_name = rest[..as_pos].trim().to_ascii_lowercase();
                 let def = rest[as_pos + " AS ENUM ".len()..].trim().to_owned();
                 self.user_types
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(type_name, ("ENUM".to_owned(), def));
                 return Some(Ok(QueryResult::Created));
             }
@@ -2907,19 +3009,18 @@ impl SqlExecutor {
                 let type_name = rest[..as_pos].trim().to_ascii_lowercase();
                 let def = rest[as_pos + " AS COMPOSITE ".len()..].trim().to_owned();
                 self.user_types
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(type_name, ("COMPOSITE".to_owned(), def));
                 return Some(Ok(QueryResult::Created));
             }
         }
         if up.starts_with("DROP TYPE ") {
             let type_name = s["DROP TYPE ".len()..].trim().to_ascii_lowercase();
-            self.user_types.lock().unwrap().remove(&type_name);
+            self.user_types.lock_safe().remove(&type_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW TYPES" {
-            let map = self.user_types.lock().unwrap();
+            let map = self.user_types.lock_safe();
             let rows: Vec<Vec<String>> = map
                 .iter()
                 .map(|(k, (kind, def))| vec![k.clone(), kind.clone(), def.clone()])
@@ -2946,7 +3047,7 @@ impl SqlExecutor {
                     .split(',')
                     .map(|v| v.trim().trim_matches('\'').to_owned())
                     .collect();
-                self.array_store.lock().unwrap().insert(key, arr);
+                self.array_store.lock_safe().insert(key, arr);
                 return Some(Ok(QueryResult::Affected(1)));
             }
         }
@@ -2954,8 +3055,7 @@ impl SqlExecutor {
             let key = s["SELECT ARRAY FROM ".len()..].trim().to_ascii_lowercase();
             let arr = self
                 .array_store
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&key)
                 .cloned()
                 .unwrap_or_default();
@@ -2979,8 +3079,7 @@ impl SqlExecutor {
             let key = s["SELECT UNNEST FROM ".len()..].trim().to_ascii_lowercase();
             let arr = self
                 .array_store
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&key)
                 .cloned()
                 .unwrap_or_default();
@@ -3001,8 +3100,7 @@ impl SqlExecutor {
                     .to_owned();
                 let arr = self
                     .array_store
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .get(&key)
                     .cloned()
                     .unwrap_or_default();
@@ -3021,7 +3119,7 @@ impl SqlExecutor {
                     .trim()
                     .trim_matches('\'')
                     .to_owned();
-                self.jsonpath_cache.lock().unwrap().insert(key, json_str);
+                self.jsonpath_cache.lock_safe().insert(key, json_str);
                 return Some(Ok(QueryResult::Affected(1)));
             }
         }
@@ -3036,8 +3134,7 @@ impl SqlExecutor {
                     .to_owned();
                 let json_str = self
                     .jsonpath_cache
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .get(&key)
                     .cloned()
                     .unwrap_or_default();
@@ -3068,8 +3165,7 @@ impl SqlExecutor {
                     .to_owned();
                 let json_str = self
                     .jsonpath_cache
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .get(&key)
                     .cloned()
                     .unwrap_or_default();
@@ -3088,8 +3184,7 @@ impl SqlExecutor {
                     .to_owned();
                 let json_str = self
                     .jsonpath_cache
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .get(&doc_key)
                     .cloned()
                     .unwrap_or_default();
@@ -3109,8 +3204,7 @@ impl SqlExecutor {
                     .trim_matches('\'')
                     .to_owned();
                 self.foreign_servers
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(server_name, conn_str);
                 return Some(Ok(QueryResult::Created));
             }
@@ -3124,21 +3218,20 @@ impl SqlExecutor {
                     .trim()
                     .to_ascii_lowercase();
                 self.foreign_tables
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(table_name, server_name);
                 return Some(Ok(QueryResult::Created));
             }
         }
         if up.starts_with("DROP SERVER ") {
             let server_name = s["DROP SERVER ".len()..].trim().to_ascii_lowercase();
-            self.foreign_servers.lock().unwrap().remove(&server_name);
+            self.foreign_servers.lock_safe().remove(&server_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up.starts_with("DROP FOREIGN TABLE ") {
             let table_name = s["DROP FOREIGN TABLE ".len()..].trim().to_ascii_lowercase();
-            self.foreign_tables.lock().unwrap().remove(&table_name);
-            self.s190_foreign_tables.lock().unwrap().remove(&table_name);
+            self.foreign_tables.lock_safe().remove(&table_name);
+            self.s190_foreign_tables.lock_safe().remove(&table_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up.starts_with("SELECT * FROM FOREIGN ") {
@@ -3147,8 +3240,7 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let server_name = self
                 .foreign_tables
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&table_name)
                 .cloned()
                 .unwrap_or_default();
@@ -3158,7 +3250,7 @@ impl SqlExecutor {
             ))));
         }
         if up == "SHOW FOREIGN SERVERS" {
-            let map = self.foreign_servers.lock().unwrap();
+            let map = self.foreign_servers.lock_safe();
             let rows: Vec<Vec<String>> = map
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -3180,8 +3272,7 @@ impl SqlExecutor {
                     .trim_matches('\'')
                     .to_owned();
                 self.federation_nodes
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(node_name, endpoint);
                 return Some(Ok(QueryResult::Ok("FEDERATION NODE ADDED".to_owned())));
             }
@@ -3190,18 +3281,18 @@ impl SqlExecutor {
             let node_name = s["REMOVE FEDERATION NODE ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.federation_nodes.lock().unwrap().remove(&node_name);
+            self.federation_nodes.lock_safe().remove(&node_name);
             return Some(Ok(QueryResult::Ok("FEDERATION NODE REMOVED".to_owned())));
         }
         if up.starts_with("FEDERATED SELECT ") {
-            let node_count = self.federation_nodes.lock().unwrap().len();
+            let node_count = self.federation_nodes.lock_safe().len();
             return Some(Ok(QueryResult::Ok(format!(
                 "FEDERATED: {} nodes queried, 0 rows merged",
                 node_count
             ))));
         }
         if up == "SHOW FEDERATION NODES" {
-            let map = self.federation_nodes.lock().unwrap();
+            let map = self.federation_nodes.lock_safe();
             let rows: Vec<Vec<String>> = map
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -3219,10 +3310,7 @@ impl SqlExecutor {
             if let Some(to_pos) = up_rest.find(" TO ") {
                 let table_name = rest[..to_pos].trim().to_ascii_lowercase();
                 let engine = rest[to_pos + " TO ".len()..].trim().to_ascii_uppercase();
-                self.table_engines
-                    .lock()
-                    .unwrap()
-                    .insert(table_name, engine);
+                self.table_engines.lock_safe().insert(table_name, engine);
                 return Some(Ok(QueryResult::Ok("ENGINE SET".to_owned())));
             }
         }
@@ -3232,15 +3320,14 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let engine = self
                 .table_engines
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&table_name)
                 .cloned()
                 .unwrap_or_else(|| "ROW".to_owned());
             return Some(Ok(QueryResult::Ok(engine)));
         }
         if up == "SHOW ALL TABLE ENGINES" {
-            let map = self.table_engines.lock().unwrap();
+            let map = self.table_engines.lock_safe();
             let rows: Vec<Vec<String>> = map
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -3261,7 +3348,7 @@ impl SqlExecutor {
                     .trim()
                     .trim_matches('\'')
                     .to_owned();
-                self.regions.lock().unwrap().insert(region_name, endpoint);
+                self.regions.lock_safe().insert(region_name, endpoint);
                 return Some(Ok(QueryResult::Ok("REGION ADDED".to_owned())));
             }
         }
@@ -3275,7 +3362,7 @@ impl SqlExecutor {
             ))));
         }
         if up == "SHOW REPLICATION LAG" {
-            let lag_map = self.replication_lag.lock().unwrap();
+            let lag_map = self.replication_lag.lock_safe();
             let rows: Vec<Vec<String>> = lag_map
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.to_string()])
@@ -3287,7 +3374,7 @@ impl SqlExecutor {
         }
         if up.starts_with("REMOVE REGION ") {
             let region_name = s["REMOVE REGION ".len()..].trim().to_ascii_lowercase();
-            self.regions.lock().unwrap().remove(&region_name);
+            self.regions.lock_safe().remove(&region_name);
             return Some(Ok(QueryResult::Ok("REGION REMOVED".to_owned())));
         }
         if up.starts_with("SET REPLICATION LAG FOR ") {
@@ -3296,10 +3383,7 @@ impl SqlExecutor {
             if let Some(to_pos) = up_rest.find(" TO ") {
                 let region_name = rest[..to_pos].trim().to_ascii_lowercase();
                 let lag: u64 = rest[to_pos + " TO ".len()..].trim().parse().unwrap_or(0);
-                self.replication_lag
-                    .lock()
-                    .unwrap()
-                    .insert(region_name, lag);
+                self.replication_lag.lock_safe().insert(region_name, lag);
                 return Some(Ok(QueryResult::Ok("LAG SET".to_owned())));
             }
         }
@@ -3319,21 +3403,17 @@ impl SqlExecutor {
                         .trim_matches('\'')
                         .to_owned();
                     self.auth_providers
-                        .lock()
-                        .unwrap()
+                        .lock_safe()
                         .insert(provider_name.clone(), provider_type);
-                    self.auth_config
-                        .lock()
-                        .unwrap()
-                        .insert(provider_name, config);
+                    self.auth_config.lock_safe().insert(provider_name, config);
                     return Some(Ok(QueryResult::Created));
                 }
             }
         }
         if up.starts_with("DROP AUTH PROVIDER ") {
             let provider_name = s["DROP AUTH PROVIDER ".len()..].trim().to_ascii_lowercase();
-            self.auth_providers.lock().unwrap().remove(&provider_name);
-            self.auth_config.lock().unwrap().remove(&provider_name);
+            self.auth_providers.lock_safe().remove(&provider_name);
+            self.auth_config.lock_safe().remove(&provider_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up.starts_with("AUTHENTICATE WITH PROVIDER ") {
@@ -3347,8 +3427,7 @@ impl SqlExecutor {
                     .to_owned();
                 let ptype = self
                     .auth_providers
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .get(&provider_name)
                     .cloned()
                     .unwrap_or_else(|| "UNKNOWN".to_owned());
@@ -3359,7 +3438,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW AUTH PROVIDERS" {
-            let map = self.auth_providers.lock().unwrap();
+            let map = self.auth_providers.lock_safe();
             let rows: Vec<Vec<String>> = map
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -3381,14 +3460,14 @@ impl SqlExecutor {
                     .trim()
                     .to_ascii_lowercase();
                 if let Ok(n) = n_str.parse::<u64>() {
-                    self.mat_view_refresh.lock().unwrap().insert(view_name, n);
+                    self.mat_view_refresh.lock_safe().insert(view_name, n);
                     return Some(Ok(QueryResult::Ok("REFRESH SCHEDULED".to_owned())));
                 }
             }
         }
         if up == "SHOW REFRESH SCHEDULE" {
-            let refresh = self.mat_view_refresh.lock().unwrap();
-            let last = self.mat_view_last_refresh.lock().unwrap();
+            let refresh = self.mat_view_refresh.lock_safe();
+            let last = self.mat_view_last_refresh.lock_safe();
             let rows: Vec<Vec<String>> = refresh
                 .iter()
                 .map(|(k, v)| {
@@ -3409,7 +3488,7 @@ impl SqlExecutor {
             let view_name = s["CANCEL REFRESH FOR VIEW ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.mat_view_refresh.lock().unwrap().remove(&view_name);
+            self.mat_view_refresh.lock_safe().remove(&view_name);
             return Some(Ok(QueryResult::Ok("REFRESH CANCELLED".to_owned())));
         }
         if up.starts_with("TRIGGER REFRESH FOR VIEW ") {
@@ -3421,8 +3500,7 @@ impl SqlExecutor {
                 .unwrap_or_default()
                 .as_millis() as u64;
             self.mat_view_last_refresh
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(view_name, now_ms);
             return Some(Ok(QueryResult::Ok("REFRESHED".to_owned())));
         }
@@ -3447,10 +3525,7 @@ impl SqlExecutor {
                             .unwrap_or_default()
                             .as_millis() as u64;
                         let expire = now_ms + n * 1000;
-                        self.ttl_cache
-                            .lock()
-                            .unwrap()
-                            .insert(key, (sql_part, expire));
+                        self.ttl_cache.lock_safe().insert(key, (sql_part, expire));
                         return Some(Ok(QueryResult::Ok("CACHED".to_owned())));
                     }
                 }
@@ -3458,7 +3533,7 @@ impl SqlExecutor {
         }
         if up.starts_with("GET CACHED QUERY ") {
             let key = s["GET CACHED QUERY ".len()..].trim().to_ascii_lowercase();
-            let cache = self.ttl_cache.lock().unwrap();
+            let cache = self.ttl_cache.lock_safe();
             if let Some((result, expire)) = cache.get(&key) {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3476,11 +3551,11 @@ impl SqlExecutor {
             let key = s["INVALIDATE CACHE FOR KEY ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.ttl_cache.lock().unwrap().remove(&key);
+            self.ttl_cache.lock_safe().remove(&key);
             return Some(Ok(QueryResult::Ok("INVALIDATED".to_owned())));
         }
         if up == "SHOW QUERY CACHE" {
-            let cache = self.ttl_cache.lock().unwrap();
+            let cache = self.ttl_cache.lock_safe();
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -3504,7 +3579,7 @@ impl SqlExecutor {
             let rest = &s["GET LOCK '".len()..];
             if let Some(end_quote) = rest.find('\'') {
                 let lock_name = rest[..end_quote].to_owned();
-                let mut locks = self.dist_locks.lock().unwrap();
+                let mut locks = self.dist_locks.lock_safe();
                 if locks.contains_key(&lock_name) {
                     return Some(Ok(QueryResult::Ok(format!("LOCK TIMEOUT: {}", lock_name))));
                 }
@@ -3520,12 +3595,12 @@ impl SqlExecutor {
             let rest = &s["RELEASE LOCK '".len()..];
             if let Some(end_quote) = rest.find('\'') {
                 let lock_name = rest[..end_quote].to_owned();
-                self.dist_locks.lock().unwrap().remove(&lock_name);
+                self.dist_locks.lock_safe().remove(&lock_name);
                 return Some(Ok(QueryResult::Ok(format!("LOCK RELEASED: {}", lock_name))));
             }
         }
         if up == "SHOW LOCKS" {
-            let locks = self.dist_locks.lock().unwrap();
+            let locks = self.dist_locks.lock_safe();
             let rows: Vec<Vec<String>> = locks
                 .iter()
                 .map(|(k, (holder, ms))| vec![k.clone(), holder.clone(), ms.to_string()])
@@ -3543,7 +3618,7 @@ impl SqlExecutor {
             let rest = &s["FORCE RELEASE LOCK '".len()..];
             if let Some(end_quote) = rest.find('\'') {
                 let lock_name = rest[..end_quote].to_owned();
-                self.dist_locks.lock().unwrap().remove(&lock_name);
+                self.dist_locks.lock_safe().remove(&lock_name);
                 return Some(Ok(QueryResult::Ok(format!("LOCK RELEASED: {}", lock_name))));
             }
         }
@@ -3559,7 +3634,7 @@ impl SqlExecutor {
                     .trim()
                     .trim_matches('\'')
                     .to_owned();
-                self.repl_filters.lock().unwrap().insert(filter_name, expr);
+                self.repl_filters.lock_safe().insert(filter_name, expr);
                 return Some(Ok(QueryResult::Created));
             }
         }
@@ -3567,11 +3642,11 @@ impl SqlExecutor {
             let filter_name = s["DROP REPLICATION FILTER ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.repl_filters.lock().unwrap().remove(&filter_name);
+            self.repl_filters.lock_safe().remove(&filter_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW REPLICATION FILTERS" {
-            let filters = self.repl_filters.lock().unwrap();
+            let filters = self.repl_filters.lock_safe();
             let rows: Vec<Vec<String>> = filters
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -3615,7 +3690,7 @@ impl SqlExecutor {
                     if let Err(e) = self.require_column_key() {
                         return Some(Err(e));
                     }
-                    self.encrypted_cols.lock().unwrap().insert(key, hint);
+                    self.encrypted_cols.lock_safe().insert(key, hint);
                     return Some(Ok(QueryResult::Created));
                 }
             }
@@ -3655,10 +3730,7 @@ impl SqlExecutor {
                             Err(e) => return Some(Err(e)),
                         };
                         let map_key = format!("{tbl}.{col}.{pk}");
-                        self.encrypted_values
-                            .lock()
-                            .unwrap()
-                            .insert(map_key, encrypted);
+                        self.encrypted_values.lock_safe().insert(map_key, encrypted);
                     }
                     return Some(Ok(QueryResult::Affected(1)));
                 }
@@ -3686,7 +3758,7 @@ impl SqlExecutor {
                         Err(e) => return Some(Err(e)),
                     };
                     let map_key = format!("{}.{}.{}", table_name, col_name, pk);
-                    let vals = self.encrypted_values.lock().unwrap();
+                    let vals = self.encrypted_values.lock_safe();
                     if let Some(encrypted) = vals.get(&map_key) {
                         return Some(
                             Self::open_cell(&key, &table_name, &col_name, &pk, encrypted)
@@ -3698,7 +3770,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW ENCRYPTED COLUMNS" {
-            let cols = self.encrypted_cols.lock().unwrap();
+            let cols = self.encrypted_cols.lock_safe();
             let rows: Vec<Vec<String>> = cols
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -3716,10 +3788,7 @@ impl SqlExecutor {
             if let Some(to_pos) = up_rest.find(" TO ") {
                 let table_name = rest[..to_pos].trim().to_ascii_lowercase();
                 let codec = rest[to_pos + " TO ".len()..].trim().to_ascii_uppercase();
-                self.table_compression
-                    .lock()
-                    .unwrap()
-                    .insert(table_name, codec);
+                self.table_compression.lock_safe().insert(table_name, codec);
                 return Some(Ok(QueryResult::Ok("COMPRESSION SET".to_owned())));
             }
         }
@@ -3729,15 +3798,14 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let codec = self
                 .table_compression
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&table_name)
                 .cloned()
                 .unwrap_or_else(|| "NONE".to_owned());
             return Some(Ok(QueryResult::Ok(codec)));
         }
         if up == "SHOW ALL ROW COMPRESSION" {
-            let map = self.table_compression.lock().unwrap();
+            let map = self.table_compression.lock_safe();
             let rows: Vec<Vec<String>> = map
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -3752,8 +3820,7 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             self.table_compression
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(table_name, "NONE".to_owned());
             return Some(Ok(QueryResult::Ok("COMPRESSION RESET".to_owned())));
         }
@@ -3775,8 +3842,7 @@ impl SqlExecutor {
                             .trim_end_matches('\'')
                             .to_owned();
                         self.routing_rules
-                            .lock()
-                            .unwrap()
+                            .lock_safe()
                             .insert(rule_name, (when_expr, node));
                         return Some(Ok(QueryResult::Created));
                     }
@@ -3785,11 +3851,11 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP ROUTE ") {
             let rule_name = s["DROP ROUTE ".len()..].trim().to_ascii_lowercase();
-            self.routing_rules.lock().unwrap().remove(&rule_name);
+            self.routing_rules.lock_safe().remove(&rule_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW ROUTES" {
-            let rules = self.routing_rules.lock().unwrap();
+            let rules = self.routing_rules.lock_safe();
             let rows: Vec<Vec<String>> = rules
                 .iter()
                 .map(|(k, (w, n))| vec![k.clone(), w.clone(), n.clone()])
@@ -3804,7 +3870,7 @@ impl SqlExecutor {
             }));
         }
         if up.starts_with("EVALUATE ROUTE FOR '") {
-            let rules = self.routing_rules.lock().unwrap();
+            let rules = self.routing_rules.lock_safe();
             if let Some((name, (_, node))) = rules.iter().next() {
                 return Some(Ok(QueryResult::Ok(format!(
                     "ROUTE: {} \u{2192} {}",
@@ -3831,10 +3897,9 @@ impl SqlExecutor {
                             .trim_end_matches('\'')
                             .to_owned();
                         self.schedules
-                            .lock()
-                            .unwrap()
+                            .lock_safe()
                             .insert(sched_name.clone(), (cron_expr, sql_stmt));
-                        self.schedule_runs.lock().unwrap().insert(sched_name, 0);
+                        self.schedule_runs.lock_safe().insert(sched_name, 0);
                         return Some(Ok(QueryResult::Created));
                     }
                 }
@@ -3842,23 +3907,22 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP SCHEDULE ") {
             let sched_name = s["DROP SCHEDULE ".len()..].trim().to_ascii_lowercase();
-            self.schedules.lock().unwrap().remove(&sched_name);
-            self.schedule_runs.lock().unwrap().remove(&sched_name);
+            self.schedules.lock_safe().remove(&sched_name);
+            self.schedule_runs.lock_safe().remove(&sched_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up.starts_with("RUN SCHEDULE ") {
             let sched_name = s["RUN SCHEDULE ".len()..].trim().to_ascii_lowercase();
             *self
                 .schedule_runs
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(sched_name.clone())
                 .or_insert(0) += 1;
             return Some(Ok(QueryResult::Ok(format!("SCHEDULE RAN: {}", sched_name))));
         }
         if up == "SHOW SCHEDULES" {
-            let scheds = self.schedules.lock().unwrap();
-            let runs = self.schedule_runs.lock().unwrap();
+            let scheds = self.schedules.lock_safe();
+            let runs = self.schedule_runs.lock_safe();
             let rows: Vec<Vec<String>> = scheds
                 .iter()
                 .map(|(k, (cron, _))| {
@@ -3891,8 +3955,7 @@ impl SqlExecutor {
                         .trim_end_matches('\'')
                         .to_owned();
                     self.obs_hooks
-                        .lock()
-                        .unwrap()
+                        .lock_safe()
                         .insert(hook_name, (event_type, stmt));
                     return Some(Ok(QueryResult::Created));
                 }
@@ -3900,11 +3963,11 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP HOOK ") {
             let hook_name = s["DROP HOOK ".len()..].trim().to_ascii_lowercase();
-            self.obs_hooks.lock().unwrap().remove(&hook_name);
+            self.obs_hooks.lock_safe().remove(&hook_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW HOOKS" {
-            let hooks = self.obs_hooks.lock().unwrap();
+            let hooks = self.obs_hooks.lock_safe();
             let rows: Vec<Vec<String>> = hooks
                 .iter()
                 .map(|(k, (ev, st))| vec![k.clone(), ev.clone(), st.clone()])
@@ -3920,7 +3983,7 @@ impl SqlExecutor {
         }
         if up.starts_with("FIRE HOOK ") {
             let hook_name = s["FIRE HOOK ".len()..].trim().to_ascii_lowercase();
-            self.hook_fire_log.lock().unwrap().push(hook_name.clone());
+            self.hook_fire_log.lock_safe().push(hook_name.clone());
             return Some(Ok(QueryResult::Ok(format!("HOOK FIRED: {}", hook_name))));
         }
 
@@ -3934,20 +3997,19 @@ impl SqlExecutor {
                 let sql_stmt = rest[as_pos + " AS '".len()..]
                     .trim_end_matches('\'')
                     .to_owned();
-                let mut order = self.migration_order.lock().unwrap();
+                let mut order = self.migration_order.lock_safe();
                 if !order.contains(&migration_name) {
                     order.push(migration_name.clone());
                 }
                 self.migrations
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(migration_name, (sql_stmt, false));
                 return Some(Ok(QueryResult::Created));
             }
         }
         if up.starts_with("APPLY MIGRATION ") {
             let migration_name = s["APPLY MIGRATION ".len()..].trim().to_ascii_lowercase();
-            let mut migs = self.migrations.lock().unwrap();
+            let mut migs = self.migrations.lock_safe();
             if let Some(entry) = migs.get_mut(&migration_name) {
                 entry.1 = true;
                 return Some(Ok(QueryResult::Ok(format!(
@@ -3962,7 +4024,7 @@ impl SqlExecutor {
         }
         if up.starts_with("ROLLBACK MIGRATION ") {
             let migration_name = s["ROLLBACK MIGRATION ".len()..].trim().to_ascii_lowercase();
-            let mut migs = self.migrations.lock().unwrap();
+            let mut migs = self.migrations.lock_safe();
             if let Some(entry) = migs.get_mut(&migration_name) {
                 entry.1 = false;
                 return Some(Ok(QueryResult::Ok(format!(
@@ -3976,8 +4038,8 @@ impl SqlExecutor {
             ))));
         }
         if up == "SHOW MIGRATIONS" {
-            let migs = self.migrations.lock().unwrap();
-            let order = self.migration_order.lock().unwrap();
+            let migs = self.migrations.lock_safe();
+            let order = self.migration_order.lock_safe();
             let rows: Vec<Vec<String>> = order
                 .iter()
                 .filter_map(|k| {
@@ -3996,8 +4058,8 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP MIGRATION ") {
             let migration_name = s["DROP MIGRATION ".len()..].trim().to_ascii_lowercase();
-            self.migrations.lock().unwrap().remove(&migration_name);
-            let mut order = self.migration_order.lock().unwrap();
+            self.migrations.lock_safe().remove(&migration_name);
+            let mut order = self.migration_order.lock_safe();
             order.retain(|x| x != &migration_name);
             return Some(Ok(QueryResult::Dropped));
         }
@@ -4010,8 +4072,8 @@ impl SqlExecutor {
                 let name = rest[..size_pos].trim().to_ascii_lowercase();
                 let size_str = rest[size_pos + " SIZE ".len()..].trim();
                 if let Ok(n) = size_str.parse::<usize>() {
-                    *self.pool_name.lock().unwrap() = Some(name);
-                    *self.pool_size.lock().unwrap() = n;
+                    *self.pool_name.lock_safe() = Some(name);
+                    *self.pool_size.lock_safe() = n;
                     return Some(Ok(QueryResult::Ok("POOL CREATED".to_owned())));
                 }
             }
@@ -4020,15 +4082,15 @@ impl SqlExecutor {
         if up.starts_with("SET POOL SIZE ") {
             let n_str = sql["SET POOL SIZE ".len()..].trim();
             if let Ok(n) = n_str.parse::<usize>() {
-                *self.pool_size.lock().unwrap() = n;
+                *self.pool_size.lock_safe() = n;
                 return Some(Ok(QueryResult::Ok("POOL SIZE SET".to_owned())));
             }
         }
 
         if up == "SHOW POOL STATUS" {
-            let name = self.pool_name.lock().unwrap().clone().unwrap_or_default();
-            let size = *self.pool_size.lock().unwrap();
-            let active = *self.pool_active.lock().unwrap();
+            let name = self.pool_name.lock_safe().clone().unwrap_or_default();
+            let size = *self.pool_size.lock_safe();
+            let active = *self.pool_active.lock_safe();
             let avail = size.saturating_sub(active);
             return Some(Ok(QueryResult::Rows {
                 columns: vec![
@@ -4047,7 +4109,7 @@ impl SqlExecutor {
         }
 
         if up == "DRAIN POOL" {
-            *self.pool_active.lock().unwrap() = 0;
+            *self.pool_active.lock_safe() = 0;
             return Some(Ok(QueryResult::Ok("POOL DRAINED".to_owned())));
         }
 
@@ -4064,7 +4126,7 @@ impl SqlExecutor {
                     .map(|s| s.trim().to_ascii_lowercase())
                 {
                     let plan = format!("PLAN: {}", sql_body);
-                    self.plan_cache.lock().unwrap().insert(key, plan);
+                    self.plan_cache.lock_safe().insert(key, plan);
                     return Some(Ok(QueryResult::Ok("PLAN CACHED".to_owned())));
                 }
             }
@@ -4074,7 +4136,7 @@ impl SqlExecutor {
             let key = sql["EXECUTE CACHED PLAN ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let cache = self.plan_cache.lock().unwrap();
+            let cache = self.plan_cache.lock_safe();
             if let Some(plan) = cache.get(&key) {
                 return Some(Ok(QueryResult::Ok(plan.clone())));
             } else {
@@ -4084,12 +4146,12 @@ impl SqlExecutor {
 
         if up.starts_with("DROP CACHED PLAN ") {
             let key = sql["DROP CACHED PLAN ".len()..].trim().to_ascii_lowercase();
-            self.plan_cache.lock().unwrap().remove(&key);
+            self.plan_cache.lock_safe().remove(&key);
             return Some(Ok(QueryResult::Dropped));
         }
 
         if up == "SHOW PLAN CACHE" {
-            let cache = self.plan_cache.lock().unwrap().clone();
+            let cache = self.plan_cache.lock_safe().clone();
             let rows: Vec<Vec<String>> = cache.into_iter().map(|(k, v)| vec![k, v]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["key".into(), "plan".into()],
@@ -4103,7 +4165,7 @@ impl SqlExecutor {
             let tbl = sql["ENABLE VERSIONING ON ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.versioned_tables.lock().unwrap().insert(tbl);
+            self.versioned_tables.lock_safe().insert(tbl);
             return Some(Ok(QueryResult::Ok("VERSIONING ENABLED".to_owned())));
         }
 
@@ -4111,7 +4173,7 @@ impl SqlExecutor {
             let tbl = sql["DISABLE VERSIONING ON ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.versioned_tables.lock().unwrap().remove(&tbl);
+            self.versioned_tables.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("VERSIONING DISABLED".to_owned())));
         }
 
@@ -4127,8 +4189,7 @@ impl SqlExecutor {
                     .unwrap_or_default()
                     .as_millis() as u64;
                 self.version_store
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .entry(tbl)
                     .or_default()
                     .push((now_ms, u64::MAX, json));
@@ -4140,7 +4201,7 @@ impl SqlExecutor {
             let tbl = sql["SELECT CURRENT VERSION FROM ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let store = self.version_store.lock().unwrap();
+            let store = self.version_store.lock_safe();
             if let Some(versions) = store.get(&tbl)
                 && let Some(latest) = versions.iter().rfind(|(_, to, _)| *to == u64::MAX)
             {
@@ -4171,7 +4232,7 @@ impl SqlExecutor {
             let tbl = sql["SHOW VERSION HISTORY FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let store = self.version_store.lock().unwrap();
+            let store = self.version_store.lock_safe();
             let rows = store
                 .get(&tbl)
                 .map(|versions| {
@@ -4199,7 +4260,7 @@ impl SqlExecutor {
             let tbl = sql["SHOW AUDIT LOG FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let log = self.audit_log.lock().unwrap();
+            let log = self.audit_log.lock_safe();
             let rows: Vec<Vec<String>> = log
                 .iter()
                 .filter(|e| e.table.to_ascii_lowercase() == tbl)
@@ -4228,7 +4289,7 @@ impl SqlExecutor {
         if up.starts_with("FILTER AUDIT LOG BY OP '") {
             let rest = &sql["FILTER AUDIT LOG BY OP '".len()..];
             let op_filter = rest.split('\'').next().unwrap_or("").to_ascii_uppercase();
-            let log = self.audit_log.lock().unwrap();
+            let log = self.audit_log.lock_safe();
             let rows: Vec<Vec<String>> = log
                 .iter()
                 .filter(|e| e.op.to_ascii_uppercase() == op_filter)
@@ -4267,7 +4328,7 @@ impl SqlExecutor {
         if up.starts_with("PURGE AUDIT LOG BEFORE ") {
             let ts_str = sql["PURGE AUDIT LOG BEFORE ".len()..].trim();
             let cutoff: u64 = ts_str.parse().unwrap_or(0);
-            let mut log = self.audit_log.lock().unwrap();
+            let mut log = self.audit_log.lock_safe();
             let before = log.len();
             log.retain(|e| e.ts.parse::<u64>().unwrap_or(0) >= cutoff);
             let removed = before - log.len();
@@ -4275,7 +4336,7 @@ impl SqlExecutor {
         }
 
         if up == "SHOW AUDIT LOG SUMMARY" {
-            let log = self.audit_log.lock().unwrap();
+            let log = self.audit_log.lock_safe();
             let mut counts: HashMap<String, u64> = HashMap::new();
             for e in log.iter() {
                 *counts.entry(e.op.clone()).or_insert(0) += 1;
@@ -4307,7 +4368,7 @@ impl SqlExecutor {
                 let after_as = &rest[as_pos + " AS '".len()..];
                 if let Some(end) = after_as.find('\'') {
                     let body = after_as[..end].to_owned();
-                    self.dynamic_stmts.lock().unwrap().insert(name, body);
+                    self.dynamic_stmts.lock_safe().insert(name, body);
                     return Some(Ok(QueryResult::Ok("DYNAMIC PREPARED".to_owned())));
                 }
             }
@@ -4317,7 +4378,7 @@ impl SqlExecutor {
             let name = sql["EXECUTE DYNAMIC PREPARED ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let stmts = self.dynamic_stmts.lock().unwrap();
+            let stmts = self.dynamic_stmts.lock_safe();
             if let Some(body) = stmts.get(&name) {
                 let body = body.clone();
                 drop(stmts);
@@ -4329,12 +4390,12 @@ impl SqlExecutor {
 
         if up.starts_with("DROP DYNAMIC ") {
             let name = sql["DROP DYNAMIC ".len()..].trim().to_ascii_lowercase();
-            self.dynamic_stmts.lock().unwrap().remove(&name);
+            self.dynamic_stmts.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Dropped));
         }
 
         if up == "SHOW DYNAMIC STMTS" {
-            let stmts = self.dynamic_stmts.lock().unwrap().clone();
+            let stmts = self.dynamic_stmts.lock_safe().clone();
             let rows: Vec<Vec<String>> = stmts.into_iter().map(|(k, v)| vec![k, v]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["name".into(), "sql".into()],
@@ -4389,13 +4450,13 @@ impl SqlExecutor {
         if up.starts_with("SET SAMPLE SEED ") {
             let n_str = sql["SET SAMPLE SEED ".len()..].trim();
             if let Ok(n) = n_str.parse::<u64>() {
-                *self.sample_seed.lock().unwrap() = n;
+                *self.sample_seed.lock_safe() = n;
                 return Some(Ok(QueryResult::Ok("SAMPLE SEED SET".to_owned())));
             }
         }
 
         if up == "SHOW SAMPLE SEED" {
-            let seed = *self.sample_seed.lock().unwrap();
+            let seed = *self.sample_seed.lock_safe();
             return Some(Ok(QueryResult::Ok(seed.to_string())));
         }
 
@@ -4431,8 +4492,7 @@ impl SqlExecutor {
                             .map(|c| c.to_vec())
                             .collect();
                         self.page_cursors
-                            .lock()
-                            .unwrap()
+                            .lock_safe()
                             .insert(cursor_name, (0, pages));
                         return Some(Ok(QueryResult::Ok("PAGE CURSOR DECLARED".to_owned())));
                     }
@@ -4444,7 +4504,7 @@ impl SqlExecutor {
             let cursor_name = sql["FETCH NEXT PAGE FROM ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let mut cursors = self.page_cursors.lock().unwrap();
+            let mut cursors = self.page_cursors.lock_safe();
             if let Some((page, pages)) = cursors.get_mut(&cursor_name) {
                 if *page < pages.len() {
                     let row = pages[*page].clone();
@@ -4469,7 +4529,7 @@ impl SqlExecutor {
             let cursor_name = sql["FETCH PREV PAGE FROM ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let mut cursors = self.page_cursors.lock().unwrap();
+            let mut cursors = self.page_cursors.lock_safe();
             if let Some((page, pages)) = cursors.get_mut(&cursor_name) {
                 if *page > 0 {
                     *page -= 1;
@@ -4497,12 +4557,12 @@ impl SqlExecutor {
             let cursor_name = sql["CLOSE PAGE CURSOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.page_cursors.lock().unwrap().remove(&cursor_name);
+            self.page_cursors.lock_safe().remove(&cursor_name);
             return Some(Ok(QueryResult::Ok("PAGE CURSOR CLOSED".to_owned())));
         }
 
         if up == "SHOW PAGE CURSORS" {
-            let cursors = self.page_cursors.lock().unwrap().clone();
+            let cursors = self.page_cursors.lock_safe().clone();
             let rows: Vec<Vec<String>> = cursors
                 .into_iter()
                 .map(|(name, (page, _))| vec![name, page.to_string()])
@@ -4526,7 +4586,7 @@ impl SqlExecutor {
                 let key = format!("{}.{}", tbl, col);
                 let buckets: Vec<(String, u64)> =
                     (0..n).map(|i| (format!("bucket_{}", i), 0u64)).collect();
-                self.histograms.lock().unwrap().insert(key, buckets);
+                self.histograms.lock_safe().insert(key, buckets);
                 return Some(Ok(QueryResult::Ok("HISTOGRAM COMPUTED".to_owned())));
             }
         }
@@ -4538,7 +4598,7 @@ impl SqlExecutor {
                 let tbl = parts[0].to_ascii_lowercase();
                 let col = parts[1].to_ascii_lowercase();
                 let key = format!("{}.{}", tbl, col);
-                let histograms = self.histograms.lock().unwrap();
+                let histograms = self.histograms.lock_safe();
                 let rows = histograms
                     .get(&key)
                     .map(|buckets| {
@@ -4566,7 +4626,7 @@ impl SqlExecutor {
                 let tbl = parts[0].to_ascii_lowercase();
                 let col = parts[1].to_ascii_lowercase();
                 let key = format!("{}.{}", tbl, col);
-                self.histograms.lock().unwrap().remove(&key);
+                self.histograms.lock_safe().remove(&key);
                 return Some(Ok(QueryResult::Dropped));
             }
         }
@@ -4581,8 +4641,7 @@ impl SqlExecutor {
                     .trim()
                     .to_ascii_lowercase();
                 self.view_deps
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .entry(view)
                     .or_default()
                     .push(dep);
@@ -4594,7 +4653,7 @@ impl SqlExecutor {
             let view = sql["SHOW DEPENDENCIES FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let deps = self.view_deps.lock().unwrap();
+            let deps = self.view_deps.lock_safe();
             let rows = deps
                 .get(&view)
                 .map(|ds| {
@@ -4610,7 +4669,7 @@ impl SqlExecutor {
         }
 
         if up == "SHOW DEPENDENCY TREE" {
-            let deps = self.view_deps.lock().unwrap().clone();
+            let deps = self.view_deps.lock_safe().clone();
             let rows: Vec<Vec<String>> = deps
                 .into_iter()
                 .flat_map(|(view, ds)| ds.into_iter().map(move |d| vec![view.clone(), d]))
@@ -4628,7 +4687,7 @@ impl SqlExecutor {
                 let dep = rest[dep_pos + " DEPENDS ON ".len()..]
                     .trim()
                     .to_ascii_lowercase();
-                if let Some(ds) = self.view_deps.lock().unwrap().get_mut(&view) {
+                if let Some(ds) = self.view_deps.lock_safe().get_mut(&view) {
                     ds.retain(|d| d != &dep);
                 }
                 return Some(Ok(QueryResult::Dropped));
@@ -4650,14 +4709,14 @@ impl SqlExecutor {
                     && let Some(val_end) = val_part.find('\'')
                 {
                     let val = val_part[..val_end].to_owned();
-                    self.live_config.lock().unwrap().insert(key, val);
+                    self.live_config.lock_safe().insert(key, val);
                     return Some(Ok(QueryResult::Ok("CONFIG SET".to_owned())));
                 }
             }
         }
 
         if up == "SHOW CONFIG" {
-            let config = self.live_config.lock().unwrap().clone();
+            let config = self.live_config.lock_safe().clone();
             let rows: Vec<Vec<String>> = config.into_iter().map(|(k, v)| vec![k, v]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["key".into(), "value".into()],
@@ -4669,13 +4728,13 @@ impl SqlExecutor {
             let rest = &sql["RESET CONFIG KEY '".len()..];
             if let Some(end) = rest.find('\'') {
                 let key = rest[..end].to_owned();
-                self.live_config.lock().unwrap().remove(&key);
+                self.live_config.lock_safe().remove(&key);
                 return Some(Ok(QueryResult::Ok("RESET".to_owned())));
             }
         }
 
         if up == "RELOAD CONFIG" {
-            let n = self.live_config.lock().unwrap().len();
+            let n = self.live_config.lock_safe().len();
             return Some(Ok(QueryResult::Ok(format!("CONFIG RELOADED: {} keys", n))));
         }
 
@@ -4683,7 +4742,7 @@ impl SqlExecutor {
             let rest = &sql["SHOW CONFIG KEY '".len()..];
             if let Some(end) = rest.find('\'') {
                 let key = rest[..end].to_owned();
-                let config = self.live_config.lock().unwrap();
+                let config = self.live_config.lock_safe();
                 if let Some(val) = config.get(&key) {
                     return Some(Ok(QueryResult::Ok(val.clone())));
                 } else {
@@ -4695,31 +4754,31 @@ impl SqlExecutor {
         // â”€â”€ S158 â€” Tenant isolation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE TENANT ") {
             let name = s["CREATE TENANT ".len()..].trim().to_ascii_lowercase();
-            self.tenants.lock().unwrap().insert(name.clone());
+            self.tenants.lock_safe().insert(name.clone());
             return Some(Ok(QueryResult::Ok(format!("TENANT CREATED: {}", name))));
         }
         if up.starts_with("DROP TENANT ") {
             let name = s["DROP TENANT ".len()..].trim().to_ascii_lowercase();
-            self.tenants.lock().unwrap().remove(&name);
-            if self.current_tenant.lock().unwrap().as_deref() == Some(&name) {
-                *self.current_tenant.lock().unwrap() = None;
+            self.tenants.lock_safe().remove(&name);
+            if self.current_tenant.lock_safe().as_deref() == Some(&name) {
+                *self.current_tenant.lock_safe() = None;
             }
             return Some(Ok(QueryResult::Ok(format!("TENANT DROPPED: {}", name))));
         }
         if up.starts_with("SET CURRENT TENANT ") {
             let name = s["SET CURRENT TENANT ".len()..].trim().to_ascii_lowercase();
-            if !self.tenants.lock().unwrap().contains(&name) {
+            if !self.tenants.lock_safe().contains(&name) {
                 return Some(Ok(QueryResult::Error(format!(
                     "tenant not found: {}",
                     name
                 ))));
             }
-            *self.current_tenant.lock().unwrap() = Some(name.clone());
+            *self.current_tenant.lock_safe() = Some(name.clone());
             return Some(Ok(QueryResult::Ok(format!("CURRENT TENANT: {}", name))));
         }
         if up == "SHOW TENANTS" {
-            let tenants = self.tenants.lock().unwrap();
-            let current = self.current_tenant.lock().unwrap();
+            let tenants = self.tenants.lock_safe();
+            let current = self.current_tenant.lock_safe();
             let rows = tenants
                 .iter()
                 .map(|t| {
@@ -4740,7 +4799,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW CURRENT TENANT" {
-            let cur = self.current_tenant.lock().unwrap();
+            let cur = self.current_tenant.lock_safe();
             let val = cur.clone().unwrap_or_else(|| "none".to_owned());
             return Some(Ok(QueryResult::Ok(val)));
         }
@@ -4754,8 +4813,7 @@ impl SqlExecutor {
                 if let Some(end) = rest[expr_start..].find('\'') {
                     let expr = rest[expr_start..expr_start + end].to_owned();
                     self.mask_policies
-                        .lock()
-                        .unwrap()
+                        .lock_safe()
                         .insert(policy_name.clone(), (String::new(), expr));
                     return Some(Ok(QueryResult::Ok(format!(
                         "MASK POLICY CREATED: {}",
@@ -4772,14 +4830,13 @@ impl SqlExecutor {
                 let table_name = parts[2].to_ascii_lowercase();
                 let col_name = parts[3].to_ascii_lowercase();
                 let key = format!("{}.{}", table_name, col_name);
-                let mut policies = self.mask_policies.lock().unwrap();
+                let mut policies = self.mask_policies.lock_safe();
                 if let Some(entry) = policies.get_mut(&policy_name) {
                     entry.0 = key.clone();
                 }
                 drop(policies);
                 self.applied_masks
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(key, policy_name.clone());
                 return Some(Ok(QueryResult::Ok(format!(
                     "MASK POLICY APPLIED: {}",
@@ -4789,16 +4846,16 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP MASK POLICY ") {
             let name = s["DROP MASK POLICY ".len()..].trim().to_ascii_lowercase();
-            self.mask_policies.lock().unwrap().remove(&name);
-            self.applied_masks.lock().unwrap().retain(|_, v| v != &name);
+            self.mask_policies.lock_safe().remove(&name);
+            self.applied_masks.lock_safe().retain(|_, v| v != &name);
             return Some(Ok(QueryResult::Ok(format!(
                 "MASK POLICY DROPPED: {}",
                 name
             ))));
         }
         if up == "SHOW MASK POLICIES" {
-            let policies = self.mask_policies.lock().unwrap();
-            let applied = self.applied_masks.lock().unwrap();
+            let policies = self.mask_policies.lock_safe();
+            let applied = self.applied_masks.lock_safe();
             let rows = policies
                 .iter()
                 .map(|(name, (tc, expr))| {
@@ -4830,34 +4887,34 @@ impl SqlExecutor {
                     parts[0].to_ascii_lowercase(),
                     parts[1].to_ascii_lowercase()
                 );
-                self.applied_masks.lock().unwrap().remove(&key);
+                self.applied_masks.lock_safe().remove(&key);
                 return Some(Ok(QueryResult::Ok(format!("MASK REMOVED FROM: {}", key))));
             }
         }
 
         // â”€â”€ S160 â€” Query timeout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET QUERY TIMEOUT UNLIMITED") {
-            *self.query_timeout_ms.lock().unwrap() = None;
+            *self.query_timeout_ms.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("UNLIMITED".to_owned())));
         }
         if up.starts_with("SET QUERY TIMEOUT ") {
             let val_str = s["SET QUERY TIMEOUT ".len()..].trim();
             if let Ok(n) = val_str.parse::<u64>() {
-                *self.query_timeout_ms.lock().unwrap() = Some(n);
+                *self.query_timeout_ms.lock_safe() = Some(n);
                 return Some(Ok(QueryResult::Ok(format!("TIMEOUT SET: {}ms", n))));
             }
         }
         if up == "SHOW QUERY TIMEOUT" {
-            let t = self.query_timeout_ms.lock().unwrap();
+            let t = self.query_timeout_ms.lock_safe();
             let val = t.map_or_else(|| "none".to_owned(), |n| n.to_string());
             return Some(Ok(QueryResult::Ok(val)));
         }
         if up == "RESET QUERY TIMEOUT" {
-            *self.query_timeout_ms.lock().unwrap() = None;
+            *self.query_timeout_ms.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("RESET".to_owned())));
         }
         if up == "SHOW TIMEOUT STATUS" {
-            let t = self.query_timeout_ms.lock().unwrap();
+            let t = self.query_timeout_ms.lock_safe();
             let val = t.map_or_else(
                 || "timeout: disabled".to_owned(),
                 |n| format!("timeout: {}ms", n),
@@ -4880,7 +4937,7 @@ impl SqlExecutor {
                 let table = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
                 let col = parts.get(5).copied().unwrap_or("").to_ascii_lowercase();
                 let entry = format!("ADD COLUMN {}.{} degree={}", table, col, deg);
-                self.parallel_ddl_log.lock().unwrap().push(entry);
+                self.parallel_ddl_log.lock_safe().push(entry);
                 return Some(Ok(QueryResult::Ok(format!("PARALLEL DDL: degree {}", deg))));
             }
         }
@@ -4894,7 +4951,7 @@ impl SqlExecutor {
             {
                 let idx = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
                 let entry = format!("CREATE INDEX {} degree={}", idx, deg);
-                self.parallel_ddl_log.lock().unwrap().push(entry);
+                self.parallel_ddl_log.lock_safe().push(entry);
                 return Some(Ok(QueryResult::Ok(format!(
                     "PARALLEL INDEX: degree {}",
                     deg
@@ -4904,12 +4961,12 @@ impl SqlExecutor {
         if up.starts_with("SET DEFAULT PARALLEL DEGREE ") {
             let val_str = s["SET DEFAULT PARALLEL DEGREE ".len()..].trim();
             if let Ok(n) = val_str.parse::<usize>() {
-                *self.parallel_ddl_degree.lock().unwrap() = n;
+                *self.parallel_ddl_degree.lock_safe() = n;
                 return Some(Ok(QueryResult::Ok(format!("DEFAULT DEGREE SET: {}", n))));
             }
         }
         if up == "SHOW PARALLEL DDL STATUS" {
-            let log = self.parallel_ddl_log.lock().unwrap();
+            let log = self.parallel_ddl_log.lock_safe();
             let rows = log.iter().map(|e| vec![e.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["entry".into()],
@@ -4917,7 +4974,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET PARALLEL DEGREE" {
-            *self.parallel_ddl_degree.lock().unwrap() = 1;
+            *self.parallel_ddl_degree.lock_safe() = 1;
             return Some(Ok(QueryResult::Ok("DEGREE RESET".to_owned())));
         }
 
@@ -4930,8 +4987,7 @@ impl SqlExecutor {
                 if let Some(end) = rest[path_start..].find('\'') {
                     let path = rest[path_start..path_start + end].to_owned();
                     self.stats_export_log
-                        .lock()
-                        .unwrap()
+                        .lock_safe()
                         .push((table.clone(), path.clone()));
                     return Some(Ok(QueryResult::Ok(format!(
                         "STATS EXPORTED: {} to {}",
@@ -4951,7 +5007,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW STATS EXPORT LOG" {
-            let log = self.stats_export_log.lock().unwrap();
+            let log = self.stats_export_log.lock_safe();
             let rows = log
                 .iter()
                 .map(|(t, p)| vec![t.clone(), p.clone()])
@@ -4962,7 +5018,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR STATS EXPORT LOG" {
-            self.stats_export_log.lock().unwrap().clear();
+            self.stats_export_log.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("LOG CLEARED".to_owned())));
         }
 
@@ -4977,8 +5033,7 @@ impl SqlExecutor {
                     .unwrap_or_default()
                     .as_millis() as u64;
                 self.snapshots
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(snap.clone(), (table.clone(), ts));
                 return Some(Ok(QueryResult::Ok(format!("SNAPSHOT CREATED: {}", snap))));
             }
@@ -4987,7 +5042,7 @@ impl SqlExecutor {
             let snap = s["RESTORE FROM SNAPSHOT ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let snapshots = self.snapshots.lock().unwrap();
+            let snapshots = self.snapshots.lock_safe();
             if let Some((table, _)) = snapshots.get(&snap) {
                 let msg = format!("RESTORED: {} from {}", table, snap);
                 return Some(Ok(QueryResult::Ok(msg)));
@@ -5000,12 +5055,12 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP SNAPSHOT ") {
             let snap = s["DROP SNAPSHOT ".len()..].trim().to_ascii_lowercase();
-            self.snapshots.lock().unwrap().remove(&snap);
+            self.snapshots.lock_safe().remove(&snap);
             return Some(Ok(QueryResult::Ok(format!("SNAPSHOT DROPPED: {}", snap))));
         }
         if up.starts_with("SHOW SNAPSHOTS FOR ") {
             let table = s["SHOW SNAPSHOTS FOR ".len()..].trim().to_ascii_lowercase();
-            let snapshots = self.snapshots.lock().unwrap();
+            let snapshots = self.snapshots.lock_safe();
             let rows = snapshots
                 .iter()
                 .filter(|(_, (t, _))| t == &table)
@@ -5017,7 +5072,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW SNAPSHOTS" {
-            let snapshots = self.snapshots.lock().unwrap();
+            let snapshots = self.snapshots.lock_safe();
             let rows = snapshots
                 .iter()
                 .map(|(n, (t, ts))| vec![n.clone(), t.clone(), ts.to_string()])
@@ -5033,20 +5088,20 @@ impl SqlExecutor {
             let model = s["SET OPTIMIZER COST MODEL ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            *self.optimizer_model.lock().unwrap() = model.clone();
+            *self.optimizer_model.lock_safe() = model.clone();
             return Some(Ok(QueryResult::Ok(format!("MODEL SET: {}", model))));
         }
         if up.starts_with("ADD OPTIMIZER HINT '") {
             let rest = &s["ADD OPTIMIZER HINT '".len()..];
             if let Some(end) = rest.find('\'') {
                 let hint = rest[..end].to_owned();
-                self.optimizer_hints.lock().unwrap().push(hint.clone());
+                self.optimizer_hints.lock_safe().push(hint.clone());
                 return Some(Ok(QueryResult::Ok(format!("HINT ADDED: {}", hint))));
             }
         }
         if up == "SHOW OPTIMIZER HINTS" {
-            let hints = self.optimizer_hints.lock().unwrap();
-            let model = self.optimizer_model.lock().unwrap();
+            let hints = self.optimizer_hints.lock_safe();
+            let model = self.optimizer_model.lock_safe();
             let mut rows: Vec<Vec<String>> = hints.iter().map(|h| vec![h.clone()]).collect();
             rows.push(vec![format!("model:{}", *model)]);
             return Some(Ok(QueryResult::Rows {
@@ -5055,12 +5110,12 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET OPTIMIZER" {
-            *self.optimizer_model.lock().unwrap() = "hash".to_owned();
-            self.optimizer_hints.lock().unwrap().clear();
+            *self.optimizer_model.lock_safe() = "hash".to_owned();
+            self.optimizer_hints.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("OPTIMIZER RESET".to_owned())));
         }
         if up == "SHOW OPTIMIZER MODEL" {
-            let model = self.optimizer_model.lock().unwrap().clone();
+            let model = self.optimizer_model.lock_safe().clone();
             return Some(Ok(QueryResult::Ok(model)));
         }
 
@@ -5074,8 +5129,7 @@ impl SqlExecutor {
                     let val_part = after[eq_pos + 1..].trim();
                     let val = parse_single_quoted(val_part).unwrap_or_else(|| val_part.to_owned());
                     self.session_vars
-                        .lock()
-                        .unwrap()
+                        .lock_safe()
                         .insert(key.clone(), val.clone());
                     return Some(Ok(QueryResult::Ok(format!("SET: {}={}", key, val))));
                 }
@@ -5085,7 +5139,7 @@ impl SqlExecutor {
             let rest = &s["GET SESSION VAR '".len()..];
             if let Some(end) = rest.find('\'') {
                 let key = rest[..end].to_owned();
-                let vars = self.session_vars.lock().unwrap();
+                let vars = self.session_vars.lock_safe();
                 if let Some(val) = vars.get(&key) {
                     return Some(Ok(QueryResult::Ok(val.clone())));
                 } else {
@@ -5097,12 +5151,12 @@ impl SqlExecutor {
             let rest = &s["UNSET SESSION VAR '".len()..];
             if let Some(end) = rest.find('\'') {
                 let key = rest[..end].to_owned();
-                self.session_vars.lock().unwrap().remove(&key);
+                self.session_vars.lock_safe().remove(&key);
                 return Some(Ok(QueryResult::Ok("UNSET".to_owned())));
             }
         }
         if up == "SHOW SESSION VARS" {
-            let vars = self.session_vars.lock().unwrap();
+            let vars = self.session_vars.lock_safe();
             let rows = vars
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -5113,7 +5167,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR SESSION VARS" {
-            let mut vars = self.session_vars.lock().unwrap();
+            let mut vars = self.session_vars.lock_safe();
             let n = vars.len();
             vars.clear();
             return Some(Ok(QueryResult::Ok(format!("CLEARED {} vars", n))));
@@ -5144,8 +5198,7 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let children_count = self
                 .inherited_tables
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .values()
                 .filter(|p| p.as_str() == table.as_str())
                 .count();
@@ -5155,7 +5208,7 @@ impl SqlExecutor {
             ))));
         }
         if up == "SHOW INHERITANCE TREE" {
-            let inh = self.inherited_tables.lock().unwrap();
+            let inh = self.inherited_tables.lock_safe();
             let rows = inh
                 .iter()
                 .map(|(child, parent)| vec![parent.clone(), child.clone()])
@@ -5167,7 +5220,7 @@ impl SqlExecutor {
         }
         if up.starts_with("SHOW PARENT OF ") {
             let table = s["SHOW PARENT OF ".len()..].trim().to_ascii_lowercase();
-            let inh = self.inherited_tables.lock().unwrap();
+            let inh = self.inherited_tables.lock_safe();
             let parent = inh
                 .get(&table)
                 .cloned()
@@ -5181,15 +5234,15 @@ impl SqlExecutor {
         // â”€â”€ S167 â€” Pluggable output formats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET OUTPUT FORMAT ") {
             let fmt = s["SET OUTPUT FORMAT ".len()..].trim().to_ascii_uppercase();
-            *self.output_format.lock().unwrap() = fmt.clone();
+            *self.output_format.lock_safe() = fmt.clone();
             return Some(Ok(QueryResult::Ok(format!("FORMAT SET: {}", fmt))));
         }
         if up == "SHOW OUTPUT FORMAT" {
-            let fmt = self.output_format.lock().unwrap().clone();
+            let fmt = self.output_format.lock_safe().clone();
             return Some(Ok(QueryResult::Ok(fmt)));
         }
         if up == "RESET OUTPUT FORMAT" {
-            *self.output_format.lock().unwrap() = "TABLE".to_owned();
+            *self.output_format.lock_safe() = "TABLE".to_owned();
             return Some(Ok(QueryResult::Ok("RESET".to_owned())));
         }
         if up.starts_with("SELECT FORMAT JSON FROM ") {
@@ -5235,10 +5288,7 @@ impl SqlExecutor {
             let histogram: Vec<(String, u64)> = (0..buckets)
                 .map(|i| (format!("bucket_{}", i), i * 10))
                 .collect();
-            self.col_histograms_v2
-                .lock()
-                .unwrap()
-                .insert(key, histogram);
+            self.col_histograms_v2.lock_safe().insert(key, histogram);
             return Some(Ok(QueryResult::Ok(format!(
                 "HISTOGRAM ANALYZED: {}.{}",
                 tbl, col
@@ -5248,7 +5298,7 @@ impl SqlExecutor {
             let key = s["SHOW COLUMN HISTOGRAM FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let hists = self.col_histograms_v2.lock().unwrap();
+            let hists = self.col_histograms_v2.lock_safe();
             let rows: Vec<Vec<String>> = hists
                 .get(&key)
                 .map(|v| {
@@ -5266,12 +5316,12 @@ impl SqlExecutor {
         // â”€â”€ S169 â€” Workload replay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CAPTURE WORKLOAD TO ") {
             let file = parse_single_quoted(&s["CAPTURE WORKLOAD TO ".len()..]).unwrap_or_default();
-            *self.workload_capture_file.lock().unwrap() = Some(file.clone());
-            *self.workload_capture_active.lock().unwrap() = true;
+            *self.workload_capture_file.lock_safe() = Some(file.clone());
+            *self.workload_capture_active.lock_safe() = true;
             return Some(Ok(QueryResult::Ok(format!("CAPTURING TO: {}", file))));
         }
         if up == "STOP CAPTURE WORKLOAD" {
-            *self.workload_capture_active.lock().unwrap() = false;
+            *self.workload_capture_active.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("CAPTURE STOPPED".to_owned())));
         }
         if up.starts_with("REPLAY WORKLOAD FROM ") {
@@ -5279,11 +5329,10 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok(format!("REPLAYING FROM: {}", file))));
         }
         if up == "SHOW WORKLOAD CAPTURE STATUS" {
-            let active = *self.workload_capture_active.lock().unwrap();
+            let active = *self.workload_capture_active.lock_safe();
             let file = self
                 .workload_capture_file
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .clone()
                 .unwrap_or_default();
             return Some(Ok(QueryResult::Rows {
@@ -5307,18 +5356,17 @@ impl SqlExecutor {
             let replacement = parse_single_quoted(&after_as[rewrite_pos + " REWRITE TO ".len()..])
                 .unwrap_or_default();
             self.rewrite_rules
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(name, (pattern, replacement));
             return Some(Ok(QueryResult::Created));
         }
         if up.starts_with("DROP REWRITE RULE ") {
             let name = s["DROP REWRITE RULE ".len()..].trim().to_ascii_lowercase();
-            self.rewrite_rules.lock().unwrap().remove(&name);
+            self.rewrite_rules.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW REWRITE RULES" {
-            let rules = self.rewrite_rules.lock().unwrap();
+            let rules = self.rewrite_rules.lock_safe();
             let rows: Vec<Vec<String>> = rules
                 .iter()
                 .map(|(n, (p, r))| vec![n.clone(), p.clone(), r.clone()])
@@ -5344,8 +5392,7 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_uppercase();
             self.table_locks
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(tbl.clone(), mode_part.clone());
             return Some(Ok(QueryResult::Ok(format!(
                 "LOCKED: {} IN {} MODE",
@@ -5354,11 +5401,11 @@ impl SqlExecutor {
         }
         if up.starts_with("UNLOCK TABLE ") {
             let tbl = s["UNLOCK TABLE ".len()..].trim().to_ascii_lowercase();
-            self.table_locks.lock().unwrap().remove(&tbl);
+            self.table_locks.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok(format!("UNLOCKED: {}", tbl))));
         }
         if up == "SHOW TABLE LOCKS" {
-            let locks = self.table_locks.lock().unwrap();
+            let locks = self.table_locks.lock_safe();
             let rows: Vec<Vec<String>> = locks
                 .iter()
                 .map(|(t, m)| vec![t.clone(), m.clone()])
@@ -5383,18 +5430,17 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             self.bloom_filter_indexes
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(idx, (tbl, col));
             return Some(Ok(QueryResult::Created));
         }
         if up.starts_with("DROP BLOOM INDEX ") {
             let idx = s["DROP BLOOM INDEX ".len()..].trim().to_ascii_lowercase();
-            self.bloom_filter_indexes.lock().unwrap().remove(&idx);
+            self.bloom_filter_indexes.lock_safe().remove(&idx);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW BLOOM INDEXES" {
-            let indexes = self.bloom_indexes.lock().unwrap();
+            let indexes = self.bloom_indexes.lock_safe();
             let rows: Vec<Vec<String>> = indexes
                 .iter()
                 .map(|(n, (t, c, _))| vec![n.clone(), t.clone(), c.clone()])
@@ -5407,34 +5453,34 @@ impl SqlExecutor {
 
         // â”€â”€ S173 â€” Result streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "SHOW STREAM CHUNK SIZE" {
-            let n = *self.stream_chunk_size.lock().unwrap();
+            let n = *self.stream_chunk_size.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["chunk_size".to_owned()],
                 rows: vec![vec![n.to_string()]],
             }));
         }
         if up == "SET STREAMING ON" {
-            *self.streaming_enabled.lock().unwrap() = true;
+            *self.streaming_enabled.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("STREAMING ON".to_owned())));
         }
         if up == "SET STREAMING OFF" {
-            *self.streaming_enabled.lock().unwrap() = false;
+            *self.streaming_enabled.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("STREAMING OFF".to_owned())));
         }
 
         // â”€â”€ S174 â€” Read replica routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ADD READ REPLICA ") {
             let host = parse_single_quoted(&s["ADD READ REPLICA ".len()..]).unwrap_or_default();
-            self.read_replicas.lock().unwrap().push(host.clone());
+            self.read_replicas.lock_safe().push(host.clone());
             return Some(Ok(QueryResult::Ok(format!("REPLICA ADDED: {}", host))));
         }
         if up.starts_with("REMOVE READ REPLICA ") {
             let host = parse_single_quoted(&s["REMOVE READ REPLICA ".len()..]).unwrap_or_default();
-            self.read_replicas.lock().unwrap().retain(|r| r != &host);
+            self.read_replicas.lock_safe().retain(|r| r != &host);
             return Some(Ok(QueryResult::Ok(format!("REPLICA REMOVED: {}", host))));
         }
         if up == "SHOW READ REPLICAS" {
-            let replicas = self.read_replicas.lock().unwrap();
+            let replicas = self.read_replicas.lock_safe();
             let rows: Vec<Vec<String>> = replicas.iter().map(|r| vec![r.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["host".to_owned()],
@@ -5445,24 +5491,24 @@ impl SqlExecutor {
             let policy = s["SET READ REPLICA POLICY ".len()..]
                 .trim()
                 .to_ascii_uppercase();
-            *self.read_replica_policy.lock().unwrap() = policy.clone();
+            *self.read_replica_policy.lock_safe() = policy.clone();
             return Some(Ok(QueryResult::Ok(format!("POLICY: {}", policy))));
         }
 
         // â”€â”€ S175 â€” Data lineage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("ENABLE LINEAGE ON ") {
             let target = s["ENABLE LINEAGE ON ".len()..].trim().to_ascii_lowercase();
-            self.lineage_enabled.lock().unwrap().insert(target.clone());
+            self.lineage_enabled.lock_safe().insert(target.clone());
             return Some(Ok(QueryResult::Ok(format!("LINEAGE ENABLED: {}", target))));
         }
         if up.starts_with("DISABLE LINEAGE ON ") {
             let target = s["DISABLE LINEAGE ON ".len()..].trim().to_ascii_lowercase();
-            self.lineage_enabled.lock().unwrap().remove(&target);
+            self.lineage_enabled.lock_safe().remove(&target);
             return Some(Ok(QueryResult::Ok(format!("LINEAGE DISABLED: {}", target))));
         }
         if up.starts_with("SHOW LINEAGE FOR ") {
             let target = s["SHOW LINEAGE FOR ".len()..].trim().to_ascii_lowercase();
-            let enabled = self.lineage_enabled.lock().unwrap().contains(&target);
+            let enabled = self.lineage_enabled.lock_safe().contains(&target);
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["target".to_owned(), "lineage_enabled".to_owned()],
                 rows: vec![vec![target, enabled.to_string()]],
@@ -5481,7 +5527,7 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             let diff = format!("DIFF: {} vs {}", s1, s2);
-            self.schema_diffs.lock().unwrap().push(diff.clone());
+            self.schema_diffs.lock_safe().push(diff.clone());
             return Some(Ok(QueryResult::Rows {
                 columns: vec![
                     "schema1".to_owned(),
@@ -5492,7 +5538,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW SCHEMA CHANGES" {
-            let diffs = self.schema_diffs.lock().unwrap();
+            let diffs = self.schema_diffs.lock_safe();
             let rows: Vec<Vec<String>> = diffs.iter().map(|d| vec![d.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["change".to_owned()],
@@ -5502,8 +5548,7 @@ impl SqlExecutor {
         if up.starts_with("APPLY SCHEMA DIFF ") && !up.starts_with("APPLY SCHEMA DIFF FROM '") {
             let file = parse_single_quoted(&s["APPLY SCHEMA DIFF ".len()..]).unwrap_or_default();
             self.schema_diffs
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("APPLIED: {}", file));
             return Some(Ok(QueryResult::Ok(format!(
                 "SCHEMA DIFF APPLIED: {}",
@@ -5513,15 +5558,15 @@ impl SqlExecutor {
 
         // â”€â”€ S177 â€” Adaptive query execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "SET ADAPTIVE EXECUTION ON" {
-            *self.adaptive_exec_enabled.lock().unwrap() = true;
+            *self.adaptive_exec_enabled.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("ADAPTIVE EXECUTION ON".to_owned())));
         }
         if up == "SET ADAPTIVE EXECUTION OFF" {
-            *self.adaptive_exec_enabled.lock().unwrap() = false;
+            *self.adaptive_exec_enabled.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("ADAPTIVE EXECUTION OFF".to_owned())));
         }
         if up == "SHOW ADAPTIVE STATS" {
-            let stats = self.adaptive_exec_stats.lock().unwrap();
+            let stats = self.adaptive_exec_stats.lock_safe();
             let rows: Vec<Vec<String>> = stats
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.to_string()])
@@ -5532,7 +5577,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET ADAPTIVE STATS" {
-            self.adaptive_exec_stats.lock().unwrap().clear();
+            self.adaptive_exec_stats.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("ADAPTIVE STATS RESET".to_owned())));
         }
 
@@ -5545,7 +5590,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW COST MODEL" {
-            let model = self.s178_cost_model.lock().unwrap();
+            let model = self.s178_cost_model.lock_safe();
             let rows = model
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.to_string()])
@@ -5561,10 +5606,7 @@ impl SqlExecutor {
                 let param = rest[..eq].trim().to_owned();
                 let val_str = rest[eq + 1..].trim();
                 if let Ok(val) = val_str.parse::<f64>() {
-                    self.s178_cost_model
-                        .lock()
-                        .unwrap()
-                        .insert(param.clone(), val);
+                    self.s178_cost_model.lock_safe().insert(param.clone(), val);
                     return Some(Ok(QueryResult::Ok(format!(
                         "COST MODEL PARAM SET: {}",
                         param
@@ -5581,8 +5623,7 @@ impl SqlExecutor {
             let name = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
             let table = parts.get(4).copied().unwrap_or("").to_ascii_lowercase();
             self.s179_constraints
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(name.clone(), (table, true));
             return Some(Ok(QueryResult::Ok(format!(
                 "CONSTRAINT VALIDATED: {}",
@@ -5590,7 +5631,7 @@ impl SqlExecutor {
             ))));
         }
         if up == "SHOW INVALID CONSTRAINTS" {
-            let cons = self.s179_constraints.lock().unwrap();
+            let cons = self.s179_constraints.lock_safe();
             let rows = cons
                 .iter()
                 .filter(|(_, (_, enabled))| !enabled)
@@ -5606,8 +5647,7 @@ impl SqlExecutor {
             let name = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
             let table = parts.get(4).copied().unwrap_or("").to_ascii_lowercase();
             self.s179_constraints
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(name.clone())
                 .and_modify(|e| e.1 = false)
                 .or_insert((table, false));
@@ -5621,8 +5661,7 @@ impl SqlExecutor {
             let name = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
             let table = parts.get(4).copied().unwrap_or("").to_ascii_lowercase();
             self.s179_constraints
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(name.clone())
                 .and_modify(|e| e.1 = true)
                 .or_insert((table, true));
@@ -5669,19 +5708,18 @@ impl SqlExecutor {
                 vec![]
             };
             self.s181_col_groups
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(grp.clone(), (table, cols));
             return Some(Ok(QueryResult::Created));
         }
         if up.starts_with("DROP COLUMN GROUP ") {
             let parts: Vec<&str> = s.split_whitespace().collect();
             let grp = parts.get(3).copied().unwrap_or("").to_ascii_lowercase();
-            self.s181_col_groups.lock().unwrap().remove(&grp);
+            self.s181_col_groups.lock_safe().remove(&grp);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW COLUMN GROUPS" {
-            let groups = self.s181_col_groups.lock().unwrap();
+            let groups = self.s181_col_groups.lock_safe();
             let rows = groups
                 .iter()
                 .map(|(g, (t, cols))| vec![g.clone(), t.clone(), cols.join(",")])
@@ -5696,13 +5734,13 @@ impl SqlExecutor {
         if up.starts_with("SET QUERY TAG ") {
             let rest = &s["SET QUERY TAG ".len()..];
             let tag = parse_single_quoted(rest).unwrap_or_else(|| rest.trim().to_owned());
-            let mut cur = self.s182_query_tag.lock().unwrap();
+            let mut cur = self.s182_query_tag.lock_safe();
             *cur = Some(tag.clone());
-            self.s182_tag_log.lock().unwrap().push(tag.clone());
+            self.s182_tag_log.lock_safe().push(tag.clone());
             return Some(Ok(QueryResult::Ok(format!("QUERY TAG SET: {}", tag))));
         }
         if up == "SHOW QUERY TAGS" {
-            let log = self.s182_tag_log.lock().unwrap();
+            let log = self.s182_tag_log.lock_safe();
             let rows = log.iter().map(|t| vec![t.clone()]).collect::<Vec<_>>();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["tag".to_owned()],
@@ -5710,16 +5748,11 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR QUERY TAG" {
-            *self.s182_query_tag.lock().unwrap() = None;
+            *self.s182_query_tag.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("QUERY TAG CLEARED".to_owned())));
         }
         if up == "SHOW CURRENT QUERY TAG" {
-            let tag = self
-                .s182_query_tag
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_default();
+            let tag = self.s182_query_tag.lock_safe().clone().unwrap_or_default();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["current_tag".to_owned()],
                 rows: vec![vec![tag]],
@@ -5736,13 +5769,12 @@ impl SqlExecutor {
             let predicate = s[where_pos + " WHERE ".len()..].trim().to_owned();
             let col = parts.get(4).copied().unwrap_or("").to_ascii_lowercase();
             self.s183_partial_indexes
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(idx.clone(), (table, col, predicate));
             return Some(Ok(QueryResult::Created));
         }
         if up == "SHOW PARTIAL INDEXES" {
-            let idxs = self.s183_partial_indexes.lock().unwrap();
+            let idxs = self.s183_partial_indexes.lock_safe();
             let rows = idxs
                 .iter()
                 .map(|(i, (t, c, p))| vec![i.clone(), t.clone(), c.clone(), p.clone()])
@@ -5760,7 +5792,7 @@ impl SqlExecutor {
         if up.starts_with("DROP PARTIAL INDEX ") {
             let parts: Vec<&str> = s.split_whitespace().collect();
             let idx = parts.get(3).copied().unwrap_or("").to_ascii_lowercase();
-            self.s183_partial_indexes.lock().unwrap().remove(&idx);
+            self.s183_partial_indexes.lock_safe().remove(&idx);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -5775,21 +5807,18 @@ impl SqlExecutor {
                 .unwrap_or("")
                 .trim_matches('\'')
                 .to_owned();
-            self.s184_archived
-                .lock()
-                .unwrap()
-                .insert(table.clone(), path);
+            self.s184_archived.lock_safe().insert(table.clone(), path);
             return Some(Ok(QueryResult::Ok(format!("TABLE ARCHIVED: {}", table))));
         }
         if up.starts_with("RESTORE TABLE ") {
             // RESTORE TABLE t FROM 'path'
             let parts: Vec<&str> = s.split_whitespace().collect();
             let table = parts.get(2).copied().unwrap_or("").to_ascii_lowercase();
-            self.s184_archived.lock().unwrap().remove(&table);
+            self.s184_archived.lock_safe().remove(&table);
             return Some(Ok(QueryResult::Ok(format!("TABLE RESTORED: {}", table))));
         }
         if up == "SHOW ARCHIVED TABLES" {
-            let archived = self.s184_archived.lock().unwrap();
+            let archived = self.s184_archived.lock_safe();
             let rows = archived
                 .iter()
                 .map(|(t, p)| vec![t.clone(), p.clone()])
@@ -5802,19 +5831,19 @@ impl SqlExecutor {
 
         // â”€â”€ S185 â€” Query priority â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "SET QUERY PRIORITY HIGH" {
-            *self.s185_query_priority.lock().unwrap() = "HIGH".to_owned();
+            *self.s185_query_priority.lock_safe() = "HIGH".to_owned();
             return Some(Ok(QueryResult::Ok("QUERY PRIORITY SET: HIGH".to_owned())));
         }
         if up == "SET QUERY PRIORITY NORMAL" {
-            *self.s185_query_priority.lock().unwrap() = "NORMAL".to_owned();
+            *self.s185_query_priority.lock_safe() = "NORMAL".to_owned();
             return Some(Ok(QueryResult::Ok("QUERY PRIORITY SET: NORMAL".to_owned())));
         }
         if up == "SET QUERY PRIORITY LOW" {
-            *self.s185_query_priority.lock().unwrap() = "LOW".to_owned();
+            *self.s185_query_priority.lock_safe() = "LOW".to_owned();
             return Some(Ok(QueryResult::Ok("QUERY PRIORITY SET: LOW".to_owned())));
         }
         if up == "SHOW QUERY PRIORITY" {
-            let prio = self.s185_query_priority.lock().unwrap().clone();
+            let prio = self.s185_query_priority.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["priority".to_owned()],
                 rows: vec![vec![prio]],
@@ -5832,17 +5861,15 @@ impl SqlExecutor {
                 .unwrap_or_default()
                 .as_millis() as u64;
             self.s186_schema_versions
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(ver.clone(), (schema.clone(), ts));
             self.s186_schema_current
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(schema, ver.clone());
             return Some(Ok(QueryResult::Created));
         }
         if up == "SHOW SCHEMA VERSIONS" {
-            let vers = self.s186_schema_versions.lock().unwrap();
+            let vers = self.s186_schema_versions.lock_safe();
             let rows = vers
                 .iter()
                 .map(|(v, (s, ts))| vec![v.clone(), s.clone(), ts.to_string()])
@@ -5871,13 +5898,13 @@ impl SqlExecutor {
             if let Some(id_str) = parts.get(2)
                 && let Ok(id) = id_str.parse::<u64>()
             {
-                self.s187_running_queries.lock().unwrap().remove(&id);
+                self.s187_running_queries.lock_safe().remove(&id);
                 return Some(Ok(QueryResult::Ok(format!("QUERY KILLED: {}", id))));
             }
             return Some(Ok(QueryResult::Ok("QUERY KILLED".to_owned())));
         }
         if up == "SHOW RUNNING QUERIES" {
-            let queries = self.s187_running_queries.lock().unwrap();
+            let queries = self.s187_running_queries.lock_safe();
             let rows = queries
                 .iter()
                 .map(|(id, sql)| vec![id.to_string(), sql.clone()])
@@ -5888,7 +5915,7 @@ impl SqlExecutor {
             }));
         }
         if up == "KILL ALL QUERIES" {
-            self.s187_running_queries.lock().unwrap().clear();
+            self.s187_running_queries.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("ALL QUERIES KILLED".to_owned())));
         }
 
@@ -5903,28 +5930,24 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             if !name.is_empty() {
                 self.s188_pipelines
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(name.clone(), sql.to_owned());
             }
             return Some(Ok(QueryResult::Created));
         }
         if up.starts_with("START PIPELINE ") {
             let name = sql[15..].trim().to_ascii_lowercase();
-            self.s188_pipeline_running
-                .lock()
-                .unwrap()
-                .insert(name.clone());
+            self.s188_pipeline_running.lock_safe().insert(name.clone());
             return Some(Ok(QueryResult::Ok(format!("PIPELINE STARTED: {}", name))));
         }
         if up.starts_with("STOP PIPELINE ") {
             let name = sql[14..].trim().to_ascii_lowercase();
-            self.s188_pipeline_running.lock().unwrap().remove(&name);
+            self.s188_pipeline_running.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Ok(format!("PIPELINE STOPPED: {}", name))));
         }
         if up == "SHOW PIPELINES" {
-            let pipelines = self.s188_pipelines.lock().unwrap();
-            let running = self.s188_pipeline_running.lock().unwrap();
+            let pipelines = self.s188_pipelines.lock_safe();
+            let running = self.s188_pipeline_running.lock_safe();
             let rows = pipelines
                 .iter()
                 .map(|(n, def)| {
@@ -5947,8 +5970,8 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP PIPELINE ") {
             let name = sql[14..].trim().to_ascii_lowercase();
-            self.s188_pipelines.lock().unwrap().remove(&name);
-            self.s188_pipeline_running.lock().unwrap().remove(&name);
+            self.s188_pipelines.lock_safe().remove(&name);
+            self.s188_pipeline_running.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -5969,12 +5992,9 @@ impl SqlExecutor {
                 let key = parts[8].trim_matches('\'').to_owned();
                 let key2 = key.clone();
                 let tc = format!("{}.{}", tbl, col);
-                self.s189_encrypted_cols
-                    .lock()
-                    .unwrap()
-                    .insert(tc.clone(), key);
+                self.s189_encrypted_cols.lock_safe().insert(tc.clone(), key);
                 // Also write to the shared encrypted_cols field so SHOW ENCRYPTED COLUMNS picks it up
-                self.encrypted_cols.lock().unwrap().insert(tc, key2);
+                self.encrypted_cols.lock_safe().insert(tc, key2);
             }
             return Some(Ok(QueryResult::Ok("COLUMN ENCRYPTED".to_owned())));
         }
@@ -5984,8 +6004,8 @@ impl SqlExecutor {
                 let tbl = parts[2].to_ascii_lowercase();
                 let col = parts[5].to_ascii_lowercase();
                 let tc = format!("{}.{}", tbl, col);
-                self.s189_encrypted_cols.lock().unwrap().remove(&tc);
-                self.encrypted_cols.lock().unwrap().remove(&tc);
+                self.s189_encrypted_cols.lock_safe().remove(&tc);
+                self.encrypted_cols.lock_safe().remove(&tc);
             }
             return Some(Ok(QueryResult::Ok("COLUMN DECRYPTED".to_owned())));
         }
@@ -6001,16 +6021,15 @@ impl SqlExecutor {
                 let remote = parts[5].trim_matches('\'').to_owned();
                 let remote_tbl = parts[7].to_ascii_lowercase();
                 self.s190_foreign_tables
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(ft_name.clone(), (remote.clone(), remote_tbl));
                 // Also write into the shared foreign_tables so the existing DROP handler cleans it up
-                self.foreign_tables.lock().unwrap().insert(ft_name, remote);
+                self.foreign_tables.lock_safe().insert(ft_name, remote);
             }
             return Some(Ok(QueryResult::Created));
         }
         if up == "SHOW FOREIGN TABLES" {
-            let tables = self.s190_foreign_tables.lock().unwrap();
+            let tables = self.s190_foreign_tables.lock_safe();
             let rows = tables
                 .iter()
                 .map(|(n, (host, tbl))| vec![n.clone(), host.clone(), tbl.clone()])
@@ -6026,13 +6045,12 @@ impl SqlExecutor {
         if up.starts_with("DROP FOREIGN TABLE ") && {
             let name_candidate = sql[19..].trim().to_ascii_lowercase();
             self.s190_foreign_tables
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .contains_key(&name_candidate)
         } {
             let name = sql[19..].trim().to_ascii_lowercase();
-            self.s190_foreign_tables.lock().unwrap().remove(&name);
-            self.foreign_tables.lock().unwrap().remove(&name);
+            self.s190_foreign_tables.lock_safe().remove(&name);
+            self.foreign_tables.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -6044,18 +6062,15 @@ impl SqlExecutor {
             if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("ON") {
                 let cs_name = parts[0].to_ascii_lowercase();
                 let tbl = parts[2].to_ascii_lowercase();
-                self.s191_change_streams
-                    .lock()
-                    .unwrap()
-                    .insert(cs_name, tbl);
+                self.s191_change_streams.lock_safe().insert(cs_name, tbl);
             }
             return Some(Ok(QueryResult::Created));
         }
         if up.starts_with("READ CHANGE STREAM ") {
             let cs_name = sql[19..].trim().to_ascii_lowercase();
-            let streams = self.s191_change_streams.lock().unwrap();
+            let streams = self.s191_change_streams.lock_safe();
             let tbl = streams.get(&cs_name).cloned().unwrap_or_default();
-            let feed = self.change_feed.lock().unwrap();
+            let feed = self.change_feed.lock_safe();
             let rows = feed
                 .get(&tbl)
                 .map(|entries| {
@@ -6072,11 +6087,11 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP CHANGE STREAM ") {
             let cs_name = sql[19..].trim().to_ascii_lowercase();
-            self.s191_change_streams.lock().unwrap().remove(&cs_name);
+            self.s191_change_streams.lock_safe().remove(&cs_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW CHANGE STREAMS" {
-            let streams = self.s191_change_streams.lock().unwrap();
+            let streams = self.s191_change_streams.lock_safe();
             let rows = streams
                 .iter()
                 .map(|(n, t)| vec![n.clone(), t.clone()])
@@ -6091,12 +6106,12 @@ impl SqlExecutor {
         if up.starts_with("SET RESULT TTL ") {
             let val_str = sql[15..].trim();
             if let Ok(v) = val_str.parse::<u64>() {
-                *self.s192_result_ttl.lock().unwrap() = Some(v);
+                *self.s192_result_ttl.lock_safe() = Some(v);
             }
             return Some(Ok(QueryResult::Ok("RESULT TTL SET".to_owned())));
         }
         if up == "SHOW RESULT TTL" {
-            let ttl = *self.s192_result_ttl.lock().unwrap();
+            let ttl = *self.s192_result_ttl.lock_safe();
             let val = ttl
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "unset".to_owned());
@@ -6106,28 +6121,28 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET RESULT TTL" {
-            *self.s192_result_ttl.lock().unwrap() = None;
+            *self.s192_result_ttl.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("RESULT TTL RESET".to_owned())));
         }
 
         // â”€â”€ S193 â€” Batch operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "BEGIN BATCH" {
-            *self.s193_batch_active.lock().unwrap() = true;
-            self.s193_batch_stmts.lock().unwrap().clear();
+            *self.s193_batch_active.lock_safe() = true;
+            self.s193_batch_stmts.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("BATCH BEGUN".to_owned())));
         }
         if up == "END BATCH" {
-            *self.s193_batch_active.lock().unwrap() = false;
+            *self.s193_batch_active.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("BATCH ENDED".to_owned())));
         }
         if up == "CANCEL BATCH" {
-            *self.s193_batch_active.lock().unwrap() = false;
-            self.s193_batch_stmts.lock().unwrap().clear();
+            *self.s193_batch_active.lock_safe() = false;
+            self.s193_batch_stmts.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("BATCH CANCELLED".to_owned())));
         }
         if up == "SHOW BATCH STATUS" {
-            let active = *self.s193_batch_active.lock().unwrap();
-            let count = self.s193_batch_stmts.lock().unwrap().len();
+            let active = *self.s193_batch_active.lock_safe();
+            let count = self.s193_batch_stmts.lock_safe().len();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["active".to_owned(), "stmt_count".to_owned()],
                 rows: vec![vec![active.to_string(), count.to_string()]],
@@ -6146,8 +6161,7 @@ impl SqlExecutor {
                 "CREATE INDEX (recommendation based on query)".to_owned()
             };
             self.s194_index_recommendations
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(rec.clone());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["recommendation".to_owned()],
@@ -6155,7 +6169,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW INDEX RECOMMENDATIONS" {
-            let recs = self.s194_index_recommendations.lock().unwrap().clone();
+            let recs = self.s194_index_recommendations.lock_safe().clone();
             let rows = recs.into_iter().map(|r| vec![r]).collect::<Vec<_>>();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["recommendation".to_owned()],
@@ -6163,7 +6177,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR INDEX RECOMMENDATIONS" {
-            self.s194_index_recommendations.lock().unwrap().clear();
+            self.s194_index_recommendations.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "INDEX RECOMMENDATIONS CLEARED".to_owned(),
             )));
@@ -6179,17 +6193,17 @@ impl SqlExecutor {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if !tbl.is_empty() {
-                self.s195_pinned_tables.lock().unwrap().insert(tbl.clone());
+                self.s195_pinned_tables.lock_safe().insert(tbl.clone());
             }
             return Some(Ok(QueryResult::Ok(format!("TABLE PINNED: {}", tbl))));
         }
         if up.starts_with("UNPIN TABLE ") {
             let tbl = sql[12..].trim().to_ascii_lowercase();
-            self.s195_pinned_tables.lock().unwrap().remove(&tbl);
+            self.s195_pinned_tables.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok(format!("TABLE UNPINNED: {}", tbl))));
         }
         if up == "SHOW PINNED TABLES" {
-            let pinned = self.s195_pinned_tables.lock().unwrap().clone();
+            let pinned = self.s195_pinned_tables.lock_safe().clone();
             let rows = pinned.into_iter().map(|t| vec![t]).collect::<Vec<_>>();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned()],
@@ -6200,15 +6214,12 @@ impl SqlExecutor {
         // â”€â”€ S196 â€” Query namespaces â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("CREATE QUERY NAMESPACE ") {
             let name = sql[23..].trim().to_ascii_lowercase();
-            self.s196_query_namespaces
-                .lock()
-                .unwrap()
-                .insert(name.clone());
+            self.s196_query_namespaces.lock_safe().insert(name.clone());
             return Some(Ok(QueryResult::Created));
         }
         if up.starts_with("SET QUERY NAMESPACE ") {
             let name = sql[20..].trim().to_ascii_lowercase();
-            *self.s196_current_namespace.lock().unwrap() = Some(name.clone());
+            *self.s196_current_namespace.lock_safe() = Some(name.clone());
             return Some(Ok(QueryResult::Ok(format!(
                 "QUERY NAMESPACE SET: {}",
                 name
@@ -6216,15 +6227,15 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP QUERY NAMESPACE ") {
             let name = sql[21..].trim().to_ascii_lowercase();
-            self.s196_query_namespaces.lock().unwrap().remove(&name);
-            if self.s196_current_namespace.lock().unwrap().as_deref() == Some(&name) {
-                *self.s196_current_namespace.lock().unwrap() = None;
+            self.s196_query_namespaces.lock_safe().remove(&name);
+            if self.s196_current_namespace.lock_safe().as_deref() == Some(&name) {
+                *self.s196_current_namespace.lock_safe() = None;
             }
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW QUERY NAMESPACES" {
-            let ns = self.s196_query_namespaces.lock().unwrap().clone();
-            let current = self.s196_current_namespace.lock().unwrap().clone();
+            let ns = self.s196_query_namespaces.lock_safe().clone();
+            let current = self.s196_current_namespace.lock_safe().clone();
             let rows = ns
                 .into_iter()
                 .map(|n| {
@@ -6246,8 +6257,7 @@ impl SqlExecutor {
         if up.starts_with("COMPACT TABLE ") {
             let tbl = sql[14..].trim().to_ascii_lowercase();
             self.s197_compaction_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("COMPACT {}", tbl));
             return Some(Ok(QueryResult::Ok(format!(
                 "COMPACTION TRIGGERED: {}",
@@ -6256,15 +6266,15 @@ impl SqlExecutor {
         }
         if up.starts_with("SET COMPACTION POLICY ") {
             let policy = sql[22..].trim().to_ascii_lowercase();
-            *self.s197_compaction_policy.lock().unwrap() = policy.clone();
+            *self.s197_compaction_policy.lock_safe() = policy.clone();
             return Some(Ok(QueryResult::Ok(format!(
                 "COMPACTION POLICY SET: {}",
                 policy
             ))));
         }
         if up == "SHOW COMPACTION STATUS" {
-            let policy = self.s197_compaction_policy.lock().unwrap().clone();
-            let log = self.s197_compaction_log.lock().unwrap().clone();
+            let policy = self.s197_compaction_policy.lock_safe().clone();
+            let log = self.s197_compaction_log.lock_safe().clone();
             let rows = vec![vec![policy, log.len().to_string()]];
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["policy".to_owned(), "compaction_count".to_owned()],
@@ -6280,8 +6290,7 @@ impl SqlExecutor {
                 let tbl = rest[..tier_pos].trim().to_ascii_lowercase();
                 let tier = rest[tier_pos + 6..].trim().to_ascii_lowercase();
                 self.s198_table_tiers
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(tbl.clone(), tier.clone());
                 return Some(Ok(QueryResult::Ok(format!(
                     "TABLE {} TIER SET TO {}",
@@ -6295,8 +6304,7 @@ impl SqlExecutor {
                 let tbl = rest[..pos].trim().to_ascii_lowercase();
                 let tier = rest[pos + 9..].trim().to_ascii_lowercase();
                 self.s198_table_tiers
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(tbl.clone(), tier.clone());
                 return Some(Ok(QueryResult::Ok(format!(
                     "TABLE {} MIGRATED TO TIER {}",
@@ -6305,7 +6313,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW TABLE TIERS" {
-            let tiers = self.s198_table_tiers.lock().unwrap().clone();
+            let tiers = self.s198_table_tiers.lock_safe().clone();
             let rows: Vec<Vec<String>> = tiers.into_iter().map(|(t, tier)| vec![t, tier]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "tier".to_owned()],
@@ -6321,20 +6329,20 @@ impl SqlExecutor {
                 if let Some(v) = part.strip_prefix("retries=")
                     && let Ok(n) = v.parse::<u64>()
                 {
-                    *self.s199_retry_retries.lock().unwrap() = n;
+                    *self.s199_retry_retries.lock_safe() = n;
                 }
                 if let Some(v) = part.strip_prefix("delay=") {
                     let v = v.trim_end_matches("ms");
                     if let Ok(n) = v.parse::<u64>() {
-                        *self.s199_retry_delay_ms.lock().unwrap() = n;
+                        *self.s199_retry_delay_ms.lock_safe() = n;
                     }
                 }
             }
             return Some(Ok(QueryResult::Ok("RETRY POLICY SET".to_owned())));
         }
         if up == "SHOW QUERY RETRY POLICY" {
-            let retries = *self.s199_retry_retries.lock().unwrap();
-            let delay = *self.s199_retry_delay_ms.lock().unwrap();
+            let retries = *self.s199_retry_retries.lock_safe();
+            let delay = *self.s199_retry_delay_ms.lock_safe();
             let rows = vec![vec![retries.to_string(), format!("{}ms", delay)]];
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["retries".to_owned(), "delay".to_owned()],
@@ -6342,8 +6350,8 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET QUERY RETRY POLICY" {
-            *self.s199_retry_retries.lock().unwrap() = 3;
-            *self.s199_retry_delay_ms.lock().unwrap() = 100;
+            *self.s199_retry_retries.lock_safe() = 3;
+            *self.s199_retry_delay_ms.lock_safe() = 100;
             return Some(Ok(QueryResult::Ok("RETRY POLICY RESET".to_owned())));
         }
 
@@ -6400,8 +6408,7 @@ impl SqlExecutor {
                     let col = after_col[..def_pos].trim().to_ascii_lowercase();
                     let expr = after_col[def_pos + 13..].trim().to_owned();
                     self.s201_col_defaults
-                        .lock()
-                        .unwrap()
+                        .lock_safe()
                         .insert((tbl, col), expr.clone());
                     return Some(Ok(QueryResult::Ok(format!("DEFAULT SET TO {}", expr))));
                 }
@@ -6417,14 +6424,14 @@ impl SqlExecutor {
                 let after_col = &rest[col_pos + 14..];
                 if let Some(drop_pos) = after_col.to_ascii_uppercase().find(" DROP DEFAULT") {
                     let col = after_col[..drop_pos].trim().to_ascii_lowercase();
-                    self.s201_col_defaults.lock().unwrap().remove(&(tbl, col));
+                    self.s201_col_defaults.lock_safe().remove(&(tbl, col));
                     return Some(Ok(QueryResult::Ok("DEFAULT DROPPED".to_owned())));
                 }
             }
         }
         if up.starts_with("SHOW COLUMN DEFAULTS FOR ") {
             let tbl = sql[25..].trim().to_ascii_lowercase();
-            let defaults = self.s201_col_defaults.lock().unwrap().clone();
+            let defaults = self.s201_col_defaults.lock_safe().clone();
             let rows: Vec<Vec<String>> = defaults
                 .into_iter()
                 .filter(|((t, _), _)| t == &tbl)
@@ -6443,14 +6450,13 @@ impl SqlExecutor {
                 let zone = rest[..for_pos].trim().to_ascii_lowercase();
                 let tbl = rest[for_pos + 5..].trim().to_ascii_lowercase();
                 self.s202_geo_partitions
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(zone.clone(), tbl);
                 return Some(Ok(QueryResult::Created));
             }
         }
         if up == "SHOW GEO PARTITIONS" {
-            let parts = self.s202_geo_partitions.lock().unwrap().clone();
+            let parts = self.s202_geo_partitions.lock_safe().clone();
             let rows: Vec<Vec<String>> = parts.into_iter().map(|(z, t)| vec![z, t]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["zone".to_owned(), "table".to_owned()],
@@ -6459,7 +6465,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP GEO PARTITION ZONE ") {
             let zone = sql[24..].trim().to_ascii_lowercase();
-            self.s202_geo_partitions.lock().unwrap().remove(&zone);
+            self.s202_geo_partitions.lock_safe().remove(&zone);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -6474,10 +6480,7 @@ impl SqlExecutor {
                 let cursor_name = rest[..for_pos].trim().to_ascii_lowercase();
                 // Seed with some placeholder rows
                 let rows: Vec<Vec<String>> = (1..=10).map(|i| vec![i.to_string()]).collect();
-                self.s203_cursors
-                    .lock()
-                    .unwrap()
-                    .insert(cursor_name, (rows, 0));
+                self.s203_cursors.lock_safe().insert(cursor_name, (rows, 0));
                 return Some(Ok(QueryResult::Ok("CURSOR DECLARED".to_owned())));
             }
         }
@@ -6488,7 +6491,7 @@ impl SqlExecutor {
                 let count_str = &rest[11..from_pos].trim();
                 let count: usize = count_str.parse().unwrap_or(10);
                 let cursor_name = rest[from_pos + 6..].trim().to_ascii_lowercase();
-                let mut guard = self.s203_cursors.lock().unwrap();
+                let mut guard = self.s203_cursors.lock_safe();
                 if let Some((rows, pos)) = guard.get_mut(&cursor_name) {
                     let end = (*pos + count).min(rows.len());
                     let fetched = rows[*pos..end].to_vec();
@@ -6506,7 +6509,7 @@ impl SqlExecutor {
         }
         if up.starts_with("CLOSE CURSOR ") {
             let cursor_name = sql[13..].trim().to_ascii_lowercase();
-            self.s203_cursors.lock().unwrap().remove(&cursor_name);
+            self.s203_cursors.lock_safe().remove(&cursor_name);
             return Some(Ok(QueryResult::Ok("CURSOR CLOSED".to_owned())));
         }
 
@@ -6526,15 +6529,12 @@ impl SqlExecutor {
                 } else {
                     (after.trim().to_ascii_lowercase(), None)
                 };
-                self.s204_clones
-                    .lock()
-                    .unwrap()
-                    .insert(new_tbl, (src, snap));
+                self.s204_clones.lock_safe().insert(new_tbl, (src, snap));
                 return Some(Ok(QueryResult::Created));
             }
         }
         if up == "SHOW TABLE CLONES" {
-            let clones = self.s204_clones.lock().unwrap().clone();
+            let clones = self.s204_clones.lock_safe().clone();
             let rows: Vec<Vec<String>> = clones
                 .into_iter()
                 .map(|(t, (src, snap))| vec![t, src, snap.unwrap_or_default()])
@@ -6553,11 +6553,11 @@ impl SqlExecutor {
         // Must come before generic SET handler
         if up.starts_with("SET WAL LEVEL ") {
             let level = sql[14..].trim().to_ascii_lowercase();
-            *self.s205_wal_level.lock().unwrap() = level.clone();
+            *self.s205_wal_level.lock_safe() = level.clone();
             return Some(Ok(QueryResult::Ok(format!("WAL LEVEL SET TO {}", level))));
         }
         if up == "SHOW WAL LEVEL" {
-            let level = self.s205_wal_level.lock().unwrap().clone();
+            let level = self.s205_wal_level.lock_safe().clone();
             let rows = vec![vec![level]];
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["wal_level".to_owned()],
@@ -6571,7 +6571,7 @@ impl SqlExecutor {
         // â”€â”€ S206 â€” Auto-vacuum tuning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET AUTO VACUUM THRESHOLD ") {
             let v: u64 = sql[26..].trim().parse().unwrap_or(50);
-            *self.s206_vacuum_threshold.lock().unwrap() = v;
+            *self.s206_vacuum_threshold.lock_safe() = v;
             return Some(Ok(QueryResult::Ok(format!(
                 "AUTO VACUUM THRESHOLD SET TO {}",
                 v
@@ -6579,15 +6579,15 @@ impl SqlExecutor {
         }
         if up.starts_with("SET AUTO VACUUM SCALE FACTOR ") {
             let v: f64 = sql[29..].trim().parse().unwrap_or(0.2);
-            *self.s206_vacuum_scale_factor.lock().unwrap() = v;
+            *self.s206_vacuum_scale_factor.lock_safe() = v;
             return Some(Ok(QueryResult::Ok(format!(
                 "AUTO VACUUM SCALE FACTOR SET TO {}",
                 v
             ))));
         }
         if up == "SHOW AUTO VACUUM SETTINGS" {
-            let threshold = *self.s206_vacuum_threshold.lock().unwrap();
-            let scale = *self.s206_vacuum_scale_factor.lock().unwrap();
+            let threshold = *self.s206_vacuum_threshold.lock_safe();
+            let scale = *self.s206_vacuum_scale_factor.lock_safe();
             let rows = vec![vec![threshold.to_string(), format!("{:.2}", scale)]];
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["threshold".to_owned(), "scale_factor".to_owned()],
@@ -6600,17 +6600,16 @@ impl SqlExecutor {
             let query = sql[19..].trim().to_owned();
             let key = query.to_ascii_lowercase();
             self.s207_pinned_plans
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(key, "PINNED_PLAN".to_owned());
             return Some(Ok(QueryResult::Ok("QUERY PLAN PINNED".to_owned())));
         }
         if up == "UNPIN QUERY PLAN" {
-            self.s207_pinned_plans.lock().unwrap().clear();
+            self.s207_pinned_plans.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("QUERY PLAN UNPINNED".to_owned())));
         }
         if up == "SHOW PINNED QUERY PLANS" {
-            let plans = self.s207_pinned_plans.lock().unwrap().clone();
+            let plans = self.s207_pinned_plans.lock_safe().clone();
             let rows: Vec<Vec<String>> = plans.into_iter().map(|(q, p)| vec![q, p]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["query".to_owned(), "plan".to_owned()],
@@ -6629,14 +6628,13 @@ impl SqlExecutor {
                 (spec.to_owned(), "*".to_owned())
             };
             self.s208_col_stats
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert((tbl, col), "computed".to_owned());
             return Some(Ok(QueryResult::Ok("STATS COMPUTED".to_owned())));
         }
         if up.starts_with("SHOW STATS FOR ") {
             let spec = sql[15..].trim();
-            let stats = self.s208_col_stats.lock().unwrap().clone();
+            let stats = self.s208_col_stats.lock_safe().clone();
             let rows: Vec<Vec<String>> = stats
                 .iter()
                 .filter(|((t, c), _)| format!("{}.{}", t, c) == spec || t == spec)
@@ -6650,8 +6648,7 @@ impl SqlExecutor {
         if up.starts_with("PURGE STATS FOR ") {
             let tbl = sql[16..].trim().to_owned();
             self.s208_col_stats
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .retain(|(t, _), _| t != &tbl);
             return Some(Ok(QueryResult::Ok("STATS PURGED".to_owned())));
         }
@@ -6665,14 +6662,14 @@ impl SqlExecutor {
             } else {
                 "UNKNOWN".to_owned()
             };
-            self.s209_hints.lock().unwrap().push(hint.clone());
+            self.s209_hints.lock_safe().push(hint.clone());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["hint".to_owned()],
                 rows: vec![vec![hint]],
             }));
         }
         if up == "SHOW QUERY HINTS" {
-            let hints = self.s209_hints.lock().unwrap().clone();
+            let hints = self.s209_hints.lock_safe().clone();
             let rows: Vec<Vec<String>> = hints.into_iter().map(|h| vec![h]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["hint".to_owned()],
@@ -6689,8 +6686,7 @@ impl SqlExecutor {
                 let child = rest[..ap_pos].trim().to_owned();
                 let parent = rest[ap_pos + 12..].trim().to_owned();
                 self.s210_inheritance
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .entry(child)
                     .or_default()
                     .push(parent);
@@ -6701,8 +6697,7 @@ impl SqlExecutor {
             let tbl = sql[27..].trim().to_owned();
             let chain = self
                 .s210_inheritance
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&tbl)
                 .cloned()
                 .unwrap_or_default();
@@ -6718,7 +6713,7 @@ impl SqlExecutor {
             if let Some(from_pos) = rest.to_ascii_uppercase().find(" FROM ") {
                 let child = rest[..from_pos].trim().to_owned();
                 let parent = rest[from_pos + 6..].trim().to_owned();
-                if let Some(v) = self.s210_inheritance.lock().unwrap().get_mut(&child) {
+                if let Some(v) = self.s210_inheritance.lock_safe().get_mut(&child) {
                     v.retain(|p| p != &parent);
                 }
             }
@@ -6729,7 +6724,7 @@ impl SqlExecutor {
         // Must be BEFORE generic SELECT handler
         if up.starts_with("SELECT") && up.contains("PIVOT") {
             let entry = sql.to_owned();
-            self.s211_pivot_cache.lock().unwrap().push(entry);
+            self.s211_pivot_cache.lock_safe().push(entry);
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["pivot_result".to_owned()],
                 rows: vec![vec!["PIVOTED".to_owned()]],
@@ -6742,7 +6737,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW PIVOT CACHE" {
-            let cache = self.s211_pivot_cache.lock().unwrap().clone();
+            let cache = self.s211_pivot_cache.lock_safe().clone();
             let rows: Vec<Vec<String>> = cache.into_iter().map(|s| vec![s]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["query".to_owned()],
@@ -6754,11 +6749,11 @@ impl SqlExecutor {
         if up.starts_with("SET TRACE SAMPLING RATE ") {
             let rate_str = sql[24..].trim();
             let rate: f64 = rate_str.parse().unwrap_or(0.0);
-            *self.s212_trace_rate.lock().unwrap() = rate;
+            *self.s212_trace_rate.lock_safe() = rate;
             return Some(Ok(QueryResult::Ok("TRACE SAMPLING RATE SET".to_owned())));
         }
         if up == "SHOW TRACE SAMPLES" {
-            let samples = self.s212_trace_samples.lock().unwrap().clone();
+            let samples = self.s212_trace_samples.lock_safe().clone();
             let rows: Vec<Vec<String>> = samples.into_iter().map(|s| vec![s]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["sample".to_owned()],
@@ -6766,7 +6761,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR TRACE SAMPLES" {
-            self.s212_trace_samples.lock().unwrap().clear();
+            self.s212_trace_samples.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("TRACE SAMPLES CLEARED".to_owned())));
         }
 
@@ -6783,20 +6778,17 @@ impl SqlExecutor {
                 } else {
                     (target.to_owned(), "*".to_owned())
                 };
-                self.s213_col_aliases
-                    .lock()
-                    .unwrap()
-                    .insert(alias, (tbl, col));
+                self.s213_col_aliases.lock_safe().insert(alias, (tbl, col));
             }
             return Some(Ok(QueryResult::Created));
         }
         if up.starts_with("DROP COLUMN ALIAS ") {
             let alias = sql[18..].trim().to_owned();
-            self.s213_col_aliases.lock().unwrap().remove(&alias);
+            self.s213_col_aliases.lock_safe().remove(&alias);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW COLUMN ALIASES" {
-            let aliases = self.s213_col_aliases.lock().unwrap().clone();
+            let aliases = self.s213_col_aliases.lock_safe().clone();
             let rows: Vec<Vec<String>> = aliases
                 .into_iter()
                 .map(|(a, (t, c))| vec![a, t, c])
@@ -6810,7 +6802,7 @@ impl SqlExecutor {
         // â”€â”€ S214 â€” Table access patterns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SHOW ACCESS PATTERN FOR ") {
             let tbl = sql[24..].trim().to_owned();
-            let patterns = self.s214_access_patterns.lock().unwrap().clone();
+            let patterns = self.s214_access_patterns.lock_safe().clone();
             let rows: Vec<Vec<String>> = patterns
                 .iter()
                 .filter(|(t, _)| t.as_str() == tbl)
@@ -6823,15 +6815,15 @@ impl SqlExecutor {
         }
         if up.starts_with("RESET ACCESS PATTERN FOR ") {
             let tbl = sql[25..].trim().to_owned();
-            self.s214_access_patterns.lock().unwrap().remove(&tbl);
+            self.s214_access_patterns.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("ACCESS PATTERN RESET".to_owned())));
         }
         if up == "SET ACCESS TRACKING ON" {
-            *self.s214_access_tracking.lock().unwrap() = true;
+            *self.s214_access_tracking.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("ACCESS TRACKING ON".to_owned())));
         }
         if up == "SET ACCESS TRACKING OFF" {
-            *self.s214_access_tracking.lock().unwrap() = false;
+            *self.s214_access_tracking.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("ACCESS TRACKING OFF".to_owned())));
         }
 
@@ -6840,8 +6832,7 @@ impl SqlExecutor {
             let raw = sql[16..].trim().trim_matches('\'').to_owned();
             let normalized = raw.to_ascii_lowercase();
             self.s215_normalized
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(normalized.clone(), raw);
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["normalized".to_owned()],
@@ -6849,7 +6840,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW NORMALIZED QUERIES" {
-            let map = self.s215_normalized.lock().unwrap().clone();
+            let map = self.s215_normalized.lock_safe().clone();
             let rows: Vec<Vec<String>> = map.into_iter().map(|(n, o)| vec![n, o]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["normalized".to_owned(), "original".to_owned()],
@@ -6857,7 +6848,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR NORMALIZED QUERIES" {
-            self.s215_normalized.lock().unwrap().clear();
+            self.s215_normalized.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("NORMALIZED QUERIES CLEARED".to_owned())));
         }
 
@@ -6871,17 +6862,16 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             self.s216_mv_refresh_status
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(mv_name, "incremental".to_owned());
             return Some(Ok(QueryResult::Ok("MV REFRESHED INCREMENTALLY".to_owned())));
         }
         if up == "SET MV REFRESH INCREMENTAL ON" {
-            *self.s216_mv_incremental.lock().unwrap() = true;
+            *self.s216_mv_incremental.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("MV INCREMENTAL REFRESH ON".to_owned())));
         }
         if up == "SHOW MV REFRESH STATUS" {
-            let status = self.s216_mv_refresh_status.lock().unwrap().clone();
+            let status = self.s216_mv_refresh_status.lock_safe().clone();
             let rows: Vec<Vec<String>> = status.into_iter().map(|(n, s)| vec![n, s]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["mv".to_owned(), "status".to_owned()],
@@ -6891,17 +6881,17 @@ impl SqlExecutor {
 
         // â”€â”€ S217 â€” Storage encryption at rest â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "ENABLE ENCRYPTION AT REST" {
-            *self.s217_encryption_enabled.lock().unwrap() = true;
+            *self.s217_encryption_enabled.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("ENCRYPTION AT REST ENABLED".to_owned())));
         }
         if up == "DISABLE ENCRYPTION AT REST" {
-            *self.s217_encryption_enabled.lock().unwrap() = false;
+            *self.s217_encryption_enabled.lock_safe() = false;
             return Some(Ok(QueryResult::Ok(
                 "ENCRYPTION AT REST DISABLED".to_owned(),
             )));
         }
         if up == "SHOW ENCRYPTION STATUS" {
-            let enabled = *self.s217_encryption_enabled.lock().unwrap();
+            let enabled = *self.s217_encryption_enabled.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["encryption_at_rest".to_owned()],
                 rows: vec![vec![enabled.to_string()]],
@@ -6913,8 +6903,7 @@ impl SqlExecutor {
             let profiled_sql = &s["PROFILE ".len()..];
             let ts = chrono_now();
             self.s218_profiles
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("{}|{}", ts, profiled_sql));
             return Some(Ok(QueryResult::Rows {
                 columns: vec![
@@ -6930,7 +6919,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW QUERY PROFILES" {
-            let profiles = self.s218_profiles.lock().unwrap();
+            let profiles = self.s218_profiles.lock_safe();
             let rows = profiles
                 .iter()
                 .map(|p| {
@@ -6947,14 +6936,14 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR QUERY PROFILES" {
-            self.s218_profiles.lock().unwrap().clear();
+            self.s218_profiles.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("QUERY PROFILES CLEARED".to_owned())));
         }
 
         // â”€â”€ S219 â€” Table rewrites â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("REWRITE TABLE ") {
             let ts = chrono_now();
-            self.s219_rewrite_history.lock().unwrap().push(format!(
+            self.s219_rewrite_history.lock_safe().push(format!(
                 "{}|{}",
                 ts,
                 &s["REWRITE TABLE ".len()..]
@@ -6962,7 +6951,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("TABLE REWRITTEN".to_owned())));
         }
         if up == "SHOW TABLE REWRITE HISTORY" {
-            let hist = self.s219_rewrite_history.lock().unwrap();
+            let hist = self.s219_rewrite_history.lock_safe();
             let rows = hist
                 .iter()
                 .map(|h| {
@@ -6979,7 +6968,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR TABLE REWRITE HISTORY" {
-            self.s219_rewrite_history.lock().unwrap().clear();
+            self.s219_rewrite_history.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "TABLE REWRITE HISTORY CLEARED".to_owned(),
             )));
@@ -6995,8 +6984,7 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_uppercase();
             self.s220_storage_formats
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(table_name, fmt);
             return Some(Ok(QueryResult::Ok("STORAGE FORMAT SET".to_owned())));
         }
@@ -7004,7 +6992,7 @@ impl SqlExecutor {
             let table_name = s["SHOW TABLE STORAGE FORMAT FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let fmts = self.s220_storage_formats.lock().unwrap();
+            let fmts = self.s220_storage_formats.lock_safe();
             let fmt = fmts
                 .get(&table_name)
                 .cloned()
@@ -7029,8 +7017,7 @@ impl SqlExecutor {
                 String::new()
             };
             self.s221_workload_classes
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(class_name, condition);
             return Some(Ok(QueryResult::Created));
         }
@@ -7038,14 +7025,11 @@ impl SqlExecutor {
             let class_name = s["DROP WORKLOAD CLASS ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s221_workload_classes
-                .lock()
-                .unwrap()
-                .remove(&class_name);
+            self.s221_workload_classes.lock_safe().remove(&class_name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW WORKLOAD CLASSES" {
-            let classes = self.s221_workload_classes.lock().unwrap();
+            let classes = self.s221_workload_classes.lock_safe();
             let rows = classes
                 .iter()
                 .map(|(n, c)| vec![n.clone(), c.clone()])
@@ -7060,16 +7044,16 @@ impl SqlExecutor {
         if up.starts_with("ON QUERY CANCEL EXECUTE ") {
             let action = s["ON QUERY CANCEL EXECUTE ".len()..].trim().to_owned();
             let id = {
-                let mut id_lock = self.s222_next_hook_id.lock().unwrap();
+                let mut id_lock = self.s222_next_hook_id.lock_safe();
                 let id = *id_lock;
                 *id_lock += 1;
                 id
             };
-            self.s222_cancel_hooks.lock().unwrap().push((id, action));
+            self.s222_cancel_hooks.lock_safe().push((id, action));
             return Some(Ok(QueryResult::Ok("CANCEL HOOK REGISTERED".to_owned())));
         }
         if up == "SHOW CANCEL HOOKS" {
-            let hooks = self.s222_cancel_hooks.lock().unwrap();
+            let hooks = self.s222_cancel_hooks.lock_safe();
             let rows = hooks
                 .iter()
                 .map(|(id, action)| vec![id.to_string(), action.clone()])
@@ -7082,7 +7066,7 @@ impl SqlExecutor {
         if up.starts_with("DROP CANCEL HOOK ") {
             let id_str = s["DROP CANCEL HOOK ".len()..].trim();
             if let Ok(id) = id_str.parse::<u64>() {
-                let mut hooks = self.s222_cancel_hooks.lock().unwrap();
+                let mut hooks = self.s222_cancel_hooks.lock_safe();
                 hooks.retain(|(hid, _)| *hid != id);
             }
             return Some(Ok(QueryResult::Dropped));
@@ -7091,7 +7075,7 @@ impl SqlExecutor {
         // â”€â”€ S223 â€” Schema introspection v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("DESCRIBE FUNCTION ") {
             let fn_name = s["DESCRIBE FUNCTION ".len()..].trim().to_ascii_lowercase();
-            let udfs = self.udfs.lock().unwrap();
+            let udfs = self.udfs.lock_safe();
             let (param, body) = udfs
                 .get(&fn_name)
                 .cloned()
@@ -7103,7 +7087,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DESCRIBE TRIGGER ") {
             let trig_name = s["DESCRIBE TRIGGER ".len()..].trim().to_ascii_lowercase();
-            let triggers = self.triggers.lock().unwrap();
+            let triggers = self.triggers.lock_safe();
             let info = if triggers.contains_key(&trig_name) {
                 "defined".to_owned()
             } else {
@@ -7127,8 +7111,7 @@ impl SqlExecutor {
             let table_name = s["CHECK TABLE ".len()..].trim().to_ascii_lowercase();
             let ts = chrono_now();
             self.s224_health_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("{}|{}|ok", ts, table_name));
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "status".to_owned()],
@@ -7139,13 +7122,12 @@ impl SqlExecutor {
             let table_name = s["REPAIR TABLE ".len()..].trim().to_ascii_lowercase();
             let ts = chrono_now();
             self.s224_health_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("{}|{}|repaired", ts, table_name));
             return Some(Ok(QueryResult::Ok("TABLE REPAIRED".to_owned())));
         }
         if up == "SHOW TABLE HEALTH" {
-            let health = self.s224_health_log.lock().unwrap();
+            let health = self.s224_health_log.lock_safe();
             let rows = health
                 .iter()
                 .map(|h| {
@@ -7168,18 +7150,18 @@ impl SqlExecutor {
             let codec = s["SET RESULT COMPRESSION ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            *self.s225_compression.lock().unwrap() = codec;
+            *self.s225_compression.lock_safe() = codec;
             return Some(Ok(QueryResult::Ok("RESULT COMPRESSION SET".to_owned())));
         }
         if up == "SHOW RESULT COMPRESSION" {
-            let codec = self.s225_compression.lock().unwrap().clone();
+            let codec = self.s225_compression.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["codec".to_owned()],
                 rows: vec![vec![codec]],
             }));
         }
         if up == "RESET RESULT COMPRESSION" {
-            *self.s225_compression.lock().unwrap() = "none".to_owned();
+            *self.s225_compression.lock_safe() = "none".to_owned();
             return Some(Ok(QueryResult::Ok("RESULT COMPRESSION RESET".to_owned())));
         }
 
@@ -7187,8 +7169,7 @@ impl SqlExecutor {
         if up == "RELOAD SERVER CONFIG" {
             let ts = chrono_now();
             self.s226_reload_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("{}|<default>", ts));
             return Some(Ok(QueryResult::Ok("SERVER CONFIG RELOADED".to_owned())));
         }
@@ -7196,15 +7177,14 @@ impl SqlExecutor {
             let path = s["RELOAD SERVER CONFIG FILE ".len()..].trim().to_owned();
             let ts = chrono_now();
             self.s226_reload_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("{}|{}", ts, path));
             return Some(Ok(QueryResult::Ok(
                 "SERVER CONFIG FILE RELOADED".to_owned(),
             )));
         }
         if up == "SHOW CONFIG RELOAD STATUS" {
-            let log = self.s226_reload_log.lock().unwrap();
+            let log = self.s226_reload_log.lock_safe();
             let rows = log
                 .iter()
                 .map(|e| {
@@ -7227,8 +7207,7 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             self.s227_adaptive_index_tables
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(table_name);
             return Some(Ok(QueryResult::Ok("ADAPTIVE INDEXING ENABLED".to_owned())));
         }
@@ -7237,13 +7216,12 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             self.s227_adaptive_index_tables
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .remove(&table_name);
             return Some(Ok(QueryResult::Ok("ADAPTIVE INDEXING DISABLED".to_owned())));
         }
         if up == "SHOW ADAPTIVE INDEX STATUS" {
-            let tables = self.s227_adaptive_index_tables.lock().unwrap();
+            let tables = self.s227_adaptive_index_tables.lock_safe();
             let rows = tables
                 .iter()
                 .map(|t| vec![t.clone(), "enabled".to_owned()])
@@ -7263,18 +7241,17 @@ impl SqlExecutor {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             self.s228_routing_rules
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(name, rest.to_owned());
             return Some(Ok(QueryResult::Created));
         }
         if up.starts_with("DROP ROUTING RULE ") {
             let name = s["DROP ROUTING RULE ".len()..].trim().to_ascii_lowercase();
-            self.s228_routing_rules.lock().unwrap().remove(&name);
+            self.s228_routing_rules.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW ROUTING RULES" {
-            let rules = self.s228_routing_rules.lock().unwrap();
+            let rules = self.s228_routing_rules.lock_safe();
             let rows = rules
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -7291,11 +7268,11 @@ impl SqlExecutor {
             let parts: Vec<&str> = rest.splitn(3, ' ').collect();
             let tname = parts.first().copied().unwrap_or("").to_ascii_lowercase();
             let dur = parts.last().copied().unwrap_or("").to_owned();
-            self.s229_expiry_policies.lock().unwrap().insert(tname, dur);
+            self.s229_expiry_policies.lock_safe().insert(tname, dur);
             return Some(Ok(QueryResult::Ok("TABLE EXPIRY SET".to_owned())));
         }
         if up == "SHOW TABLE EXPIRY POLICIES" {
-            let policies = self.s229_expiry_policies.lock().unwrap();
+            let policies = self.s229_expiry_policies.lock_safe();
             let rows = policies
                 .iter()
                 .map(|(t, d)| vec![t.clone(), d.clone()])
@@ -7309,7 +7286,7 @@ impl SqlExecutor {
             let tname = s["CANCEL TABLE EXPIRY FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s229_expiry_policies.lock().unwrap().remove(&tname);
+            self.s229_expiry_policies.lock_safe().remove(&tname);
             return Some(Ok(QueryResult::Ok("TABLE EXPIRY CANCELLED".to_owned())));
         }
 
@@ -7318,7 +7295,7 @@ impl SqlExecutor {
             let tname = s["SHOW COLUMN RENAME HISTORY FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let hist = self.s230_rename_history.lock().unwrap();
+            let hist = self.s230_rename_history.lock_safe();
             let entries = hist.get(&tname).cloned().unwrap_or_default();
             let rows = entries.into_iter().map(|(o, n)| vec![o, n]).collect();
             return Some(Ok(QueryResult::Rows {
@@ -7327,7 +7304,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR COLUMN RENAME HISTORY" {
-            self.s230_rename_history.lock().unwrap().clear();
+            self.s230_rename_history.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "COLUMN RENAME HISTORY CLEARED".to_owned(),
             )));
@@ -7378,14 +7355,11 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            self.s232_savepoint_descs
-                .lock()
-                .unwrap()
-                .insert(sp_name, desc);
+            self.s232_savepoint_descs.lock_safe().insert(sp_name, desc);
             return Some(Ok(QueryResult::Ok("SAVEPOINT SET".to_owned())));
         }
         if up == "LIST SAVEPOINTS" {
-            let descs = self.s232_savepoint_descs.lock().unwrap();
+            let descs = self.s232_savepoint_descs.lock_safe();
             let rows = descs
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -7412,18 +7386,18 @@ impl SqlExecutor {
             let mode = s["SET STANDBY QUERY MODE ".len()..]
                 .trim()
                 .to_ascii_uppercase();
-            *self.s233_standby_mode.lock().unwrap() = mode;
+            *self.s233_standby_mode.lock_safe() = mode;
             return Some(Ok(QueryResult::Ok("STANDBY MODE SET".to_owned())));
         }
         if up == "SHOW STANDBY QUERY MODE" {
-            let mode = self.s233_standby_mode.lock().unwrap().clone();
+            let mode = self.s233_standby_mode.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["mode".to_owned()],
                 rows: vec![vec![mode]],
             }));
         }
         if up == "ALLOW WRITES ON STANDBY" {
-            *self.s233_allow_writes.lock().unwrap() = true;
+            *self.s233_allow_writes.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("STANDBY WRITES ALLOWED".to_owned())));
         }
 
@@ -7432,7 +7406,7 @@ impl SqlExecutor {
             let tbl = s["SHOW INDEX USAGE FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let usage = self.s234_index_usage.lock().unwrap();
+            let usage = self.s234_index_usage.lock_safe();
             let count = usage.get(&tbl).copied().unwrap_or(0);
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "scans".to_owned()],
@@ -7443,12 +7417,12 @@ impl SqlExecutor {
             let tbl = s["RESET INDEX USAGE FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s234_index_usage.lock().unwrap().insert(tbl.clone(), 0);
-            self.s234_reset_tables.lock().unwrap().insert(tbl);
+            self.s234_index_usage.lock_safe().insert(tbl.clone(), 0);
+            self.s234_reset_tables.lock_safe().insert(tbl);
             return Some(Ok(QueryResult::Ok("INDEX USAGE RESET".to_owned())));
         }
         if up == "SHOW UNUSED INDEXES" {
-            let reset = self.s234_reset_tables.lock().unwrap();
+            let reset = self.s234_reset_tables.lock_safe();
             let rows = reset
                 .iter()
                 .map(|t| vec![t.clone(), "0".to_owned()])
@@ -7472,7 +7446,7 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            self.s235_export_status.lock().unwrap().push((schema, path));
+            self.s235_export_status.lock_safe().push((schema, path));
             return Some(Ok(QueryResult::Ok("SCHEMA EXPORTED".to_owned())));
         }
         if up.starts_with("IMPORT SCHEMA FROM ") {
@@ -7481,13 +7455,12 @@ impl SqlExecutor {
                 .trim_matches('\'')
                 .to_owned();
             self.s235_export_status
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(("import".to_owned(), path));
             return Some(Ok(QueryResult::Ok("SCHEMA IMPORTED".to_owned())));
         }
         if up == "SHOW SCHEMA EXPORT STATUS" {
-            let log = self.s235_export_status.lock().unwrap();
+            let log = self.s235_export_status.lock_safe();
             let rows = log
                 .iter()
                 .map(|(s, p)| vec![s.clone(), p.clone()])
@@ -7506,14 +7479,11 @@ impl SqlExecutor {
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            self.s236_buckets
-                .lock()
-                .unwrap()
-                .insert(name, rest.to_owned());
+            self.s236_buckets.lock_safe().insert(name, rest.to_owned());
             return Some(Ok(QueryResult::Created));
         }
         if up == "SHOW QUERY BUCKETS" {
-            let buckets = self.s236_buckets.lock().unwrap();
+            let buckets = self.s236_buckets.lock_safe();
             let rows = buckets
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -7525,7 +7495,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP QUERY BUCKET ") {
             let name = s["DROP QUERY BUCKET ".len()..].trim().to_ascii_lowercase();
-            self.s236_buckets.lock().unwrap().remove(&name);
+            self.s236_buckets.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -7535,20 +7505,19 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            *self.s237_metrics_target.lock().unwrap() = Some(target);
-            *self.s237_metrics_streaming.lock().unwrap() = true;
+            *self.s237_metrics_target.lock_safe() = Some(target);
+            *self.s237_metrics_streaming.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("METRICS STREAMING STARTED".to_owned())));
         }
         if up == "STOP METRICS STREAM" {
-            *self.s237_metrics_streaming.lock().unwrap() = false;
+            *self.s237_metrics_streaming.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("METRICS STREAM STOPPED".to_owned())));
         }
         if up == "SHOW METRICS STREAM STATUS" {
-            let streaming = *self.s237_metrics_streaming.lock().unwrap();
+            let streaming = *self.s237_metrics_streaming.lock_safe();
             let target = self
                 .s237_metrics_target
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .clone()
                 .unwrap_or_default();
             return Some(Ok(QueryResult::Rows {
@@ -7573,19 +7542,18 @@ impl SqlExecutor {
                     "INSERT".to_owned()
                 };
                 self.s238_observe_hooks
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(hook_name, (tbl, event));
                 return Some(Ok(QueryResult::Created));
             }
         }
         if up.starts_with("DROP OBSERVE HOOK ") {
             let name = s["DROP OBSERVE HOOK ".len()..].trim().to_ascii_lowercase();
-            self.s238_observe_hooks.lock().unwrap().remove(&name);
+            self.s238_observe_hooks.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Dropped));
         }
         if up == "SHOW OBSERVE HOOKS" {
-            let hooks = self.s238_observe_hooks.lock().unwrap();
+            let hooks = self.s238_observe_hooks.lock_safe();
             let rows: Vec<Vec<String>> = hooks
                 .iter()
                 .map(|(k, (t, e))| vec![k.clone(), t.clone(), e.clone()])
@@ -7603,14 +7571,13 @@ impl SqlExecutor {
         // â”€â”€ S239 â€” Query affinity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET QUERY AFFINITY NODE ") {
             let node = s["SET QUERY AFFINITY NODE ".len()..].trim().to_owned();
-            *self.s239_affinity_node.lock().unwrap() = Some(node);
+            *self.s239_affinity_node.lock_safe() = Some(node);
             return Some(Ok(QueryResult::Ok("QUERY AFFINITY SET".to_owned())));
         }
         if up == "SHOW QUERY AFFINITY" {
             let node = self
                 .s239_affinity_node
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .clone()
                 .unwrap_or_default();
             return Some(Ok(QueryResult::Rows {
@@ -7619,7 +7586,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET QUERY AFFINITY" {
-            *self.s239_affinity_node.lock().unwrap() = None;
+            *self.s239_affinity_node.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("QUERY AFFINITY RESET".to_owned())));
         }
 
@@ -7627,7 +7594,7 @@ impl SqlExecutor {
         if up.starts_with("SHOW COLUMN LINEAGE FOR ") {
             let spec = s["SHOW COLUMN LINEAGE FOR ".len()..].trim().to_owned();
             let (tbl, col) = split_table_col(&spec);
-            let lineage = self.s240_lineage.lock().unwrap();
+            let lineage = self.s240_lineage.lock_safe();
             let sources = lineage
                 .get(&(tbl.clone(), col.clone()))
                 .cloned()
@@ -7645,7 +7612,7 @@ impl SqlExecutor {
             let rest = s["TRACE COLUMN ".len()..].trim();
             let spec = rest.split(" TO SOURCE").next().unwrap_or("").trim();
             let (tbl, col) = split_table_col(spec);
-            let lineage = self.s240_lineage.lock().unwrap();
+            let lineage = self.s240_lineage.lock_safe();
             let sources = lineage
                 .get(&(tbl.clone(), col.clone()))
                 .cloned()
@@ -7660,7 +7627,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW LINEAGE GRAPH" {
-            let lineage = self.s240_lineage.lock().unwrap();
+            let lineage = self.s240_lineage.lock_safe();
             let rows: Vec<Vec<String>> = lineage
                 .iter()
                 .flat_map(|((t, c), sources)| {
@@ -7677,23 +7644,23 @@ impl SqlExecutor {
 
         // â”€â”€ S241 â€” Failsafe mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "ENABLE FAILSAFE MODE" {
-            *self.s241_failsafe_enabled.lock().unwrap() = true;
+            *self.s241_failsafe_enabled.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("FAILSAFE MODE ENABLED".to_owned())));
         }
         if up == "DISABLE FAILSAFE MODE" {
-            *self.s241_failsafe_enabled.lock().unwrap() = false;
+            *self.s241_failsafe_enabled.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("FAILSAFE MODE DISABLED".to_owned())));
         }
         if up == "SHOW FAILSAFE STATUS" {
-            let enabled = *self.s241_failsafe_enabled.lock().unwrap();
-            let tested = *self.s241_failsafe_tested.lock().unwrap();
+            let enabled = *self.s241_failsafe_enabled.lock_safe();
+            let tested = *self.s241_failsafe_tested.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["enabled".to_owned(), "last_tested".to_owned()],
                 rows: vec![vec![enabled.to_string(), tested.to_string()]],
             }));
         }
         if up == "TEST FAILSAFE" {
-            *self.s241_failsafe_tested.lock().unwrap() = true;
+            *self.s241_failsafe_tested.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("FAILSAFE TEST PASSED".to_owned())));
         }
 
@@ -7702,8 +7669,7 @@ impl SqlExecutor {
             let query_sql = s["COMPUTE QUERY SIGNATURE ".len()..].trim();
             let sig = format!("{:016x}", fingerprint_hash(query_sql));
             self.s242_query_signatures
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(sig.clone(), query_sql.to_owned());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["signature".to_owned(), "sql".to_owned()],
@@ -7711,7 +7677,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW QUERY SIGNATURES" {
-            let sigs = self.s242_query_signatures.lock().unwrap();
+            let sigs = self.s242_query_signatures.lock_safe();
             let rows: Vec<Vec<String>> = sigs
                 .iter()
                 .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -7726,7 +7692,7 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            let sigs = self.s242_query_signatures.lock().unwrap();
+            let sigs = self.s242_query_signatures.lock_safe();
             let rows: Vec<Vec<String>> = sigs
                 .iter()
                 .filter(|(k, _)| k.as_str() == sig)
@@ -7745,15 +7711,12 @@ impl SqlExecutor {
             if parts.len() == 2 {
                 let tbl = parts[0].trim().to_ascii_lowercase();
                 let strategy = parts[1].trim().to_ascii_uppercase();
-                self.s243_merge_strategies
-                    .lock()
-                    .unwrap()
-                    .insert(tbl, strategy);
+                self.s243_merge_strategies.lock_safe().insert(tbl, strategy);
                 return Some(Ok(QueryResult::Ok("MERGE STRATEGY SET".to_owned())));
             }
         }
         if up == "SHOW TABLE MERGE STRATEGIES" {
-            let strategies = self.s243_merge_strategies.lock().unwrap();
+            let strategies = self.s243_merge_strategies.lock_safe();
             let rows: Vec<Vec<String>> = strategies
                 .iter()
                 .map(|(t, s)| vec![t.clone(), s.clone()])
@@ -7777,8 +7740,7 @@ impl SqlExecutor {
                     .unwrap_or_default()
                     .as_millis() as u64;
                 self.s244_schema_snapshots
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(snap_name, (schema_name, ts));
                 return Some(Ok(QueryResult::Ok("SCHEMA SNAPSHOT CREATED".to_owned())));
             }
@@ -7790,14 +7752,13 @@ impl SqlExecutor {
                 .to_owned();
             let exists = self
                 .s244_schema_snapshots
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .contains_key(&snap_name);
             let _ = exists;
             return Some(Ok(QueryResult::Ok("SCHEMA RESTORED".to_owned())));
         }
         if up == "SHOW SCHEMA SNAPSHOTS" {
-            let snaps = self.s244_schema_snapshots.lock().unwrap();
+            let snaps = self.s244_schema_snapshots.lock_safe();
             let rows: Vec<Vec<String>> = snaps
                 .iter()
                 .map(|(name, (schema, ts))| vec![name.clone(), schema.clone(), ts.to_string()])
@@ -7826,10 +7787,7 @@ impl SqlExecutor {
             } else {
                 "default.plan".to_owned()
             };
-            self.s245_exported_plans
-                .lock()
-                .unwrap()
-                .insert(path, plan_sql);
+            self.s245_exported_plans.lock_safe().insert(path, plan_sql);
             return Some(Ok(QueryResult::Ok("QUERY PLAN EXPORTED".to_owned())));
         }
         if up.starts_with("IMPORT QUERY PLAN FROM ") {
@@ -7841,7 +7799,7 @@ impl SqlExecutor {
             return Some(Ok(QueryResult::Ok("QUERY PLAN IMPORTED".to_owned())));
         }
         if up == "SHOW EXPORTED PLANS" {
-            let plans = self.s245_exported_plans.lock().unwrap();
+            let plans = self.s245_exported_plans.lock_safe();
             let rows: Vec<Vec<String>> = plans
                 .iter()
                 .map(|(p, s)| vec![p.clone(), s.clone()])
@@ -7864,60 +7822,58 @@ impl SqlExecutor {
         }
         if up.starts_with("DEFRAGMENT TABLE ") {
             let tbl = s["DEFRAGMENT TABLE ".len()..].trim().to_ascii_lowercase();
-            self.s246_defrag_log.lock().unwrap().push(tbl);
+            self.s246_defrag_log.lock_safe().push(tbl);
             return Some(Ok(QueryResult::Ok("TABLE DEFRAGMENTED".to_owned())));
         }
         if up == "SET AUTO DEFRAGMENT ON" {
-            *self.s246_auto_defragment.lock().unwrap() = true;
+            *self.s246_auto_defragment.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("AUTO DEFRAGMENT ENABLED".to_owned())));
         }
         if up == "SET AUTO DEFRAGMENT OFF" {
-            *self.s246_auto_defragment.lock().unwrap() = false;
+            *self.s246_auto_defragment.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("AUTO DEFRAGMENT DISABLED".to_owned())));
         }
 
         // â”€â”€ S247 â€” Shard rebalancing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "REBALANCE SHARDS" {
-            self.s247_rebalance_log.lock().unwrap().push(chrono_now());
+            self.s247_rebalance_log.lock_safe().push(chrono_now());
             return Some(Ok(QueryResult::Ok("SHARDS REBALANCED".to_owned())));
         }
         if up == "SHOW SHARD BALANCE" {
-            let policy = self.s247_rebalance_policy.lock().unwrap().clone();
-            let runs = self.s247_rebalance_log.lock().unwrap().len();
+            let policy = self.s247_rebalance_policy.lock_safe().clone();
+            let runs = self.s247_rebalance_log.lock_safe().len();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["policy".to_owned(), "rebalance_count".to_owned()],
                 rows: vec![vec![policy, runs.to_string()]],
             }));
         }
         if up == "SET SHARD REBALANCE POLICY AUTO" {
-            *self.s247_rebalance_policy.lock().unwrap() = "AUTO".to_owned();
+            *self.s247_rebalance_policy.lock_safe() = "AUTO".to_owned();
             return Some(Ok(QueryResult::Ok("SHARD REBALANCE POLICY SET".to_owned())));
         }
         if up == "SET SHARD REBALANCE POLICY MANUAL" {
-            *self.s247_rebalance_policy.lock().unwrap() = "MANUAL".to_owned();
+            *self.s247_rebalance_policy.lock_safe() = "MANUAL".to_owned();
             return Some(Ok(QueryResult::Ok("SHARD REBALANCE POLICY SET".to_owned())));
         }
 
         // â"€â"€ S248 â€" Cross-shard transactions â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         if up.starts_with("BEGIN CROSS SHARD") {
-            *self.s248_cross_shard_tx_active.lock().unwrap() = true;
+            *self.s248_cross_shard_tx_active.lock_safe() = true;
             self.s248_cross_shard_tx_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("BEGIN@{}", chrono_now()));
             return Some(Ok(QueryResult::TxBegin));
         }
         if up.starts_with("COMMIT CROSS SHARD") {
-            *self.s248_cross_shard_tx_active.lock().unwrap() = false;
+            *self.s248_cross_shard_tx_active.lock_safe() = false;
             self.s248_cross_shard_tx_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("COMMIT@{}", chrono_now()));
             return Some(Ok(QueryResult::TxCommit));
         }
         if up == "SHOW CROSS SHARD TX STATUS" {
-            let active = *self.s248_cross_shard_tx_active.lock().unwrap();
-            let log = self.s248_cross_shard_tx_log.lock().unwrap().clone();
+            let active = *self.s248_cross_shard_tx_active.lock_safe();
+            let log = self.s248_cross_shard_tx_log.lock_safe().clone();
             let log_entries: Vec<Vec<String>> = log.iter().map(|e| vec![e.clone()]).collect();
             let rows: Vec<Vec<String>> = if log_entries.is_empty() {
                 vec![vec![
@@ -7939,20 +7895,18 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             self.s249_stats_reset_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push((tbl, chrono_now()));
             return Some(Ok(QueryResult::Ok("TABLE STATS RESET".to_owned())));
         }
         if up == "RESET ALL TABLE STATS" {
             self.s249_stats_reset_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(("ALL".to_owned(), chrono_now()));
             return Some(Ok(QueryResult::Ok("ALL TABLE STATS RESET".to_owned())));
         }
         if up == "SHOW STATS RESET HISTORY" {
-            let log = self.s249_stats_reset_log.lock().unwrap().clone();
+            let log = self.s249_stats_reset_log.lock_safe().clone();
             let rows = log
                 .iter()
                 .map(|(t, ts)| vec![t.clone(), ts.clone()])
@@ -7967,15 +7921,15 @@ impl SqlExecutor {
         if up.starts_with("LOCK QUERY PLAN FOR ") {
             let sql_key = s["LOCK QUERY PLAN FOR ".len()..].trim().to_owned();
             let plan = format!("LOCKED_PLAN_FOR:{}", sql_key);
-            self.s250_locked_plans.lock().unwrap().insert(sql_key, plan);
+            self.s250_locked_plans.lock_safe().insert(sql_key, plan);
             return Some(Ok(QueryResult::Ok("QUERY PLAN LOCKED".to_owned())));
         }
         if up == "UNLOCK QUERY PLAN" {
-            self.s250_locked_plans.lock().unwrap().clear();
+            self.s250_locked_plans.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("QUERY PLAN UNLOCKED".to_owned())));
         }
         if up == "SHOW LOCKED QUERY PLANS" {
-            let plans = self.s250_locked_plans.lock().unwrap().clone();
+            let plans = self.s250_locked_plans.lock_safe().clone();
             let rows = plans.into_iter().map(|(k, v)| vec![k, v]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["sql".to_owned(), "plan".to_owned()],
@@ -7995,7 +7949,7 @@ impl SqlExecutor {
                     .unwrap_or(10);
                 let buckets: Vec<(String, u64)> =
                     (0..n).map(|i| (format!("b{}", i), 0u64)).collect();
-                self.s251_histograms_v3.lock().unwrap().insert(key, buckets);
+                self.s251_histograms_v3.lock_safe().insert(key, buckets);
                 return Some(Ok(QueryResult::Ok("HISTOGRAM BUILT".to_owned())));
             }
             return Some(Ok(QueryResult::Ok("HISTOGRAM BUILT".to_owned())));
@@ -8005,7 +7959,7 @@ impl SqlExecutor {
             let key_raw = s["SHOW HISTOGRAM FOR ".len()..].trim();
             if key_raw.contains('.') {
                 let key = key_raw.to_ascii_lowercase();
-                let map = self.s251_histograms_v3.lock().unwrap();
+                let map = self.s251_histograms_v3.lock_safe();
                 let rows = map
                     .get(&key)
                     .map(|v| {
@@ -8025,7 +7979,7 @@ impl SqlExecutor {
             let key_raw = s["DROP HISTOGRAM FOR ".len()..].trim();
             if key_raw.contains('.') {
                 let key = key_raw.to_ascii_lowercase();
-                self.s251_histograms_v3.lock().unwrap().remove(&key);
+                self.s251_histograms_v3.lock_safe().remove(&key);
                 return Some(Ok(QueryResult::Ok("HISTOGRAM DROPPED".to_owned())));
             }
         }
@@ -8038,8 +7992,7 @@ impl SqlExecutor {
                 let tbl = rest[..rp].trim().to_ascii_lowercase();
                 let role = rest[rp + " TO ROLE ".len()..].trim().to_ascii_lowercase();
                 self.s252_role_grants
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .push((role, tbl, "SELECT".to_owned()));
                 return Some(Ok(QueryResult::Ok("GRANTED".to_owned())));
             }
@@ -8050,13 +8003,13 @@ impl SqlExecutor {
             if let Some(rp) = up_rest.find(" FROM ROLE ") {
                 let tbl = rest[..rp].trim().to_ascii_lowercase();
                 let role = rest[rp + " FROM ROLE ".len()..].trim().to_ascii_lowercase();
-                let mut grants = self.s252_role_grants.lock().unwrap();
+                let mut grants = self.s252_role_grants.lock_safe();
                 grants.retain(|(r, t, p)| !(r == &role && t == &tbl && p == "SELECT"));
                 return Some(Ok(QueryResult::Ok("REVOKED".to_owned())));
             }
         }
         if up == "SHOW ROLE GRANTS" {
-            let grants = self.s252_role_grants.lock().unwrap().clone();
+            let grants = self.s252_role_grants.lock_safe().clone();
             let rows = grants.into_iter().map(|(r, t, p)| vec![r, t, p]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec![
@@ -8079,21 +8032,20 @@ impl SqlExecutor {
                     .trim_matches('\'')
                     .to_owned();
                 let id = {
-                    let mut nid = self.s253_next_id.lock().unwrap();
+                    let mut nid = self.s253_next_id.lock_safe();
                     let cur = *nid;
                     *nid += 1;
                     cur
                 };
                 self.s253_scheduled_queries
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .push((id, sql_part, at_str, false));
                 return Some(Ok(QueryResult::Ok(format!("SCHEDULED id={}", id))));
             }
             return Some(Ok(QueryResult::Ok("SCHEDULED".to_owned())));
         }
         if up == "SHOW SCHEDULED QUERIES" {
-            let qs = self.s253_scheduled_queries.lock().unwrap().clone();
+            let qs = self.s253_scheduled_queries.lock_safe().clone();
             let rows = qs
                 .iter()
                 .map(|(id, sql, at, cancelled)| {
@@ -8118,7 +8070,7 @@ impl SqlExecutor {
         if up.starts_with("CANCEL SCHEDULED QUERY ") {
             let id_str = s["CANCEL SCHEDULED QUERY ".len()..].trim();
             if let Ok(id) = id_str.parse::<u64>() {
-                let mut qs = self.s253_scheduled_queries.lock().unwrap();
+                let mut qs = self.s253_scheduled_queries.lock_safe();
                 for entry in qs.iter_mut() {
                     if entry.0 == id {
                         entry.3 = true;
@@ -8133,23 +8085,23 @@ impl SqlExecutor {
             let tbl = s["COALESCE INDEXES ON ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s254_coalesce_log.lock().unwrap().push(tbl);
+            self.s254_coalesce_log.lock_safe().push(tbl);
             return Some(Ok(QueryResult::Ok("INDEXES COALESCED".to_owned())));
         }
         if up == "SHOW INDEX COALESCE STATUS" {
-            let auto = *self.s254_auto_coalesce.lock().unwrap();
-            let count = self.s254_coalesce_log.lock().unwrap().len();
+            let auto = *self.s254_auto_coalesce.lock_safe();
+            let count = self.s254_coalesce_log.lock_safe().len();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["auto_coalesce".to_owned(), "coalesce_count".to_owned()],
                 rows: vec![vec![auto.to_string(), count.to_string()]],
             }));
         }
         if up == "SET AUTO COALESCE ON" {
-            *self.s254_auto_coalesce.lock().unwrap() = true;
+            *self.s254_auto_coalesce.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("AUTO COALESCE ON".to_owned())));
         }
         if up == "SET AUTO COALESCE OFF" {
-            *self.s254_auto_coalesce.lock().unwrap() = false;
+            *self.s254_auto_coalesce.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("AUTO COALESCE OFF".to_owned())));
         }
 
@@ -8161,7 +8113,7 @@ impl SqlExecutor {
                 let tbl = rest[..sp].trim().to_ascii_lowercase();
                 let deg_str = rest[sp + " SCAN PARALLELISM ".len()..].trim();
                 let deg: u64 = deg_str.parse().unwrap_or(1);
-                self.s255_scan_parallelism.lock().unwrap().insert(tbl, deg);
+                self.s255_scan_parallelism.lock_safe().insert(tbl, deg);
                 return Some(Ok(QueryResult::Ok("SCAN PARALLELISM SET".to_owned())));
             }
         }
@@ -8171,8 +8123,7 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let deg = self
                 .s255_scan_parallelism
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&tbl)
                 .copied()
                 .unwrap_or(1);
@@ -8185,7 +8136,7 @@ impl SqlExecutor {
             let tbl = s["RESET SCAN PARALLELISM FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s255_scan_parallelism.lock().unwrap().remove(&tbl);
+            self.s255_scan_parallelism.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("SCAN PARALLELISM RESET".to_owned())));
         }
 
@@ -8199,20 +8150,19 @@ impl SqlExecutor {
                 let ttl_str = rest[ttl_pos + "' TTL ".len()..].trim();
                 let ttl: u64 = ttl_str.parse().unwrap_or(60);
                 let id = {
-                    let mut nid = self.s256_next_id.lock().unwrap();
+                    let mut nid = self.s256_next_id.lock_safe();
                     let cur = *nid;
                     *nid += 1;
                     cur
                 };
                 self.s256_cached_queries
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .push((id, sql_part, ttl));
                 return Some(Ok(QueryResult::Ok(format!("CACHED id={}", id))));
             }
         }
         if up == "SHOW CACHED QUERIES" {
-            let cqs = self.s256_cached_queries.lock().unwrap().clone();
+            let cqs = self.s256_cached_queries.lock_safe().clone();
             let rows = cqs
                 .iter()
                 .map(|(id, sql, ttl)| vec![id.to_string(), sql.clone(), ttl.to_string()])
@@ -8226,8 +8176,7 @@ impl SqlExecutor {
             let id_str = s["EVICT CACHED QUERY ".len()..].trim();
             if let Ok(id) = id_str.parse::<u64>() {
                 self.s256_cached_queries
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .retain(|(i, _, _)| *i != id);
             }
             return Some(Ok(QueryResult::Ok("CACHED QUERY EVICTED".to_owned())));
@@ -8240,13 +8189,12 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             self.s257_live_migrations
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(schema, ("RUNNING".to_owned(), false));
             return Some(Ok(QueryResult::Ok("LIVE MIGRATION STARTED".to_owned())));
         }
         if up == "SHOW LIVE MIGRATION STATUS" {
-            let migs = self.s257_live_migrations.lock().unwrap().clone();
+            let migs = self.s257_live_migrations.lock_safe().clone();
             let rows = migs
                 .into_iter()
                 .map(|(s, (status, paused))| vec![s, status, paused.to_string()])
@@ -8261,14 +8209,14 @@ impl SqlExecutor {
             }));
         }
         if up == "PAUSE LIVE MIGRATION" {
-            let mut migs = self.s257_live_migrations.lock().unwrap();
+            let mut migs = self.s257_live_migrations.lock_safe();
             for v in migs.values_mut() {
                 v.1 = true;
             }
             return Some(Ok(QueryResult::Ok("LIVE MIGRATION PAUSED".to_owned())));
         }
         if up == "RESUME LIVE MIGRATION" {
-            let mut migs = self.s257_live_migrations.lock().unwrap();
+            let mut migs = self.s257_live_migrations.lock_safe();
             for v in migs.values_mut() {
                 v.1 = false;
             }
@@ -8283,13 +8231,13 @@ impl SqlExecutor {
                 let id_str = rest[..ap].trim();
                 let ms_str = rest[ap + " ACTUAL ".len()..rest.len() - 2].trim();
                 if let (Ok(id), Ok(ms)) = (id_str.parse::<u64>(), ms_str.parse::<u64>()) {
-                    self.s258_cost_feedback.lock().unwrap().push((id, ms));
+                    self.s258_cost_feedback.lock_safe().push((id, ms));
                     return Some(Ok(QueryResult::Ok("COST FEEDBACK RECORDED".to_owned())));
                 }
             }
         }
         if up == "SHOW QUERY COST FEEDBACK" {
-            let fb = self.s258_cost_feedback.lock().unwrap().clone();
+            let fb = self.s258_cost_feedback.lock_safe().clone();
             let rows = fb
                 .iter()
                 .map(|(id, ms)| vec![id.to_string(), ms.to_string()])
@@ -8300,7 +8248,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR QUERY COST FEEDBACK" {
-            self.s258_cost_feedback.lock().unwrap().clear();
+            self.s258_cost_feedback.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("COST FEEDBACK CLEARED".to_owned())));
         }
 
@@ -8316,8 +8264,7 @@ impl SqlExecutor {
                     let col = tbl_col[op + 1..cp].trim().to_ascii_lowercase();
                     let fpr: f64 = fpr_str.parse().unwrap_or(0.01);
                     self.s259_bloom_filters_v2
-                        .lock()
-                        .unwrap()
+                        .lock_safe()
                         .insert(tbl, (col, fpr));
                     return Some(Ok(QueryResult::Ok("BLOOM FILTER CREATED".to_owned())));
                 }
@@ -8327,11 +8274,11 @@ impl SqlExecutor {
             let tbl = s["DROP BLOOM FILTER ON ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s259_bloom_filters_v2.lock().unwrap().remove(&tbl);
+            self.s259_bloom_filters_v2.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("BLOOM FILTER DROPPED".to_owned())));
         }
         if up == "SHOW BLOOM FILTERS" {
-            let bf = self.s259_bloom_filters_v2.lock().unwrap().clone();
+            let bf = self.s259_bloom_filters_v2.lock_safe().clone();
             let rows = bf
                 .into_iter()
                 .map(|(tbl, (col, fpr))| vec![tbl, col, fpr.to_string()])
@@ -8347,14 +8294,13 @@ impl SqlExecutor {
             let rest = &s["SUBMIT ASYNC QUERY '".len()..];
             let sql_part = rest.trim_end_matches('\'').to_owned();
             let id = {
-                let mut nid = self.s260_next_id.lock().unwrap();
+                let mut nid = self.s260_next_id.lock_safe();
                 let cur = *nid;
                 *nid += 1;
                 cur
             };
             self.s260_async_queries
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(id, (sql_part, "DONE".to_owned()));
             return Some(Ok(QueryResult::Ok(format!(
                 "ASYNC QUERY SUBMITTED id={}",
@@ -8364,7 +8310,7 @@ impl SqlExecutor {
         if up.starts_with("SHOW ASYNC QUERY STATUS ") {
             let id_str = s["SHOW ASYNC QUERY STATUS ".len()..].trim();
             if let Ok(id) = id_str.parse::<u64>() {
-                let aq = self.s260_async_queries.lock().unwrap();
+                let aq = self.s260_async_queries.lock_safe();
                 let status = aq
                     .get(&id)
                     .map(|(_, st)| st.clone())
@@ -8378,7 +8324,7 @@ impl SqlExecutor {
         if up.starts_with("FETCH ASYNC RESULT ") {
             let id_str = s["FETCH ASYNC RESULT ".len()..].trim();
             if let Ok(id) = id_str.parse::<u64>() {
-                let aq = self.s260_async_queries.lock().unwrap();
+                let aq = self.s260_async_queries.lock_safe();
                 let sql_part = aq.get(&id).map(|(sql, _)| sql.clone()).unwrap_or_default();
                 return Some(Ok(QueryResult::Rows {
                     columns: vec!["id".to_owned(), "sql".to_owned()],
@@ -8411,15 +8357,14 @@ impl SqlExecutor {
                         .trim()
                         .to_ascii_lowercase();
                     self.s261_expr_indexes
-                        .lock()
-                        .unwrap()
+                        .lock_safe()
                         .insert(idx_name, (tbl, expr.to_owned()));
                     return Some(Ok(QueryResult::Ok("EXPRESSION INDEX CREATED".to_owned())));
                 }
             }
         }
         if up == "SHOW EXPRESSION INDEXES" {
-            let idxs = self.s261_expr_indexes.lock().unwrap().clone();
+            let idxs = self.s261_expr_indexes.lock_safe().clone();
             let rows = idxs
                 .into_iter()
                 .map(|(idx, (tbl, expr))| vec![idx, tbl, expr])
@@ -8433,7 +8378,7 @@ impl SqlExecutor {
             let idx = s["DROP EXPRESSION INDEX ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s261_expr_indexes.lock().unwrap().remove(&idx);
+            self.s261_expr_indexes.lock_safe().remove(&idx);
             return Some(Ok(QueryResult::Ok("EXPRESSION INDEX DROPPED".to_owned())));
         }
 
@@ -8444,12 +8389,12 @@ impl SqlExecutor {
             if let Some(tp) = up_rest.find(" TO ") {
                 let tbl = rest[..tp].trim().to_ascii_lowercase();
                 let col = rest[tp + " TO ".len()..].trim().to_ascii_lowercase();
-                self.s262_shard_keys.lock().unwrap().insert(tbl, col);
+                self.s262_shard_keys.lock_safe().insert(tbl, col);
                 return Some(Ok(QueryResult::Ok("SHARD KEY SET".to_owned())));
             }
         }
         if up == "SHOW SHARD KEYS" {
-            let sk = self.s262_shard_keys.lock().unwrap().clone();
+            let sk = self.s262_shard_keys.lock_safe().clone();
             let rows = sk.into_iter().map(|(tbl, col)| vec![tbl, col]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "shard_key".to_owned()],
@@ -8458,7 +8403,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP SHARD KEY FOR ") {
             let tbl = s["DROP SHARD KEY FOR ".len()..].trim().to_ascii_lowercase();
-            self.s262_shard_keys.lock().unwrap().remove(&tbl);
+            self.s262_shard_keys.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("SHARD KEY DROPPED".to_owned())));
         }
 
@@ -8470,14 +8415,13 @@ impl SqlExecutor {
                 let sql_part = rest[..ap].trim().to_owned();
                 let snap = rest[ap + "' AGAINST SNAPSHOT ".len()..].trim().to_owned();
                 self.s263_result_diffs
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .push((sql_part, snap, "NO_DIFF".to_owned()));
                 return Some(Ok(QueryResult::Ok("RESULT DIFF COMPUTED".to_owned())));
             }
         }
         if up == "SHOW RESULT DIFFS" {
-            let diffs = self.s263_result_diffs.lock().unwrap().clone();
+            let diffs = self.s263_result_diffs.lock_safe().clone();
             let rows = diffs
                 .into_iter()
                 .map(|(sql, snap, summary)| vec![sql, snap, summary])
@@ -8492,28 +8436,28 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR RESULT DIFFS" {
-            self.s263_result_diffs.lock().unwrap().clear();
+            self.s263_result_diffs.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("RESULT DIFFS CLEARED".to_owned())));
         }
 
         // â”€â”€ S264 â€" Connection multiplexing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up == "SET CONNECTION POOL MULTIPLEXING ON" {
-            *self.s264_multiplexing.lock().unwrap() = true;
+            *self.s264_multiplexing.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("MULTIPLEXING ON".to_owned())));
         }
         if up == "SET CONNECTION POOL MULTIPLEXING OFF" {
-            *self.s264_multiplexing.lock().unwrap() = false;
+            *self.s264_multiplexing.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("MULTIPLEXING OFF".to_owned())));
         }
         if up == "SHOW MULTIPLEXING STATUS" {
-            let m = *self.s264_multiplexing.lock().unwrap();
+            let m = *self.s264_multiplexing.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["multiplexing".to_owned()],
                 rows: vec![vec![m.to_string()]],
             }));
         }
         if up == "RESET MULTIPLEXING" {
-            *self.s264_multiplexing.lock().unwrap() = false;
+            *self.s264_multiplexing.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("MULTIPLEXING RESET".to_owned())));
         }
 
@@ -8525,15 +8469,12 @@ impl SqlExecutor {
                 let tbl = rest[..cp].trim().to_ascii_lowercase();
                 let val_str = rest[cp + " COMPACTION THRESHOLD ".len()..].trim();
                 let val: u64 = val_str.parse().unwrap_or(0);
-                self.s265_compaction_threshold
-                    .lock()
-                    .unwrap()
-                    .insert(tbl, val);
+                self.s265_compaction_threshold.lock_safe().insert(tbl, val);
                 return Some(Ok(QueryResult::Ok("COMPACTION THRESHOLD SET".to_owned())));
             }
         }
         if up == "SHOW TABLE COMPACTION POLICY" {
-            let cp = self.s265_compaction_threshold.lock().unwrap().clone();
+            let cp = self.s265_compaction_threshold.lock_safe().clone();
             let rows = cp
                 .into_iter()
                 .map(|(tbl, v)| vec![tbl, v.to_string()])
@@ -8544,7 +8485,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET TABLE COMPACTION POLICY" {
-            self.s265_compaction_threshold.lock().unwrap().clear();
+            self.s265_compaction_threshold.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("COMPACTION POLICY RESET".to_owned())));
         }
 
@@ -8558,14 +8499,13 @@ impl SqlExecutor {
                     .trim_end_matches('\'')
                     .to_owned();
                 self.s266_plan_versions
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(ver, (sql_part, "PLAN".to_owned()));
                 return Some(Ok(QueryResult::Ok("QUERY PLAN VERSION SAVED".to_owned())));
             }
         }
         if up == "SHOW QUERY PLAN VERSIONS" {
-            let pv = self.s266_plan_versions.lock().unwrap().clone();
+            let pv = self.s266_plan_versions.lock_safe().clone();
             let rows = pv
                 .into_iter()
                 .map(|(ver, (sql, plan))| vec![ver, sql, plan])
@@ -8577,7 +8517,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP QUERY PLAN VERSION ") {
             let ver = s["DROP QUERY PLAN VERSION ".len()..].trim().to_owned();
-            self.s266_plan_versions.lock().unwrap().remove(&ver);
+            self.s266_plan_versions.lock_safe().remove(&ver);
             return Some(Ok(QueryResult::Ok("QUERY PLAN VERSION DROPPED".to_owned())));
         }
 
@@ -8589,14 +8529,13 @@ impl SqlExecutor {
                 let file = rest[..tp].trim().to_owned();
                 let schema = rest[tp + "' TO ".len()..].trim().to_owned();
                 self.s267_diff_history
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .push(format!("{}->{}", file, schema));
                 return Some(Ok(QueryResult::Ok("SCHEMA DIFF APPLIED".to_owned())));
             }
         }
         if up == "SHOW SCHEMA DIFF HISTORY" {
-            let hist = self.s267_diff_history.lock().unwrap().clone();
+            let hist = self.s267_diff_history.lock_safe().clone();
             let rows = hist.into_iter().map(|h| vec![h]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["diff".to_owned()],
@@ -8604,7 +8543,7 @@ impl SqlExecutor {
             }));
         }
         if up == "UNDO LAST SCHEMA DIFF" {
-            self.s267_diff_history.lock().unwrap().pop();
+            self.s267_diff_history.lock_safe().pop();
             return Some(Ok(QueryResult::Ok("LAST SCHEMA DIFF UNDONE".to_owned())));
         }
 
@@ -8616,15 +8555,12 @@ impl SqlExecutor {
                 let tbl = rest[..onp].trim().to_ascii_lowercase();
                 let col = rest[onp + " ON ".len()..dp].trim().to_ascii_lowercase();
                 let delay = rest[dp + " DELAY ".len()..].trim().to_owned();
-                self.s268_watermarks
-                    .lock()
-                    .unwrap()
-                    .insert(tbl, (col, delay));
+                self.s268_watermarks.lock_safe().insert(tbl, (col, delay));
                 return Some(Ok(QueryResult::Ok("WATERMARK SET".to_owned())));
             }
         }
         if up == "SHOW WATERMARKS" {
-            let wm = self.s268_watermarks.lock().unwrap().clone();
+            let wm = self.s268_watermarks.lock_safe().clone();
             let rows = wm
                 .into_iter()
                 .map(|(tbl, (col, delay))| vec![tbl, col, delay])
@@ -8636,7 +8572,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP WATERMARK FOR ") {
             let tbl = s["DROP WATERMARK FOR ".len()..].trim().to_ascii_lowercase();
-            self.s268_watermarks.lock().unwrap().remove(&tbl);
+            self.s268_watermarks.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("WATERMARK DROPPED".to_owned())));
         }
 
@@ -8644,12 +8580,12 @@ impl SqlExecutor {
         if up.starts_with("SET QUERY COST BUDGET ") {
             let val_str = s["SET QUERY COST BUDGET ".len()..].trim();
             if let Ok(val) = val_str.parse::<u64>() {
-                *self.s269_cost_budget.lock().unwrap() = Some(val);
+                *self.s269_cost_budget.lock_safe() = Some(val);
                 return Some(Ok(QueryResult::Ok("QUERY COST BUDGET SET".to_owned())));
             }
         }
         if up == "SHOW QUERY COST BUDGET" {
-            let b = *self.s269_cost_budget.lock().unwrap();
+            let b = *self.s269_cost_budget.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["budget".to_owned()],
                 rows: vec![vec![
@@ -8659,7 +8595,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET QUERY COST BUDGET" {
-            *self.s269_cost_budget.lock().unwrap() = None;
+            *self.s269_cost_budget.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("QUERY COST BUDGET RESET".to_owned())));
         }
 
@@ -8670,17 +8606,17 @@ impl SqlExecutor {
             if let Some(fp) = up_rest.find(" FOR ") {
                 let alias = rest[..fp].trim().to_ascii_lowercase();
                 let tbl = rest[fp + " FOR ".len()..].trim().to_ascii_lowercase();
-                self.s270_table_aliases.lock().unwrap().insert(alias, tbl);
+                self.s270_table_aliases.lock_safe().insert(alias, tbl);
                 return Some(Ok(QueryResult::Ok("TABLE ALIAS CREATED".to_owned())));
             }
         }
         if up.starts_with("DROP TABLE ALIAS ") {
             let alias = s["DROP TABLE ALIAS ".len()..].trim().to_ascii_lowercase();
-            self.s270_table_aliases.lock().unwrap().remove(&alias);
+            self.s270_table_aliases.lock_safe().remove(&alias);
             return Some(Ok(QueryResult::Ok("TABLE ALIAS DROPPED".to_owned())));
         }
         if up == "SHOW TABLE ALIASES" {
-            let al = self.s270_table_aliases.lock().unwrap().clone();
+            let al = self.s270_table_aliases.lock_safe().clone();
             let rows = al
                 .into_iter()
                 .map(|(alias, tbl)| vec![alias, tbl])
@@ -8701,13 +8637,12 @@ impl SqlExecutor {
         if up.starts_with("CANCEL INDEX BUILD ") {
             let idx = s["CANCEL INDEX BUILD ".len()..].trim().to_owned();
             self.s271_build_history
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("CANCELLED:{}", idx));
             return Some(Ok(QueryResult::Ok("INDEX BUILD CANCELLED".to_owned())));
         }
         if up == "SHOW INDEX BUILD HISTORY" {
-            let hist = self.s271_build_history.lock().unwrap().clone();
+            let hist = self.s271_build_history.lock_safe().clone();
             let rows = hist.into_iter().map(|h| vec![h]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["event".to_owned()],
@@ -8723,17 +8658,17 @@ impl SqlExecutor {
                 let name = rest[..lp].trim().to_owned();
                 let limit_str = rest[lp + " LIMIT ".len()..].trim();
                 let limit: u64 = limit_str.parse().unwrap_or(1);
-                self.s272_semaphores.lock().unwrap().insert(name, limit);
+                self.s272_semaphores.lock_safe().insert(name, limit);
                 return Some(Ok(QueryResult::Ok("QUERY SEMAPHORE CREATED".to_owned())));
             }
         }
         if up.starts_with("DROP QUERY SEMAPHORE ") {
             let name = s["DROP QUERY SEMAPHORE ".len()..].trim().to_owned();
-            self.s272_semaphores.lock().unwrap().remove(&name);
+            self.s272_semaphores.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Ok("QUERY SEMAPHORE DROPPED".to_owned())));
         }
         if up == "SHOW QUERY SEMAPHORES" {
-            let sems = self.s272_semaphores.lock().unwrap().clone();
+            let sems = self.s272_semaphores.lock_safe().clone();
             let rows = sems
                 .into_iter()
                 .map(|(n, l)| vec![n, l.to_string()])
@@ -8747,16 +8682,16 @@ impl SqlExecutor {
         // â”€â”€ S273 â€" Table freeze â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("FREEZE TABLE ") {
             let tbl = s["FREEZE TABLE ".len()..].trim().to_ascii_lowercase();
-            self.s273_frozen.lock().unwrap().insert(tbl);
+            self.s273_frozen.lock_safe().insert(tbl);
             return Some(Ok(QueryResult::Ok("TABLE FROZEN".to_owned())));
         }
         if up.starts_with("UNFREEZE TABLE ") {
             let tbl = s["UNFREEZE TABLE ".len()..].trim().to_ascii_lowercase();
-            self.s273_frozen.lock().unwrap().remove(&tbl);
+            self.s273_frozen.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("TABLE UNFROZEN".to_owned())));
         }
         if up == "SHOW FROZEN TABLES" {
-            let frozen = self.s273_frozen.lock().unwrap().clone();
+            let frozen = self.s273_frozen.lock_safe().clone();
             let rows = frozen.into_iter().map(|t| vec![t]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned()],
@@ -8769,7 +8704,7 @@ impl SqlExecutor {
             let key = s["SHOW VALUE DISTRIBUTION FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let dist = self.s274_value_dist.lock().unwrap();
+            let dist = self.s274_value_dist.lock_safe();
             let entries = dist.get(&key).cloned().unwrap_or_default();
             let rows = entries
                 .into_iter()
@@ -8805,13 +8740,13 @@ impl SqlExecutor {
                     entries.sort();
                 }
             }
-            self.s274_value_dist.lock().unwrap().insert(key, entries);
+            self.s274_value_dist.lock_safe().insert(key, entries);
             return Some(Ok(QueryResult::Ok(
                 "VALUE DISTRIBUTION REFRESHED".to_owned(),
             )));
         }
         if up == "CLEAR VALUE DISTRIBUTION" {
-            self.s274_value_dist.lock().unwrap().clear();
+            self.s274_value_dist.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("VALUE DISTRIBUTION CLEARED".to_owned())));
         }
 
@@ -8823,15 +8758,12 @@ impl SqlExecutor {
                 let tbl = rest[..tp].trim().to_ascii_lowercase();
                 let thr_str = rest[tp + " THRESHOLD ".len()..].trim();
                 let thr: u64 = thr_str.parse().unwrap_or(0);
-                self.s275_circuit_breakers
-                    .lock()
-                    .unwrap()
-                    .insert(tbl, (thr, 0));
+                self.s275_circuit_breakers.lock_safe().insert(tbl, (thr, 0));
                 return Some(Ok(QueryResult::Ok("CIRCUIT BREAKER SET".to_owned())));
             }
         }
         if up == "SHOW CIRCUIT BREAKER STATUS" {
-            let cb = self.s275_circuit_breakers.lock().unwrap().clone();
+            let cb = self.s275_circuit_breakers.lock_safe().clone();
             let rows = cb
                 .into_iter()
                 .map(|(tbl, (thr, trips))| vec![tbl, thr.to_string(), trips.to_string()])
@@ -8849,7 +8781,7 @@ impl SqlExecutor {
             let tbl = s["RESET CIRCUIT BREAKER FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s275_circuit_breakers.lock().unwrap().remove(&tbl);
+            self.s275_circuit_breakers.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("CIRCUIT BREAKER RESET".to_owned())));
         }
 
@@ -8860,11 +8792,11 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let count = self.scan_table_as_strings(&tbl).len();
             let checksum = format!("{:x}", count as u64 ^ 0x9e37_79b9);
-            self.s276_checksums.lock().unwrap().insert(tbl, checksum);
+            self.s276_checksums.lock_safe().insert(tbl, checksum);
             return Some(Ok(QueryResult::Ok("CHECKSUM COMPUTED".to_owned())));
         }
         if up == "SHOW TABLE CHECKSUMS" {
-            let cs = self.s276_checksums.lock().unwrap().clone();
+            let cs = self.s276_checksums.lock_safe().clone();
             let rows = cs.into_iter().map(|(t, c)| vec![t, c]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "checksum".to_owned()],
@@ -8877,7 +8809,7 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let count = self.scan_table_as_strings(&tbl).len();
             let current = format!("{:x}", count as u64 ^ 0x9e37_79b9);
-            let stored = self.s276_checksums.lock().unwrap().get(&tbl).cloned();
+            let stored = self.s276_checksums.lock_safe().get(&tbl).cloned();
             let valid = stored.as_deref() == Some(current.as_str());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "valid".to_owned()],
@@ -8889,35 +8821,35 @@ impl SqlExecutor {
         if up.starts_with("SET QUERY BATCH SIZE ") {
             let val_str = s["SET QUERY BATCH SIZE ".len()..].trim();
             if let Ok(val) = val_str.parse::<u64>() {
-                *self.s277_batch_size.lock().unwrap() = val;
+                *self.s277_batch_size.lock_safe() = val;
                 return Some(Ok(QueryResult::Ok("QUERY BATCH SIZE SET".to_owned())));
             }
         }
         if up == "SHOW QUERY BATCH SIZE" {
-            let v = *self.s277_batch_size.lock().unwrap();
+            let v = *self.s277_batch_size.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["batch_size".to_owned()],
                 rows: vec![vec![v.to_string()]],
             }));
         }
         if up == "RESET QUERY BATCH SIZE" {
-            *self.s277_batch_size.lock().unwrap() = 1;
+            *self.s277_batch_size.lock_safe() = 1;
             return Some(Ok(QueryResult::Ok("QUERY BATCH SIZE RESET".to_owned())));
         }
 
         // â”€â”€ S278 â€" Schema lock â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("LOCK SCHEMA ") {
             let schema = s["LOCK SCHEMA ".len()..].trim().to_ascii_lowercase();
-            self.s278_schema_locks.lock().unwrap().insert(schema);
+            self.s278_schema_locks.lock_safe().insert(schema);
             return Some(Ok(QueryResult::Ok("SCHEMA LOCKED".to_owned())));
         }
         if up.starts_with("UNLOCK SCHEMA ") {
             let schema = s["UNLOCK SCHEMA ".len()..].trim().to_ascii_lowercase();
-            self.s278_schema_locks.lock().unwrap().remove(&schema);
+            self.s278_schema_locks.lock_safe().remove(&schema);
             return Some(Ok(QueryResult::Ok("SCHEMA UNLOCKED".to_owned())));
         }
         if up == "SHOW SCHEMA LOCKS" {
-            let locks = self.s278_schema_locks.lock().unwrap().clone();
+            let locks = self.s278_schema_locks.lock_safe().clone();
             let rows = locks.into_iter().map(|s| vec![s]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["schema".to_owned()],
@@ -8933,13 +8865,12 @@ impl SqlExecutor {
             let count = self.scan_table_as_strings(&tbl).len() as u64;
             let predicted = count + (count / 10).max(1);
             self.s279_growth_predictions
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(tbl, predicted);
             return Some(Ok(QueryResult::Ok("GROWTH PREDICTED".to_owned())));
         }
         if up == "SHOW GROWTH PREDICTIONS" {
-            let gp = self.s279_growth_predictions.lock().unwrap().clone();
+            let gp = self.s279_growth_predictions.lock_safe().clone();
             let rows = gp
                 .into_iter()
                 .map(|(t, v)| vec![t, v.to_string()])
@@ -8950,7 +8881,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR GROWTH PREDICTIONS" {
-            self.s279_growth_predictions.lock().unwrap().clear();
+            self.s279_growth_predictions.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("GROWTH PREDICTIONS CLEARED".to_owned())));
         }
 
@@ -8961,12 +8892,12 @@ impl SqlExecutor {
             if let Some(ap) = up_rest.find(" AT '") {
                 let idx = rest[..ap].trim().to_owned();
                 let at = rest[ap + " AT '".len()..].trim_end_matches('\'').to_owned();
-                self.s280_defrag_schedule.lock().unwrap().insert(idx, at);
+                self.s280_defrag_schedule.lock_safe().insert(idx, at);
                 return Some(Ok(QueryResult::Ok("INDEX DEFRAG SCHEDULED".to_owned())));
             }
         }
         if up == "SHOW INDEX DEFRAG SCHEDULE" {
-            let ds = self.s280_defrag_schedule.lock().unwrap().clone();
+            let ds = self.s280_defrag_schedule.lock_safe().clone();
             let rows = ds.into_iter().map(|(idx, at)| vec![idx, at]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["index".to_owned(), "scheduled_at".to_owned()],
@@ -8975,7 +8906,7 @@ impl SqlExecutor {
         }
         if up.starts_with("CANCEL INDEX DEFRAG ") {
             let idx = s["CANCEL INDEX DEFRAG ".len()..].trim().to_owned();
-            self.s280_defrag_schedule.lock().unwrap().remove(&idx);
+            self.s280_defrag_schedule.lock_safe().remove(&idx);
             return Some(Ok(QueryResult::Ok("INDEX DEFRAG CANCELLED".to_owned())));
         }
 
@@ -8989,7 +8920,7 @@ impl SqlExecutor {
                     .trim_end_matches('\'')
                     .to_owned();
                 if let Some((tbl, col)) = tbl_col.split_once('.') {
-                    self.s281_result_masks.lock().unwrap().insert(
+                    self.s281_result_masks.lock_safe().insert(
                         (tbl.to_ascii_lowercase(), col.to_ascii_lowercase()),
                         pattern,
                     );
@@ -8998,7 +8929,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW RESULT MASKS" {
-            let masks = self.s281_result_masks.lock().unwrap().clone();
+            let masks = self.s281_result_masks.lock_safe().clone();
             let rows = masks
                 .into_iter()
                 .map(|((tbl, col), pat)| vec![tbl, col, pat])
@@ -9016,8 +8947,7 @@ impl SqlExecutor {
             let tbl_col = s["DROP RESULT MASK ON ".len()..].trim();
             if let Some((tbl, col)) = tbl_col.split_once('.') {
                 self.s281_result_masks
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .remove(&(tbl.to_ascii_lowercase(), col.to_ascii_lowercase()));
             }
             return Some(Ok(QueryResult::Ok("RESULT MASK DROPPED".to_owned())));
@@ -9030,8 +8960,7 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let lag = self
                 .replication_lag
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&tbl)
                 .copied()
                 .unwrap_or(0);
@@ -9045,14 +8974,14 @@ impl SqlExecutor {
                 .trim()
                 .trim_end_matches('s');
             if let Ok(val) = val_str.parse::<u64>() {
-                *self.s282_repl_lag_threshold.lock().unwrap() = Some(val);
+                *self.s282_repl_lag_threshold.lock_safe() = Some(val);
                 return Some(Ok(QueryResult::Ok(
                     "REPLICATION LAG THRESHOLD SET".to_owned(),
                 )));
             }
         }
         if up == "RESET REPLICATION LAG THRESHOLD" {
-            *self.s282_repl_lag_threshold.lock().unwrap() = None;
+            *self.s282_repl_lag_threshold.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "REPLICATION LAG THRESHOLD RESET".to_owned(),
             )));
@@ -9064,14 +8993,14 @@ impl SqlExecutor {
                 .trim()
                 .trim_end_matches('s');
             if let Ok(val) = val_str.parse::<u64>() {
-                *self.s283_idle_timeout_ms.lock().unwrap() = Some(val * 1000);
+                *self.s283_idle_timeout_ms.lock_safe() = Some(val * 1000);
                 return Some(Ok(QueryResult::Ok(
                     "CONNECTION IDLE TIMEOUT SET".to_owned(),
                 )));
             }
         }
         if up == "SHOW CONNECTION IDLE TIMEOUT" {
-            let v = *self.s283_idle_timeout_ms.lock().unwrap();
+            let v = *self.s283_idle_timeout_ms.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["idle_timeout_ms".to_owned()],
                 rows: vec![vec![
@@ -9081,7 +9010,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET CONNECTION IDLE TIMEOUT" {
-            *self.s283_idle_timeout_ms.lock().unwrap() = None;
+            *self.s283_idle_timeout_ms.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "CONNECTION IDLE TIMEOUT RESET".to_owned(),
             )));
@@ -9094,12 +9023,12 @@ impl SqlExecutor {
             if let Some(tp) = up_rest.find(" TO ") {
                 let tbl = rest[..tp].trim().to_ascii_lowercase();
                 let tier = rest[tp + " TO ".len()..].trim().to_ascii_uppercase();
-                self.s284_archival_tiers.lock().unwrap().insert(tbl, tier);
+                self.s284_archival_tiers.lock_safe().insert(tbl, tier);
                 return Some(Ok(QueryResult::Ok("ARCHIVAL TIER SET".to_owned())));
             }
         }
         if up == "SHOW ARCHIVAL TIERS" {
-            let tiers = self.s284_archival_tiers.lock().unwrap().clone();
+            let tiers = self.s284_archival_tiers.lock_safe().clone();
             let rows = tiers.into_iter().map(|(t, tier)| vec![t, tier]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "tier".to_owned()],
@@ -9110,7 +9039,7 @@ impl SqlExecutor {
             let tbl = s["RESET ARCHIVAL TIER FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s284_archival_tiers.lock().unwrap().remove(&tbl);
+            self.s284_archival_tiers.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("ARCHIVAL TIER RESET".to_owned())));
         }
 
@@ -9121,12 +9050,12 @@ impl SqlExecutor {
             if let Some(ap) = up_rest.find(" AGAINST ") {
                 let v1 = rest[..ap].trim().to_owned();
                 let v2 = rest[ap + " AGAINST ".len()..].trim().to_owned();
-                self.s285_plan_diffs.lock().unwrap().push((v1, v2));
+                self.s285_plan_diffs.lock_safe().push((v1, v2));
                 return Some(Ok(QueryResult::Ok("QUERY PLAN DIFF COMPUTED".to_owned())));
             }
         }
         if up == "SHOW PLAN DIFFS" {
-            let diffs = self.s285_plan_diffs.lock().unwrap().clone();
+            let diffs = self.s285_plan_diffs.lock_safe().clone();
             let rows = diffs.into_iter().map(|(a, b)| vec![a, b]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["v1".to_owned(), "v2".to_owned()],
@@ -9134,7 +9063,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR PLAN DIFFS" {
-            self.s285_plan_diffs.lock().unwrap().clear();
+            self.s285_plan_diffs.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("PLAN DIFFS CLEARED".to_owned())));
         }
 
@@ -9143,10 +9072,9 @@ impl SqlExecutor {
             let tbl = s["ENABLE ACCESS AUDIT ON ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s286_access_audit.lock().unwrap().insert(tbl.clone());
+            self.s286_access_audit.lock_safe().insert(tbl.clone());
             self.s286_audit_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(tbl)
                 .or_default()
                 .push("ENABLED".to_owned());
@@ -9156,10 +9084,9 @@ impl SqlExecutor {
             let tbl = s["DISABLE ACCESS AUDIT ON ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s286_access_audit.lock().unwrap().remove(&tbl);
+            self.s286_access_audit.lock_safe().remove(&tbl);
             self.s286_audit_log
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(tbl)
                 .or_default()
                 .push("DISABLED".to_owned());
@@ -9169,7 +9096,7 @@ impl SqlExecutor {
             let tbl = s["SHOW ACCESS AUDIT LOG FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            let log = self.s286_audit_log.lock().unwrap();
+            let log = self.s286_audit_log.lock_safe();
             let entries = log.get(&tbl).cloned().unwrap_or_default();
             let rows = entries.into_iter().map(|e| vec![e]).collect();
             return Some(Ok(QueryResult::Rows {
@@ -9183,8 +9110,7 @@ impl SqlExecutor {
             let idx = s["SHOW INDEX BLOAT FOR ".len()..].trim().to_owned();
             let bloat = self
                 .s287_index_bloat
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&idx)
                 .copied()
                 .unwrap_or(0.0);
@@ -9194,7 +9120,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW ALL INDEX BLOAT" {
-            let bloat = self.s287_index_bloat.lock().unwrap().clone();
+            let bloat = self.s287_index_bloat.lock_safe().clone();
             let rows = bloat
                 .into_iter()
                 .map(|(i, b)| vec![i, b.to_string()])
@@ -9205,13 +9131,13 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR INDEX BLOAT STATS" {
-            self.s287_index_bloat.lock().unwrap().clear();
+            self.s287_index_bloat.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("INDEX BLOAT STATS CLEARED".to_owned())));
         }
 
         // ── S288 — Query priority queue ──────────────────────────────────────────
         if up == "SHOW QUERY PRIORITY QUEUE" {
-            let pq = self.s288_priority_queue.lock().unwrap().clone();
+            let pq = self.s288_priority_queue.lock_safe().clone();
             let mut rows: Vec<Vec<String>> = pq
                 .into_iter()
                 .map(|(id, p)| vec![id.to_string(), p.to_string()])
@@ -9225,7 +9151,7 @@ impl SqlExecutor {
         if up.starts_with("PROMOTE QUERY ") && up.ends_with(" IN QUEUE") {
             let id_str = &s["PROMOTE QUERY ".len()..s.len() - " IN QUEUE".len()];
             if let Ok(id) = id_str.trim().parse::<u64>() {
-                let mut pq = self.s288_priority_queue.lock().unwrap();
+                let mut pq = self.s288_priority_queue.lock_safe();
                 *pq.entry(id).or_insert(0) += 1;
                 return Some(Ok(QueryResult::Ok("QUERY PROMOTED".to_owned())));
             }
@@ -9233,7 +9159,7 @@ impl SqlExecutor {
         if up.starts_with("DEMOTE QUERY ") && up.ends_with(" IN QUEUE") {
             let id_str = &s["DEMOTE QUERY ".len()..s.len() - " IN QUEUE".len()];
             if let Ok(id) = id_str.trim().parse::<u64>() {
-                let mut pq = self.s288_priority_queue.lock().unwrap();
+                let mut pq = self.s288_priority_queue.lock_safe();
                 *pq.entry(id).or_insert(0) -= 1;
                 return Some(Ok(QueryResult::Ok("QUERY DEMOTED".to_owned())));
             }
@@ -9246,13 +9172,13 @@ impl SqlExecutor {
             if let Some(fp) = up_rest.find(" FORMAT ") {
                 let tbl = rest[..fp].trim().to_ascii_lowercase();
                 let fmt = rest[fp + " FORMAT ".len()..].trim().to_ascii_uppercase();
-                *self.s289_export_format.lock().unwrap() = fmt.clone();
-                self.s289_export_log.lock().unwrap().push((tbl, fmt));
+                *self.s289_export_format.lock_safe() = fmt.clone();
+                self.s289_export_log.lock_safe().push((tbl, fmt));
                 return Some(Ok(QueryResult::Ok("TABLE STATS EXPORTED".to_owned())));
             }
         }
         if up == "SHOW STATS EXPORT FORMATS V2" {
-            let log = self.s289_export_log.lock().unwrap().clone();
+            let log = self.s289_export_log.lock_safe().clone();
             let rows = log.into_iter().map(|(t, f)| vec![t, f]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "format".to_owned()],
@@ -9260,8 +9186,8 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET STATS EXPORT FORMAT V2" {
-            *self.s289_export_format.lock().unwrap() = "JSON".to_owned();
-            self.s289_export_log.lock().unwrap().clear();
+            *self.s289_export_format.lock_safe() = "JSON".to_owned();
+            self.s289_export_log.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("STATS EXPORT FORMAT RESET".to_owned())));
         }
 
@@ -9273,14 +9199,14 @@ impl SqlExecutor {
                 let s1 = rest[..wp].trim().to_owned();
                 let s2 = rest[wp + " WITH ".len()..].trim().to_owned();
                 let report = format!("{} COMPATIBLE WITH {}", s1, s2);
-                *self.s290_compat_report.lock().unwrap() = Some(report);
+                *self.s290_compat_report.lock_safe() = Some(report);
                 return Some(Ok(QueryResult::Ok(
                     "SCHEMA COMPATIBILITY CHECKED".to_owned(),
                 )));
             }
         }
         if up == "SHOW COMPATIBILITY REPORT" {
-            let report = self.s290_compat_report.lock().unwrap().clone();
+            let report = self.s290_compat_report.lock_safe().clone();
             let rows = match report {
                 Some(r) => vec![vec![r]],
                 None => vec![],
@@ -9291,7 +9217,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR COMPATIBILITY REPORT" {
-            *self.s290_compat_report.lock().unwrap() = None;
+            *self.s290_compat_report.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "COMPATIBILITY REPORT CLEARED".to_owned(),
             )));
@@ -9303,11 +9229,11 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             let count = self.scan_table_as_strings(&tbl).len() as u64;
-            self.s291_row_estimates.lock().unwrap().insert(tbl, count);
+            self.s291_row_estimates.lock_safe().insert(tbl, count);
             return Some(Ok(QueryResult::Ok("ROW COUNT ESTIMATED".to_owned())));
         }
         if up == "SHOW ROW COUNT ESTIMATES" {
-            let est = self.s291_row_estimates.lock().unwrap().clone();
+            let est = self.s291_row_estimates.lock_safe().clone();
             let rows = est
                 .into_iter()
                 .map(|(t, c)| vec![t, c.to_string()])
@@ -9322,7 +9248,7 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             let count = self.scan_table_as_strings(&tbl).len() as u64;
-            self.s291_row_estimates.lock().unwrap().insert(tbl, count);
+            self.s291_row_estimates.lock_safe().insert(tbl, count);
             return Some(Ok(QueryResult::Ok(
                 "ROW COUNT ESTIMATE REFRESHED".to_owned(),
             )));
@@ -9337,13 +9263,13 @@ impl SqlExecutor {
                 .split(',')
                 .filter_map(|p| p.trim().trim_end_matches('s').parse::<u64>().ok())
                 .collect();
-            *self.s292_timeout_escalation.lock().unwrap() = vals;
+            *self.s292_timeout_escalation.lock_safe() = vals;
             return Some(Ok(QueryResult::Ok(
                 "TIMEOUT ESCALATION POLICY SET".to_owned(),
             )));
         }
         if up == "SHOW TIMEOUT ESCALATION POLICY" {
-            let vals = self.s292_timeout_escalation.lock().unwrap().clone();
+            let vals = self.s292_timeout_escalation.lock_safe().clone();
             let rows = vals.into_iter().map(|v| vec![v.to_string()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["timeout_secs".to_owned()],
@@ -9351,7 +9277,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET TIMEOUT ESCALATION POLICY" {
-            self.s292_timeout_escalation.lock().unwrap().clear();
+            self.s292_timeout_escalation.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "TIMEOUT ESCALATION POLICY RESET".to_owned(),
             )));
@@ -9361,14 +9287,11 @@ impl SqlExecutor {
         if up.starts_with("FORECAST INDEX USAGE FOR ") {
             let idx = s["FORECAST INDEX USAGE FOR ".len()..].trim().to_owned();
             let forecast = (idx.len() as u64) * 100;
-            self.s293_usage_forecast
-                .lock()
-                .unwrap()
-                .insert(idx, forecast);
+            self.s293_usage_forecast.lock_safe().insert(idx, forecast);
             return Some(Ok(QueryResult::Ok("INDEX USAGE FORECASTED".to_owned())));
         }
         if up == "SHOW INDEX USAGE FORECAST" {
-            let fc = self.s293_usage_forecast.lock().unwrap().clone();
+            let fc = self.s293_usage_forecast.lock_safe().clone();
             let rows = fc
                 .into_iter()
                 .map(|(i, f)| vec![i, f.to_string()])
@@ -9379,7 +9302,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR INDEX USAGE FORECAST" {
-            self.s293_usage_forecast.lock().unwrap().clear();
+            self.s293_usage_forecast.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "INDEX USAGE FORECAST CLEARED".to_owned(),
             )));
@@ -9394,14 +9317,13 @@ impl SqlExecutor {
                 let s2 = rest[ap + " AGAINST ".len()..fp].trim().to_owned();
                 let tbl = rest[fp + " FOR ".len()..].trim().to_ascii_lowercase();
                 self.s294_snapshot_diffs
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .push((s1, s2, tbl, "COMPUTED".to_owned()));
                 return Some(Ok(QueryResult::Ok("SNAPSHOT DIFF COMPUTED".to_owned())));
             }
         }
         if up == "SHOW SNAPSHOT DIFFS" {
-            let diffs = self.s294_snapshot_diffs.lock().unwrap().clone();
+            let diffs = self.s294_snapshot_diffs.lock_safe().clone();
             let rows = diffs
                 .into_iter()
                 .map(|(a, b, t, st)| vec![a, b, t, st])
@@ -9417,7 +9339,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR SNAPSHOT DIFFS" {
-            self.s294_snapshot_diffs.lock().unwrap().clear();
+            self.s294_snapshot_diffs.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("SNAPSHOT DIFFS CLEARED".to_owned())));
         }
 
@@ -9426,18 +9348,18 @@ impl SqlExecutor {
             let val = s["SET QUERY MEMORY LIMIT ".len()..]
                 .trim()
                 .to_ascii_uppercase();
-            *self.s295_memory_limit.lock().unwrap() = Some(val);
+            *self.s295_memory_limit.lock_safe() = Some(val);
             return Some(Ok(QueryResult::Ok("QUERY MEMORY LIMIT SET".to_owned())));
         }
         if up == "SHOW QUERY RESOURCE LIMITS" {
-            let lim = self.s295_memory_limit.lock().unwrap().clone();
+            let lim = self.s295_memory_limit.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["memory_limit".to_owned()],
                 rows: vec![vec![lim.unwrap_or_else(|| "NONE".to_owned())]],
             }));
         }
         if up == "RESET QUERY RESOURCE LIMITS" {
-            *self.s295_memory_limit.lock().unwrap() = None;
+            *self.s295_memory_limit.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "QUERY RESOURCE LIMITS RESET".to_owned(),
             )));
@@ -9450,8 +9372,7 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let stats = self
                 .s296_pruning_stats
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&tbl)
                 .copied()
                 .unwrap_or(0);
@@ -9464,13 +9385,13 @@ impl SqlExecutor {
             let tbl = s["RESET PARTITION PRUNING STATS FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s296_pruning_stats.lock().unwrap().remove(&tbl);
+            self.s296_pruning_stats.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok(
                 "PARTITION PRUNING STATS RESET".to_owned(),
             )));
         }
         if up == "SHOW ALL PARTITION PRUNING STATS" {
-            let stats = self.s296_pruning_stats.lock().unwrap().clone();
+            let stats = self.s296_pruning_stats.lock_safe().clone();
             let rows = stats
                 .into_iter()
                 .map(|(t, c)| vec![t, c.to_string()])
@@ -9495,8 +9416,7 @@ impl SqlExecutor {
                     .trim_end_matches('\'')
                     .to_owned();
                 self.s297_validation_rules
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(rule, (schema, expr));
                 return Some(Ok(QueryResult::Ok(
                     "SCHEMA VALIDATION RULE CREATED".to_owned(),
@@ -9505,13 +9425,13 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP SCHEMA VALIDATION RULE ") {
             let rule = s["DROP SCHEMA VALIDATION RULE ".len()..].trim().to_owned();
-            self.s297_validation_rules.lock().unwrap().remove(&rule);
+            self.s297_validation_rules.lock_safe().remove(&rule);
             return Some(Ok(QueryResult::Ok(
                 "SCHEMA VALIDATION RULE DROPPED".to_owned(),
             )));
         }
         if up == "SHOW SCHEMA VALIDATION RULES" {
-            let rules = self.s297_validation_rules.lock().unwrap().clone();
+            let rules = self.s297_validation_rules.lock_safe().clone();
             let rows = rules
                 .into_iter()
                 .map(|(r, (sch, e))| vec![r, sch, e])
@@ -9525,11 +9445,8 @@ impl SqlExecutor {
         // ── S298 — Query explain history ─────────────────────────────────────────
         if up.starts_with("SHOW EXPLAIN HISTORY FOR ") {
             let sql_key = s["SHOW EXPLAIN HISTORY FOR ".len()..].trim().to_owned();
-            self.s298_explain_history
-                .lock()
-                .unwrap()
-                .push(sql_key.clone());
-            let hist = self.s298_explain_history.lock().unwrap().clone();
+            self.s298_explain_history.lock_safe().push(sql_key.clone());
+            let hist = self.s298_explain_history.lock_safe().clone();
             let rows = hist.into_iter().map(|h| vec![h]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["sql".to_owned()],
@@ -9537,11 +9454,11 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR EXPLAIN HISTORY" {
-            self.s298_explain_history.lock().unwrap().clear();
+            self.s298_explain_history.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("EXPLAIN HISTORY CLEARED".to_owned())));
         }
         if up == "SHOW EXPLAIN HISTORY SUMMARY" {
-            let hist = self.s298_explain_history.lock().unwrap().clone();
+            let hist = self.s298_explain_history.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["total_entries".to_owned()],
                 rows: vec![vec![hist.len().to_string()]],
@@ -9566,12 +9483,12 @@ impl SqlExecutor {
             if let Some(tp) = up_rest.find(" TO ") {
                 let tbl = rest[..tp].trim().to_ascii_lowercase();
                 let algo = rest[tp + " TO ".len()..].trim().to_ascii_uppercase();
-                self.s299_compression_algo.lock().unwrap().insert(tbl, algo);
+                self.s299_compression_algo.lock_safe().insert(tbl, algo);
                 return Some(Ok(QueryResult::Ok("COMPRESSION ALGORITHM SET".to_owned())));
             }
         }
         if up == "SHOW ALL COMPRESSION RATIOS" {
-            let algos = self.s299_compression_algo.lock().unwrap().clone();
+            let algos = self.s299_compression_algo.lock_safe().clone();
             let rows = algos.into_iter().map(|(t, a)| vec![t, a]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "algorithm".to_owned()],
@@ -9605,14 +9522,14 @@ impl SqlExecutor {
                 .trim_end_matches('\'')
                 .to_owned();
             let fp = format!("fp_{:x}", q.len() as u64 * 2654435761u64);
-            self.s301_fingerprints.lock().unwrap().insert(q, fp.clone());
+            self.s301_fingerprints.lock_safe().insert(q, fp.clone());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["fingerprint".to_owned()],
                 rows: vec![vec![fp]],
             }));
         }
         if up == "SHOW QUERY FINGERPRINTS" {
-            let fps = self.s301_fingerprints.lock().unwrap().clone();
+            let fps = self.s301_fingerprints.lock_safe().clone();
             let rows = fps.into_iter().map(|(q, f)| vec![q, f]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["sql".to_owned(), "fingerprint".to_owned()],
@@ -9620,7 +9537,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR QUERY FINGERPRINTS" {
-            self.s301_fingerprints.lock().unwrap().clear();
+            self.s301_fingerprints.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("QUERY FINGERPRINTS CLEARED".to_owned())));
         }
 
@@ -9633,7 +9550,7 @@ impl SqlExecutor {
                 let after = &rest[p + " REORDER COLUMNS (".len()..];
                 let cols_str = after.trim_end_matches([')', ' ', ';']);
                 let cols: Vec<String> = cols_str.split(',').map(|c| c.trim().to_owned()).collect();
-                self.s302_column_order.lock().unwrap().insert(tbl, cols);
+                self.s302_column_order.lock_safe().insert(tbl, cols);
                 return Some(Ok(QueryResult::Ok("COLUMN ORDER UPDATED".to_owned())));
             }
         }
@@ -9643,8 +9560,7 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let order = self
                 .s302_column_order
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&tbl)
                 .cloned()
                 .unwrap_or_default();
@@ -9657,7 +9573,7 @@ impl SqlExecutor {
             let tbl = s["RESET COLUMN ORDER FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s302_column_order.lock().unwrap().remove(&tbl);
+            self.s302_column_order.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("COLUMN ORDER RESET".to_owned())));
         }
 
@@ -9667,20 +9583,20 @@ impl SqlExecutor {
                 .trim()
                 .parse()
                 .unwrap_or(1);
-            *self.s303_index_build_parallelism.lock().unwrap() = n;
+            *self.s303_index_build_parallelism.lock_safe() = n;
             return Some(Ok(QueryResult::Ok(
                 "INDEX BUILD PARALLELISM SET".to_owned(),
             )));
         }
         if up == "SHOW INDEX BUILD PARALLELISM" {
-            let n = *self.s303_index_build_parallelism.lock().unwrap();
+            let n = *self.s303_index_build_parallelism.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["parallelism".to_owned()],
                 rows: vec![vec![n.to_string()]],
             }));
         }
         if up == "RESET INDEX BUILD PARALLELISM" {
-            *self.s303_index_build_parallelism.lock().unwrap() = 1;
+            *self.s303_index_build_parallelism.lock_safe() = 1;
             return Some(Ok(QueryResult::Ok(
                 "INDEX BUILD PARALLELISM RESET".to_owned(),
             )));
@@ -9692,20 +9608,20 @@ impl SqlExecutor {
                 .trim()
                 .parse()
                 .unwrap_or(1.0);
-            *self.s304_sample_rate.lock().unwrap() = rate;
+            *self.s304_sample_rate.lock_safe() = rate;
             return Some(Ok(QueryResult::Ok(
                 "QUERY RESULT SAMPLE RATE SET".to_owned(),
             )));
         }
         if up == "SHOW QUERY RESULT SAMPLE RATE" {
-            let rate = *self.s304_sample_rate.lock().unwrap();
+            let rate = *self.s304_sample_rate.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["sample_rate".to_owned()],
                 rows: vec![vec![rate.to_string()]],
             }));
         }
         if up == "RESET QUERY RESULT SAMPLE RATE" {
-            *self.s304_sample_rate.lock().unwrap() = 1.0;
+            *self.s304_sample_rate.lock_safe() = 1.0;
             return Some(Ok(QueryResult::Ok(
                 "QUERY RESULT SAMPLE RATE RESET".to_owned(),
             )));
@@ -9718,12 +9634,12 @@ impl SqlExecutor {
             if let Some(p) = up_rest.find(" TO ") {
                 let tbl = rest[..p].trim().to_ascii_lowercase();
                 let quota = rest[p + " TO ".len()..].trim().to_owned();
-                self.s305_storage_quotas.lock().unwrap().insert(tbl, quota);
+                self.s305_storage_quotas.lock_safe().insert(tbl, quota);
                 return Some(Ok(QueryResult::Ok("STORAGE QUOTA SET".to_owned())));
             }
         }
         if up == "SHOW STORAGE QUOTAS" {
-            let quotas = self.s305_storage_quotas.lock().unwrap().clone();
+            let quotas = self.s305_storage_quotas.lock_safe().clone();
             let rows = quotas.into_iter().map(|(t, q)| vec![t, q]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "quota".to_owned()],
@@ -9734,7 +9650,7 @@ impl SqlExecutor {
             let tbl = s["DROP STORAGE QUOTA FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s305_storage_quotas.lock().unwrap().remove(&tbl);
+            self.s305_storage_quotas.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("STORAGE QUOTA DROPPED".to_owned())));
         }
 
@@ -9745,10 +9661,7 @@ impl SqlExecutor {
             if let Some(p) = up_rest.find(" FOR ") {
                 let name = rest[..p].trim().to_owned();
                 let schema = rest[p + " FOR ".len()..].trim().to_ascii_lowercase();
-                self.s306_rollback_points
-                    .lock()
-                    .unwrap()
-                    .insert(name, schema);
+                self.s306_rollback_points.lock_safe().insert(name, schema);
                 return Some(Ok(QueryResult::Ok(
                     "MIGRATION ROLLBACK POINT CREATED".to_owned(),
                 )));
@@ -9756,12 +9669,7 @@ impl SqlExecutor {
         }
         if up.starts_with("ROLLBACK TO MIGRATION POINT ") {
             let name = s["ROLLBACK TO MIGRATION POINT ".len()..].trim().to_owned();
-            if self
-                .s306_rollback_points
-                .lock()
-                .unwrap()
-                .contains_key(&name)
-            {
+            if self.s306_rollback_points.lock_safe().contains_key(&name) {
                 return Some(Ok(QueryResult::Ok(
                     "ROLLED BACK TO MIGRATION POINT".to_owned(),
                 )));
@@ -9772,7 +9680,7 @@ impl SqlExecutor {
             )));
         }
         if up == "SHOW MIGRATION ROLLBACK POINTS" {
-            let points = self.s306_rollback_points.lock().unwrap().clone();
+            let points = self.s306_rollback_points.lock_safe().clone();
             let rows = points.into_iter().map(|(n, s)| vec![n, s]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["name".to_owned(), "schema".to_owned()],
@@ -9786,12 +9694,12 @@ impl SqlExecutor {
             if let Some(p) = rest.find("' TO '") {
                 let q = rest[..p].to_owned();
                 let path = rest[p + "' TO '".len()..].trim_end_matches('\'').to_owned();
-                self.s307_execution_graphs.lock().unwrap().insert(q, path);
+                self.s307_execution_graphs.lock_safe().insert(q, path);
                 return Some(Ok(QueryResult::Ok("EXECUTION GRAPH EXPORTED".to_owned())));
             }
         }
         if up == "SHOW EXECUTION GRAPHS" {
-            let graphs = self.s307_execution_graphs.lock().unwrap().clone();
+            let graphs = self.s307_execution_graphs.lock_safe().clone();
             let rows = graphs.into_iter().map(|(q, p)| vec![q, p]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["sql".to_owned(), "path".to_owned()],
@@ -9799,7 +9707,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR EXECUTION GRAPHS" {
-            self.s307_execution_graphs.lock().unwrap().clear();
+            self.s307_execution_graphs.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("EXECUTION GRAPHS CLEARED".to_owned())));
         }
 
@@ -9810,15 +9718,12 @@ impl SqlExecutor {
             if let Some(p) = up_rest.find(" ACCESS RATE LIMIT ") {
                 let tbl = rest[..p].trim().to_ascii_lowercase();
                 let limit = rest[p + " ACCESS RATE LIMIT ".len()..].trim().to_owned();
-                self.s308_access_rate_limits
-                    .lock()
-                    .unwrap()
-                    .insert(tbl, limit);
+                self.s308_access_rate_limits.lock_safe().insert(tbl, limit);
                 return Some(Ok(QueryResult::Ok("ACCESS RATE LIMIT SET".to_owned())));
             }
         }
         if up == "SHOW ACCESS RATE LIMITS" {
-            let limits = self.s308_access_rate_limits.lock().unwrap().clone();
+            let limits = self.s308_access_rate_limits.lock_safe().clone();
             let rows = limits.into_iter().map(|(t, l)| vec![t, l]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "limit".to_owned()],
@@ -9829,7 +9734,7 @@ impl SqlExecutor {
             let tbl = s["DROP ACCESS RATE LIMIT FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s308_access_rate_limits.lock().unwrap().remove(&tbl);
+            self.s308_access_rate_limits.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("ACCESS RATE LIMIT DROPPED".to_owned())));
         }
 
@@ -9841,8 +9746,7 @@ impl SqlExecutor {
                 let col = col.to_ascii_lowercase();
                 let ratio = 0.0f64;
                 self.s309_null_ratios
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert((tbl.clone(), col.clone()), ratio);
                 return Some(Ok(QueryResult::Rows {
                     columns: vec![
@@ -9855,7 +9759,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW NULL RATIOS" {
-            let ratios = self.s309_null_ratios.lock().unwrap().clone();
+            let ratios = self.s309_null_ratios.lock_safe().clone();
             let rows = ratios
                 .into_iter()
                 .map(|((t, c), r)| vec![t, c, r.to_string()])
@@ -9870,7 +9774,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR NULL RATIOS" {
-            self.s309_null_ratios.lock().unwrap().clear();
+            self.s309_null_ratios.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("NULL RATIOS CLEARED".to_owned())));
         }
 
@@ -9882,8 +9786,7 @@ impl SqlExecutor {
                 let v1 = rest[..p].trim().to_owned();
                 let v2 = rest[p + " WITH ".len()..].trim().to_owned();
                 self.s310_plan_cost_comparisons
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .push((v1.clone(), v2.clone()));
                 return Some(Ok(QueryResult::Rows {
                     columns: vec!["v1".to_owned(), "v2".to_owned()],
@@ -9892,7 +9795,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW PLAN COST COMPARISONS" {
-            let comps = self.s310_plan_cost_comparisons.lock().unwrap().clone();
+            let comps = self.s310_plan_cost_comparisons.lock_safe().clone();
             let rows = comps.into_iter().map(|(v1, v2)| vec![v1, v2]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["v1".to_owned(), "v2".to_owned()],
@@ -9900,7 +9803,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR PLAN COST COMPARISONS" {
-            self.s310_plan_cost_comparisons.lock().unwrap().clear();
+            self.s310_plan_cost_comparisons.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "PLAN COST COMPARISONS CLEARED".to_owned(),
             )));
@@ -9913,15 +9816,12 @@ impl SqlExecutor {
             if let Some(p) = up_rest.find(" TO ") {
                 let tbl = rest[..p].trim().to_ascii_lowercase();
                 let thresh = rest[p + " TO ".len()..].trim().to_owned();
-                self.s311_replica_lag_alerts
-                    .lock()
-                    .unwrap()
-                    .insert(tbl, thresh);
+                self.s311_replica_lag_alerts.lock_safe().insert(tbl, thresh);
                 return Some(Ok(QueryResult::Ok("REPLICA LAG ALERT SET".to_owned())));
             }
         }
         if up == "SHOW REPLICA LAG ALERTS" {
-            let alerts = self.s311_replica_lag_alerts.lock().unwrap().clone();
+            let alerts = self.s311_replica_lag_alerts.lock_safe().clone();
             let rows = alerts.into_iter().map(|(t, v)| vec![t, v]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "threshold".to_owned()],
@@ -9932,7 +9832,7 @@ impl SqlExecutor {
             let tbl = s["CLEAR REPLICA LAG ALERT FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s311_replica_lag_alerts.lock().unwrap().remove(&tbl);
+            self.s311_replica_lag_alerts.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("REPLICA LAG ALERT CLEARED".to_owned())));
         }
 
@@ -9943,8 +9843,7 @@ impl SqlExecutor {
                 .to_owned();
             let sel = 1.0f64;
             self.s312_index_selectivity
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(idx.clone(), sel);
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["index".to_owned(), "selectivity".to_owned()],
@@ -9952,7 +9851,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW INDEX SELECTIVITY" {
-            let sels = self.s312_index_selectivity.lock().unwrap().clone();
+            let sels = self.s312_index_selectivity.lock_safe().clone();
             let rows = sels
                 .into_iter()
                 .map(|(i, v)| vec![i, v.to_string()])
@@ -9963,7 +9862,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR INDEX SELECTIVITY" {
-            self.s312_index_selectivity.lock().unwrap().clear();
+            self.s312_index_selectivity.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("INDEX SELECTIVITY CLEARED".to_owned())));
         }
 
@@ -9973,11 +9872,11 @@ impl SqlExecutor {
                 .trim()
                 .parse()
                 .unwrap_or(0);
-            *self.s313_global_row_limit.lock().unwrap() = Some(n);
+            *self.s313_global_row_limit.lock_safe() = Some(n);
             return Some(Ok(QueryResult::Ok("GLOBAL QUERY ROW LIMIT SET".to_owned())));
         }
         if up == "SHOW GLOBAL QUERY ROW LIMIT" {
-            let lim = self.s313_global_row_limit.lock().unwrap();
+            let lim = self.s313_global_row_limit.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["row_limit".to_owned()],
                 rows: vec![vec![
@@ -9987,7 +9886,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET GLOBAL QUERY ROW LIMIT" {
-            *self.s313_global_row_limit.lock().unwrap() = None;
+            *self.s313_global_row_limit.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "GLOBAL QUERY ROW LIMIT RESET".to_owned(),
             )));
@@ -10000,12 +9899,12 @@ impl SqlExecutor {
             if let Some(p) = up_rest.find(" AT '") {
                 let tbl = rest[..p].trim().to_ascii_lowercase();
                 let at = rest[p + " AT '".len()..].trim_end_matches('\'').to_owned();
-                self.s314_vacuum_schedule.lock().unwrap().insert(tbl, at);
+                self.s314_vacuum_schedule.lock_safe().insert(tbl, at);
                 return Some(Ok(QueryResult::Ok("VACUUM SCHEDULED".to_owned())));
             }
         }
         if up == "SHOW VACUUM SCHEDULE" {
-            let sched = self.s314_vacuum_schedule.lock().unwrap().clone();
+            let sched = self.s314_vacuum_schedule.lock_safe().clone();
             let rows = sched.into_iter().map(|(t, a)| vec![t, a]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "at".to_owned()],
@@ -10016,7 +9915,7 @@ impl SqlExecutor {
             let tbl = s["CANCEL VACUUM SCHEDULE FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s314_vacuum_schedule.lock().unwrap().remove(&tbl);
+            self.s314_vacuum_schedule.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("VACUUM SCHEDULE CANCELLED".to_owned())));
         }
 
@@ -10036,7 +9935,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR DEPENDENCY CACHE" {
-            *self.s315_dependency_cache_clears.lock().unwrap() += 1;
+            *self.s315_dependency_cache_clears.lock_safe() += 1;
             return Some(Ok(QueryResult::Ok("DEPENDENCY CACHE CLEARED".to_owned())));
         }
 
@@ -10045,18 +9944,18 @@ impl SqlExecutor {
             let tag = s["SET CONNECTION TAG '".len()..]
                 .trim_end_matches('\'')
                 .to_owned();
-            self.s316_connection_tags.lock().unwrap().push(tag);
+            self.s316_connection_tags.lock_safe().push(tag);
             return Some(Ok(QueryResult::Ok("CONNECTION TAG SET".to_owned())));
         }
         if up == "SHOW CONNECTION TAGS" {
-            let tags = self.s316_connection_tags.lock().unwrap().clone();
+            let tags = self.s316_connection_tags.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["tag".to_owned()],
                 rows: tags.into_iter().map(|t| vec![t]).collect(),
             }));
         }
         if up == "CLEAR CONNECTION TAG" {
-            self.s316_connection_tags.lock().unwrap().clear();
+            self.s316_connection_tags.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("CONNECTION TAG CLEARED".to_owned())));
         }
 
@@ -10067,8 +9966,7 @@ impl SqlExecutor {
                 let tbl_l = tbl.to_ascii_lowercase();
                 let report = format!("{}.{} skew=LOW", tbl_l, col.to_ascii_lowercase());
                 self.s317_data_skew_report
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(tbl_l.clone(), report.clone());
                 return Some(Ok(QueryResult::Rows {
                     columns: vec!["report".to_owned()],
@@ -10077,7 +9975,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW DATA SKEW REPORT" {
-            let reports = self.s317_data_skew_report.lock().unwrap().clone();
+            let reports = self.s317_data_skew_report.lock_safe().clone();
             let rows = reports.into_values().map(|r| vec![r]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["report".to_owned()],
@@ -10085,7 +9983,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR DATA SKEW REPORT" {
-            self.s317_data_skew_report.lock().unwrap().clear();
+            self.s317_data_skew_report.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("DATA SKEW REPORT CLEARED".to_owned())));
         }
 
@@ -10097,14 +9995,13 @@ impl SqlExecutor {
                 let idx = rest[..p].trim().to_owned();
                 let bloat: u64 = rest[p + " AT BLOAT ".len()..].trim().parse().unwrap_or(0);
                 self.s318_index_rebuild_triggers
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(idx, bloat);
                 return Some(Ok(QueryResult::Ok("INDEX REBUILD TRIGGER SET".to_owned())));
             }
         }
         if up == "SHOW INDEX REBUILD TRIGGERS" {
-            let trigs = self.s318_index_rebuild_triggers.lock().unwrap().clone();
+            let trigs = self.s318_index_rebuild_triggers.lock_safe().clone();
             let rows = trigs
                 .into_iter()
                 .map(|(i, b)| vec![i, b.to_string()])
@@ -10116,10 +10013,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP INDEX REBUILD TRIGGER ") {
             let idx = s["DROP INDEX REBUILD TRIGGER ".len()..].trim().to_owned();
-            self.s318_index_rebuild_triggers
-                .lock()
-                .unwrap()
-                .remove(&idx);
+            self.s318_index_rebuild_triggers.lock_safe().remove(&idx);
             return Some(Ok(QueryResult::Ok(
                 "INDEX REBUILD TRIGGER DROPPED".to_owned(),
             )));
@@ -10130,18 +10024,18 @@ impl SqlExecutor {
             let key = s["EVICT QUERY PLAN CACHE ENTRY '".len()..]
                 .trim_end_matches('\'')
                 .to_owned();
-            self.s319_plan_cache_evictions.lock().unwrap().push(key);
+            self.s319_plan_cache_evictions.lock_safe().push(key);
             return Some(Ok(QueryResult::Ok("PLAN CACHE ENTRY EVICTED".to_owned())));
         }
         if up == "SHOW PLAN CACHE EVICTIONS" {
-            let evs = self.s319_plan_cache_evictions.lock().unwrap().clone();
+            let evs = self.s319_plan_cache_evictions.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["sql".to_owned()],
                 rows: evs.into_iter().map(|e| vec![e]).collect(),
             }));
         }
         if up == "CLEAR PLAN CACHE EVICTIONS" {
-            self.s319_plan_cache_evictions.lock().unwrap().clear();
+            self.s319_plan_cache_evictions.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "PLAN CACHE EVICTIONS CLEARED".to_owned(),
             )));
@@ -10154,15 +10048,12 @@ impl SqlExecutor {
             if let Some(p) = up_rest.find(" WRITE THROTTLE ") {
                 let tbl = rest[..p].trim().to_ascii_lowercase();
                 let throttle = rest[p + " WRITE THROTTLE ".len()..].trim().to_owned();
-                self.s320_write_throttles
-                    .lock()
-                    .unwrap()
-                    .insert(tbl, throttle);
+                self.s320_write_throttles.lock_safe().insert(tbl, throttle);
                 return Some(Ok(QueryResult::Ok("WRITE THROTTLE SET".to_owned())));
             }
         }
         if up == "SHOW WRITE THROTTLES" {
-            let throttles = self.s320_write_throttles.lock().unwrap().clone();
+            let throttles = self.s320_write_throttles.lock_safe().clone();
             let rows = throttles.into_iter().map(|(t, v)| vec![t, v]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "throttle".to_owned()],
@@ -10173,7 +10064,7 @@ impl SqlExecutor {
             let tbl = s["DROP WRITE THROTTLE FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s320_write_throttles.lock().unwrap().remove(&tbl);
+            self.s320_write_throttles.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("WRITE THROTTLE DROPPED".to_owned())));
         }
 
@@ -10185,8 +10076,7 @@ impl SqlExecutor {
                 let col = col.to_ascii_lowercase();
                 let count = self.scan_table_as_strings(&tbl).len() as u64;
                 self.s321_cardinality_estimates
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert((tbl.clone(), col.clone()), count);
                 return Some(Ok(QueryResult::Rows {
                     columns: vec![
@@ -10199,7 +10089,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW CARDINALITY ESTIMATES" {
-            let ests = self.s321_cardinality_estimates.lock().unwrap().clone();
+            let ests = self.s321_cardinality_estimates.lock_safe().clone();
             let rows = ests
                 .into_iter()
                 .map(|((t, c), n)| vec![t, c, n.to_string()])
@@ -10214,7 +10104,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR CARDINALITY ESTIMATES" {
-            self.s321_cardinality_estimates.lock().unwrap().clear();
+            self.s321_cardinality_estimates.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "CARDINALITY ESTIMATES CLEARED".to_owned(),
             )));
@@ -10226,12 +10116,12 @@ impl SqlExecutor {
             if let Some(p) = rest.find(" = '") {
                 let name = rest[..p].trim().to_owned();
                 let value = rest[p + " = '".len()..].trim_end_matches('\'').to_owned();
-                self.s322_session_vars2.lock().unwrap().insert(name, value);
+                self.s322_session_vars2.lock_safe().insert(name, value);
                 return Some(Ok(QueryResult::Ok("SESSION VAR2 SET".to_owned())));
             }
         }
         if up == "SHOW SESSION VARS2" {
-            let vars = self.s322_session_vars2.lock().unwrap().clone();
+            let vars = self.s322_session_vars2.lock_safe().clone();
             let rows = vars.into_iter().map(|(n, v)| vec![n, v]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["name".to_owned(), "value".to_owned()],
@@ -10240,7 +10130,7 @@ impl SqlExecutor {
         }
         if up.starts_with("UNSET SESSION VAR2 ") {
             let name = s["UNSET SESSION VAR2 ".len()..].trim().to_owned();
-            self.s322_session_vars2.lock().unwrap().remove(&name);
+            self.s322_session_vars2.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Ok("SESSION VAR2 UNSET".to_owned())));
         }
 
@@ -10253,12 +10143,12 @@ impl SqlExecutor {
                 let every = rest[p + " EVERY '".len()..]
                     .trim_end_matches('\'')
                     .to_owned();
-                self.s323_backup_schedule.lock().unwrap().insert(tbl, every);
+                self.s323_backup_schedule.lock_safe().insert(tbl, every);
                 return Some(Ok(QueryResult::Ok("BACKUP SCHEDULED".to_owned())));
             }
         }
         if up == "SHOW BACKUP SCHEDULE" {
-            let sched = self.s323_backup_schedule.lock().unwrap().clone();
+            let sched = self.s323_backup_schedule.lock_safe().clone();
             let rows = sched.into_iter().map(|(t, e)| vec![t, e]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "every".to_owned()],
@@ -10269,7 +10159,7 @@ impl SqlExecutor {
             let tbl = s["CANCEL BACKUP SCHEDULE FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s323_backup_schedule.lock().unwrap().remove(&tbl);
+            self.s323_backup_schedule.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("BACKUP SCHEDULE CANCELLED".to_owned())));
         }
 
@@ -10281,8 +10171,7 @@ impl SqlExecutor {
                 let idx = rest[..p].trim().to_owned();
                 let thresh: u64 = rest[p + " AT ".len()..].trim().parse().unwrap_or(0);
                 self.s324_index_fragmentation_alerts
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(idx, thresh);
                 return Some(Ok(QueryResult::Ok(
                     "INDEX FRAGMENTATION ALERT SET".to_owned(),
@@ -10290,7 +10179,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW INDEX FRAGMENTATION ALERTS" {
-            let alerts = self.s324_index_fragmentation_alerts.lock().unwrap().clone();
+            let alerts = self.s324_index_fragmentation_alerts.lock_safe().clone();
             let rows = alerts
                 .into_iter()
                 .map(|(i, t)| vec![i, t.to_string()])
@@ -10305,8 +10194,7 @@ impl SqlExecutor {
                 .trim()
                 .to_owned();
             self.s324_index_fragmentation_alerts
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .remove(&idx);
             return Some(Ok(QueryResult::Ok(
                 "INDEX FRAGMENTATION ALERT CLEARED".to_owned(),
@@ -10316,18 +10204,18 @@ impl SqlExecutor {
         // ── S325 — Query result set limits ───────────────────────────────────────
         if up.starts_with("SET RESULT SET SIZE LIMIT ") {
             let lim = s["SET RESULT SET SIZE LIMIT ".len()..].trim().to_owned();
-            *self.s325_result_set_size_limit.lock().unwrap() = Some(lim);
+            *self.s325_result_set_size_limit.lock_safe() = Some(lim);
             return Some(Ok(QueryResult::Ok("RESULT SET SIZE LIMIT SET".to_owned())));
         }
         if up == "SHOW RESULT SET SIZE LIMIT" {
-            let lim = self.s325_result_set_size_limit.lock().unwrap().clone();
+            let lim = self.s325_result_set_size_limit.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["limit".to_owned()],
                 rows: vec![vec![lim.unwrap_or_else(|| "NONE".to_owned())]],
             }));
         }
         if up == "RESET RESULT SET SIZE LIMIT" {
-            *self.s325_result_set_size_limit.lock().unwrap() = None;
+            *self.s325_result_set_size_limit.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "RESULT SET SIZE LIMIT RESET".to_owned(),
             )));
@@ -10339,8 +10227,7 @@ impl SqlExecutor {
                 .trim()
                 .to_ascii_lowercase();
             self.s326_hot_key_report
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(tbl.clone(), Vec::new());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "hot_keys".to_owned()],
@@ -10348,7 +10235,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW HOT KEY REPORT" {
-            let report = self.s326_hot_key_report.lock().unwrap().clone();
+            let report = self.s326_hot_key_report.lock_safe().clone();
             let rows = report
                 .into_iter()
                 .map(|(t, ks)| vec![t, ks.join(",")])
@@ -10359,7 +10246,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR HOT KEY REPORT" {
-            self.s326_hot_key_report.lock().unwrap().clear();
+            self.s326_hot_key_report.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("HOT KEY REPORT CLEARED".to_owned())));
         }
 
@@ -10372,12 +10259,11 @@ impl SqlExecutor {
                 let desc = rest[p + " DESC '".len()..]
                     .trim_end_matches('\'')
                     .to_owned();
-                let mut next_id = self.s327_next_id.lock().unwrap();
+                let mut next_id = self.s327_next_id.lock_safe();
                 let id = *next_id;
                 *next_id += 1;
                 self.s327_schema_change_approvals
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(id, (schema, desc, false));
                 return Some(Ok(QueryResult::Rows {
                     columns: vec!["id".to_owned()],
@@ -10390,7 +10276,7 @@ impl SqlExecutor {
                 .trim()
                 .parse()
                 .unwrap_or(0);
-            let mut approvals = self.s327_schema_change_approvals.lock().unwrap();
+            let mut approvals = self.s327_schema_change_approvals.lock_safe();
             if let Some(entry) = approvals.get_mut(&id) {
                 entry.2 = true;
                 return Some(Ok(QueryResult::Ok("SCHEMA CHANGE APPROVED".to_owned())));
@@ -10401,7 +10287,7 @@ impl SqlExecutor {
             )));
         }
         if up == "SHOW PENDING SCHEMA CHANGES" {
-            let approvals = self.s327_schema_change_approvals.lock().unwrap().clone();
+            let approvals = self.s327_schema_change_approvals.lock_safe().clone();
             let rows = approvals
                 .into_iter()
                 .filter(|(_, (_, _, approved))| !approved)
@@ -10419,18 +10305,18 @@ impl SqlExecutor {
 
         // ── S328 — Query cost anomaly detection ──────────────────────────────────
         if up == "DETECT QUERY COST ANOMALIES" {
-            self.s328_cost_anomalies.lock().unwrap().clear();
+            self.s328_cost_anomalies.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("NO COST ANOMALIES DETECTED".to_owned())));
         }
         if up == "SHOW COST ANOMALIES" {
-            let anomalies = self.s328_cost_anomalies.lock().unwrap().clone();
+            let anomalies = self.s328_cost_anomalies.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["anomaly".to_owned()],
                 rows: anomalies.into_iter().map(|a| vec![a]).collect(),
             }));
         }
         if up == "CLEAR COST ANOMALIES" {
-            self.s328_cost_anomalies.lock().unwrap().clear();
+            self.s328_cost_anomalies.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("COST ANOMALIES CLEARED".to_owned())));
         }
 
@@ -10439,21 +10325,18 @@ impl SqlExecutor {
             let host = s["PROMOTE READ REPLICA '".len()..]
                 .trim_end_matches('\'')
                 .to_owned();
-            self.s329_replica_promotions
-                .lock()
-                .unwrap()
-                .push(host.clone());
+            self.s329_replica_promotions.lock_safe().push(host.clone());
             return Some(Ok(QueryResult::Ok("READ REPLICA PROMOTED".to_owned())));
         }
         if up == "SHOW REPLICA PROMOTION HISTORY" {
-            let hist = self.s329_replica_promotions.lock().unwrap().clone();
+            let hist = self.s329_replica_promotions.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["host".to_owned()],
                 rows: hist.into_iter().map(|h| vec![h]).collect(),
             }));
         }
         if up == "CLEAR REPLICA PROMOTION HISTORY" {
-            self.s329_replica_promotions.lock().unwrap().clear();
+            self.s329_replica_promotions.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "REPLICA PROMOTION HISTORY CLEARED".to_owned(),
             )));
@@ -10461,7 +10344,7 @@ impl SqlExecutor {
 
         // ── S330 — Index usage heatmap ────────────────────────────────────────────
         if up == "SHOW INDEX USAGE HEATMAP" {
-            let heatmap = self.s330_index_usage_heatmap.lock().unwrap().clone();
+            let heatmap = self.s330_index_usage_heatmap.lock_safe().clone();
             let rows = heatmap
                 .into_iter()
                 .map(|(i, h)| vec![i, h.to_string()])
@@ -10477,7 +10360,7 @@ impl SqlExecutor {
             )));
         }
         if up == "CLEAR INDEX USAGE HEATMAP" {
-            self.s330_index_usage_heatmap.lock().unwrap().clear();
+            self.s330_index_usage_heatmap.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "INDEX USAGE HEATMAP CLEARED".to_owned(),
             )));
@@ -10486,18 +10369,18 @@ impl SqlExecutor {
         // ── S331 — Query batch retry policy ──────────────────────────────────────
         if up.starts_with("SET BATCH RETRY POLICY ") {
             let policy = s["SET BATCH RETRY POLICY ".len()..].trim().to_owned();
-            *self.s331_batch_retry_policy.lock().unwrap() = Some(policy);
+            *self.s331_batch_retry_policy.lock_safe() = Some(policy);
             return Some(Ok(QueryResult::Ok("BATCH RETRY POLICY SET".to_owned())));
         }
         if up == "SHOW BATCH RETRY POLICY" {
-            let policy = self.s331_batch_retry_policy.lock().unwrap().clone();
+            let policy = self.s331_batch_retry_policy.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["policy".to_owned()],
                 rows: vec![vec![policy.unwrap_or_else(|| "NONE".to_owned())]],
             }));
         }
         if up == "RESET BATCH RETRY POLICY" {
-            *self.s331_batch_retry_policy.lock().unwrap() = None;
+            *self.s331_batch_retry_policy.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("BATCH RETRY POLICY RESET".to_owned())));
         }
 
@@ -10508,8 +10391,7 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let stat = self
                 .s332_storage_compression_stats
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&tbl)
                 .cloned()
                 .unwrap_or_else(|| "UNKNOWN".to_owned());
@@ -10524,15 +10406,14 @@ impl SqlExecutor {
                 .to_ascii_lowercase();
             let count = self.scan_table_as_strings(&tbl).len() as u64;
             self.s332_storage_compression_stats
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(tbl, format!("rows={}", count));
             return Some(Ok(QueryResult::Ok(
                 "STORAGE COMPRESSION STATS REFRESHED".to_owned(),
             )));
         }
         if up == "CLEAR STORAGE COMPRESSION STATS" {
-            self.s332_storage_compression_stats.lock().unwrap().clear();
+            self.s332_storage_compression_stats.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "STORAGE COMPRESSION STATS CLEARED".to_owned(),
             )));
@@ -10546,7 +10427,7 @@ impl SqlExecutor {
                 let s1 = rest[..p].trim().to_ascii_lowercase();
                 let s2 = rest[p + " AND ".len()..].trim().to_ascii_lowercase();
                 let report = format!("{} vs {}: NO DRIFT", s1, s2);
-                *self.s333_schema_drift_report.lock().unwrap() = Some(report.clone());
+                *self.s333_schema_drift_report.lock_safe() = Some(report.clone());
                 return Some(Ok(QueryResult::Rows {
                     columns: vec!["report".to_owned()],
                     rows: vec![vec![report]],
@@ -10554,14 +10435,14 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW SCHEMA DRIFT REPORT" {
-            let report = self.s333_schema_drift_report.lock().unwrap().clone();
+            let report = self.s333_schema_drift_report.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["report".to_owned()],
                 rows: vec![vec![report.unwrap_or_else(|| "NONE".to_owned())]],
             }));
         }
         if up == "CLEAR SCHEMA DRIFT REPORT" {
-            *self.s333_schema_drift_report.lock().unwrap() = None;
+            *self.s333_schema_drift_report.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "SCHEMA DRIFT REPORT CLEARED".to_owned(),
             )));
@@ -10573,14 +10454,13 @@ impl SqlExecutor {
                 .trim_end_matches('\'')
                 .to_owned();
             self.s334_plan_stability_report
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(q)
                 .or_default();
             return Some(Ok(QueryResult::Ok("PLAN STABILITY TRACKED".to_owned())));
         }
         if up == "SHOW PLAN STABILITY REPORT" {
-            let report = self.s334_plan_stability_report.lock().unwrap().clone();
+            let report = self.s334_plan_stability_report.lock_safe().clone();
             let rows = report
                 .into_iter()
                 .map(|(q, h)| vec![q, h.len().to_string()])
@@ -10591,7 +10471,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR PLAN STABILITY REPORT" {
-            self.s334_plan_stability_report.lock().unwrap().clear();
+            self.s334_plan_stability_report.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "PLAN STABILITY REPORT CLEARED".to_owned(),
             )));
@@ -10602,11 +10482,11 @@ impl SqlExecutor {
             let tbl = s["DRAIN CONNECTIONS FOR ".len()..]
                 .trim()
                 .to_ascii_lowercase();
-            self.s335_draining_tables.lock().unwrap().insert(tbl);
+            self.s335_draining_tables.lock_safe().insert(tbl);
             return Some(Ok(QueryResult::Ok("CONNECTIONS DRAINING".to_owned())));
         }
         if up == "SHOW DRAINING TABLES" {
-            let tables = self.s335_draining_tables.lock().unwrap().clone();
+            let tables = self.s335_draining_tables.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned()],
                 rows: tables.into_iter().map(|t| vec![t]).collect(),
@@ -10614,31 +10494,27 @@ impl SqlExecutor {
         }
         if up.starts_with("CANCEL DRAIN FOR ") {
             let tbl = s["CANCEL DRAIN FOR ".len()..].trim().to_ascii_lowercase();
-            self.s335_draining_tables.lock().unwrap().remove(&tbl);
+            self.s335_draining_tables.lock_safe().remove(&tbl);
             return Some(Ok(QueryResult::Ok("DRAIN CANCELLED".to_owned())));
         }
 
         // ── S336 — Index build resource limits ───────────────────────────────────
         if up.starts_with("SET INDEX BUILD MEMORY LIMIT ") {
             let lim = s["SET INDEX BUILD MEMORY LIMIT ".len()..].trim().to_owned();
-            *self.s336_index_build_resource_limits.lock().unwrap() = Some(lim);
+            *self.s336_index_build_resource_limits.lock_safe() = Some(lim);
             return Some(Ok(QueryResult::Ok(
                 "INDEX BUILD MEMORY LIMIT SET".to_owned(),
             )));
         }
         if up == "SHOW INDEX BUILD RESOURCE LIMITS" {
-            let lim = self
-                .s336_index_build_resource_limits
-                .lock()
-                .unwrap()
-                .clone();
+            let lim = self.s336_index_build_resource_limits.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["limit".to_owned()],
                 rows: vec![vec![lim.unwrap_or_else(|| "NONE".to_owned())]],
             }));
         }
         if up == "RESET INDEX BUILD RESOURCE LIMITS" {
-            *self.s336_index_build_resource_limits.lock().unwrap() = None;
+            *self.s336_index_build_resource_limits.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "INDEX BUILD RESOURCE LIMITS RESET".to_owned(),
             )));
@@ -10646,15 +10522,15 @@ impl SqlExecutor {
 
         // ── S337 — Query result streaming v2 ─────────────────────────────────────
         if up == "SET STREAMING V2 MODE ON" {
-            *self.s337_streaming_v2_mode.lock().unwrap() = true;
+            *self.s337_streaming_v2_mode.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("STREAMING V2 MODE ON".to_owned())));
         }
         if up == "SET STREAMING V2 MODE OFF" {
-            *self.s337_streaming_v2_mode.lock().unwrap() = false;
+            *self.s337_streaming_v2_mode.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("STREAMING V2 MODE OFF".to_owned())));
         }
         if up == "SHOW STREAMING V2 STATUS" {
-            let on = *self.s337_streaming_v2_mode.lock().unwrap();
+            let on = *self.s337_streaming_v2_mode.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["streaming_v2".to_owned()],
                 rows: vec![vec![if on {
@@ -10675,8 +10551,7 @@ impl SqlExecutor {
                     .trim_end_matches('\'')
                     .to_owned();
                 self.s338_shard_split_merge_history
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .push(format!("SPLIT {} AT {}", tbl, key));
                 return Some(Ok(QueryResult::Ok("SHARD SPLIT".to_owned())));
             }
@@ -10684,13 +10559,12 @@ impl SqlExecutor {
         if up.starts_with("MERGE SHARDS FOR ") {
             let tbl = s["MERGE SHARDS FOR ".len()..].trim().to_ascii_lowercase();
             self.s338_shard_split_merge_history
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .push(format!("MERGE {}", tbl));
             return Some(Ok(QueryResult::Ok("SHARDS MERGED".to_owned())));
         }
         if up == "SHOW SHARD SPLIT MERGE HISTORY" {
-            let hist = self.s338_shard_split_merge_history.lock().unwrap().clone();
+            let hist = self.s338_shard_split_merge_history.lock_safe().clone();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["event".to_owned()],
                 rows: hist.into_iter().map(|h| vec![h]).collect(),
@@ -10707,8 +10581,7 @@ impl SqlExecutor {
                     .trim_end_matches('\'')
                     .to_owned();
                 self.s339_object_tags
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .entry(obj)
                     .or_default()
                     .push(tag);
@@ -10716,7 +10589,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW OBJECT TAGS" {
-            let tags = self.s339_object_tags.lock().unwrap().clone();
+            let tags = self.s339_object_tags.lock_safe().clone();
             let rows = tags
                 .into_iter()
                 .map(|(o, ts)| vec![o, ts.join(",")])
@@ -10728,7 +10601,7 @@ impl SqlExecutor {
         }
         if up.starts_with("REMOVE TAG FROM ") {
             let obj = s["REMOVE TAG FROM ".len()..].trim().to_ascii_lowercase();
-            self.s339_object_tags.lock().unwrap().remove(&obj);
+            self.s339_object_tags.lock_safe().remove(&obj);
             return Some(Ok(QueryResult::Ok("TAG REMOVED".to_owned())));
         }
 
@@ -10754,15 +10627,15 @@ impl SqlExecutor {
 
         // ── S341 — query text redaction ──────────────────────────────────────────
         if up == "SET QUERY TEXT REDACTION ON" {
-            *self.s341_query_redaction.lock().unwrap() = true;
+            *self.s341_query_redaction.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("REDACTION ENABLED".to_owned())));
         }
         if up == "SET QUERY TEXT REDACTION OFF" {
-            *self.s341_query_redaction.lock().unwrap() = false;
+            *self.s341_query_redaction.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("REDACTION DISABLED".to_owned())));
         }
         if up == "SHOW QUERY TEXT REDACTION STATUS" {
-            let on = *self.s341_query_redaction.lock().unwrap();
+            let on = *self.s341_query_redaction.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["redaction".to_owned()],
                 rows: vec![vec![if on {
@@ -10779,12 +10652,12 @@ impl SqlExecutor {
             if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
                 let col = rest[..idx].trim().to_owned();
                 let codec = rest[idx + 4..].trim().to_owned();
-                self.s342_column_codecs.lock().unwrap().insert(col, codec);
+                self.s342_column_codecs.lock_safe().insert(col, codec);
                 return Some(Ok(QueryResult::Ok("COLUMN CODEC SET".to_owned())));
             }
         }
         if up == "SHOW COLUMN CODECS" {
-            let map = self.s342_column_codecs.lock().unwrap();
+            let map = self.s342_column_codecs.lock_safe();
             let rows = map
                 .iter()
                 .map(|(c, v)| vec![c.clone(), v.clone()])
@@ -10796,7 +10669,7 @@ impl SqlExecutor {
         }
         if up.starts_with("RESET COLUMN CODEC FOR ") {
             let col = s["RESET COLUMN CODEC FOR ".len()..].trim().to_owned();
-            self.s342_column_codecs.lock().unwrap().remove(&col);
+            self.s342_column_codecs.lock_safe().remove(&col);
             return Some(Ok(QueryResult::Ok("COLUMN CODEC RESET".to_owned())));
         }
 
@@ -10804,11 +10677,11 @@ impl SqlExecutor {
         if up.starts_with("CREATE INDEX ") && up.ends_with(" CONCURRENTLY") {
             let rest = &s["CREATE INDEX ".len()..];
             let idx = rest.split_whitespace().next().unwrap_or("").to_owned();
-            self.s343_concurrent_builds.lock().unwrap().insert(idx);
+            self.s343_concurrent_builds.lock_safe().insert(idx);
             return Some(Ok(QueryResult::Created));
         }
         if up == "SHOW CONCURRENT INDEX BUILDS" {
-            let set = self.s343_concurrent_builds.lock().unwrap();
+            let set = self.s343_concurrent_builds.lock_safe();
             let rows = set.iter().map(|i| vec![i.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["index".to_owned()],
@@ -10819,7 +10692,7 @@ impl SqlExecutor {
             let idx = s["CANCEL CONCURRENT INDEX BUILD ".len()..]
                 .trim()
                 .to_owned();
-            self.s343_concurrent_builds.lock().unwrap().remove(&idx);
+            self.s343_concurrent_builds.lock_safe().remove(&idx);
             return Some(Ok(QueryResult::Ok(
                 "CONCURRENT INDEX BUILD CANCELLED".to_owned(),
             )));
@@ -10828,14 +10701,13 @@ impl SqlExecutor {
         // ── S344 — query result set encoding ─────────────────────────────────────
         if up.starts_with("SET RESULT ENCODING ") {
             let enc = s["SET RESULT ENCODING ".len()..].trim().to_owned();
-            *self.s344_result_encoding.lock().unwrap() = Some(enc);
+            *self.s344_result_encoding.lock_safe() = Some(enc);
             return Some(Ok(QueryResult::Ok("RESULT ENCODING SET".to_owned())));
         }
         if up == "SHOW RESULT ENCODING" {
             let enc = self
                 .s344_result_encoding
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .clone()
                 .unwrap_or_else(|| "UTF8".to_owned());
             return Some(Ok(QueryResult::Rows {
@@ -10844,7 +10716,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET RESULT ENCODING" {
-            *self.s344_result_encoding.lock().unwrap() = None;
+            *self.s344_result_encoding.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("RESULT ENCODING RESET".to_owned())));
         }
 
@@ -10855,8 +10727,7 @@ impl SqlExecutor {
                 let table = rest[..idx].trim().to_owned();
                 let class = rest[idx + " STORAGE CLASS TO ".len()..].trim().to_owned();
                 self.s345_storage_migrations
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(table, class);
                 return Some(Ok(QueryResult::Ok(
                     "STORAGE CLASS MIGRATION STARTED".to_owned(),
@@ -10864,7 +10735,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW STORAGE CLASS MIGRATIONS" {
-            let map = self.s345_storage_migrations.lock().unwrap();
+            let map = self.s345_storage_migrations.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, c)| vec![t.clone(), c.clone()])
@@ -10878,7 +10749,7 @@ impl SqlExecutor {
             let table = s["CANCEL STORAGE CLASS MIGRATION FOR ".len()..]
                 .trim()
                 .to_owned();
-            self.s345_storage_migrations.lock().unwrap().remove(&table);
+            self.s345_storage_migrations.lock_safe().remove(&table);
             return Some(Ok(QueryResult::Ok(
                 "STORAGE CLASS MIGRATION CANCELLED".to_owned(),
             )));
@@ -10890,15 +10761,12 @@ impl SqlExecutor {
             if let Some(idx) = rest.to_ascii_uppercase().find(" FOR ") {
                 let bl = rest[..idx].trim().to_owned();
                 let schema = rest[idx + " FOR ".len()..].trim().to_owned();
-                self.s346_schema_baselines
-                    .lock()
-                    .unwrap()
-                    .insert(bl, schema);
+                self.s346_schema_baselines.lock_safe().insert(bl, schema);
                 return Some(Ok(QueryResult::Created));
             }
         }
         if up == "SHOW SCHEMA BASELINES" {
-            let map = self.s346_schema_baselines.lock().unwrap();
+            let map = self.s346_schema_baselines.lock_safe();
             let rows = map
                 .iter()
                 .map(|(b, s)| vec![b.clone(), s.clone()])
@@ -10910,7 +10778,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP SCHEMA BASELINE ") {
             let bl = s["DROP SCHEMA BASELINE ".len()..].trim().to_owned();
-            self.s346_schema_baselines.lock().unwrap().remove(&bl);
+            self.s346_schema_baselines.lock_safe().remove(&bl);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -10918,21 +10786,21 @@ impl SqlExecutor {
         if up.starts_with("SHOW EXECUTION TIMELINE FOR ") {
             let q = s["SHOW EXECUTION TIMELINE FOR ".len()..].trim();
             let q = q.trim_matches('\'').to_owned();
-            self.s347_execution_timeline.lock().unwrap().push(q.clone());
+            self.s347_execution_timeline.lock_safe().push(q.clone());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["query".to_owned(), "stage".to_owned()],
                 rows: vec![vec![q, "COMPLETE".to_owned()]],
             }));
         }
         if up == "SHOW EXECUTION TIMELINE SUMMARY" {
-            let timeline = self.s347_execution_timeline.lock().unwrap();
+            let timeline = self.s347_execution_timeline.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["count".to_owned()],
                 rows: vec![vec![timeline.len().to_string()]],
             }));
         }
         if up == "CLEAR EXECUTION TIMELINE" {
-            self.s347_execution_timeline.lock().unwrap().clear();
+            self.s347_execution_timeline.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("EXECUTION TIMELINE CLEARED".to_owned())));
         }
 
@@ -10942,15 +10810,12 @@ impl SqlExecutor {
             if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
                 let table = rest[..idx].trim().to_owned();
                 let quota: u64 = rest[idx + 4..].trim().parse().unwrap_or(0);
-                self.s348_connection_quotas
-                    .lock()
-                    .unwrap()
-                    .insert(table, quota);
+                self.s348_connection_quotas.lock_safe().insert(table, quota);
                 return Some(Ok(QueryResult::Ok("CONNECTION QUOTA SET".to_owned())));
             }
         }
         if up == "SHOW CONNECTION QUOTAS" {
-            let map = self.s348_connection_quotas.lock().unwrap();
+            let map = self.s348_connection_quotas.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, q)| vec![t.clone(), q.to_string()])
@@ -10962,7 +10827,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP CONNECTION QUOTA FOR ") {
             let table = s["DROP CONNECTION QUOTA FOR ".len()..].trim().to_owned();
-            self.s348_connection_quotas.lock().unwrap().remove(&table);
+            self.s348_connection_quotas.lock_safe().remove(&table);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -10972,7 +10837,7 @@ impl SqlExecutor {
             if let Some(idx) = rest.to_ascii_uppercase().find(" LIMIT ") {
                 let col = rest[..idx].trim().to_owned();
                 let k: u64 = rest[idx + " LIMIT ".len()..].trim().parse().unwrap_or(0);
-                self.s349_topk_values.lock().unwrap().insert(col, k);
+                self.s349_topk_values.lock_safe().insert(col, k);
                 return Some(Ok(QueryResult::Ok("TOP K VALUES COMPUTED".to_owned())));
             }
         }
@@ -10980,8 +10845,7 @@ impl SqlExecutor {
             let col = s["SHOW TOP K VALUES FOR ".len()..].trim().to_owned();
             let k = self
                 .s349_topk_values
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&col)
                 .copied()
                 .unwrap_or(0);
@@ -10991,7 +10855,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR TOP K VALUES" {
-            self.s349_topk_values.lock().unwrap().clear();
+            self.s349_topk_values.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("TOP K VALUES CLEARED".to_owned())));
         }
 
@@ -11001,11 +10865,11 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            self.s350_plan_warm.lock().unwrap().push(q);
+            self.s350_plan_warm.lock_safe().push(q);
             return Some(Ok(QueryResult::Ok("PLAN CACHE WARMED".to_owned())));
         }
         if up == "SHOW PLAN CACHE WARM STATUS" {
-            let warm = self.s350_plan_warm.lock().unwrap();
+            let warm = self.s350_plan_warm.lock_safe();
             let rows = warm.iter().map(|q| vec![q.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["query".to_owned()],
@@ -11013,7 +10877,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR PLAN CACHE WARM STATUS" {
-            self.s350_plan_warm.lock().unwrap().clear();
+            self.s350_plan_warm.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "PLAN CACHE WARM STATUS CLEARED".to_owned(),
             )));
@@ -11025,15 +10889,12 @@ impl SqlExecutor {
             if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
                 let table = rest[..idx].trim().to_owned();
                 let pref = rest[idx + 4..].trim().to_owned();
-                self.s351_read_preferences
-                    .lock()
-                    .unwrap()
-                    .insert(table, pref);
+                self.s351_read_preferences.lock_safe().insert(table, pref);
                 return Some(Ok(QueryResult::Ok("READ PREFERENCE SET".to_owned())));
             }
         }
         if up == "SHOW READ PREFERENCES" {
-            let map = self.s351_read_preferences.lock().unwrap();
+            let map = self.s351_read_preferences.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, p)| vec![t.clone(), p.clone()])
@@ -11045,7 +10906,7 @@ impl SqlExecutor {
         }
         if up.starts_with("RESET READ PREFERENCE FOR ") {
             let table = s["RESET READ PREFERENCE FOR ".len()..].trim().to_owned();
-            self.s351_read_preferences.lock().unwrap().remove(&table);
+            self.s351_read_preferences.lock_safe().remove(&table);
             return Some(Ok(QueryResult::Ok("READ PREFERENCE RESET".to_owned())));
         }
 
@@ -11054,11 +10915,11 @@ impl SqlExecutor {
             let idx = s["REBUILD INDEX ".len()..s.len() - " ONLINE".len()]
                 .trim()
                 .to_owned();
-            self.s352_online_rebuilds.lock().unwrap().insert(idx);
+            self.s352_online_rebuilds.lock_safe().insert(idx);
             return Some(Ok(QueryResult::Ok("ONLINE REBUILD STARTED".to_owned())));
         }
         if up == "SHOW ONLINE REBUILD STATUS" {
-            let set = self.s352_online_rebuilds.lock().unwrap();
+            let set = self.s352_online_rebuilds.lock_safe();
             let rows = set.iter().map(|i| vec![i.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["index".to_owned()],
@@ -11067,21 +10928,21 @@ impl SqlExecutor {
         }
         if up.starts_with("CANCEL ONLINE REBUILD FOR ") {
             let idx = s["CANCEL ONLINE REBUILD FOR ".len()..].trim().to_owned();
-            self.s352_online_rebuilds.lock().unwrap().remove(&idx);
+            self.s352_online_rebuilds.lock_safe().remove(&idx);
             return Some(Ok(QueryResult::Ok("ONLINE REBUILD CANCELLED".to_owned())));
         }
 
         // ── S353 — query result checksum ─────────────────────────────────────────
         if up == "SET RESULT CHECKSUM ON" {
-            *self.s353_result_checksum.lock().unwrap() = true;
+            *self.s353_result_checksum.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("RESULT CHECKSUM ENABLED".to_owned())));
         }
         if up == "SET RESULT CHECKSUM OFF" {
-            *self.s353_result_checksum.lock().unwrap() = false;
+            *self.s353_result_checksum.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("RESULT CHECKSUM DISABLED".to_owned())));
         }
         if up == "SHOW RESULT CHECKSUM STATUS" {
-            let on = *self.s353_result_checksum.lock().unwrap();
+            let on = *self.s353_result_checksum.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["checksum".to_owned()],
                 rows: vec![vec![if on {
@@ -11104,14 +10965,13 @@ impl SqlExecutor {
                 let min = rest[min_idx + 5..max_idx].trim().to_owned();
                 let max = rest[max_idx + 5..].trim().to_owned();
                 self.s354_autoscale_policies
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(table, format!("{},{}", min, max));
                 return Some(Ok(QueryResult::Ok("AUTOSCALE POLICY SET".to_owned())));
             }
         }
         if up == "SHOW AUTOSCALE POLICIES" {
-            let map = self.s354_autoscale_policies.lock().unwrap();
+            let map = self.s354_autoscale_policies.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, v)| vec![t.clone(), v.clone()])
@@ -11123,7 +10983,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP AUTOSCALE POLICY FOR ") {
             let table = s["DROP AUTOSCALE POLICY FOR ".len()..].trim().to_owned();
-            self.s354_autoscale_policies.lock().unwrap().remove(&table);
+            self.s354_autoscale_policies.lock_safe().remove(&table);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -11134,8 +10994,7 @@ impl SqlExecutor {
                 let obj = rest[..idx].trim().to_owned();
                 let ver = rest[idx + 4..].trim().trim_matches('\'').to_owned();
                 self.s355_object_versions
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .entry(obj)
                     .or_default()
                     .push(ver);
@@ -11146,8 +11005,7 @@ impl SqlExecutor {
             let obj = s["SHOW OBJECT VERSIONS FOR ".len()..].trim().to_owned();
             let versions = self
                 .s355_object_versions
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&obj)
                 .cloned()
                 .unwrap_or_default();
@@ -11159,7 +11017,7 @@ impl SqlExecutor {
         }
         if up.starts_with("CLEAR OBJECT VERSIONS FOR ") {
             let obj = s["CLEAR OBJECT VERSIONS FOR ".len()..].trim().to_owned();
-            self.s355_object_versions.lock().unwrap().remove(&obj);
+            self.s355_object_versions.lock_safe().remove(&obj);
             return Some(Ok(QueryResult::Ok("OBJECT VERSIONS CLEARED".to_owned())));
         }
 
@@ -11169,23 +11027,18 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            *self.s356_client_id.lock().unwrap() = Some(id);
+            *self.s356_client_id.lock_safe() = Some(id);
             return Some(Ok(QueryResult::Ok("CLIENT ID SET".to_owned())));
         }
         if up == "SHOW CLIENT ID" {
-            let id = self
-                .s356_client_id
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_default();
+            let id = self.s356_client_id.lock_safe().clone().unwrap_or_default();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["client_id".to_owned()],
                 rows: vec![vec![id]],
             }));
         }
         if up == "CLEAR CLIENT ID" {
-            *self.s356_client_id.lock().unwrap() = None;
+            *self.s356_client_id.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("CLIENT ID CLEARED".to_owned())));
         }
 
@@ -11193,15 +11046,14 @@ impl SqlExecutor {
         if up.starts_with("REBALANCE SKEW FOR ") {
             let table = s["REBALANCE SKEW FOR ".len()..].trim().to_owned();
             self.s357_skew_rebalance_history
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(table)
                 .or_default()
                 .push(chrono_now());
             return Some(Ok(QueryResult::Ok("SKEW REBALANCE STARTED".to_owned())));
         }
         if up == "SHOW SKEW REBALANCE HISTORY" {
-            let map = self.s357_skew_rebalance_history.lock().unwrap();
+            let map = self.s357_skew_rebalance_history.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, h)| vec![t.clone(), h.len().to_string()])
@@ -11213,10 +11065,7 @@ impl SqlExecutor {
         }
         if up.starts_with("CANCEL SKEW REBALANCE FOR ") {
             let table = s["CANCEL SKEW REBALANCE FOR ".len()..].trim().to_owned();
-            self.s357_skew_rebalance_history
-                .lock()
-                .unwrap()
-                .remove(&table);
+            self.s357_skew_rebalance_history.lock_safe().remove(&table);
             return Some(Ok(QueryResult::Ok("SKEW REBALANCE CANCELLED".to_owned())));
         }
 
@@ -11225,11 +11074,11 @@ impl SqlExecutor {
             let idx = s["SUBSCRIBE INDEX BUILD NOTIFICATIONS FOR ".len()..]
                 .trim()
                 .to_owned();
-            self.s358_index_build_subs.lock().unwrap().insert(idx);
+            self.s358_index_build_subs.lock_safe().insert(idx);
             return Some(Ok(QueryResult::Ok("SUBSCRIBED".to_owned())));
         }
         if up == "SHOW INDEX BUILD SUBSCRIPTIONS" {
-            let set = self.s358_index_build_subs.lock().unwrap();
+            let set = self.s358_index_build_subs.lock_safe();
             let rows = set.iter().map(|i| vec![i.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["index".to_owned()],
@@ -11240,7 +11089,7 @@ impl SqlExecutor {
             let idx = s["UNSUBSCRIBE INDEX BUILD NOTIFICATIONS FOR ".len()..]
                 .trim()
                 .to_owned();
-            self.s358_index_build_subs.lock().unwrap().remove(&idx);
+            self.s358_index_build_subs.lock_safe().remove(&idx);
             return Some(Ok(QueryResult::Ok("UNSUBSCRIBED".to_owned())));
         }
 
@@ -11254,7 +11103,7 @@ impl SqlExecutor {
                     .trim_matches('\'')
                     .to_owned();
                 let diff = format!("{} vs {}", a, b);
-                self.s359_explain_diffs.lock().unwrap().push(diff.clone());
+                self.s359_explain_diffs.lock_safe().push(diff.clone());
                 return Some(Ok(QueryResult::Rows {
                     columns: vec!["diff".to_owned()],
                     rows: vec![vec![diff]],
@@ -11262,7 +11111,7 @@ impl SqlExecutor {
             }
         }
         if up == "SHOW EXPLAIN DIFFS" {
-            let diffs = self.s359_explain_diffs.lock().unwrap();
+            let diffs = self.s359_explain_diffs.lock_safe();
             let rows = diffs.iter().map(|d| vec![d.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["diff".to_owned()],
@@ -11270,7 +11119,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR EXPLAIN DIFFS" {
-            self.s359_explain_diffs.lock().unwrap().clear();
+            self.s359_explain_diffs.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("EXPLAIN DIFFS CLEARED".to_owned())));
         }
 
@@ -11280,15 +11129,12 @@ impl SqlExecutor {
             if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
                 let table = rest[..idx].trim().to_owned();
                 let size = rest[idx + 4..].trim().to_owned();
-                self.s360_write_buffer_sizes
-                    .lock()
-                    .unwrap()
-                    .insert(table, size);
+                self.s360_write_buffer_sizes.lock_safe().insert(table, size);
                 return Some(Ok(QueryResult::Ok("WRITE BUFFER SIZE SET".to_owned())));
             }
         }
         if up == "SHOW WRITE BUFFER SIZES" {
-            let map = self.s360_write_buffer_sizes.lock().unwrap();
+            let map = self.s360_write_buffer_sizes.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, sz)| vec![t.clone(), sz.clone()])
@@ -11300,7 +11146,7 @@ impl SqlExecutor {
         }
         if up.starts_with("RESET WRITE BUFFER SIZE FOR ") {
             let table = s["RESET WRITE BUFFER SIZE FOR ".len()..].trim().to_owned();
-            self.s360_write_buffer_sizes.lock().unwrap().remove(&table);
+            self.s360_write_buffer_sizes.lock_safe().remove(&table);
             return Some(Ok(QueryResult::Ok("WRITE BUFFER SIZE RESET".to_owned())));
         }
 
@@ -11310,8 +11156,7 @@ impl SqlExecutor {
             let table = col.split('.').next().unwrap_or("").to_owned();
             let count = self.scan_table_as_strings(&table).len() as u64;
             self.s361_distinct_estimates
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(col.clone(), count);
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["column".to_owned(), "estimate".to_owned()],
@@ -11319,7 +11164,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW DISTINCT COUNT ESTIMATES" {
-            let map = self.s361_distinct_estimates.lock().unwrap();
+            let map = self.s361_distinct_estimates.lock_safe();
             let rows = map
                 .iter()
                 .map(|(c, n)| vec![c.clone(), n.to_string()])
@@ -11330,7 +11175,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR DISTINCT COUNT ESTIMATES" {
-            self.s361_distinct_estimates.lock().unwrap().clear();
+            self.s361_distinct_estimates.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "DISTINCT COUNT ESTIMATES CLEARED".to_owned(),
             )));
@@ -11342,12 +11187,12 @@ impl SqlExecutor {
             if let Some(idx) = rest.find('=') {
                 let name = rest[..idx].trim().to_owned();
                 let value = rest[idx + 1..].trim().trim_matches('\'').to_owned();
-                self.s362_global_vars.lock().unwrap().insert(name, value);
+                self.s362_global_vars.lock_safe().insert(name, value);
                 return Some(Ok(QueryResult::Ok("GLOBAL VAR SET".to_owned())));
             }
         }
         if up == "SHOW GLOBAL VARS" {
-            let map = self.s362_global_vars.lock().unwrap();
+            let map = self.s362_global_vars.lock_safe();
             let rows = map
                 .iter()
                 .map(|(n, v)| vec![n.clone(), v.clone()])
@@ -11359,7 +11204,7 @@ impl SqlExecutor {
         }
         if up.starts_with("UNSET GLOBAL VAR ") {
             let name = s["UNSET GLOBAL VAR ".len()..].trim().to_owned();
-            self.s362_global_vars.lock().unwrap().remove(&name);
+            self.s362_global_vars.lock_safe().remove(&name);
             return Some(Ok(QueryResult::Ok("GLOBAL VAR UNSET".to_owned())));
         }
 
@@ -11368,11 +11213,11 @@ impl SqlExecutor {
             let table = s["BACKUP TABLE ".len()..s.len() - " INCREMENTAL".len()]
                 .trim()
                 .to_owned();
-            self.s363_incremental_backups.lock().unwrap().push(table);
+            self.s363_incremental_backups.lock_safe().push(table);
             return Some(Ok(QueryResult::Ok("INCREMENTAL BACKUP STARTED".to_owned())));
         }
         if up == "SHOW INCREMENTAL BACKUPS" {
-            let backups = self.s363_incremental_backups.lock().unwrap();
+            let backups = self.s363_incremental_backups.lock_safe();
             let rows = backups.iter().map(|t| vec![t.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned()],
@@ -11380,7 +11225,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR INCREMENTAL BACKUPS" {
-            self.s363_incremental_backups.lock().unwrap().clear();
+            self.s363_incremental_backups.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "INCREMENTAL BACKUPS CLEARED".to_owned(),
             )));
@@ -11392,7 +11237,7 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            *self.s364_index_maint_window.lock().unwrap() = Some(win);
+            *self.s364_index_maint_window.lock_safe() = Some(win);
             return Some(Ok(QueryResult::Ok(
                 "INDEX MAINTENANCE WINDOW SET".to_owned(),
             )));
@@ -11400,8 +11245,7 @@ impl SqlExecutor {
         if up == "SHOW INDEX MAINTENANCE WINDOW" {
             let win = self
                 .s364_index_maint_window
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .clone()
                 .unwrap_or_default();
             return Some(Ok(QueryResult::Rows {
@@ -11410,7 +11254,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET INDEX MAINTENANCE WINDOW" {
-            *self.s364_index_maint_window.lock().unwrap() = None;
+            *self.s364_index_maint_window.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "INDEX MAINTENANCE WINDOW RESET".to_owned(),
             )));
@@ -11422,13 +11266,9 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            let token = format!(
-                "tok_{}",
-                self.s365_pagination_tokens.lock().unwrap().len() + 1
-            );
+            let token = format!("tok_{}", self.s365_pagination_tokens.lock_safe().len() + 1);
             self.s365_pagination_tokens
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(token.clone(), q);
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["token".to_owned()],
@@ -11436,7 +11276,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW PAGINATION TOKENS" {
-            let map = self.s365_pagination_tokens.lock().unwrap();
+            let map = self.s365_pagination_tokens.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, q)| vec![t.clone(), q.clone()])
@@ -11451,7 +11291,7 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            self.s365_pagination_tokens.lock().unwrap().remove(&token);
+            self.s365_pagination_tokens.lock_safe().remove(&token);
             return Some(Ok(QueryResult::Ok("PAGINATION TOKEN REVOKED".to_owned())));
         }
 
@@ -11459,8 +11299,7 @@ impl SqlExecutor {
         if up.starts_with("CLASSIFY ACCESS PATTERN FOR ") {
             let table = s["CLASSIFY ACCESS PATTERN FOR ".len()..].trim().to_owned();
             self.s366_access_classes
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(table.clone(), "MIXED".to_owned());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "class".to_owned()],
@@ -11468,7 +11307,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW ACCESS PATTERN CLASSES" {
-            let map = self.s366_access_classes.lock().unwrap();
+            let map = self.s366_access_classes.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, c)| vec![t.clone(), c.clone()])
@@ -11479,7 +11318,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR ACCESS PATTERN CLASSES" {
-            self.s366_access_classes.lock().unwrap().clear();
+            self.s366_access_classes.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "ACCESS PATTERN CLASSES CLEARED".to_owned(),
             )));
@@ -11491,14 +11330,14 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            self.s367_dry_run_results.lock().unwrap().push(ddl.clone());
+            self.s367_dry_run_results.lock_safe().push(ddl.clone());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["ddl".to_owned(), "result".to_owned()],
                 rows: vec![vec![ddl, "VALID".to_owned()]],
             }));
         }
         if up == "SHOW DRY RUN RESULTS" {
-            let results = self.s367_dry_run_results.lock().unwrap();
+            let results = self.s367_dry_run_results.lock_safe();
             let rows = results.iter().map(|d| vec![d.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["ddl".to_owned()],
@@ -11506,7 +11345,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR DRY RUN RESULTS" {
-            self.s367_dry_run_results.lock().unwrap().clear();
+            self.s367_dry_run_results.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("DRY RUN RESULTS CLEARED".to_owned())));
         }
 
@@ -11514,8 +11353,7 @@ impl SqlExecutor {
         if up == "SHOW QUERY LATENCY PERCENTILES" {
             let report = self
                 .s368_latency_percentiles
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .clone()
                 .unwrap_or_else(|| "p50=0,p95=0,p99=0".to_owned());
             return Some(Ok(QueryResult::Rows {
@@ -11524,13 +11362,13 @@ impl SqlExecutor {
             }));
         }
         if up == "REFRESH QUERY LATENCY PERCENTILES" {
-            *self.s368_latency_percentiles.lock().unwrap() = Some("p50=1,p95=5,p99=10".to_owned());
+            *self.s368_latency_percentiles.lock_safe() = Some("p50=1,p95=5,p99=10".to_owned());
             return Some(Ok(QueryResult::Ok(
                 "LATENCY PERCENTILES REFRESHED".to_owned(),
             )));
         }
         if up == "CLEAR QUERY LATENCY PERCENTILES" {
-            *self.s368_latency_percentiles.lock().unwrap() = None;
+            *self.s368_latency_percentiles.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "LATENCY PERCENTILES CLEARED".to_owned(),
             )));
@@ -11540,8 +11378,7 @@ impl SqlExecutor {
         if up.starts_with("RECORD REPLICA FAILOVER FOR ") {
             let table = s["RECORD REPLICA FAILOVER FOR ".len()..].trim().to_owned();
             self.s369_failover_history
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(table)
                 .or_default()
                 .push(chrono_now());
@@ -11553,8 +11390,7 @@ impl SqlExecutor {
                 .to_owned();
             let hist = self
                 .s369_failover_history
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get(&table)
                 .cloned()
                 .unwrap_or_default();
@@ -11565,7 +11401,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR REPLICA FAILOVER HISTORY" {
-            self.s369_failover_history.lock().unwrap().clear();
+            self.s369_failover_history.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "REPLICA FAILOVER HISTORY CLEARED".to_owned(),
             )));
@@ -11575,8 +11411,7 @@ impl SqlExecutor {
         if up.starts_with("RECOMMEND INDEX USAGE FOR ") {
             let table = s["RECOMMEND INDEX USAGE FOR ".len()..].trim().to_owned();
             self.s370_index_usage_recs_v2
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(table.clone(), "ADD INDEX ON PRIMARY KEY".to_owned());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["table".to_owned(), "recommendation".to_owned()],
@@ -11584,7 +11419,7 @@ impl SqlExecutor {
             }));
         }
         if up == "SHOW INDEX USAGE RECOMMENDATIONS V2" {
-            let map = self.s370_index_usage_recs_v2.lock().unwrap();
+            let map = self.s370_index_usage_recs_v2.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, r)| vec![t.clone(), r.clone()])
@@ -11595,7 +11430,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR INDEX USAGE RECOMMENDATIONS V2" {
-            self.s370_index_usage_recs_v2.lock().unwrap().clear();
+            self.s370_index_usage_recs_v2.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "INDEX USAGE RECOMMENDATIONS V2 CLEARED".to_owned(),
             )));
@@ -11603,15 +11438,15 @@ impl SqlExecutor {
 
         // ── S371 — query batch deduplication ─────────────────────────────────────
         if up == "SET BATCH DEDUP ON" {
-            *self.s371_batch_dedup.lock().unwrap() = true;
+            *self.s371_batch_dedup.lock_safe() = true;
             return Some(Ok(QueryResult::Ok("BATCH DEDUP ENABLED".to_owned())));
         }
         if up == "SET BATCH DEDUP OFF" {
-            *self.s371_batch_dedup.lock().unwrap() = false;
+            *self.s371_batch_dedup.lock_safe() = false;
             return Some(Ok(QueryResult::Ok("BATCH DEDUP DISABLED".to_owned())));
         }
         if up == "SHOW BATCH DEDUP STATUS" {
-            let on = *self.s371_batch_dedup.lock().unwrap();
+            let on = *self.s371_batch_dedup.lock_safe();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["dedup".to_owned()],
                 rows: vec![vec![if on {
@@ -11633,12 +11468,12 @@ impl SqlExecutor {
             if let Some(for_idx) = rest_up.find(" FOR ") {
                 let rule = rest[..for_idx].trim().to_owned();
                 let desc = rest[for_idx + 5..].trim().to_owned();
-                self.s372_tiering_rules.lock().unwrap().insert(rule, desc);
+                self.s372_tiering_rules.lock_safe().insert(rule, desc);
                 return Some(Ok(QueryResult::Created));
             }
         }
         if up == "SHOW STORAGE TIERING RULES" {
-            let map = self.s372_tiering_rules.lock().unwrap();
+            let map = self.s372_tiering_rules.lock_safe();
             let rows = map
                 .iter()
                 .map(|(r, d)| vec![r.clone(), d.clone()])
@@ -11650,7 +11485,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP STORAGE TIERING RULE ") {
             let rule = s["DROP STORAGE TIERING RULE ".len()..].trim().to_owned();
-            self.s372_tiering_rules.lock().unwrap().remove(&rule);
+            self.s372_tiering_rules.lock_safe().remove(&rule);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -11658,7 +11493,7 @@ impl SqlExecutor {
         if up.starts_with("CHECK SCHEMA CONSISTENCY FOR ") {
             let schema = s["CHECK SCHEMA CONSISTENCY FOR ".len()..].trim().to_owned();
             let report = format!("schema {} consistent", schema);
-            *self.s373_consistency_report.lock().unwrap() = Some(report.clone());
+            *self.s373_consistency_report.lock_safe() = Some(report.clone());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["report".to_owned()],
                 rows: vec![vec![report]],
@@ -11667,8 +11502,7 @@ impl SqlExecutor {
         if up == "SHOW SCHEMA CONSISTENCY REPORT" {
             let report = self
                 .s373_consistency_report
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .clone()
                 .unwrap_or_else(|| "no report".to_owned());
             return Some(Ok(QueryResult::Rows {
@@ -11677,7 +11511,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR SCHEMA CONSISTENCY REPORT" {
-            *self.s373_consistency_report.lock().unwrap() = None;
+            *self.s373_consistency_report.lock_safe() = None;
             return Some(Ok(QueryResult::Ok(
                 "SCHEMA CONSISTENCY REPORT CLEARED".to_owned(),
             )));
@@ -11689,14 +11523,14 @@ impl SqlExecutor {
                 .trim()
                 .trim_matches('\'')
                 .to_owned();
-            self.s374_plan_regressions.lock().unwrap().push(q.clone());
+            self.s374_plan_regressions.lock_safe().push(q.clone());
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["query".to_owned(), "regressed".to_owned()],
                 rows: vec![vec![q, "false".to_owned()]],
             }));
         }
         if up == "SHOW PLAN REGRESSIONS" {
-            let regressions = self.s374_plan_regressions.lock().unwrap();
+            let regressions = self.s374_plan_regressions.lock_safe();
             let rows = regressions.iter().map(|r| vec![r.clone()]).collect();
             return Some(Ok(QueryResult::Rows {
                 columns: vec!["query".to_owned()],
@@ -11704,7 +11538,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR PLAN REGRESSIONS" {
-            self.s374_plan_regressions.lock().unwrap().clear();
+            self.s374_plan_regressions.lock_safe().clear();
             return Some(Ok(QueryResult::Ok("PLAN REGRESSIONS CLEARED".to_owned())));
         }
 
@@ -11715,14 +11549,13 @@ impl SqlExecutor {
                 let table = rest[..idx].trim().to_owned();
                 let node = rest[idx + " TO NODE ".len()..].trim().to_owned();
                 self.s375_connection_affinity
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .insert(table, node);
                 return Some(Ok(QueryResult::Ok("CONNECTION AFFINITY SET".to_owned())));
             }
         }
         if up == "SHOW CONNECTION AFFINITIES" {
-            let map = self.s375_connection_affinity.lock().unwrap();
+            let map = self.s375_connection_affinity.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, n)| vec![t.clone(), n.clone()])
@@ -11734,7 +11567,7 @@ impl SqlExecutor {
         }
         if up.starts_with("DROP CONNECTION AFFINITY FOR ") {
             let table = s["DROP CONNECTION AFFINITY FOR ".len()..].trim().to_owned();
-            self.s375_connection_affinity.lock().unwrap().remove(&table);
+            self.s375_connection_affinity.lock_safe().remove(&table);
             return Some(Ok(QueryResult::Dropped));
         }
 
@@ -11743,14 +11576,13 @@ impl SqlExecutor {
             let pct = s["SET INDEX BUILD THROTTLE ".len()..s.len() - " PERCENT".len()]
                 .trim()
                 .to_owned();
-            *self.s376_index_build_throttle.lock().unwrap() = Some(pct);
+            *self.s376_index_build_throttle.lock_safe() = Some(pct);
             return Some(Ok(QueryResult::Ok("INDEX BUILD THROTTLE SET".to_owned())));
         }
         if up == "SHOW INDEX BUILD THROTTLE" {
             let pct = self
                 .s376_index_build_throttle
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .clone()
                 .unwrap_or_else(|| "100".to_owned());
             return Some(Ok(QueryResult::Rows {
@@ -11759,7 +11591,7 @@ impl SqlExecutor {
             }));
         }
         if up == "RESET INDEX BUILD THROTTLE" {
-            *self.s376_index_build_throttle.lock().unwrap() = None;
+            *self.s376_index_build_throttle.lock_safe() = None;
             return Some(Ok(QueryResult::Ok("INDEX BUILD THROTTLE RESET".to_owned())));
         }
 
@@ -11769,12 +11601,12 @@ impl SqlExecutor {
             if let Some(idx) = rest.to_ascii_uppercase().find(" AS ") {
                 let q = rest[..idx].trim().trim_matches('\'').to_owned();
                 let ver = rest[idx + 4..].trim().trim_matches('\'').to_owned();
-                self.s377_result_set_versions.lock().unwrap().insert(q, ver);
+                self.s377_result_set_versions.lock_safe().insert(q, ver);
                 return Some(Ok(QueryResult::Ok("RESULT SET VERSION TAGGED".to_owned())));
             }
         }
         if up == "SHOW RESULT SET VERSIONS" {
-            let map = self.s377_result_set_versions.lock().unwrap();
+            let map = self.s377_result_set_versions.lock_safe();
             let rows = map
                 .iter()
                 .map(|(q, v)| vec![q.clone(), v.clone()])
@@ -11785,7 +11617,7 @@ impl SqlExecutor {
             }));
         }
         if up == "CLEAR RESULT SET VERSIONS" {
-            self.s377_result_set_versions.lock().unwrap().clear();
+            self.s377_result_set_versions.lock_safe().clear();
             return Some(Ok(QueryResult::Ok(
                 "RESULT SET VERSIONS CLEARED".to_owned(),
             )));
@@ -11795,8 +11627,7 @@ impl SqlExecutor {
         if up.starts_with("REBALANCE SHARD KEY FOR ") {
             let table = s["REBALANCE SHARD KEY FOR ".len()..].trim().to_owned();
             self.s378_shard_key_rebalance_history
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .entry(table)
                 .or_default()
                 .push(chrono_now());
@@ -11805,7 +11636,7 @@ impl SqlExecutor {
             )));
         }
         if up == "SHOW SHARD KEY REBALANCE HISTORY" {
-            let map = self.s378_shard_key_rebalance_history.lock().unwrap();
+            let map = self.s378_shard_key_rebalance_history.lock_safe();
             let rows = map
                 .iter()
                 .map(|(t, h)| vec![t.clone(), h.len().to_string()])
@@ -11820,8 +11651,7 @@ impl SqlExecutor {
                 .trim()
                 .to_owned();
             self.s378_shard_key_rebalance_history
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .remove(&table);
             return Some(Ok(QueryResult::Ok(
                 "SHARD KEY REBALANCE CANCELLED".to_owned(),
@@ -11834,15 +11664,12 @@ impl SqlExecutor {
             if let Some(idx) = rest.to_ascii_uppercase().find(" TO ") {
                 let obj = rest[..idx].trim().to_owned();
                 let owner = rest[idx + 4..].trim().to_owned();
-                self.s379_object_ownership
-                    .lock()
-                    .unwrap()
-                    .insert(obj, owner);
+                self.s379_object_ownership.lock_safe().insert(obj, owner);
                 return Some(Ok(QueryResult::Ok("OWNER SET".to_owned())));
             }
         }
         if up == "SHOW OBJECT OWNERSHIP" {
-            let map = self.s379_object_ownership.lock().unwrap();
+            let map = self.s379_object_ownership.lock_safe();
             let rows = map
                 .iter()
                 .map(|(o, u)| vec![o.clone(), u.clone()])
@@ -11854,7 +11681,7 @@ impl SqlExecutor {
         }
         if up.starts_with("CLEAR OBJECT OWNERSHIP FOR ") {
             let obj = s["CLEAR OBJECT OWNERSHIP FOR ".len()..].trim().to_owned();
-            self.s379_object_ownership.lock().unwrap().remove(&obj);
+            self.s379_object_ownership.lock_safe().remove(&obj);
             return Some(Ok(QueryResult::Ok("OBJECT OWNERSHIP CLEARED".to_owned())));
         }
 
@@ -11963,28 +11790,42 @@ impl SqlExecutor {
             .collect()
     }
 
+    /// B11 (PP-25) — an autocommit write applies immediately, so it takes
+    /// the same lock transactional commits hold from their SERIALIZABLE
+    /// conflict check through their last table commit; otherwise it could
+    /// land between the two. Writes inside a transaction only stage rows and
+    /// take nothing; reads never take it.
+    fn autocommit_write_lock(&self) -> Option<SqlCommitGuard> {
+        if self.txn.lock_safe().is_some() {
+            return None;
+        }
+        Some(sql_commit_lock())
+    }
+
     fn exec_begin(&self, level: IsolationLevel) -> Result<QueryResult, ExecError> {
-        let mut guard = self.txn.lock().unwrap();
+        let mut guard = self.txn.lock_safe();
         if guard.is_some() {
             return Err(ExecError::TxnAlreadyActive);
         }
         *guard = Some(HashMap::new());
         drop(guard);
-        *self.mvcc_txn.lock().unwrap() = Some(MvccTxnState::new(level));
+        self.savepoints.lock_safe().clear();
+        *self.mvcc_txn.lock_safe() = Some(MvccTxnState::new(level));
         Ok(QueryResult::TxBegin)
     }
 
     fn exec_commit(&self) -> Result<QueryResult, ExecError> {
-        let mut guard = self.txn.lock().unwrap();
+        let mut guard = self.txn.lock_safe();
         let txn_map = guard.take().ok_or(ExecError::NoActiveTxn)?;
         drop(guard);
-        let mvcc_state = self.mvcc_txn.lock().unwrap().take();
+        let mvcc_state = self.mvcc_txn.lock_safe().take();
+        self.savepoints.lock_safe().clear();
 
         // Held from the conflict check through the last table commit, so no
-        // other transactional commit can land between "nothing conflicts" and
-        // "our writes are applied" (PP-25). Single-statement autocommit writes
-        // do not take it; they are not checked for conflicts either.
-        let _commit_guard = SQL_COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // other commit can land between "nothing conflicts" and "our writes
+        // are applied" (PP-25). Autocommit writes take it too (B11, see
+        // `autocommit_write_lock`).
+        let _commit_guard = sql_commit_lock();
 
         // MVCC Phase 2 — SERIALIZABLE write-write conflict detection. For
         // every pk this transaction wrote, compare the value visible at its
@@ -12124,10 +11965,11 @@ impl SqlExecutor {
     }
 
     fn exec_rollback(&self) -> Result<QueryResult, ExecError> {
-        let mut guard = self.txn.lock().unwrap();
+        let mut guard = self.txn.lock_safe();
         let txn_map = guard.take().ok_or(ExecError::NoActiveTxn)?;
         drop(guard);
-        *self.mvcc_txn.lock().unwrap() = None;
+        *self.mvcc_txn.lock_safe() = None;
+        self.savepoints.lock_safe().clear();
         for (table, txn_id) in txn_map {
             if let Ok(engine) = self.registry.get(&table) {
                 let _ = engine.rollback_txn(txn_id);
@@ -12143,7 +11985,7 @@ impl SqlExecutor {
         // at first touch, whether that touch is a read or a write.
         self.ensure_read_ts(table);
 
-        let mut guard = self.txn.lock().unwrap();
+        let mut guard = self.txn.lock_safe();
         let map = guard.as_mut()?;
         if let Some(&id) = map.get(table) {
             return Some(id);
@@ -12159,7 +12001,7 @@ impl SqlExecutor {
     /// transaction is REPEATABLE READ / SERIALIZABLE. No-op in READ COMMITTED
     /// / autocommit, or if this table's read_ts is already fixed.
     fn ensure_read_ts(&self, table: &str) {
-        let mut guard = self.mvcc_txn.lock().unwrap();
+        let mut guard = self.mvcc_txn.lock_safe();
         let Some(state) = guard.as_mut() else {
             return;
         };
@@ -12171,7 +12013,7 @@ impl SqlExecutor {
             return;
         };
         let ts = engine.begin_snapshot();
-        if let Some(state) = self.mvcc_txn.lock().unwrap().as_mut() {
+        if let Some(state) = self.mvcc_txn.lock_safe().as_mut() {
             state.read_ts.entry(table.to_owned()).or_insert(ts);
         }
     }
@@ -12182,8 +12024,7 @@ impl SqlExecutor {
     fn read_ts_for(&self, table: &str) -> Option<u64> {
         self.ensure_read_ts(table);
         self.mvcc_txn
-            .lock()
-            .unwrap()
+            .lock_safe()
             .as_ref()?
             .read_ts
             .get(table)
@@ -12193,7 +12034,7 @@ impl SqlExecutor {
     /// Record that this transaction wrote `pk` in `table` (SERIALIZABLE only —
     /// used at commit time for write-write conflict detection).
     fn record_write(&self, table: &str, pk: u64) {
-        let mut guard = self.mvcc_txn.lock().unwrap();
+        let mut guard = self.mvcc_txn.lock_safe();
         if let Some(state) = guard.as_mut()
             && matches!(state.isolation, IsolationLevel::Serializable)
         {
@@ -12211,15 +12052,15 @@ impl SqlExecutor {
     /// when access is denied.
     fn check_table_access(&self, table: &str) -> Option<QueryResult> {
         // S81 — auth check
-        if let Some(required) = self.table_tokens.lock().unwrap().get(table).cloned() {
-            let sess = self.session_token.lock().unwrap().clone();
+        if let Some(required) = self.table_tokens.lock_safe().get(table).cloned() {
+            let sess = self.session_token.lock_safe().clone();
             if sess.as_deref() != Some(&required) {
                 return Some(sql_error("28000", "auth required"));
             }
         }
 
         // S82 — rate limit check
-        let mut limits = self.rate_limits.lock().unwrap();
+        let mut limits = self.rate_limits.lock_safe();
         if let Some(entry) = limits.get_mut(table) {
             let elapsed = entry.2.elapsed().as_secs_f64();
             if elapsed > 1.0 {
@@ -12246,8 +12087,7 @@ impl SqlExecutor {
     ) -> Result<Vec<EngineRow>, ExecError> {
         let pol_exprs: Vec<Expr> = self
             .policies
-            .lock()
-            .unwrap()
+            .lock_safe()
             .values()
             .filter(|(tbl, _)| tbl == table)
             .map(|(_, expr)| expr.clone())
@@ -12342,7 +12182,7 @@ impl SqlExecutor {
 
         // S80 â€” virtual table vv_audit_log
         if stmt.table == "vv_audit_log" {
-            let log = self.audit_log.lock().unwrap();
+            let log = self.audit_log.lock_safe();
             let columns = vec![
                 "ts".to_owned(),
                 "op".to_owned(),
@@ -12367,7 +12207,7 @@ impl SqlExecutor {
 
         // S71 â€” virtual table vv_stat_statements
         if stmt.table == "vv_stat_statements" {
-            let stats = self.query_stats.lock().unwrap();
+            let stats = self.query_stats.lock_safe();
             let columns = vec![
                 "query".to_owned(),
                 "fingerprint".to_owned(),
@@ -12396,7 +12236,7 @@ impl SqlExecutor {
 
         // S94 â€” virtual table vv_query_fingerprints
         if stmt.table == "vv_query_fingerprints" {
-            let stats = self.query_stats.lock().unwrap();
+            let stats = self.query_stats.lock_safe();
             let mut fingerprint_map: HashMap<String, (u64, f64)> = HashMap::new();
             for (q, s) in stats.iter() {
                 let entry = fingerprint_map.entry(q.clone()).or_insert((0, 0.0));
@@ -12426,7 +12266,7 @@ impl SqlExecutor {
             } = col
                 && name.eq_ignore_ascii_case("PG_STAT_STATEMENTS_RESET")
             {
-                self.query_stats.lock().unwrap().clear();
+                self.query_stats.lock_safe().clear();
                 return Ok(QueryResult::Rows {
                     columns: vec!["pg_stat_statements_reset".to_owned()],
                     rows: vec![vec!["".to_owned()]],
@@ -12436,7 +12276,7 @@ impl SqlExecutor {
 
         // S95 â€” pg_stat_statements compatibility alias
         if stmt.table == "pg_stat_statements" {
-            let stats = self.query_stats.lock().unwrap();
+            let stats = self.query_stats.lock_safe();
             let columns = vec![
                 "userid".to_owned(),
                 "dbid".to_owned(),
@@ -12470,7 +12310,7 @@ impl SqlExecutor {
 
         // S93 â€” virtual table vv_slow_log
         if stmt.table == "vv_slow_log" {
-            let log = self.slow_log.lock().unwrap();
+            let log = self.slow_log.lock_safe();
             let columns = vec![
                 "sql".to_owned(),
                 "duration_ms".to_owned(),
@@ -12493,7 +12333,7 @@ impl SqlExecutor {
 
         // S89 â€” logical decode virtual function
         if stmt.table == "vv_logical_decode" {
-            let log = self.audit_log.lock().unwrap().clone();
+            let log = self.audit_log.lock_safe().clone();
             let columns = vec![
                 "lsn".to_owned(),
                 "xid".to_owned(),
@@ -12521,7 +12361,7 @@ impl SqlExecutor {
 
         // S97 â€” virtual table vv_wait_events
         if stmt.table == "vv_wait_events" {
-            let events = self.wait_events.lock().unwrap();
+            let events = self.wait_events.lock_safe();
             let columns = vec![
                 "event_type".to_owned(),
                 "object_name".to_owned(),
@@ -12545,14 +12385,13 @@ impl SqlExecutor {
         // S99 â€” vv_health virtual table
         if stmt.table == "vv_health" {
             let uptime_s = self.created_at.elapsed().as_secs();
-            let cache_hits = self.query_cache.lock().unwrap().len() as u64;
-            let slow_count = self.slow_log.lock().unwrap().len() as u64;
-            let rep_slots = self.replication_slots.lock().unwrap().len() as u64;
-            let ro = *self.read_only.lock().unwrap();
+            let cache_hits = self.query_cache.lock_safe().len() as u64;
+            let slow_count = self.slow_log.lock_safe().len() as u64;
+            let rep_slots = self.replication_slots.lock_safe().len() as u64;
+            let ro = *self.read_only.lock_safe();
             let archive = self
                 .archive_path
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .clone()
                 .unwrap_or_else(|| "none".to_owned());
             let columns = vec!["metric".to_owned(), "value".to_owned()];
@@ -12618,7 +12457,7 @@ impl SqlExecutor {
 
         // S115 â€” vv_table_stats virtual table
         if stmt.table == "vv_table_stats" {
-            let stats = self.table_stats.lock().unwrap();
+            let stats = self.table_stats.lock_safe();
             let columns = vec![
                 "table".to_owned(),
                 "column".to_owned(),
@@ -12647,7 +12486,7 @@ impl SqlExecutor {
 
         // S116 â€” vv_connections virtual table
         if stmt.table == "vv_connections" {
-            let max = *self.max_connections.lock().unwrap();
+            let max = *self.max_connections.lock_safe();
             let current = self
                 .connection_count
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -12668,7 +12507,7 @@ impl SqlExecutor {
 
         // S117 â€” vv_resource_groups virtual table
         if stmt.table == "vv_resource_groups" {
-            let groups = self.resource_groups.lock().unwrap();
+            let groups = self.resource_groups.lock_safe();
             let columns = vec![
                 "name".to_owned(),
                 "cpu_pct".to_owned(),
@@ -12693,8 +12532,7 @@ impl SqlExecutor {
         if stmt.table == "vv_schemas" {
             let schemas: Vec<Vec<String>> = self
                 .schemas
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .iter()
                 .map(|s| vec![s.clone()])
                 .collect();
@@ -12728,18 +12566,13 @@ impl SqlExecutor {
                 }
             }
             if let Some((cte_cols, cte_rows)) = cte_map.get(&stmt.table) {
-                let filtered: Vec<Vec<String>> = if let Some(where_expr) = &stmt.where_clause {
-                    cte_rows
-                        .iter()
-                        .filter(|row| {
-                            let m: HashMap<String, String> =
-                                cte_cols.iter().cloned().zip(row.iter().cloned()).collect();
-                            Self::eval_str_where(where_expr, &m)
-                        })
-                        .cloned()
-                        .collect()
-                } else {
-                    cte_rows.clone()
+                let filtered = match self.filter_str_rows(
+                    cte_rows.clone(),
+                    cte_cols,
+                    stmt.where_clause.as_ref(),
+                ) {
+                    Ok(rows) => rows,
+                    Err(e) => return Ok(e),
                 };
                 let filtered = if let Some(lim) = stmt.limit {
                     filtered.into_iter().take(lim as usize).collect()
@@ -12756,7 +12589,7 @@ impl SqlExecutor {
         }
 
         // S45 â€” handle views
-        let view_stmt_opt = self.views.lock().unwrap().get(&stmt.table).cloned();
+        let view_stmt_opt = self.views.lock_safe().get(&stmt.table).cloned();
         if let Some(view_stmt) = view_stmt_opt {
             let result = self.exec_select(view_stmt)?;
             return match result {
@@ -12764,17 +12597,13 @@ impl SqlExecutor {
                     columns: view_cols,
                     rows: view_rows,
                 } => {
-                    let filtered: Vec<Vec<String>> = if let Some(where_expr) = &stmt.where_clause {
-                        view_rows
-                            .into_iter()
-                            .filter(|row| {
-                                let m: HashMap<String, String> =
-                                    view_cols.iter().cloned().zip(row.iter().cloned()).collect();
-                                Self::eval_str_where(where_expr, &m)
-                            })
-                            .collect()
-                    } else {
-                        view_rows
+                    let filtered = match self.filter_str_rows(
+                        view_rows,
+                        &view_cols,
+                        stmt.where_clause.as_ref(),
+                    ) {
+                        Ok(rows) => rows,
+                        Err(e) => return Ok(e),
                     };
                     let filtered = if let Some(lim) = stmt.limit {
                         filtered.into_iter().take(lim as usize).collect()
@@ -12822,8 +12651,7 @@ impl SqlExecutor {
                     };
                     let _ = rows;
                     self.views
-                        .lock()
-                        .unwrap()
+                        .lock_safe()
                         .insert(lateral.alias.clone(), fake_stmt);
                 }
             }
@@ -12831,7 +12659,7 @@ impl SqlExecutor {
 
         // S75 â€” materialized views
         let mat_view_data = {
-            let guard = self.mat_views.lock().unwrap();
+            let guard = self.mat_views.lock_safe();
             guard.get(&stmt.table).cloned()
         };
         if let Some((mat_select, cached_rows)) = mat_view_data {
@@ -12844,19 +12672,11 @@ impl SqlExecutor {
                     _ => None,
                 })
                 .collect();
-            let filtered: Vec<Vec<String>> = if let Some(where_expr) = &stmt.where_clause {
-                cached_rows
-                    .iter()
-                    .filter(|row| {
-                        let m: HashMap<String, String> =
-                            mat_cols.iter().cloned().zip(row.iter().cloned()).collect();
-                        Self::eval_str_where(where_expr, &m)
-                    })
-                    .cloned()
-                    .collect()
-            } else {
-                cached_rows
-            };
+            let filtered =
+                match self.filter_str_rows(cached_rows, &mat_cols, stmt.where_clause.as_ref()) {
+                    Ok(rows) => rows,
+                    Err(e) => return Ok(e),
+                };
             return Ok(QueryResult::Rows {
                 columns: mat_cols,
                 rows: filtered,
@@ -13427,7 +13247,7 @@ impl SqlExecutor {
             .collect();
 
         // S79 â€” apply column masks
-        let masks_snap: HashMap<(String, String), String> = self.masks.lock().unwrap().clone();
+        let masks_snap: HashMap<(String, String), String> = self.masks.lock_safe().clone();
         let rows: Vec<Vec<String>> = if masks_snap.is_empty() {
             rows
         } else {
@@ -13449,7 +13269,7 @@ impl SqlExecutor {
         };
 
         // S87 â€” notice for empty table
-        let warnings_on = *self.warnings_enabled.lock().unwrap();
+        let warnings_on = *self.warnings_enabled.lock_safe();
 
         // S40 â€” set operations
         let (mut out_col_names, mut rows) = (out_col_names, rows);
@@ -13521,6 +13341,7 @@ impl SqlExecutor {
 
         let mut groups: BTreeMap<String, Vec<&vectorvolt_engine::EngineRow>> = BTreeMap::new();
         for row in &rows {
+            self.check_deadline()?;
             let key = if group_col_indices.is_empty() {
                 String::new()
             } else {
@@ -13762,6 +13583,7 @@ impl SqlExecutor {
                 let all_right: Vec<Vec<String>> = right_map.values().flatten().cloned().collect();
                 for left_row in &combined {
                     for right_row in &all_right {
+                        self.check_deadline()?;
                         let mut merged = left_row.clone();
                         merged.extend(right_row.clone());
                         next.push(merged);
@@ -13772,6 +13594,7 @@ impl SqlExecutor {
             }
             let left_key_idx = left_key_indices[join_idx];
             for left_row in &combined {
+                self.check_deadline()?;
                 let key = left_row.get(left_key_idx).cloned().unwrap_or_default();
                 if let Some(right_matches) = right_map.get(&key) {
                     for right_row in right_matches {
@@ -13860,6 +13683,11 @@ impl SqlExecutor {
                     vals[idx] = tv.to_bits();
                 }
             }
+            self.check_deadline()?;
+            // B5/B6 — CHECK constraints and foreign keys
+            if let Some(err) = self.check_row_constraints(&stmt.table, schema, &vals, None)? {
+                return Ok(err);
+            }
             let pk = vals[0];
             engine
                 .insert(pk, vals)
@@ -13872,6 +13700,14 @@ impl SqlExecutor {
     fn exec_alter_table(&self, stmt: AlterTableStmt) -> Result<QueryResult, ExecError> {
         match stmt.op {
             AlterOp::AddColumn(col_def) => {
+                // B5 — ADD COLUMN does not record constraints; refuse rather
+                // than silently dropping the CHECK.
+                if col_def.check.is_some() {
+                    return Ok(sql_error(
+                        "0A000",
+                        "CHECK constraints in ALTER TABLE ADD COLUMN are not supported",
+                    ));
+                }
                 let col = ColumnDef::new(col_def.name, ColumnType::from_token(&col_def.col_type));
                 self.registry
                     .alter_table(&stmt.table, &[col], &[])
@@ -13879,6 +13715,12 @@ impl SqlExecutor {
             }
             // S113 â€” ONLINE add column: add column, preserve all rows, return online message
             AlterOp::AddColumnOnline(col_def) => {
+                if col_def.check.is_some() {
+                    return Ok(sql_error(
+                        "0A000",
+                        "CHECK constraints in ALTER TABLE ADD COLUMN are not supported",
+                    ));
+                }
                 let col = ColumnDef::new(
                     col_def.name.clone(),
                     ColumnType::from_token(&col_def.col_type),
@@ -13944,8 +13786,7 @@ impl SqlExecutor {
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
                 // S230 â€” track rename history
                 self.s230_rename_history
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .entry(stmt.table.clone())
                     .or_default()
                     .push((from.clone(), to.clone()));
@@ -14093,7 +13934,7 @@ impl SqlExecutor {
     }
 
     fn exec_insert(&self, stmt: InsertStmt) -> Result<QueryResult, ExecError> {
-        if *self.read_only.lock().unwrap() {
+        if *self.read_only.lock_safe() {
             return Ok(sql_error("25006", "read-only transaction"));
         }
         // S81/S82 — token auth + rate limit apply to writes too
@@ -14119,7 +13960,7 @@ impl SqlExecutor {
         let mut row_vals: Vec<u64> = vec![0u64; col_count];
 
         // S59 â€” apply defaults for missing columns
-        if let Some(defaults) = self.col_defaults.lock().unwrap().get(&stmt.table).cloned() {
+        if let Some(defaults) = self.col_defaults.lock_safe().get(&stmt.table).cloned() {
             for (col_idx, maybe_default) in defaults.iter().enumerate() {
                 if let Some(default_val) = maybe_default {
                     let col_name = schema
@@ -14154,73 +13995,16 @@ impl SqlExecutor {
             row_vals[idx] = bits;
         }
 
-        // S60 â€” FK validation
-        let fks = self
-            .foreign_keys
-            .lock()
-            .unwrap()
-            .get(&stmt.table)
-            .cloned()
-            .unwrap_or_default();
-        for (fk_col, ref_table, ref_col) in &fks {
-            if let Some((fk_idx, fk_def)) = schema.find(fk_col) {
-                let val = row_vals[fk_idx];
-                let val_str = TypedValue::from_bits(fk_def.col_type, val).display_str();
-                if val_str == "0" || val_str == "NULL" {
-                    continue; // NULL FK values are allowed
-                }
-                // Check ref_table has a row with ref_col = val
-                let ref_engine = self
-                    .registry
-                    .get(ref_table)
-                    .map_err(|_| ExecError::TableNotFound(ref_table.clone()))?;
-                let ref_rows = self.scan_live(&ref_engine)?;
-                let found = ref_rows.iter().any(|r| {
-                    if let Some((ref_idx, ref_def)) = ref_engine.schema.find(ref_col) {
-                        let rv = TypedValue::from_bits(
-                            ref_def.col_type,
-                            r.values.get(ref_idx).copied().unwrap_or(0),
-                        )
-                        .display_str();
-                        rv == val_str
-                    } else {
-                        false
-                    }
-                });
-                if !found {
-                    return Err(ExecError::Engine(format!(
-                        "foreign key violation: {fk_col} -> {ref_table}.{ref_col}"
-                    )));
-                }
-            }
-        }
-
-        // S59 â€” CHECK constraint validation
-        let checks = self
-            .col_checks
-            .lock()
-            .unwrap()
-            .get(&stmt.table)
-            .cloned()
-            .unwrap_or_default();
-        for (col_idx, maybe_check) in checks.iter().enumerate() {
-            if let Some(check_expr) = maybe_check {
-                let col_name = schema
-                    .get(col_idx)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_default();
-                let col_type = schema
-                    .get(col_idx)
-                    .map(|c| c.col_type)
-                    .unwrap_or(ColumnType::U64);
-                let val = row_vals.get(col_idx).copied().unwrap_or(0);
-                let val_str = TypedValue::from_bits(col_type, val).display_str();
-                if !eval_check(check_expr, &col_name, &val_str) {
-                    return Err(ExecError::Engine(format!(
-                        "check constraint violated on column {col_name}"
-                    )));
-                }
-            }
+        // B7 — BEFORE INSERT row triggers
+        if let Some(err) = self.fire_triggers(
+            &stmt.table,
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+            schema,
+            Some(&row_vals),
+            None,
+        )? {
+            return Ok(err);
         }
 
         let pk = row_vals[0];
@@ -14253,12 +14037,52 @@ impl SqlExecutor {
                         new_vals[idx] = self.expr_to_bits(expr, col_def.col_type)?;
                     }
                 }
+                // B5/B6/B7 — the upsert's UPDATE is checked and fires UPDATE
+                // triggers like any other update.
+                if let Some(err) = self.fire_triggers(
+                    &stmt.table,
+                    TriggerTiming::Before,
+                    TriggerEvent::Update,
+                    schema,
+                    Some(&new_vals),
+                    Some(&current.values),
+                )? {
+                    return Ok(err);
+                }
+                if let Some(err) = self.check_row_constraints(
+                    &stmt.table,
+                    schema,
+                    &new_vals,
+                    Some(&current.values),
+                )? {
+                    return Ok(err);
+                }
+                let changes = [(current.values.as_slice(), Some(new_vals.as_slice()))];
+                if let Some(err) = self.check_parent_refs(&stmt.table, schema, &changes)? {
+                    return Ok(err);
+                }
                 engine
-                    .update(pk, new_vals)
+                    .update(pk, new_vals.clone())
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
+                if let Some(err) = self.fire_triggers(
+                    &stmt.table,
+                    TriggerTiming::After,
+                    TriggerEvent::Update,
+                    schema,
+                    Some(&new_vals),
+                    Some(&current.values),
+                )? {
+                    return Ok(err);
+                }
                 return Ok(QueryResult::Affected(1));
             }
         }
+
+        // B5/B6 — CHECK constraints and foreign keys on the new row
+        if let Some(err) = self.check_row_constraints(&stmt.table, schema, &row_vals, None)? {
+            return Ok(err);
+        }
+        let after_vals = row_vals.clone();
 
         if let Some(txn_id) = self.txn_id_for(&stmt.table) {
             engine
@@ -14327,13 +14151,25 @@ impl SqlExecutor {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            self.audit_log.lock().unwrap().push(AuditEntry {
+            self.audit_log.lock_safe().push(AuditEntry {
                 ts: "2026-09-11 00:00:00".to_owned(),
                 op: "INSERT".to_owned(),
                 table: stmt.table.clone(),
                 old_val: String::new(),
                 new_val,
             });
+        }
+
+        // B7 — AFTER INSERT row triggers
+        if let Some(err) = self.fire_triggers(
+            &stmt.table,
+            TriggerTiming::After,
+            TriggerEvent::Insert,
+            schema,
+            Some(&after_vals),
+            None,
+        )? {
+            return Ok(err);
         }
 
         // S73 â€” extra rows
@@ -14347,14 +14183,18 @@ impl SqlExecutor {
                 on_conflict_ignore: false,
                 extra_rows: vec![],
             };
-            self.exec_insert(extra_insert)?;
+            self.check_deadline()?;
+            let r = self.exec_insert(extra_insert)?;
+            if matches!(r, QueryResult::Error(_)) {
+                return Ok(r);
+            }
         }
 
         Ok(QueryResult::Affected(1))
     }
 
     fn exec_update(&self, stmt: UpdateStmt) -> Result<QueryResult, ExecError> {
-        if *self.read_only.lock().unwrap() {
+        if *self.read_only.lock_safe() {
             return Ok(sql_error("25006", "read-only transaction"));
         }
         // S81/S82 — token auth + rate limit apply to writes too
@@ -14374,7 +14214,12 @@ impl SqlExecutor {
         let to_update = self.apply_rls(to_update, schema, &stmt.table)?;
         let count = to_update.len() as u64;
 
+        // B5/B6/B7 — compute every new row, fire BEFORE triggers and check
+        // constraints before anything is written, so a violation leaves the
+        // table untouched.
+        let mut planned: Vec<(EngineRow, Vec<u64>)> = Vec::with_capacity(to_update.len());
         for row in to_update {
+            self.check_deadline()?;
             let mut new_vals = row.values.clone();
             for (col_name, expr) in &stmt.assignments {
                 let (idx, col_def) = schema
@@ -14382,23 +14227,61 @@ impl SqlExecutor {
                     .ok_or_else(|| ExecError::ColumnNotFound(col_name.clone()))?;
                 new_vals[idx] = self.expr_to_bits(expr, col_def.col_type)?;
             }
+            if let Some(err) = self.fire_triggers(
+                &stmt.table,
+                TriggerTiming::Before,
+                TriggerEvent::Update,
+                schema,
+                Some(&new_vals),
+                Some(&row.values),
+            )? {
+                return Ok(err);
+            }
+            if let Some(err) =
+                self.check_row_constraints(&stmt.table, schema, &new_vals, Some(&row.values))?
+            {
+                return Ok(err);
+            }
+            planned.push((row, new_vals));
+        }
+        let changes: Vec<(&[u64], Option<&[u64]>)> = planned
+            .iter()
+            .map(|(row, new_vals)| (row.values.as_slice(), Some(new_vals.as_slice())))
+            .collect();
+        if let Some(err) = self.check_parent_refs(&stmt.table, schema, &changes)? {
+            return Ok(err);
+        }
+        drop(changes);
+
+        for (row, new_vals) in planned {
+            self.check_deadline()?;
             if let Some(txn_id) = self.txn_id_for(&stmt.table) {
                 engine
                     .delete_txn(txn_id, row.pk)
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
                 engine
-                    .insert_txn(txn_id, row.pk, new_vals)
+                    .insert_txn(txn_id, row.pk, new_vals.clone())
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
                 self.record_write(&stmt.table, row.pk);
             } else {
                 engine
-                    .update(row.pk, new_vals)
+                    .update(row.pk, new_vals.clone())
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
+            }
+            if let Some(err) = self.fire_triggers(
+                &stmt.table,
+                TriggerTiming::After,
+                TriggerEvent::Update,
+                schema,
+                Some(&new_vals),
+                Some(&row.values),
+            )? {
+                return Ok(err);
             }
         }
 
         // S80 â€” audit log for UPDATE
-        self.audit_log.lock().unwrap().push(AuditEntry {
+        self.audit_log.lock_safe().push(AuditEntry {
             ts: "2026-09-11 00:00:00".to_owned(),
             op: "UPDATE".to_owned(),
             table: stmt.table.clone(),
@@ -14410,7 +14293,7 @@ impl SqlExecutor {
     }
 
     fn exec_delete(&self, stmt: DeleteStmt) -> Result<QueryResult, ExecError> {
-        if *self.read_only.lock().unwrap() {
+        if *self.read_only.lock_safe() {
             return Ok(sql_error("25006", "read-only transaction"));
         }
         // S81/S82 — token auth + rate limit apply to writes too
@@ -14433,23 +14316,55 @@ impl SqlExecutor {
         let to_delete = self.apply_rls(to_delete, schema, &stmt.table)?;
         let count = to_delete.len() as u64;
 
-        if let Some(txn_id) = self.txn_id_for(&stmt.table) {
-            for row in to_delete {
+        // B7 — BEFORE DELETE row triggers; B6 — RESTRICT on referenced rows.
+        for row in &to_delete {
+            self.check_deadline()?;
+            if let Some(err) = self.fire_triggers(
+                &stmt.table,
+                TriggerTiming::Before,
+                TriggerEvent::Delete,
+                schema,
+                None,
+                Some(&row.values),
+            )? {
+                return Ok(err);
+            }
+        }
+        let changes: Vec<(&[u64], Option<&[u64]>)> = to_delete
+            .iter()
+            .map(|row| (row.values.as_slice(), None))
+            .collect();
+        if let Some(err) = self.check_parent_refs(&stmt.table, schema, &changes)? {
+            return Ok(err);
+        }
+        drop(changes);
+
+        for row in &to_delete {
+            self.check_deadline()?;
+            if let Some(txn_id) = self.txn_id_for(&stmt.table) {
                 engine
                     .delete_txn(txn_id, row.pk)
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
                 self.record_write(&stmt.table, row.pk);
-            }
-        } else {
-            for row in to_delete {
+            } else {
                 engine
                     .delete(row.pk)
                     .map_err(|e| ExecError::Engine(e.to_string()))?;
             }
+            if let Some(err) = self.fire_triggers(
+                &stmt.table,
+                TriggerTiming::After,
+                TriggerEvent::Delete,
+                schema,
+                None,
+                Some(&row.values),
+            )? {
+                return Ok(err);
+            }
         }
 
         // S80 â€” audit log for DELETE
-        self.audit_log.lock().unwrap().push(AuditEntry {
+        self.audit_log.lock_safe().push(AuditEntry {
             ts: "2026-09-11 00:00:00".to_owned(),
             op: "DELETE".to_owned(),
             table: stmt.table.clone(),
@@ -14460,8 +14375,7 @@ impl SqlExecutor {
         // S114 â€” track dead rows for VACUUM
         *self
             .dead_rows
-            .lock()
-            .unwrap()
+            .lock_safe()
             .entry(stmt.table.clone())
             .or_insert(0) += count;
 
@@ -14489,6 +14403,11 @@ impl SqlExecutor {
 
         let schema = TableSchema::new(cols).map_err(|e| ExecError::Engine(e.to_string()))?;
 
+        // B5 — a CHECK that cannot be evaluated is rejected, not stored.
+        if let Err(e) = Self::validate_checks(&checks, &schema, &table_name) {
+            return Ok(sql_error("0A000", &e));
+        }
+
         self.registry
             .create_table_typed(&stmt.table, schema)
             .map_err(|e| ExecError::Engine(e.to_string()))?;
@@ -14498,19 +14417,22 @@ impl SqlExecutor {
         let has_checks = checks.iter().any(|c| c.is_some());
         if has_defaults {
             self.col_defaults
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(table_name.clone(), defaults);
         }
         if has_checks {
             self.col_checks
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .insert(table_name.clone(), checks);
+        } else {
+            // Do not inherit constraints of a dropped table of the same name.
+            self.col_checks.lock_safe().remove(&table_name);
         }
         // S60 â€” store FKs
         if !fks.is_empty() {
-            self.foreign_keys.lock().unwrap().insert(table_name, fks);
+            self.foreign_keys.lock_safe().insert(table_name, fks);
+        } else {
+            self.foreign_keys.lock_safe().remove(&table_name);
         }
 
         Ok(QueryResult::Created)
@@ -14532,7 +14454,7 @@ impl SqlExecutor {
         let already_exists = path.exists();
         let content = format!("{{\"col\":\"{}\"}}", stmt.col);
         std::fs::write(path, content).map_err(|e| ExecError::Engine(e.to_string()))?;
-        let warnings_on = *self.warnings_enabled.lock().unwrap();
+        let warnings_on = *self.warnings_enabled.lock_safe();
         if already_exists && warnings_on {
             return Ok(QueryResult::WithNotice {
                 result: Box::new(QueryResult::Created),
@@ -14568,12 +14490,12 @@ impl SqlExecutor {
 
     // S45 â€” CREATE/DROP VIEW
     fn exec_create_view(&self, stmt: CreateViewStmt) -> Result<QueryResult, ExecError> {
-        self.views.lock().unwrap().insert(stmt.name, *stmt.select);
+        self.views.lock_safe().insert(stmt.name, *stmt.select);
         Ok(QueryResult::Created)
     }
 
     fn exec_drop_view(&self, stmt: DropViewStmt) -> Result<QueryResult, ExecError> {
-        self.views.lock().unwrap().remove(&stmt.name);
+        self.views.lock_safe().remove(&stmt.name);
         Ok(QueryResult::Dropped)
     }
 
@@ -14605,44 +14527,122 @@ impl SqlExecutor {
     }
 
     /// S41/S45 helper â€” evaluate WHERE on a string-row map.
-    fn eval_str_where(expr: &Expr, row: &HashMap<String, String>) -> bool {
-        match expr {
+    /// Evaluate a WHERE clause over a string-valued row (views, CTEs,
+    /// materialized views). B10 — predicates this evaluator cannot handle are
+    /// an error (reported as SQLSTATE 0A000), never silently true.
+    fn eval_str_where(expr: &Expr, row: &HashMap<String, String>) -> Result<bool, String> {
+        Ok(match expr {
             Expr::BinOp {
                 op: BinOp::And,
                 left,
                 right,
-            } => Self::eval_str_where(left, row) && Self::eval_str_where(right, row),
+            } => Self::eval_str_where(left, row)? && Self::eval_str_where(right, row)?,
             Expr::BinOp {
                 op: BinOp::Or,
                 left,
                 right,
-            } => Self::eval_str_where(left, row) || Self::eval_str_where(right, row),
+            } => Self::eval_str_where(left, row)? || Self::eval_str_where(right, row)?,
             Expr::BinOp { op, left, right } => {
-                let lv = Self::str_val(left, row);
-                let rv = Self::str_val(right, row);
+                let lv = Self::str_val(left, row)?;
+                let rv = Self::str_val(right, row)?;
                 compare_values(&lv, op, &rv)
             }
             Expr::IsNull { col, negated } => {
-                let v = row.get(col).cloned().unwrap_or_default();
+                let v = Self::str_col(col, row)?;
                 let is_null = v.is_empty() || v == "NULL";
                 if *negated { !is_null } else { is_null }
             }
-            _ => true, // permissive for unsupported predicates
+            Expr::In { col, values } => {
+                let v = Self::str_col(col, row)?;
+                values
+                    .iter()
+                    .any(|lit| compare_values(&v, &BinOp::Eq, &Self::str_lit(lit)))
+            }
+            Expr::Between { col, lo, hi } => {
+                let v = Self::str_col(col, row)?;
+                compare_values(&v, &BinOp::Gte, &Self::str_lit(lo))
+                    && compare_values(&v, &BinOp::Lte, &Self::str_lit(hi))
+            }
+            Expr::Like {
+                col,
+                pattern,
+                negated,
+                case_insensitive,
+            } => {
+                let v = Self::str_col(col, row)?;
+                let m = if *case_insensitive {
+                    like_match(&v.to_lowercase(), &pattern.to_lowercase())
+                } else {
+                    like_match(&v, pattern)
+                };
+                m != *negated
+            }
+            other => return Err(format!("unsupported predicate in WHERE clause: {other:?}")),
+        })
+    }
+
+    /// Column lookup for [`eval_str_where`](Self::eval_str_where): exact name,
+    /// else a unique `table.col` header (join output).
+    fn str_col(name: &str, row: &HashMap<String, String>) -> Result<String, String> {
+        if let Some(v) = row.get(name) {
+            return Ok(v.clone());
+        }
+        let suffix = format!(".{name}");
+        let mut hits = row.iter().filter(|(k, _)| k.ends_with(&suffix));
+        match (hits.next(), hits.next()) {
+            (Some((_, v)), None) => Ok(v.clone()),
+            (Some(_), Some(_)) => Err(format!("column reference \"{name}\" is ambiguous")),
+            (None, _) => Err(format!("column \"{name}\" does not exist")),
         }
     }
 
-    fn str_val(expr: &Expr, row: &HashMap<String, String>) -> String {
-        match expr {
-            Expr::Col(name) => row.get(name).cloned().unwrap_or_default(),
-            Expr::Lit(lit) => match lit {
-                LitVal::Int(n) => n.to_string(),
-                LitVal::Float(f) => format!("{f:.6}"),
-                LitVal::Str(s) => s.clone(),
-                LitVal::Bool(b) => b.to_string(),
-                LitVal::Null => "NULL".to_owned(),
-            },
-            _ => String::new(),
+    fn str_lit(lit: &LitVal) -> String {
+        match lit {
+            LitVal::Int(n) => n.to_string(),
+            LitVal::Float(f) => format!("{f:.6}"),
+            LitVal::Str(s) => s.clone(),
+            LitVal::Bool(b) => b.to_string(),
+            LitVal::Null => "NULL".to_owned(),
         }
+    }
+
+    fn str_val(expr: &Expr, row: &HashMap<String, String>) -> Result<String, String> {
+        match expr {
+            Expr::Col(name) => Self::str_col(name, row),
+            Expr::QualifiedCol { table, col } => match row.get(&format!("{table}.{col}")) {
+                Some(v) => Ok(v.clone()),
+                None => Self::str_col(col, row),
+            },
+            Expr::Lit(lit) => Ok(Self::str_lit(lit)),
+            other => Err(format!("unsupported value in WHERE clause: {other:?}")),
+        }
+    }
+
+    /// B10 — filter string rows by `where_expr`, or the error result to return
+    /// (0A000 for an unsupported predicate, 57014 on statement timeout).
+    fn filter_str_rows(
+        &self,
+        rows: Vec<Vec<String>>,
+        cols: &[String],
+        where_expr: Option<&Expr>,
+    ) -> Result<Vec<Vec<String>>, QueryResult> {
+        let Some(where_expr) = where_expr else {
+            return Ok(rows);
+        };
+        let mut out = Vec::new();
+        for row in rows {
+            if self.check_deadline().is_err() {
+                return Err(sql_error("57014", STATEMENT_TIMEOUT_MSG));
+            }
+            let m: HashMap<String, String> =
+                cols.iter().cloned().zip(row.iter().cloned()).collect();
+            match Self::eval_str_where(where_expr, &m) {
+                Ok(true) => out.push(row),
+                Ok(false) => {}
+                Err(e) => return Err(sql_error("0A000", &e)),
+            }
+        }
+        Ok(out)
     }
 
     /// Try to extract a simple single-column range predicate for pushdown.
@@ -14700,6 +14700,7 @@ impl SqlExecutor {
                 let mut seen = std::collections::HashSet::new();
                 let mut live = Vec::with_capacity(raw.len());
                 for row in raw {
+                    self.check_deadline()?;
                     if !seen.insert(row.pk) {
                         continue;
                     }
@@ -14727,6 +14728,395 @@ impl SqlExecutor {
         }
     }
 
+    // ── B5/B6/B7 — constraints and triggers ──────────────────────────────
+
+    /// B5 — parse a stored CHECK expression back into a row predicate.
+    fn parse_check_expr(check: &str) -> Result<Expr, String> {
+        let sql = format!("SELECT * FROM __vv_check WHERE {check}");
+        let tokens = Lexer::new(&sql).tokenize().map_err(|e| e.to_string())?;
+        match SqlParser::new(tokens).parse().map_err(|e| e.to_string())? {
+            Stmt::Select(sel) => sel
+                .where_clause
+                .ok_or_else(|| "empty CHECK expression".to_owned()),
+            _ => Err("not a row predicate".to_owned()),
+        }
+    }
+
+    /// B5 — reject, at CREATE time, any CHECK the row evaluator cannot
+    /// enforce (instead of storing a constraint that never fires).
+    fn validate_checks(
+        checks: &[Option<String>],
+        schema: &TableSchema,
+        table: &str,
+    ) -> Result<(), String> {
+        for (idx, check) in checks.iter().enumerate() {
+            let Some(check) = check else { continue };
+            let col = schema.get(idx).map(|c| c.name.as_str()).unwrap_or("?");
+            let expr = Self::parse_check_expr(check)
+                .map_err(|e| format!("unsupported CHECK constraint on column {col}: {e}"))?;
+            Self::validate_policy_expr(&expr, schema, table)
+                .map_err(|e| format!("unsupported CHECK constraint on column {col}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// The open per-table txn id, without joining the table to the txn.
+    fn open_txn_for(&self, table: &str) -> Option<TxnId> {
+        self.txn.lock_safe().as_ref()?.get(table).copied()
+    }
+
+    /// Point read that sees this session's staged (uncommitted) writes.
+    fn get_visible(
+        &self,
+        table: &str,
+        engine: &vectorvolt_engine::TableEngine,
+        pk: u64,
+    ) -> Result<Option<EngineRow>, ExecError> {
+        match self.open_txn_for(table) {
+            Some(id) => engine.get_txn(id, pk),
+            None => engine.get(pk),
+        }
+        .map_err(|e| ExecError::Engine(e.to_string()))
+    }
+
+    /// Full scan that overlays this session's staged (uncommitted) writes.
+    fn scan_visible(
+        &self,
+        table: &str,
+        engine: &vectorvolt_engine::TableEngine,
+    ) -> Result<Vec<EngineRow>, ExecError> {
+        let mut rows = self.scan_live(engine)?;
+        if let Some(id) = self.open_txn_for(table) {
+            let ops = engine
+                .txn_write_set(id)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+            if !ops.is_empty() {
+                let staged: HashMap<u64, Option<Vec<u64>>> = ops.into_iter().collect();
+                rows.retain(|r| !staged.contains_key(&r.pk));
+                for (pk, values) in staged {
+                    if let Some(values) = values {
+                        rows.push(EngineRow { pk, values });
+                    }
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// B5/B6 — enforce `table`'s CHECK constraints (23514) and outgoing
+    /// FOREIGN KEYs (23503) on a row about to be written. `old` is the row
+    /// being replaced (UPDATE / upsert); unchanged FK columns are not
+    /// re-checked. Returns the error result to send back, if any.
+    fn check_row_constraints(
+        &self,
+        table: &str,
+        schema: &TableSchema,
+        vals: &[u64],
+        old: Option<&[u64]>,
+    ) -> Result<Option<QueryResult>, ExecError> {
+        let checks = self
+            .col_checks
+            .lock_safe()
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
+        if checks.iter().any(Option::is_some) {
+            let row = EngineRow {
+                pk: vals.first().copied().unwrap_or(0),
+                values: vals.to_vec(),
+            };
+            for (idx, check) in checks.iter().enumerate() {
+                let Some(check) = check else { continue };
+                let col = schema.get(idx).map(|c| c.name.clone()).unwrap_or_default();
+                let expr = match Self::parse_check_expr(check) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        return Ok(Some(sql_error(
+                            "0A000",
+                            &format!("CHECK constraint on column {col} cannot be evaluated: {e}"),
+                        )));
+                    }
+                };
+                if !self.eval_expr(&expr, &row, schema, table)? {
+                    return Ok(Some(sql_error(
+                        "23514",
+                        &format!(
+                            "new row for relation \"{table}\" violates check constraint \"{table}_{col}_check\" (column {col}: CHECK ({check}))"
+                        ),
+                    )));
+                }
+            }
+        }
+
+        let fks = self
+            .foreign_keys
+            .lock_safe()
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
+        for (fk_col, ref_table, ref_col) in &fks {
+            let Some((fk_idx, fk_def)) = schema.find(fk_col) else {
+                continue;
+            };
+            let bits = vals.get(fk_idx).copied().unwrap_or(0);
+            if old.is_some_and(|o| o.get(fk_idx).copied().unwrap_or(0) == bits) {
+                continue;
+            }
+            let val_str = TypedValue::from_bits(fk_def.col_type, bits).display_str();
+            if val_str == "0" || val_str == "NULL" {
+                continue; // NULL FK values are allowed
+            }
+            let ref_engine = self
+                .registry
+                .get(ref_table)
+                .map_err(|_| ExecError::TableNotFound(ref_table.clone()))?;
+            let Some((ref_idx, ref_def)) = ref_engine.schema.find(ref_col) else {
+                return Err(ExecError::ColumnNotFound(format!("{ref_table}.{ref_col}")));
+            };
+            let ref_type = ref_def.col_type;
+            let found = if ref_idx == 0 {
+                match TypedValue::parse(ref_type, &val_str) {
+                    Ok(tv) => self
+                        .get_visible(ref_table, &ref_engine, tv.to_bits())?
+                        .is_some(),
+                    Err(_) => false,
+                }
+            } else {
+                self.scan_visible(ref_table, &ref_engine)?.iter().any(|r| {
+                    TypedValue::from_bits(ref_type, r.values.get(ref_idx).copied().unwrap_or(0))
+                        .display_str()
+                        == val_str
+                })
+            };
+            if !found {
+                return Ok(Some(sql_error(
+                    "23503",
+                    &format!(
+                        "insert or update on table \"{table}\" violates foreign key constraint: key ({fk_col})=({val_str}) is not present in table \"{ref_table}\" ({ref_col})"
+                    ),
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// B6 — parent side of every FOREIGN KEY referencing `table` (RESTRICT,
+    /// the only action the parser records): refuse to delete a row, or to
+    /// change its referenced column, while child rows still point at it.
+    /// `changes` is (old row, new row) with `None` for a delete.
+    fn check_parent_refs(
+        &self,
+        table: &str,
+        schema: &TableSchema,
+        changes: &[(&[u64], Option<&[u64]>)],
+    ) -> Result<Option<QueryResult>, ExecError> {
+        let referencing: Vec<(String, String, String)> = self
+            .foreign_keys
+            .lock_safe()
+            .iter()
+            .flat_map(|(child, fks)| {
+                fks.iter()
+                    .filter(|(_, ref_table, _)| ref_table == table)
+                    .map(move |(col, _, ref_col)| (child.clone(), col.clone(), ref_col.clone()))
+            })
+            .collect();
+        if referencing.is_empty() || changes.is_empty() {
+            return Ok(None);
+        }
+        let deleted: HashSet<u64> = changes
+            .iter()
+            .filter(|(_, new)| new.is_none())
+            .map(|(old, _)| old.first().copied().unwrap_or(0))
+            .collect();
+        for (child, fk_col, ref_col) in &referencing {
+            let Some((ref_idx, ref_def)) = schema.find(ref_col) else {
+                continue;
+            };
+            let at = |v: &[u64], i: usize| v.get(i).copied().unwrap_or(0);
+            let gone: HashSet<String> = changes
+                .iter()
+                .filter(|(old, new)| new.is_none_or(|n| at(n, ref_idx) != at(old, ref_idx)))
+                .map(|(old, _)| {
+                    TypedValue::from_bits(ref_def.col_type, at(old, ref_idx)).display_str()
+                })
+                .filter(|v| v != "0" && v != "NULL")
+                .collect();
+            if gone.is_empty() {
+                continue;
+            }
+            let Ok(child_engine) = self.registry.get(child) else {
+                continue;
+            };
+            let Some((fk_idx, fk_def)) = child_engine.schema.find(fk_col) else {
+                continue;
+            };
+            let fk_type = fk_def.col_type;
+            let still_referenced = self
+                .scan_visible(child, &child_engine)?
+                .iter()
+                .filter(|r| !(child == table && deleted.contains(&r.pk)))
+                .map(|r| TypedValue::from_bits(fk_type, at(&r.values, fk_idx)).display_str())
+                .find(|v| gone.contains(v));
+            if let Some(v) = still_referenced {
+                return Ok(Some(sql_error(
+                    "23503",
+                    &format!(
+                        "update or delete on table \"{table}\" violates foreign key constraint on table \"{child}\": key ({ref_col})=({v}) is still referenced from {child}.{fk_col}"
+                    ),
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// B7 — the SQL a trigger runs: a stored procedure's statements
+    /// (`CREATE PROCEDURE f AS BEGIN ...; END`) or a function whose body is
+    /// `;`-separated SQL statements.
+    fn trigger_body(&self, func: &str) -> Result<Vec<String>, String> {
+        if let Some(body) = self
+            .procedures
+            .lock_safe()
+            .get(&func.to_ascii_lowercase())
+            .cloned()
+        {
+            return Ok(body);
+        }
+        let Some((_, body)) = self.udfs.lock_safe().get(func).cloned() else {
+            return Err(format!("function {func}() does not exist"));
+        };
+        let stmts: Vec<String> = body
+            .split(';')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Ok(stmts)
+    }
+
+    /// B7 — SQL literal for a cell, for `NEW.col` / `OLD.col` substitution.
+    fn sql_literal(col_type: ColumnType, bits: u64) -> String {
+        let v = TypedValue::from_bits(col_type, bits).display_str();
+        if v.parse::<f64>().is_ok() || v == "true" || v == "false" {
+            v
+        } else {
+            format!("'{}'", v.replace('\'', "''"))
+        }
+    }
+
+    /// B7 — replace `NEW.col` / `OLD.col` in a trigger statement with the
+    /// row's values.
+    fn substitute_row_refs(
+        sql: &str,
+        schema: &TableSchema,
+        new: Option<&[u64]>,
+        old: Option<&[u64]>,
+    ) -> String {
+        let mut cols: Vec<(usize, &ColumnDef)> = schema.columns().iter().enumerate().collect();
+        // Longest names first so NEW.val is not clobbered by NEW.v.
+        cols.sort_by_key(|(_, c)| std::cmp::Reverse(c.name.len()));
+        let mut out = sql.to_owned();
+        for (prefix, vals) in [("NEW.", new), ("OLD.", old)] {
+            let Some(vals) = vals else { continue };
+            for (i, c) in &cols {
+                let lit = Self::sql_literal(c.col_type, vals.get(*i).copied().unwrap_or(0));
+                for p in [prefix.to_owned(), prefix.to_ascii_lowercase()] {
+                    out = out.replace(&format!("{p}{}", c.name), &lit);
+                }
+            }
+        }
+        out
+    }
+
+    /// B7 — validate CREATE TRIGGER: the table must exist and the function
+    /// must resolve to SQL statements the executor can run.
+    fn validate_trigger(&self, def: &TriggerDef) -> Result<(), String> {
+        let engine = self
+            .registry
+            .get(&def.table)
+            .map_err(|_| format!("relation \"{}\" does not exist", def.table))?;
+        let body = self.trigger_body(&def.func)?;
+        if body.is_empty() {
+            return Err(format!("trigger function {}() has an empty body", def.func));
+        }
+        let zeros = vec![0u64; engine.schema.col_count()];
+        let is_proc = self
+            .procedures
+            .lock_safe()
+            .contains_key(&def.func.to_ascii_lowercase());
+        if !is_proc {
+            for stmt in &body {
+                let sql =
+                    Self::substitute_row_refs(stmt, &engine.schema, Some(&zeros), Some(&zeros));
+                let parsed = Lexer::new(&sql)
+                    .tokenize()
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| SqlParser::new(t).parse().map_err(|e| e.to_string()));
+                if let Err(e) = parsed {
+                    return Err(format!(
+                        "function {}() cannot be used as a trigger: its body must be SQL statements ({e})",
+                        def.func
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// B7 — fire `table`'s row triggers for one row. Triggers run their SQL
+    /// through `execute` in this session (same transaction); an error from
+    /// any of them aborts the firing statement. Nesting is capped at
+    /// `MAX_TRIGGER_DEPTH` (SQLSTATE 54001).
+    fn fire_triggers(
+        &self,
+        table: &str,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        schema: &TableSchema,
+        new: Option<&[u64]>,
+        old: Option<&[u64]>,
+    ) -> Result<Option<QueryResult>, ExecError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut defs: Vec<TriggerDef> = self
+            .triggers
+            .lock_safe()
+            .values()
+            .filter(|t| t.table == table && t.timing == timing && t.event == event)
+            .cloned()
+            .collect();
+        if defs.is_empty() {
+            return Ok(None);
+        }
+        // PostgreSQL fires same-kind triggers in name order.
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+
+        struct DepthGuard<'a>(&'a std::sync::atomic::AtomicU32);
+        impl Drop for DepthGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, SeqCst);
+            }
+        }
+        let depth = self.trigger_depth.fetch_add(1, SeqCst);
+        let _depth = DepthGuard(&self.trigger_depth);
+        if depth >= MAX_TRIGGER_DEPTH {
+            return Ok(Some(sql_error(
+                "54001",
+                &format!("trigger nesting depth exceeded (max {MAX_TRIGGER_DEPTH})"),
+            )));
+        }
+        for def in defs {
+            let body = match self.trigger_body(&def.func) {
+                Ok(b) => b,
+                Err(e) => return Ok(Some(sql_error("42883", &e))),
+            };
+            for stmt in body {
+                let sql = Self::substitute_row_refs(&stmt, schema, new, old);
+                if let r @ QueryResult::Error(_) = self.execute(&sql)? {
+                    return Ok(Some(r));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Scan all rows and verify each is still live via `get()`.
     ///
     /// `scan(col=0, 0..MAX)` reads directly from partition files and may return
@@ -14747,6 +15137,7 @@ impl SqlExecutor {
         let mut seen = std::collections::HashSet::new();
         let mut live = Vec::with_capacity(raw.len());
         for row in raw {
+            self.check_deadline()?;
             if !seen.insert(row.pk) {
                 continue;
             }
@@ -14769,14 +15160,16 @@ impl SqlExecutor {
     ) -> Result<Vec<EngineRow>, ExecError> {
         match where_clause {
             None => Ok(rows),
-            Some(expr) => rows
-                .into_iter()
-                .filter_map(|row| match self.eval_expr(expr, &row, schema, table) {
-                    Ok(true) => Some(Ok(row)),
-                    Ok(false) => None,
-                    Err(e) => Some(Err(e)),
-                })
-                .collect(),
+            Some(expr) => {
+                let mut out = Vec::new();
+                for row in rows {
+                    self.check_deadline()?;
+                    if self.eval_expr(expr, &row, schema, table)? {
+                        out.push(row);
+                    }
+                }
+                Ok(out)
+            }
         }
     }
 
@@ -15315,12 +15708,12 @@ impl SqlExecutor {
                     "PG_CANCEL_BACKEND" => Ok("true".to_owned()),
                     // S95 / compat
                     "PG_STAT_STATEMENTS_RESET" => {
-                        self.query_stats.lock().unwrap().clear();
+                        self.query_stats.lock_safe().clear();
                         Ok(String::new())
                     }
                     // S65 â€” UDF dispatch
                     udf_name => {
-                        let maybe_udf = self.udfs.lock().unwrap().get(udf_name).cloned();
+                        let maybe_udf = self.udfs.lock_safe().get(udf_name).cloned();
                         if let Some((param, body)) = maybe_udf {
                             let arg_val = vals.first().cloned().unwrap_or_default();
                             // Simple substitution: replace param occurrences in body
@@ -15454,7 +15847,7 @@ impl SqlExecutor {
     fn exec_explain_buffers(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
         let table_name = stmt.table.clone();
         // Check cache for hit/miss
-        let cache_hit = self.query_cache.lock().unwrap().contains_key(&table_name);
+        let cache_hit = self.query_cache.lock_safe().contains_key(&table_name);
         let buffers_hit = if cache_hit { 1u64 } else { 0u64 };
         let buffers_miss = if cache_hit { 0u64 } else { 1u64 };
         // Get plan
@@ -15537,8 +15930,7 @@ impl SqlExecutor {
             "\\dv" => {
                 let views: Vec<Vec<String>> = self
                     .views
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .keys()
                     .map(|k| vec![k.clone(), "view".to_owned()])
                     .collect();
@@ -15555,13 +15947,13 @@ impl SqlExecutor {
                 Ok(QueryResult::Rows { columns, rows })
             }
             "\\timing" => {
-                let mut t = self.timing_enabled.lock().unwrap();
+                let mut t = self.timing_enabled.lock_safe();
                 *t = !*t;
                 let state = if *t { "on" } else { "off" };
                 Ok(QueryResult::Ok(format!("Timing is {}", state)))
             }
             "\\x" => {
-                let mut e = self.expanded_mode.lock().unwrap();
+                let mut e = self.expanded_mode.lock_safe();
                 *e = !*e;
                 let state = if *e { "on" } else { "off" };
                 Ok(QueryResult::Ok(format!("Expanded display is {}", state)))
@@ -15589,15 +15981,14 @@ impl SqlExecutor {
             _ => vec![],
         };
         self.cursors
-            .lock()
-            .unwrap()
+            .lock_safe()
             .insert(name, CursorState { rows, pos: 0 });
         Ok(QueryResult::Affected(0))
     }
 
     // S103 â€” FETCH FROM cursor
     fn exec_fetch_cursor(&self, name: &str, count: u64) -> Result<QueryResult, ExecError> {
-        let mut guard = self.cursors.lock().unwrap();
+        let mut guard = self.cursors.lock_safe();
         let state = guard
             .get_mut(name)
             .ok_or_else(|| ExecError::Engine(format!("cursor {} not found", name)))?;
@@ -15623,7 +16014,7 @@ impl SqlExecutor {
 
     // S103 â€” CLOSE cursor
     fn exec_close_cursor(&self, name: &str) -> Result<QueryResult, ExecError> {
-        self.cursors.lock().unwrap().remove(name);
+        self.cursors.lock_safe().remove(name);
         Ok(QueryResult::Affected(0))
     }
 
@@ -15634,23 +16025,27 @@ impl SqlExecutor {
         param: String,
         body: String,
     ) -> Result<QueryResult, ExecError> {
-        self.udfs.lock().unwrap().insert(name, (param, body));
+        self.udfs.lock_safe().insert(name, (param, body));
         Ok(QueryResult::Created)
     }
 
     fn exec_drop_function(&self, name: String) -> Result<QueryResult, ExecError> {
-        self.udfs.lock().unwrap().remove(&name);
+        self.udfs.lock_safe().remove(&name);
         Ok(QueryResult::Dropped)
     }
 
     // S66 â€” Triggers
     fn exec_create_trigger(&self, def: TriggerDef) -> Result<QueryResult, ExecError> {
-        self.triggers.lock().unwrap().insert(def.name.clone(), def);
+        // B7 — only store triggers that can actually fire.
+        if let Err(e) = self.validate_trigger(&def) {
+            return Ok(sql_error("0A000", &e));
+        }
+        self.triggers.lock_safe().insert(def.name.clone(), def);
         Ok(QueryResult::Created)
     }
 
     fn exec_drop_trigger(&self, name: String) -> Result<QueryResult, ExecError> {
-        self.triggers.lock().unwrap().remove(&name);
+        self.triggers.lock_safe().remove(&name);
         Ok(QueryResult::Dropped)
     }
 
@@ -15802,13 +16197,13 @@ impl SqlExecutor {
             QueryResult::Rows { rows, .. } => rows,
             _ => vec![],
         };
-        self.mat_views.lock().unwrap().insert(name, (select, rows));
+        self.mat_views.lock_safe().insert(name, (select, rows));
         Ok(QueryResult::Created)
     }
 
     fn exec_refresh_mat_view(&self, name: String) -> Result<QueryResult, ExecError> {
         let select = {
-            let guard = self.mat_views.lock().unwrap();
+            let guard = self.mat_views.lock_safe();
             guard.get(&name).map(|(s, _)| s.clone())
         };
         if let Some(select) = select {
@@ -15817,7 +16212,7 @@ impl SqlExecutor {
                 QueryResult::Rows { rows, .. } => rows,
                 _ => vec![],
             };
-            self.mat_views.lock().unwrap().insert(name, (select, rows));
+            self.mat_views.lock_safe().insert(name, (select, rows));
             Ok(QueryResult::Affected(0))
         } else {
             Err(ExecError::TableNotFound(name))
@@ -15825,43 +16220,72 @@ impl SqlExecutor {
     }
 
     fn exec_drop_mat_view(&self, name: String) -> Result<QueryResult, ExecError> {
-        self.mat_views.lock().unwrap().remove(&name);
-        self.views.lock().unwrap().remove(&name);
+        self.mat_views.lock_safe().remove(&name);
+        self.views.lock_safe().remove(&name);
         Ok(QueryResult::Dropped)
     }
 
     // S53 â€” Savepoints
     fn exec_savepoint(&self, name: String) -> Result<QueryResult, ExecError> {
-        let guard = self.txn.lock().unwrap();
-        let snapshot = guard.as_ref().cloned().unwrap_or_default();
-        drop(guard);
-        self.savepoints.lock().unwrap().insert(name, snapshot);
+        // B9 — snapshot every touched table's staged write set, so ROLLBACK
+        // TO can restore it exactly (including later changes to tables the
+        // transaction had already touched before the savepoint).
+        let current = self.txn.lock_safe().clone().unwrap_or_default();
+        let mut snapshot = SavepointSnap::new();
+        for (table, txn_id) in current {
+            let engine = self
+                .registry
+                .get(&table)
+                .map_err(|_| ExecError::TableNotFound(table.clone()))?;
+            let ops = engine
+                .txn_write_set(txn_id)
+                .map_err(|e| ExecError::Engine(e.to_string()))?;
+            snapshot.insert(table, ops);
+        }
+        self.savepoints.lock_safe().insert(name, snapshot);
         Ok(QueryResult::TxBegin)
     }
 
     fn exec_release_savepoint(&self, name: String) -> Result<QueryResult, ExecError> {
-        self.savepoints.lock().unwrap().remove(&name);
+        self.savepoints.lock_safe().remove(&name);
         Ok(QueryResult::TxCommit)
     }
 
     fn exec_rollback_to(&self, name: String) -> Result<QueryResult, ExecError> {
-        let sp = self
-            .savepoints
-            .lock()
-            .unwrap()
-            .get(&name)
-            .cloned()
-            .unwrap_or_default();
-        // Rollback tables that were opened after the savepoint
-        let current = self.txn.lock().unwrap().clone().unwrap_or_default();
+        let Some(current) = self.txn.lock_safe().clone() else {
+            return Ok(sql_error(
+                "25P01",
+                "ROLLBACK TO SAVEPOINT can only be used in transaction blocks",
+            ));
+        };
+        let Some(sp) = self.savepoints.lock_safe().get(&name).cloned() else {
+            return Ok(sql_error(
+                "3B001",
+                &format!("savepoint \"{name}\" does not exist"),
+            ));
+        };
+        // B9 — discard every table's staged writes and replay the write set
+        // recorded at SAVEPOINT time into a fresh per-table txn. Tables first
+        // touched after the savepoint simply drop out of the transaction.
+        let mut restored = TxnMap::new();
         for (table, txn_id) in &current {
-            if !sp.contains_key(table)
-                && let Ok(engine) = self.registry.get(table)
-            {
-                let _ = engine.rollback_txn(*txn_id);
+            let Ok(engine) = self.registry.get(table) else {
+                continue;
+            };
+            let _ = engine.rollback_txn(*txn_id);
+            if let Some(ops) = sp.get(table) {
+                let id = engine.begin();
+                for (pk, op) in ops {
+                    match op {
+                        Some(values) => engine.insert_txn(id, *pk, values.clone()),
+                        None => engine.delete_txn(id, *pk),
+                    }
+                    .map_err(|e| ExecError::Engine(e.to_string()))?;
+                }
+                restored.insert(table.clone(), id);
             }
         }
-        *self.txn.lock().unwrap() = Some(sp);
+        *self.txn.lock_safe() = Some(restored);
         Ok(QueryResult::TxRollback)
     }
 
@@ -15886,7 +16310,7 @@ impl SqlExecutor {
 
     // S57 â€” Prepared statements
     fn exec_prepare(&self, name: String, stmt: Stmt) -> Result<QueryResult, ExecError> {
-        self.prepared.lock().unwrap().insert(name, stmt);
+        self.prepared.lock_safe().insert(name, stmt);
         Ok(QueryResult::Affected(0))
     }
 
@@ -15897,8 +16321,7 @@ impl SqlExecutor {
     ) -> Result<QueryResult, ExecError> {
         let stmt = self
             .prepared
-            .lock()
-            .unwrap()
+            .lock_safe()
             .get(&name)
             .cloned()
             .ok_or_else(|| ExecError::Engine(format!("prepared statement '{}' not found", name)))?;
@@ -15910,22 +16333,20 @@ impl SqlExecutor {
     pub fn pgwire_parse(&self, name: &str, sql: &str) -> Result<(), ExecError> {
         let tokens = Lexer::new(sql).tokenize()?;
         let stmt = SqlParser::new(tokens).parse()?;
-        self.prepared.lock().unwrap().insert(name.to_owned(), stmt);
+        self.prepared.lock_safe().insert(name.to_owned(), stmt);
         Ok(())
     }
 
     pub fn pgwire_bind(&self, portal: &str, stmt_name: &str, params: Vec<LitVal>) {
         self.bound_portals
-            .lock()
-            .unwrap()
+            .lock_safe()
             .insert(portal.to_owned(), (stmt_name.to_owned(), params));
     }
 
     pub fn pgwire_execute_portal(&self, portal: &str) -> Result<QueryResult, ExecError> {
         let (stmt_name, params) = self
             .bound_portals
-            .lock()
-            .unwrap()
+            .lock_safe()
             .get(portal)
             .cloned()
             .ok_or_else(|| ExecError::Engine(format!("portal '{}' not bound", portal)))?;
@@ -15934,7 +16355,7 @@ impl SqlExecutor {
     }
 
     pub fn pgwire_describe(&self, stmt_name: &str) -> Vec<String> {
-        let stmt_opt = self.prepared.lock().unwrap().get(stmt_name).cloned();
+        let stmt_opt = self.prepared.lock_safe().get(stmt_name).cloned();
         match stmt_opt {
             Some(Stmt::Select(s)) => s
                 .columns
@@ -15957,7 +16378,7 @@ impl SqlExecutor {
 
     // S83 â€” check whether a client IP is allowed
     pub fn check_ip_allowed(&self, client_ip: &str) -> bool {
-        let ips = self.allowed_ips.lock().unwrap();
+        let ips = self.allowed_ips.lock_safe();
         if ips.is_empty() {
             true
         } else {
@@ -16092,45 +16513,6 @@ fn like_match(val: &str, pattern: &str) -> bool {
     val == pattern
 }
 
-// S59 â€” simple check constraint evaluator
-fn eval_check(expr: &str, col: &str, val: &str) -> bool {
-    // Parse simple expressions like "col > 0", "col >= 18", "col < 100"
-    let expr = expr.trim();
-    let ops = [
-        (">=", "gte"),
-        ("<=", "lte"),
-        ("<>", "neq"),
-        (">", "gt"),
-        ("<", "lt"),
-        ("=", "eq"),
-    ];
-    for (op_str, _) in &ops {
-        if let Some(rhs) = expr.split(op_str).nth(1) {
-            let rhs = rhs.trim().trim_matches('\'');
-            let lhs_part = expr.split(op_str).next().unwrap_or("").trim();
-            if lhs_part.eq_ignore_ascii_case(col) || lhs_part == col {
-                if let (Ok(l), Ok(r)) = (val.parse::<f64>(), rhs.parse::<f64>()) {
-                    return match *op_str {
-                        ">=" => l >= r,
-                        "<=" => l <= r,
-                        "<>" => (l - r).abs() >= f64::EPSILON,
-                        ">" => l > r,
-                        "<" => l < r,
-                        "=" => (l - r).abs() < f64::EPSILON,
-                        _ => true,
-                    };
-                }
-                return match *op_str {
-                    "<>" => val != rhs,
-                    "=" => val == rhs,
-                    _ => true,
-                };
-            }
-        }
-    }
-    true // unknown expression â†’ pass
-}
-
 // S63 â€” simple JSON key extraction
 fn json_extract(json: &str, key: &str) -> String {
     // Find "key": value pattern
@@ -16192,7 +16574,7 @@ impl SqlExecutor {
     // S109 â€” graceful shutdown
     fn exec_shutdown_graceful(&self) -> Result<QueryResult, ExecError> {
         // Flush WAL: write audit_log JSON to file
-        let log = self.audit_log.lock().unwrap().clone();
+        let log = self.audit_log.lock_safe().clone();
         let log_json: String = log
             .iter()
             .map(|e| {
@@ -16211,7 +16593,7 @@ impl SqlExecutor {
 
     // S114 â€” VACUUM
     fn exec_vacuum(&self, table: String, analyze: bool) -> Result<QueryResult, ExecError> {
-        let dead = self.dead_rows.lock().unwrap().remove(&table).unwrap_or(0);
+        let dead = self.dead_rows.lock_safe().remove(&table).unwrap_or(0);
         if analyze {
             // Also run analyze
             self.exec_analyze(table.clone())?;
@@ -16270,7 +16652,7 @@ impl SqlExecutor {
             }
             col_stats.insert(col_name.clone(), stat);
         }
-        self.table_stats.lock().unwrap().insert(table, col_stats);
+        self.table_stats.lock_safe().insert(table, col_stats);
         Ok(QueryResult::Affected(0))
     }
 }
@@ -18788,9 +19170,13 @@ mod tests {
     fn test_s53_rollback_to_no_savepoint() {
         let (ex, _dir) = setup();
         ex.execute("BEGIN").unwrap();
-        // Rolling back to non-existent savepoint uses empty map â€” OK
-        let r = ex.execute("ROLLBACK TO SAVEPOINT ghost");
-        assert!(r.is_ok(), "{r:?}");
+        // B9 — an unknown savepoint is SQLSTATE 3B001 (it used to silently
+        // discard every staged write).
+        let r = ex.execute("ROLLBACK TO SAVEPOINT ghost").unwrap();
+        assert!(
+            matches!(&r, QueryResult::Error(e) if e.starts_with("[3B001]")),
+            "{r:?}"
+        );
         // Need to clean up â€” begin a fresh txn won't work since we reset
         // Just verify it completed
     }
@@ -19187,8 +19573,14 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE cf (pk U64, age U64 CHECK (age > 18 ))")
             .unwrap();
-        let r = ex.execute("INSERT INTO cf (pk, age) VALUES (1, 5)");
-        assert!(r.is_err());
+        // B5 — a violation is SQLSTATE 23514 naming the column.
+        let r = ex
+            .execute("INSERT INTO cf (pk, age) VALUES (1, 5)")
+            .unwrap();
+        assert!(
+            matches!(&r, QueryResult::Error(e) if e.starts_with("[23514]") && e.contains("age")),
+            "{r:?}"
+        );
     }
 
     #[test]
@@ -19213,7 +19605,8 @@ mod tests {
             .unwrap();
         ex.execute("INSERT INTO cu (pk, score) VALUES (1, 10)")
             .unwrap();
-        // Update is not re-checked in this MVP, just verify data is intact
+        // B5 — UPDATE is re-checked (was "not re-checked in this MVP").
+        ex.execute("UPDATE cu SET score = 20 WHERE pk = 1").unwrap();
         let r = ex.execute("SELECT score FROM cu WHERE pk = 1").unwrap();
         assert!(matches!(r, QueryResult::Rows { .. }));
     }
@@ -19239,8 +19632,14 @@ mod tests {
             "CREATE TABLE chi2 (pk U64, par_id U64, FOREIGN KEY (par_id) REFERENCES par2 (pk))",
         )
         .unwrap();
-        let r = ex.execute("INSERT INTO chi2 (pk, par_id) VALUES (1, 999)");
-        assert!(r.is_err());
+        // B6 — a missing parent is SQLSTATE 23503.
+        let r = ex
+            .execute("INSERT INTO chi2 (pk, par_id) VALUES (1, 999)")
+            .unwrap();
+        assert!(
+            matches!(&r, QueryResult::Error(e) if e.starts_with("[23503]")),
+            "{r:?}"
+        );
     }
 
     #[test]
@@ -19641,7 +20040,7 @@ mod tests {
         // so exec_commit's own commit_txn call on it later returns
         // TxnNotFound.
         let forced_table = {
-            let guard = ex.txn.lock().unwrap();
+            let guard = ex.txn.lock_safe();
             let map = guard.as_ref().unwrap();
             if map.contains_key("p3d") {
                 "p3d"
@@ -19650,7 +20049,7 @@ mod tests {
             }
         };
         let txn_id = {
-            let guard = ex.txn.lock().unwrap();
+            let guard = ex.txn.lock_safe();
             *guard.as_ref().unwrap().get(forced_table).unwrap()
         };
         registry
@@ -19957,7 +20356,7 @@ mod tests {
         ex.execute("CREATE FUNCTION greet(name) RETURNS TEXT AS 'Hello name'")
             .unwrap();
         // UDF is registered; calling it as StrFunc dispatches body substitution
-        let has_udf = ex.udfs.lock().unwrap().contains_key("greet");
+        let has_udf = ex.udfs.lock_safe().contains_key("greet");
         assert!(has_udf);
     }
 
@@ -19968,7 +20367,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("DROP FUNCTION tmp");
         assert!(r.is_ok(), "{r:?}");
-        assert!(!ex.udfs.lock().unwrap().contains_key("tmp"));
+        assert!(!ex.udfs.lock_safe().contains_key("tmp"));
     }
 
     // â”€â”€ S66 â€” Triggers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -19976,19 +20375,25 @@ mod tests {
     fn test_s66_create_trigger() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE trig_t (pk U64, v U64)").unwrap();
-        ex.execute("CREATE FUNCTION log_it(row) RETURNS VOID AS 'row'")
+        ex.execute("CREATE TABLE trig_log (pk U64)").unwrap();
+        ex.execute(
+            "CREATE PROCEDURE log_it AS BEGIN INSERT INTO trig_log (pk) VALUES (NEW.pk); END",
+        )
+        .unwrap();
+        let r = ex
+            .execute(
+                "CREATE TRIGGER trig1 AFTER INSERT ON trig_t FOR EACH ROW EXECUTE FUNCTION log_it()",
+            )
             .unwrap();
-        let r = ex.execute(
-            "CREATE TRIGGER trig1 AFTER INSERT ON trig_t FOR EACH ROW EXECUTE FUNCTION log_it()",
-        );
-        assert!(r.is_ok(), "{r:?}");
+        assert!(matches!(r, QueryResult::Created), "{r:?}");
     }
 
     #[test]
     fn test_s66_trigger_fires_on_insert() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE tri2 (pk U64, v U64)").unwrap();
-        ex.execute("CREATE FUNCTION noop(r) RETURNS VOID AS 'r'")
+        ex.execute("CREATE TABLE tri2_log (pk U64)").unwrap();
+        ex.execute("CREATE PROCEDURE noop AS BEGIN INSERT INTO tri2_log (pk) VALUES (NEW.pk); END")
             .unwrap();
         ex.execute("CREATE TRIGGER t2 AFTER INSERT ON tri2 FOR EACH ROW EXECUTE FUNCTION noop()")
             .unwrap();
@@ -20000,24 +20405,25 @@ mod tests {
     fn test_s66_trigger_before_insert() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE tri3 (pk U64)").unwrap();
-        ex.execute("CREATE FUNCTION chk(r) RETURNS VOID AS 'r'")
+        ex.execute("CREATE PROCEDURE chk AS BEGIN SELECT * FROM tri3; END")
             .unwrap();
         let r = ex
-            .execute("CREATE TRIGGER t3 BEFORE INSERT ON tri3 FOR EACH ROW EXECUTE FUNCTION chk()");
-        assert!(r.is_ok(), "{r:?}");
+            .execute("CREATE TRIGGER t3 BEFORE INSERT ON tri3 FOR EACH ROW EXECUTE FUNCTION chk()")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Created), "{r:?}");
     }
 
     #[test]
     fn test_s66_drop_trigger() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE tri4 (pk U64)").unwrap();
-        ex.execute("CREATE FUNCTION f4(r) RETURNS VOID AS 'r'")
+        ex.execute("CREATE PROCEDURE f4 AS BEGIN SELECT * FROM tri4; END")
             .unwrap();
         ex.execute("CREATE TRIGGER t4 AFTER DELETE ON tri4 FOR EACH ROW EXECUTE FUNCTION f4()")
             .unwrap();
         let r = ex.execute("DROP TRIGGER t4");
         assert!(r.is_ok(), "{r:?}");
-        assert!(!ex.triggers.lock().unwrap().contains_key("t4"));
+        assert!(!ex.triggers.lock_safe().contains_key("t4"));
     }
 
     #[test]
@@ -20025,15 +20431,15 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE ta (pk U64)").unwrap();
         ex.execute("CREATE TABLE tb2 (pk U64)").unwrap();
-        ex.execute("CREATE FUNCTION f_a(r) RETURNS VOID AS 'r'")
+        ex.execute("CREATE PROCEDURE f_a AS BEGIN SELECT * FROM ta; END")
             .unwrap();
-        ex.execute("CREATE FUNCTION f_b(r) RETURNS VOID AS 'r'")
+        ex.execute("CREATE PROCEDURE f_b AS BEGIN SELECT * FROM tb2; END")
             .unwrap();
         ex.execute("CREATE TRIGGER trig_a AFTER INSERT ON ta FOR EACH ROW EXECUTE FUNCTION f_a()")
             .unwrap();
         ex.execute("CREATE TRIGGER trig_b AFTER INSERT ON tb2 FOR EACH ROW EXECUTE FUNCTION f_b()")
             .unwrap();
-        assert_eq!(ex.triggers.lock().unwrap().len(), 2);
+        assert_eq!(ex.triggers.lock_safe().len(), 2);
     }
 
     // â”€â”€ S67 â€” Index Hints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -20965,7 +21371,7 @@ mod tests {
             let r = ex.execute(bad);
             assert!(!matches!(r, Ok(QueryResult::Created)), "{bad}: {r:?}");
         }
-        assert!(ex.policies.lock().unwrap().is_empty());
+        assert!(ex.policies.lock_safe().is_empty());
         assert!(
             ex.execute("CREATE POLICY p3 ON missing USING (val > 5)")
                 .is_err()
@@ -21068,7 +21474,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 42)")
             .unwrap();
-        let log = ex.audit_log.lock().unwrap();
+        let log = ex.audit_log.lock_safe();
         assert!(log.iter().any(|e| e.op == "INSERT"));
     }
 
@@ -21078,7 +21484,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 1)").unwrap();
         ex.execute("UPDATE t SET val = 2 WHERE pk = 1").unwrap();
-        let log = ex.audit_log.lock().unwrap();
+        let log = ex.audit_log.lock_safe();
         assert!(log.iter().any(|e| e.op == "UPDATE"));
     }
 
@@ -21088,7 +21494,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 1)").unwrap();
         ex.execute("DELETE FROM t WHERE pk = 1").unwrap();
-        let log = ex.audit_log.lock().unwrap();
+        let log = ex.audit_log.lock_safe();
         assert!(log.iter().any(|e| e.op == "DELETE"));
     }
 
@@ -21107,7 +21513,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 1)").unwrap();
         ex.execute("TRUNCATE AUDIT LOG").unwrap();
-        let log = ex.audit_log.lock().unwrap();
+        let log = ex.audit_log.lock_safe();
         assert!(log.is_empty());
     }
 
@@ -21116,7 +21522,7 @@ mod tests {
     fn test_s81_set_token() {
         let (ex, _dir) = setup();
         ex.execute("SET SESSION TOKEN 'secret123'").unwrap();
-        let tok = ex.session_token.lock().unwrap().clone();
+        let tok = ex.session_token.lock_safe().clone();
         assert_eq!(tok, Some("secret123".to_owned()));
     }
 
@@ -21326,7 +21732,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("ROTATE TLS CERT '/path/cert.pem' KEY '/path/key.pem'")
             .unwrap();
-        let cert = ex.tls_cert_path.lock().unwrap().clone();
+        let cert = ex.tls_cert_path.lock_safe().clone();
         assert_eq!(cert, Some("/path/cert.pem".to_owned()));
     }
 
@@ -21334,7 +21740,7 @@ mod tests {
     fn test_s84_cert_key_stored() {
         let (ex, _dir) = setup();
         ex.execute("ROTATE TLS CERT '/c.pem' KEY '/k.pem'").unwrap();
-        let key = ex.tls_key_path.lock().unwrap().clone();
+        let key = ex.tls_key_path.lock_safe().clone();
         assert_eq!(key, Some("/k.pem".to_owned()));
     }
 
@@ -21345,7 +21751,7 @@ mod tests {
             .unwrap();
         ex.execute("ROTATE TLS CERT '/new.pem' KEY '/new_key.pem'")
             .unwrap();
-        let cert = ex.tls_cert_path.lock().unwrap().clone();
+        let cert = ex.tls_cert_path.lock_safe().clone();
         assert_eq!(cert, Some("/new.pem".to_owned()));
     }
 
@@ -21372,7 +21778,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.pgwire_parse("s1", "SELECT * FROM t").ok();
         ex.pgwire_bind("p1", "s1", vec![LitVal::Int(1)]);
-        let portals = ex.bound_portals.lock().unwrap();
+        let portals = ex.bound_portals.lock_safe();
         assert!(portals.contains_key("p1"));
     }
 
@@ -21493,14 +21899,14 @@ mod tests {
     fn test_s87_set_warnings_off() {
         let (ex, _dir) = setup();
         ex.execute("SET WARNINGS OFF").unwrap();
-        let warnings_on = *ex.warnings_enabled.lock().unwrap();
+        let warnings_on = *ex.warnings_enabled.lock_safe();
         assert!(!warnings_on);
     }
 
     #[test]
     fn test_s87_warnings_on_by_default() {
         let (ex, _dir) = setup();
-        let warnings_on = *ex.warnings_enabled.lock().unwrap();
+        let warnings_on = *ex.warnings_enabled.lock_safe();
         assert!(!warnings_on); // warnings off by default; enable with SET WARNINGS ON
     }
 
@@ -21519,7 +21925,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("CREATE REPLICATION SLOT myslot").unwrap();
         assert!(matches!(r, QueryResult::Created));
-        let guard = ex.replication_slots.lock().unwrap();
+        let guard = ex.replication_slots.lock_safe();
         assert!(guard.contains_key("myslot"));
     }
 
@@ -21529,7 +21935,7 @@ mod tests {
         ex.execute("CREATE REPLICATION SLOT myslot").unwrap();
         let r = ex.execute("DROP REPLICATION SLOT myslot").unwrap();
         assert!(matches!(r, QueryResult::Dropped));
-        let guard = ex.replication_slots.lock().unwrap();
+        let guard = ex.replication_slots.lock_safe();
         assert!(!guard.contains_key("myslot"));
     }
 
@@ -21538,7 +21944,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE REPLICATION SLOT tmpslot TEMPORARY")
             .unwrap();
-        let guard = ex.replication_slots.lock().unwrap();
+        let guard = ex.replication_slots.lock_safe();
         assert!(guard.get("tmpslot").unwrap().temporary);
     }
 
@@ -21636,7 +22042,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("SET READ ONLY").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert!(*ex.read_only.lock().unwrap());
+        assert!(*ex.read_only.lock_safe());
     }
 
     #[test]
@@ -21703,7 +22109,7 @@ mod tests {
         ex.execute("SET READ ONLY").unwrap();
         let r = ex.execute("SET READ WRITE").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert!(!*ex.read_only.lock().unwrap());
+        assert!(!*ex.read_only.lock_safe());
     }
 
     #[test]
@@ -21724,7 +22130,7 @@ mod tests {
         ex.execute("SET READ ONLY").unwrap();
         let r = ex.execute("PROMOTE STANDBY").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(!*ex.read_only.lock().unwrap());
+        assert!(!*ex.read_only.lock_safe());
     }
 
     #[test]
@@ -21732,7 +22138,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("DEMOTE PRIMARY").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(*ex.read_only.lock().unwrap());
+        assert!(*ex.read_only.lock_safe());
     }
 
     #[test]
@@ -21760,9 +22166,9 @@ mod tests {
         ex.execute("DEMOTE PRIMARY").unwrap();
         ex.execute("PROMOTE STANDBY").unwrap();
         ex.execute("DEMOTE PRIMARY").unwrap();
-        assert!(*ex.read_only.lock().unwrap());
+        assert!(*ex.read_only.lock_safe());
         ex.execute("PROMOTE STANDBY").unwrap();
-        assert!(!*ex.read_only.lock().unwrap());
+        assert!(!*ex.read_only.lock_safe());
     }
 
     // â”€â”€ S92 â€” WAL archiving â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -21772,7 +22178,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("SET ARCHIVE PATH '/tmp/vv_wal_test'").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        let path = ex.archive_path.lock().unwrap().clone();
+        let path = ex.archive_path.lock_safe().clone();
         assert_eq!(path, Some("/tmp/vv_wal_test".to_owned()));
     }
 
@@ -21820,7 +22226,7 @@ mod tests {
         ex.execute(&format!("SET ARCHIVE PATH '{}'", path)).unwrap();
         ex.execute("ARCHIVE NOW").unwrap();
         ex.execute("ARCHIVE NOW").unwrap();
-        let count = *ex.archive_count.lock().unwrap();
+        let count = *ex.archive_count.lock_safe();
         assert_eq!(count, 2);
     }
 
@@ -21831,7 +22237,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("SET SLOW_QUERY_THRESHOLD 100").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        let t = *ex.slow_query_threshold_ms.lock().unwrap();
+        let t = *ex.slow_query_threshold_ms.lock_safe();
         assert_eq!(t, Some(100));
     }
 
@@ -21842,7 +22248,7 @@ mod tests {
         ex.execute("SET SLOW_QUERY_THRESHOLD 0").unwrap();
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         ex.execute("SELECT * FROM t").unwrap();
-        let log = ex.slow_log.lock().unwrap();
+        let log = ex.slow_log.lock_safe();
         assert!(!log.is_empty());
     }
 
@@ -21853,7 +22259,7 @@ mod tests {
         ex.execute("SET SLOW_QUERY_THRESHOLD 99999999").unwrap();
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         ex.execute("SELECT * FROM t").unwrap();
-        let log = ex.slow_log.lock().unwrap();
+        let log = ex.slow_log.lock_safe();
         // None of these should exceed 99999999ms
         assert!(log.is_empty());
     }
@@ -21881,7 +22287,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         ex.execute("SELECT * FROM t").unwrap();
         ex.execute("TRUNCATE SLOW LOG").unwrap();
-        let log = ex.slow_log.lock().unwrap();
+        let log = ex.slow_log.lock_safe();
         assert!(log.is_empty());
     }
 
@@ -22004,7 +22410,7 @@ mod tests {
             .execute("SELECT pg_stat_statements_reset() FROM t")
             .unwrap();
         assert!(matches!(r, QueryResult::Rows { .. }));
-        let stats = ex.query_stats.lock().unwrap();
+        let stats = ex.query_stats.lock_safe();
         assert!(stats.is_empty());
     }
 
@@ -22033,7 +22439,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("SET AUTO_EXPLAIN_THRESHOLD 50").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        let t = *ex.auto_explain_threshold_ms.lock().unwrap();
+        let t = *ex.auto_explain_threshold_ms.lock_safe();
         assert_eq!(t, Some(50));
     }
 
@@ -22104,7 +22510,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         ex.execute("SELECT * FROM t").unwrap();
-        let events = ex.wait_events.lock().unwrap();
+        let events = ex.wait_events.lock_safe();
         assert!(!events.is_empty());
     }
 
@@ -22130,7 +22536,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         ex.execute("SELECT * FROM t").unwrap();
         ex.execute("RESET WAIT EVENTS").unwrap();
-        let events = ex.wait_events.lock().unwrap();
+        let events = ex.wait_events.lock_safe();
         assert!(events.is_empty());
     }
 
@@ -22140,7 +22546,7 @@ mod tests {
         ex.execute("RESET WAIT EVENTS").unwrap();
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         ex.execute("SELECT * FROM t").unwrap();
-        let events = ex.wait_events.lock().unwrap();
+        let events = ex.wait_events.lock_safe();
         // Each execute() call records a wait event
         assert!(!events.is_empty());
     }
@@ -22388,10 +22794,10 @@ mod tests {
     fn test_s102_timing_toggle() {
         let (ex, _dir) = setup();
         ex.execute("\\timing").unwrap(); // on
-        let enabled = *ex.timing_enabled.lock().unwrap();
+        let enabled = *ex.timing_enabled.lock_safe();
         assert!(enabled);
         ex.execute("\\timing").unwrap(); // off
-        let enabled2 = *ex.timing_enabled.lock().unwrap();
+        let enabled2 = *ex.timing_enabled.lock_safe();
         assert!(!enabled2);
     }
 
@@ -22406,7 +22812,7 @@ mod tests {
             .execute("DECLARE cur CURSOR FOR SELECT * FROM t")
             .unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert!(ex.cursors.lock().unwrap().contains_key("cur"));
+        assert!(ex.cursors.lock_safe().contains_key("cur"));
     }
 
     #[test]
@@ -22445,7 +22851,7 @@ mod tests {
         ex.execute("DECLARE cur CURSOR FOR SELECT * FROM t")
             .unwrap();
         ex.execute("CLOSE cur").unwrap();
-        assert!(!ex.cursors.lock().unwrap().contains_key("cur"));
+        assert!(!ex.cursors.lock_safe().contains_key("cur"));
     }
 
     #[test]
@@ -22576,7 +22982,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("SET STATEMENT_TIMEOUT 5000").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        let ms = *ex.statement_timeout_ms.lock().unwrap();
+        let ms = *ex.statement_timeout_ms.lock_safe();
         assert_eq!(ms, Some(5000));
     }
 
@@ -22718,7 +23124,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("CREATE DATABASE mydb").unwrap();
         assert!(matches!(r, QueryResult::Created));
-        assert!(ex.databases.lock().unwrap().contains("mydb"));
+        assert!(ex.databases.lock_safe().contains("mydb"));
     }
 
     #[test]
@@ -22735,7 +23141,7 @@ mod tests {
         ex.execute("CREATE DATABASE mydb").unwrap();
         let r = ex.execute("USE mydb").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert_eq!(*ex.current_db.lock().unwrap(), "mydb");
+        assert_eq!(*ex.current_db.lock_safe(), "mydb");
     }
 
     #[test]
@@ -22754,8 +23160,8 @@ mod tests {
     #[test]
     fn test_s110_default_database() {
         let (ex, _dir) = setup();
-        assert_eq!(*ex.current_db.lock().unwrap(), "vectorvolt");
-        assert!(ex.databases.lock().unwrap().contains("vectorvolt"));
+        assert_eq!(*ex.current_db.lock_safe(), "vectorvolt");
+        assert!(ex.databases.lock_safe().contains("vectorvolt"));
     }
 
     // S111 â€” schema namespacing
@@ -22780,7 +23186,7 @@ mod tests {
         ex.execute("CREATE SCHEMA myschema").unwrap();
         let r = ex.execute("SET search_path TO myschema").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert_eq!(*ex.search_path.lock().unwrap(), "myschema");
+        assert_eq!(*ex.search_path.lock_safe(), "myschema");
     }
 
     #[test]
@@ -22851,7 +23257,7 @@ mod tests {
         ex.execute("CREATE TABLE events (pk U64, ts TEXT) PARTITION BY RANGE (ts)")
             .unwrap();
         ex.execute("CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')").unwrap();
-        let guard = ex.partitions.lock().unwrap();
+        let guard = ex.partitions.lock_safe();
         assert!(guard.contains_key("events_2024"));
     }
 
@@ -22945,7 +23351,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64)").unwrap();
         ex.execute("INSERT INTO t (pk) VALUES (1)").unwrap();
         ex.execute("DELETE FROM t WHERE pk = 1").unwrap();
-        let dead = *ex.dead_rows.lock().unwrap().get("t").unwrap_or(&0);
+        let dead = *ex.dead_rows.lock_safe().get("t").unwrap_or(&0);
         assert_eq!(dead, 1);
     }
 
@@ -22988,7 +23394,7 @@ mod tests {
         ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
         ex.execute("INSERT INTO t (pk, v) VALUES (2, 20)").unwrap();
         ex.execute("ANALYZE t").unwrap();
-        let stats = ex.table_stats.lock().unwrap();
+        let stats = ex.table_stats.lock_safe();
         let col_stats = stats.get("t").unwrap();
         let pk_stat = col_stats.get("pk").unwrap();
         assert_eq!(pk_stat.row_count, 2);
@@ -23001,7 +23407,7 @@ mod tests {
         ex.execute("INSERT INTO t (pk) VALUES (1)").unwrap();
         ex.execute("INSERT INTO t (pk) VALUES (2)").unwrap();
         ex.execute("ANALYZE t").unwrap();
-        let stats = ex.table_stats.lock().unwrap();
+        let stats = ex.table_stats.lock_safe();
         let pk_stat = stats.get("t").unwrap().get("pk").unwrap();
         assert!(pk_stat.distinct_count >= 1);
     }
@@ -23022,7 +23428,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         ex.execute("INSERT INTO t (pk, v) VALUES (1, 10)").unwrap();
         ex.execute("ANALYZE t").unwrap();
-        let stats = ex.table_stats.lock().unwrap();
+        let stats = ex.table_stats.lock_safe();
         let col_stats = stats.get("t").unwrap();
         assert!(col_stats.contains_key("pk"));
         assert!(col_stats.contains_key("v"));
@@ -23034,7 +23440,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("SET MAX_CONNECTIONS 200").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert_eq!(*ex.max_connections.lock().unwrap(), 200);
+        assert_eq!(*ex.max_connections.lock_safe(), 200);
     }
 
     #[test]
@@ -23063,7 +23469,7 @@ mod tests {
     #[test]
     fn test_s116_default_max() {
         let (ex, _dir) = setup();
-        assert_eq!(*ex.max_connections.lock().unwrap(), 100);
+        assert_eq!(*ex.max_connections.lock_safe(), 100);
     }
 
     #[test]
@@ -23085,7 +23491,7 @@ mod tests {
             .execute("CREATE RESOURCE GROUP rg1 LIMIT (CPU=50, MEMORY=512)")
             .unwrap();
         assert!(matches!(r, QueryResult::Created));
-        assert!(ex.resource_groups.lock().unwrap().contains_key("rg1"));
+        assert!(ex.resource_groups.lock_safe().contains_key("rg1"));
     }
 
     #[test]
@@ -23104,7 +23510,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("ASSIGN USER alice TO rg1").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        let groups = ex.resource_groups.lock().unwrap();
+        let groups = ex.resource_groups.lock_safe();
         let rg = groups.get("rg1").unwrap();
         assert!(rg.users.contains(&"alice".to_owned()));
     }
@@ -23131,7 +23537,7 @@ mod tests {
             .execute("ALTER RESOURCE GROUP rg1 LIMIT (CPU=75)")
             .unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        let groups = ex.resource_groups.lock().unwrap();
+        let groups = ex.resource_groups.lock_safe();
         let rg = groups.get("rg1").unwrap();
         assert_eq!(rg.cpu_pct, 75);
     }
@@ -23282,7 +23688,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64, v U64)").unwrap();
         let r = ex.execute("SNAPSHOT TABLE t").unwrap();
         assert!(matches!(r, QueryResult::Affected(1)));
-        let log = ex.time_travel_log.lock().unwrap();
+        let log = ex.time_travel_log.lock_safe();
         assert!(log.contains_key("t"));
     }
 
@@ -23323,7 +23729,7 @@ mod tests {
         ex.execute("CREATE TABLE t (pk U64)").unwrap();
         ex.execute("SNAPSHOT TABLE t").unwrap();
         ex.execute("SNAPSHOT TABLE t").unwrap();
-        let log = ex.time_travel_log.lock().unwrap();
+        let log = ex.time_travel_log.lock_safe();
         assert_eq!(log.get("t").unwrap().len(), 2);
     }
 
@@ -23333,7 +23739,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("ENABLE CHANGE FEED ON orders").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert!(ex.change_feed_enabled.lock().unwrap().contains("orders"));
+        assert!(ex.change_feed_enabled.lock_safe().contains("orders"));
     }
 
     #[test]
@@ -23342,7 +23748,7 @@ mod tests {
         ex.execute("ENABLE CHANGE FEED ON orders").unwrap();
         let r = ex.execute("DISABLE CHANGE FEED ON orders").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert!(!ex.change_feed_enabled.lock().unwrap().contains("orders"));
+        assert!(!ex.change_feed_enabled.lock_safe().contains("orders"));
     }
 
     #[test]
@@ -23353,7 +23759,7 @@ mod tests {
         ex.execute("ENABLE CHANGE FEED ON orders").unwrap();
         ex.execute("INSERT INTO orders (pk, amount) VALUES (1, 100)")
             .unwrap();
-        let feed = ex.change_feed.lock().unwrap();
+        let feed = ex.change_feed.lock_safe();
         let entries = feed.get("orders").unwrap();
         assert!(!entries.is_empty());
         assert_eq!(entries[0].0, "INSERT");
@@ -23382,7 +23788,7 @@ mod tests {
             .unwrap();
         ex.execute("INSERT INTO orders (pk, amount) VALUES (1, 100)")
             .unwrap();
-        let feed = ex.change_feed.lock().unwrap();
+        let feed = ex.change_feed.lock_safe();
         assert!(!feed.contains_key("orders"));
     }
 
@@ -23395,7 +23801,7 @@ mod tests {
             .execute("CREATE BLOOM INDEX idx_name ON t(name)")
             .unwrap();
         assert!(matches!(r, QueryResult::Created));
-        assert!(ex.bloom_indexes.lock().unwrap().contains_key("idx_name"));
+        assert!(ex.bloom_indexes.lock_safe().contains_key("idx_name"));
     }
 
     #[test]
@@ -23406,7 +23812,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("DROP BLOOM INDEX idx_name").unwrap();
         assert!(matches!(r, QueryResult::Dropped));
-        assert!(!ex.bloom_indexes.lock().unwrap().contains_key("idx_name"));
+        assert!(!ex.bloom_indexes.lock_safe().contains_key("idx_name"));
     }
 
     #[test]
@@ -23445,7 +23851,7 @@ mod tests {
         ex.execute("INSERT INTO t (pk, val) VALUES (1, 99)")
             .unwrap();
         ex.execute("CREATE BLOOM INDEX idx ON t(val)").unwrap();
-        let idxs = ex.bloom_indexes.lock().unwrap();
+        let idxs = ex.bloom_indexes.lock_safe();
         let (_, _, vals) = idxs.get("idx").unwrap();
         assert!(vals.contains("99"));
     }
@@ -23456,7 +23862,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("ALTER TABLE t STORE COLUMNAR").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert!(ex.columnar_tables.lock().unwrap().contains("t"));
+        assert!(ex.columnar_tables.lock_safe().contains("t"));
     }
 
     #[test]
@@ -23465,7 +23871,7 @@ mod tests {
         ex.execute("ALTER TABLE t STORE COLUMNAR").unwrap();
         let r = ex.execute("ALTER TABLE t STORE ROW").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert!(!ex.columnar_tables.lock().unwrap().contains("t"));
+        assert!(!ex.columnar_tables.lock_safe().contains("t"));
     }
 
     #[test]
@@ -23496,7 +23902,7 @@ mod tests {
     #[test]
     fn test_s124_aqe_default_on() {
         let (ex, _dir) = setup();
-        assert!(*ex.aqe_enabled.lock().unwrap());
+        assert!(*ex.aqe_enabled.lock_safe());
     }
 
     #[test]
@@ -23504,7 +23910,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("SET ADAPTIVE QUERY EXECUTION OFF").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert!(!*ex.aqe_enabled.lock().unwrap());
+        assert!(!*ex.aqe_enabled.lock_safe());
     }
 
     #[test]
@@ -23512,7 +23918,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET ADAPTIVE QUERY EXECUTION OFF").unwrap();
         ex.execute("SET ADAPTIVE QUERY EXECUTION ON").unwrap();
-        assert!(*ex.aqe_enabled.lock().unwrap());
+        assert!(*ex.aqe_enabled.lock_safe());
     }
 
     #[test]
@@ -23542,7 +23948,7 @@ mod tests {
     #[test]
     fn test_s125_default_chunk_size() {
         let (ex, _dir) = setup();
-        assert_eq!(*ex.stream_chunk_size.lock().unwrap(), 100);
+        assert_eq!(*ex.stream_chunk_size.lock_safe(), 100);
     }
 
     #[test]
@@ -23550,7 +23956,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("SET STREAM CHUNK SIZE 50").unwrap();
         assert!(matches!(r, QueryResult::Affected(0)));
-        assert_eq!(*ex.stream_chunk_size.lock().unwrap(), 50);
+        assert_eq!(*ex.stream_chunk_size.lock_safe(), 50);
     }
 
     #[test]
@@ -23600,7 +24006,7 @@ mod tests {
             .execute("INSERT GEO POINT INTO locations(position) VALUES (48.8566, 2.3522)")
             .unwrap();
         assert!(matches!(r, QueryResult::Affected(1)));
-        let geo = ex.geo_columns.lock().unwrap();
+        let geo = ex.geo_columns.lock_safe();
         let point = geo
             .get("locations")
             .and_then(|m| m.get("position"))
@@ -23672,7 +24078,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
         assert!(matches!(r, QueryResult::Created));
-        let edges = ex.graph_edges.lock().unwrap();
+        let edges = ex.graph_edges.lock_safe();
         assert!(!edges.is_empty());
         assert_eq!(
             edges[0],
@@ -23686,7 +24092,7 @@ mod tests {
         ex.execute("CREATE EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
         let r = ex.execute("DROP EDGE (Alice)-[:KNOWS]->(Bob)").unwrap();
         assert!(matches!(r, QueryResult::Dropped));
-        assert!(ex.graph_edges.lock().unwrap().is_empty());
+        assert!(ex.graph_edges.lock_safe().is_empty());
     }
 
     #[test]
@@ -23835,7 +24241,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("BEGIN DISTRIBUTED TRANSACTION txn1").unwrap();
         assert!(matches!(r, QueryResult::TxBegin));
-        assert_eq!(*ex.dist_txn_active.lock().unwrap(), Some("txn1".to_owned()));
+        assert_eq!(*ex.dist_txn_active.lock_safe(), Some("txn1".to_owned()));
     }
 
     #[test]
@@ -23843,7 +24249,7 @@ mod tests {
         let (ex, _dir) = setup();
         let r = ex.execute("PREPARE TRANSACTION txn1").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.prepared_txns.lock().unwrap().contains_key("txn1"));
+        assert!(ex.prepared_txns.lock_safe().contains_key("txn1"));
     }
 
     #[test]
@@ -23856,7 +24262,7 @@ mod tests {
         } else {
             panic!();
         }
-        assert!(!ex.prepared_txns.lock().unwrap().contains_key("txn1"));
+        assert!(!ex.prepared_txns.lock_safe().contains_key("txn1"));
     }
 
     #[test]
@@ -23869,7 +24275,7 @@ mod tests {
         } else {
             panic!();
         }
-        assert!(!ex.prepared_txns.lock().unwrap().contains_key("txn1"));
+        assert!(!ex.prepared_txns.lock_safe().contains_key("txn1"));
     }
 
     #[test]
@@ -23893,7 +24299,7 @@ mod tests {
             .execute("CREATE PROCEDURE myproc AS BEGIN SELECT 1; SELECT 2; END")
             .unwrap();
         assert!(matches!(r, QueryResult::Created));
-        assert!(ex.procedures.lock().unwrap().contains_key("myproc"));
+        assert!(ex.procedures.lock_safe().contains_key("myproc"));
     }
 
     #[test]
@@ -23913,7 +24319,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("DROP PROCEDURE myproc").unwrap();
         assert!(matches!(r, QueryResult::Dropped));
-        assert!(!ex.procedures.lock().unwrap().contains_key("myproc"));
+        assert!(!ex.procedures.lock_safe().contains_key("myproc"));
     }
 
     #[test]
@@ -23946,7 +24352,7 @@ mod tests {
             .execute("CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')")
             .unwrap();
         assert!(matches!(r, QueryResult::Created));
-        assert!(ex.user_types.lock().unwrap().contains_key("mood"));
+        assert!(ex.user_types.lock_safe().contains_key("mood"));
     }
 
     #[test]
@@ -23956,7 +24362,7 @@ mod tests {
             .execute("CREATE TYPE address AS COMPOSITE (street TEXT, zip INT)")
             .unwrap();
         assert!(matches!(r, QueryResult::Created));
-        let types = ex.user_types.lock().unwrap();
+        let types = ex.user_types.lock_safe();
         assert_eq!(types.get("address").unwrap().0, "COMPOSITE");
     }
 
@@ -23967,7 +24373,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("DROP TYPE mood").unwrap();
         assert!(matches!(r, QueryResult::Dropped));
-        assert!(!ex.user_types.lock().unwrap().contains_key("mood"));
+        assert!(!ex.user_types.lock_safe().contains_key("mood"));
     }
 
     #[test]
@@ -24008,7 +24414,7 @@ mod tests {
             .execute("INSERT ARRAY INTO myarr VALUES ('a', 'b', 'c')")
             .unwrap();
         assert!(matches!(r, QueryResult::Affected(1)));
-        let store = ex.array_store.lock().unwrap();
+        let store = ex.array_store.lock_safe();
         assert_eq!(store.get("myarr").unwrap().len(), 3);
     }
 
@@ -24076,7 +24482,7 @@ mod tests {
             .execute("STORE JSON doc1 AS '{\"name\":\"Alice\"}'")
             .unwrap();
         assert!(matches!(r, QueryResult::Affected(1)));
-        assert!(ex.jsonpath_cache.lock().unwrap().contains_key("doc1"));
+        assert!(ex.jsonpath_cache.lock_safe().contains_key("doc1"));
     }
 
     #[test]
@@ -24147,7 +24553,7 @@ mod tests {
             .execute("CREATE SERVER myserver CONNECTION 'host=pg.example.com'")
             .unwrap();
         assert!(matches!(r, QueryResult::Created));
-        assert!(ex.foreign_servers.lock().unwrap().contains_key("myserver"));
+        assert!(ex.foreign_servers.lock_safe().contains_key("myserver"));
     }
 
     #[test]
@@ -24159,12 +24565,7 @@ mod tests {
             .execute("CREATE FOREIGN TABLE remote_users SERVER myserver")
             .unwrap();
         assert!(matches!(r, QueryResult::Created));
-        assert!(
-            ex.foreign_tables
-                .lock()
-                .unwrap()
-                .contains_key("remote_users")
-        );
+        assert!(ex.foreign_tables.lock_safe().contains_key("remote_users"));
     }
 
     #[test]
@@ -24174,7 +24575,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("DROP SERVER myserver").unwrap();
         assert!(matches!(r, QueryResult::Dropped));
-        assert!(!ex.foreign_servers.lock().unwrap().contains_key("myserver"));
+        assert!(!ex.foreign_servers.lock_safe().contains_key("myserver"));
     }
 
     #[test]
@@ -24214,7 +24615,7 @@ mod tests {
             .execute("ADD FEDERATION NODE node1 ENDPOINT 'http://node1:5432'")
             .unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.federation_nodes.lock().unwrap().contains_key("node1"));
+        assert!(ex.federation_nodes.lock_safe().contains_key("node1"));
     }
 
     #[test]
@@ -24224,7 +24625,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("REMOVE FEDERATION NODE node1").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(!ex.federation_nodes.lock().unwrap().contains_key("node1"));
+        assert!(!ex.federation_nodes.lock_safe().contains_key("node1"));
     }
 
     #[test]
@@ -24275,7 +24676,7 @@ mod tests {
             .unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
         assert_eq!(
-            ex.table_engines.lock().unwrap().get("sales").unwrap(),
+            ex.table_engines.lock_safe().get("sales").unwrap(),
             "COLUMNAR"
         );
     }
@@ -24339,7 +24740,7 @@ mod tests {
             .execute("ADD REGION us-east ENDPOINT 'http://us-east.vv.io'")
             .unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.regions.lock().unwrap().contains_key("us-east"));
+        assert!(ex.regions.lock_safe().contains_key("us-east"));
     }
 
     #[test]
@@ -24375,7 +24776,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("REMOVE REGION ap-south").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(!ex.regions.lock().unwrap().contains_key("ap-south"));
+        assert!(!ex.regions.lock_safe().contains_key("ap-south"));
     }
 
     #[test]
@@ -24383,7 +24784,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET REPLICATION LAG FOR us-west TO 100")
             .unwrap();
-        let lag = *ex.replication_lag.lock().unwrap().get("us-west").unwrap();
+        let lag = *ex.replication_lag.lock_safe().get("us-west").unwrap();
         assert_eq!(lag, 100);
     }
 
@@ -24396,7 +24797,7 @@ mod tests {
             .unwrap();
         assert!(matches!(r, QueryResult::Created));
         assert_eq!(
-            ex.auth_providers.lock().unwrap().get("corp_ldap").unwrap(),
+            ex.auth_providers.lock_safe().get("corp_ldap").unwrap(),
             "LDAP"
         );
     }
@@ -24409,7 +24810,7 @@ mod tests {
             .unwrap();
         assert!(matches!(r, QueryResult::Created));
         assert_eq!(
-            ex.auth_providers.lock().unwrap().get("google").unwrap(),
+            ex.auth_providers.lock_safe().get("google").unwrap(),
             "OAUTH"
         );
     }
@@ -24421,7 +24822,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("DROP AUTH PROVIDER myldap").unwrap();
         assert!(matches!(r, QueryResult::Dropped));
-        assert!(!ex.auth_providers.lock().unwrap().contains_key("myldap"));
+        assert!(!ex.auth_providers.lock_safe().contains_key("myldap"));
     }
 
     #[test]
@@ -24513,7 +24914,7 @@ mod tests {
             let _ = rows;
         }
         // last_refresh should be set
-        let last = ex.mat_view_last_refresh.lock().unwrap();
+        let last = ex.mat_view_last_refresh.lock_safe();
         assert!(last.contains_key("ts_mv"));
     }
 
@@ -24770,8 +25171,7 @@ mod tests {
             .unwrap();
         let stored = ex
             .encrypted_values
-            .lock()
-            .unwrap()
+            .lock_safe()
             .get("emp.salary.2")
             .cloned()
             .unwrap();
@@ -24802,7 +25202,7 @@ mod tests {
             ex.execute("ALTER TABLE emp ENCRYPT COLUMN salary WITH KEY 'k'")
                 .is_err()
         );
-        assert!(ex.encrypted_values.lock().unwrap().is_empty());
+        assert!(ex.encrypted_values.lock_safe().is_empty());
     }
 
     #[test]
@@ -24829,10 +25229,9 @@ mod tests {
         let (ex, _dir) = setup_with_key();
         ex.execute("INSERT ENCRYPTED INTO emp salary KEY 'hk' VALUE 'a' PK 1")
             .unwrap();
-        let v1 = ex.encrypted_values.lock().unwrap()["emp.salary.1"].clone();
+        let v1 = ex.encrypted_values.lock_safe()["emp.salary.1"].clone();
         ex.encrypted_values
-            .lock()
-            .unwrap()
+            .lock_safe()
             .insert("emp.salary.2".to_owned(), v1);
         assert!(
             ex.execute("SELECT DECRYPT salary FROM emp KEY 'hk' PK 2")
@@ -26138,7 +26537,7 @@ mod tests {
     fn test_s166_show_inheritance_tree() {
         let (ex, _dir) = setup();
         {
-            let mut inh = ex.inherited_tables.lock().unwrap();
+            let mut inh = ex.inherited_tables.lock_safe();
             inh.insert("emp_us".to_owned(), "emp".to_owned());
         }
         let r = ex.execute("SHOW INHERITANCE TREE").unwrap();
@@ -26153,7 +26552,7 @@ mod tests {
     fn test_s166_show_parent_of() {
         let (ex, _dir) = setup();
         {
-            let mut inh = ex.inherited_tables.lock().unwrap();
+            let mut inh = ex.inherited_tables.lock_safe();
             inh.insert("emp_us".to_owned(), "emp".to_owned());
         }
         let r = ex.execute("SHOW PARENT OF emp_us").unwrap();
@@ -29696,14 +30095,14 @@ mod tests {
     fn test_s248_active_flag_set_after_begin() {
         let (ex, _dir) = setup();
         ex.execute("BEGIN CROSS SHARD TRANSACTION").unwrap();
-        assert!(*ex.s248_cross_shard_tx_active.lock().unwrap());
+        assert!(*ex.s248_cross_shard_tx_active.lock_safe());
     }
     #[test]
     fn test_s248_active_flag_cleared_after_commit() {
         let (ex, _dir) = setup();
         ex.execute("BEGIN CROSS SHARD TRANSACTION").unwrap();
         ex.execute("COMMIT CROSS SHARD").unwrap();
-        assert!(!*ex.s248_cross_shard_tx_active.lock().unwrap());
+        assert!(!*ex.s248_cross_shard_tx_active.lock_safe());
     }
 
     // ── S249 — Table statistics reset ────────────────────────────────────────────
@@ -29741,7 +30140,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("RESET TABLE STATS FOR t1").unwrap();
         ex.execute("RESET TABLE STATS FOR t2").unwrap();
-        let log = ex.s249_stats_reset_log.lock().unwrap().clone();
+        let log = ex.s249_stats_reset_log.lock_safe().clone();
         assert_eq!(log.len(), 2);
     }
 
@@ -29773,7 +30172,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("LOCK QUERY PLAN FOR SELECT * FROM orders")
             .unwrap();
-        assert!(!ex.s250_locked_plans.lock().unwrap().is_empty());
+        assert!(!ex.s250_locked_plans.lock_safe().is_empty());
     }
     #[test]
     fn test_s250_unlock_clears_plans() {
@@ -29781,7 +30180,7 @@ mod tests {
         ex.execute("LOCK QUERY PLAN FOR SELECT * FROM orders")
             .unwrap();
         ex.execute("UNLOCK QUERY PLAN").unwrap();
-        assert!(ex.s250_locked_plans.lock().unwrap().is_empty());
+        assert!(ex.s250_locked_plans.lock_safe().is_empty());
     }
 
     // ── S251 — Column histograms v3 ───────────────────────────────────────────────
@@ -29828,7 +30227,7 @@ mod tests {
         ex.execute("BUILD HISTOGRAM FOR orders.amount BUCKETS 5")
             .unwrap();
         ex.execute("DROP HISTOGRAM FOR orders.amount").unwrap();
-        assert!(ex.s251_histograms_v3.lock().unwrap().is_empty());
+        assert!(ex.s251_histograms_v3.lock_safe().is_empty());
     }
 
     // ── S252 — Table access control v2 ───────────────────────────────────────────
@@ -29863,7 +30262,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("GRANT SELECT ON orders TO ROLE analyst")
             .unwrap();
-        assert!(!ex.s252_role_grants.lock().unwrap().is_empty());
+        assert!(!ex.s252_role_grants.lock_safe().is_empty());
     }
     #[test]
     fn test_s252_revoke_removes_grant() {
@@ -29872,7 +30271,7 @@ mod tests {
             .unwrap();
         ex.execute("REVOKE SELECT ON orders FROM ROLE analyst")
             .unwrap();
-        assert!(ex.s252_role_grants.lock().unwrap().is_empty());
+        assert!(ex.s252_role_grants.lock_safe().is_empty());
     }
 
     // ── S253 — Query scheduling ───────────────────────────────────────────────────
@@ -29907,7 +30306,7 @@ mod tests {
             .unwrap();
         ex.execute("SCHEDULE QUERY 'SELECT 2' AT '2026-02-01 00:00'")
             .unwrap();
-        assert_eq!(ex.s253_scheduled_queries.lock().unwrap().len(), 2);
+        assert_eq!(ex.s253_scheduled_queries.lock_safe().len(), 2);
     }
     #[test]
     fn test_s253_cancel_marks_cancelled() {
@@ -29915,7 +30314,7 @@ mod tests {
         ex.execute("SCHEDULE QUERY 'SELECT 1' AT '2026-01-01 00:00'")
             .unwrap();
         ex.execute("CANCEL SCHEDULED QUERY 1").unwrap();
-        let qs = ex.s253_scheduled_queries.lock().unwrap();
+        let qs = ex.s253_scheduled_queries.lock_safe();
         assert!(qs[0].3);
     }
 
@@ -29949,7 +30348,7 @@ mod tests {
     fn test_s254_coalesce_log_records_table() {
         let (ex, _dir) = setup();
         ex.execute("COALESCE INDEXES ON orders").unwrap();
-        let log = ex.s254_coalesce_log.lock().unwrap();
+        let log = ex.s254_coalesce_log.lock_safe();
         assert_eq!(log[0], "orders");
     }
 
@@ -29991,12 +30390,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET TABLE orders SCAN PARALLELISM 4").unwrap();
         ex.execute("RESET SCAN PARALLELISM FOR orders").unwrap();
-        assert!(
-            !ex.s255_scan_parallelism
-                .lock()
-                .unwrap()
-                .contains_key("orders")
-        );
+        assert!(!ex.s255_scan_parallelism.lock_safe().contains_key("orders"));
     }
 
     // ── S256 — Query result caching v2 ───────────────────────────────────────────
@@ -30029,14 +30423,14 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CACHE QUERY 'SELECT 1' TTL 60").unwrap();
         ex.execute("CACHE QUERY 'SELECT 2' TTL 120").unwrap();
-        assert_eq!(ex.s256_cached_queries.lock().unwrap().len(), 2);
+        assert_eq!(ex.s256_cached_queries.lock_safe().len(), 2);
     }
     #[test]
     fn test_s256_evict_removes_entry() {
         let (ex, _dir) = setup();
         ex.execute("CACHE QUERY 'SELECT 1' TTL 60").unwrap();
         ex.execute("EVICT CACHED QUERY 1").unwrap();
-        assert!(ex.s256_cached_queries.lock().unwrap().is_empty());
+        assert!(ex.s256_cached_queries.lock_safe().is_empty());
     }
 
     // ── S257 — Live schema migration ──────────────────────────────────────────────
@@ -30073,7 +30467,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("MIGRATE SCHEMA public LIVE").unwrap();
         ex.execute("PAUSE LIVE MIGRATION").unwrap();
-        let migs = ex.s257_live_migrations.lock().unwrap();
+        let migs = ex.s257_live_migrations.lock_safe();
         assert!(migs["public"].1);
     }
 
@@ -30133,7 +30527,7 @@ mod tests {
     fn test_s258_feedback_recorded_value() {
         let (ex, _dir) = setup();
         ex.execute("REPORT QUERY COST 3 ACTUAL 99ms").unwrap();
-        let fb = ex.s258_cost_feedback.lock().unwrap();
+        let fb = ex.s258_cost_feedback.lock_safe();
         assert_eq!(fb[0], (3, 99));
     }
     #[test]
@@ -30148,7 +30542,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("REPORT QUERY COST 1 ACTUAL 50ms").unwrap();
         ex.execute("CLEAR QUERY COST FEEDBACK").unwrap();
-        assert!(ex.s258_cost_feedback.lock().unwrap().is_empty());
+        assert!(ex.s258_cost_feedback.lock_safe().is_empty());
     }
 
     // â”€â”€ S259 â€" Table bloom filters v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30181,7 +30575,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE BLOOM FILTER ON orders(status) FPR 0.05")
             .unwrap();
-        let bf = ex.s259_bloom_filters_v2.lock().unwrap();
+        let bf = ex.s259_bloom_filters_v2.lock_safe();
         assert_eq!(bf.get("orders").unwrap().1, 0.05);
     }
     #[test]
@@ -30190,7 +30584,7 @@ mod tests {
         ex.execute("CREATE BLOOM FILTER ON orders(status) FPR 0.01")
             .unwrap();
         ex.execute("DROP BLOOM FILTER ON orders").unwrap();
-        assert!(ex.s259_bloom_filters_v2.lock().unwrap().is_empty());
+        assert!(ex.s259_bloom_filters_v2.lock_safe().is_empty());
     }
 
     // â”€â”€ S260 â€" Async query execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30229,7 +30623,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SUBMIT ASYNC QUERY 'SELECT 1'").unwrap();
         ex.execute("SUBMIT ASYNC QUERY 'SELECT 2'").unwrap();
-        assert_eq!(ex.s260_async_queries.lock().unwrap().len(), 2);
+        assert_eq!(ex.s260_async_queries.lock_safe().len(), 2);
     }
 
     // â”€â”€ S261 â€" Column expression indexes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30262,7 +30656,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE INDEX idx_expr ON orders(total + total)")
             .unwrap();
-        let idxs = ex.s261_expr_indexes.lock().unwrap();
+        let idxs = ex.s261_expr_indexes.lock_safe();
         assert_eq!(idxs.get("idx_expr").unwrap().1, "total + total");
     }
     #[test]
@@ -30271,7 +30665,7 @@ mod tests {
         ex.execute("CREATE INDEX idx_expr ON orders(total + total)")
             .unwrap();
         ex.execute("DROP EXPRESSION INDEX idx_expr").unwrap();
-        assert!(ex.s261_expr_indexes.lock().unwrap().is_empty());
+        assert!(ex.s261_expr_indexes.lock_safe().is_empty());
     }
 
     // â”€â”€ S262 â€" Table sharding keys â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30299,7 +30693,7 @@ mod tests {
     fn test_s262_stored_value() {
         let (ex, _dir) = setup();
         ex.execute("SET SHARD KEY FOR orders TO id").unwrap();
-        let sk = ex.s262_shard_keys.lock().unwrap();
+        let sk = ex.s262_shard_keys.lock_safe();
         assert_eq!(sk.get("orders").unwrap(), "id");
     }
     #[test]
@@ -30307,7 +30701,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET SHARD KEY FOR orders TO id").unwrap();
         ex.execute("DROP SHARD KEY FOR orders").unwrap();
-        assert!(ex.s262_shard_keys.lock().unwrap().is_empty());
+        assert!(ex.s262_shard_keys.lock_safe().is_empty());
     }
 
     // â”€â”€ S263 â€" Query result diff â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30342,7 +30736,7 @@ mod tests {
             .unwrap();
         ex.execute("DIFF QUERY RESULT 'SELECT 2' AGAINST SNAPSHOT s2")
             .unwrap();
-        assert_eq!(ex.s263_result_diffs.lock().unwrap().len(), 2);
+        assert_eq!(ex.s263_result_diffs.lock_safe().len(), 2);
     }
     #[test]
     fn test_s263_clear_empties_diffs() {
@@ -30350,7 +30744,7 @@ mod tests {
         ex.execute("DIFF QUERY RESULT 'SELECT 1' AGAINST SNAPSHOT s1")
             .unwrap();
         ex.execute("CLEAR RESULT DIFFS").unwrap();
-        assert!(ex.s263_result_diffs.lock().unwrap().is_empty());
+        assert!(ex.s263_result_diffs.lock_safe().is_empty());
     }
 
     // â”€â”€ S264 â€" Connection multiplexing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30385,7 +30779,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET CONNECTION POOL MULTIPLEXING ON").unwrap();
         ex.execute("RESET MULTIPLEXING").unwrap();
-        assert!(!*ex.s264_multiplexing.lock().unwrap());
+        assert!(!*ex.s264_multiplexing.lock_safe());
     }
 
     // â”€â”€ S265 â€" Table compaction policy v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30418,7 +30812,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET TABLE orders COMPACTION THRESHOLD 2000")
             .unwrap();
-        let ct = ex.s265_compaction_threshold.lock().unwrap();
+        let ct = ex.s265_compaction_threshold.lock_safe();
         assert_eq!(*ct.get("orders").unwrap(), 2000);
     }
     #[test]
@@ -30427,7 +30821,7 @@ mod tests {
         ex.execute("SET TABLE orders COMPACTION THRESHOLD 1000")
             .unwrap();
         ex.execute("RESET TABLE COMPACTION POLICY").unwrap();
-        assert!(ex.s265_compaction_threshold.lock().unwrap().is_empty());
+        assert!(ex.s265_compaction_threshold.lock_safe().is_empty());
     }
 
     // â”€â”€ S266 â€" Query plan versioning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30460,7 +30854,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SAVE QUERY PLAN VERSION v1 FOR 'SELECT 1'")
             .unwrap();
-        let pv = ex.s266_plan_versions.lock().unwrap();
+        let pv = ex.s266_plan_versions.lock_safe();
         assert_eq!(pv.get("v1").unwrap().0, "SELECT 1");
     }
     #[test]
@@ -30469,7 +30863,7 @@ mod tests {
         ex.execute("SAVE QUERY PLAN VERSION v1 FOR 'SELECT 1'")
             .unwrap();
         ex.execute("DROP QUERY PLAN VERSION v1").unwrap();
-        assert!(ex.s266_plan_versions.lock().unwrap().is_empty());
+        assert!(ex.s266_plan_versions.lock_safe().is_empty());
     }
 
     // â”€â”€ S267 â€" Schema diff apply â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30504,7 +30898,7 @@ mod tests {
             .unwrap();
         ex.execute("APPLY SCHEMA DIFF FROM 'b.sql' TO public")
             .unwrap();
-        assert_eq!(ex.s267_diff_history.lock().unwrap().len(), 2);
+        assert_eq!(ex.s267_diff_history.lock_safe().len(), 2);
     }
     #[test]
     fn test_s267_undo_removes_last() {
@@ -30512,7 +30906,7 @@ mod tests {
         ex.execute("APPLY SCHEMA DIFF FROM 'a.sql' TO public")
             .unwrap();
         ex.execute("UNDO LAST SCHEMA DIFF").unwrap();
-        assert!(ex.s267_diff_history.lock().unwrap().is_empty());
+        assert!(ex.s267_diff_history.lock_safe().is_empty());
     }
 
     // â”€â”€ S268 â€" Table watermarking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30545,7 +30939,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET WATERMARK FOR orders ON created_at DELAY 5s")
             .unwrap();
-        let wm = ex.s268_watermarks.lock().unwrap();
+        let wm = ex.s268_watermarks.lock_safe();
         assert_eq!(wm.get("orders").unwrap().1, "5s");
     }
     #[test]
@@ -30554,7 +30948,7 @@ mod tests {
         ex.execute("SET WATERMARK FOR orders ON created_at DELAY 5s")
             .unwrap();
         ex.execute("DROP WATERMARK FOR orders").unwrap();
-        assert!(ex.s268_watermarks.lock().unwrap().is_empty());
+        assert!(ex.s268_watermarks.lock_safe().is_empty());
     }
 
     // â”€â”€ S269 â€" Query cost budget â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30593,7 +30987,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET QUERY COST BUDGET 500").unwrap();
         ex.execute("RESET QUERY COST BUDGET").unwrap();
-        assert!(ex.s269_cost_budget.lock().unwrap().is_none());
+        assert!(ex.s269_cost_budget.lock_safe().is_none());
     }
 
     // â”€â”€ S270 â€" Table alias mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30621,7 +31015,7 @@ mod tests {
     fn test_s270_stored_mapping() {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE ALIAS o FOR orders").unwrap();
-        let al = ex.s270_table_aliases.lock().unwrap();
+        let al = ex.s270_table_aliases.lock_safe();
         assert_eq!(al.get("o").unwrap(), "orders");
     }
     #[test]
@@ -30629,7 +31023,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE ALIAS o FOR orders").unwrap();
         ex.execute("DROP TABLE ALIAS o").unwrap();
-        assert!(ex.s270_table_aliases.lock().unwrap().is_empty());
+        assert!(ex.s270_table_aliases.lock_safe().is_empty());
     }
 
     // â”€â”€ S271 â€" Index build progress â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30656,7 +31050,7 @@ mod tests {
     fn test_s271_history_records_cancel() {
         let (ex, _dir) = setup();
         ex.execute("CANCEL INDEX BUILD idx1").unwrap();
-        let h = ex.s271_build_history.lock().unwrap();
+        let h = ex.s271_build_history.lock_safe();
         assert!(h[0].contains("idx1"));
     }
     #[test]
@@ -30664,7 +31058,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CANCEL INDEX BUILD idx1").unwrap();
         ex.execute("CANCEL INDEX BUILD idx2").unwrap();
-        assert_eq!(ex.s271_build_history.lock().unwrap().len(), 2);
+        assert_eq!(ex.s271_build_history.lock_safe().len(), 2);
     }
 
     // â”€â”€ S272 â€" Query semaphores â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30692,7 +31086,7 @@ mod tests {
     fn test_s272_stored_limit() {
         let (ex, _dir) = setup();
         ex.execute("CREATE QUERY SEMAPHORE sem1 LIMIT 7").unwrap();
-        let sems = ex.s272_semaphores.lock().unwrap();
+        let sems = ex.s272_semaphores.lock_safe();
         assert_eq!(*sems.get("sem1").unwrap(), 7);
     }
     #[test]
@@ -30700,7 +31094,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE QUERY SEMAPHORE sem1 LIMIT 5").unwrap();
         ex.execute("DROP QUERY SEMAPHORE sem1").unwrap();
-        assert!(ex.s272_semaphores.lock().unwrap().is_empty());
+        assert!(ex.s272_semaphores.lock_safe().is_empty());
     }
 
     // â”€â”€ S273 â€" Table freeze â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30728,14 +31122,14 @@ mod tests {
     fn test_s273_frozen_contains_table() {
         let (ex, _dir) = setup();
         ex.execute("FREEZE TABLE orders").unwrap();
-        assert!(ex.s273_frozen.lock().unwrap().contains("orders"));
+        assert!(ex.s273_frozen.lock_safe().contains("orders"));
     }
     #[test]
     fn test_s273_unfreeze_removes_entry() {
         let (ex, _dir) = setup();
         ex.execute("FREEZE TABLE orders").unwrap();
         ex.execute("UNFREEZE TABLE orders").unwrap();
-        assert!(!ex.s273_frozen.lock().unwrap().contains("orders"));
+        assert!(!ex.s273_frozen.lock_safe().contains("orders"));
     }
 
     // â”€â”€ S274 â€" Column value distribution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30768,12 +31162,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("REFRESH VALUE DISTRIBUTION FOR orders.status")
             .unwrap();
-        assert!(
-            ex.s274_value_dist
-                .lock()
-                .unwrap()
-                .contains_key("orders.status")
-        );
+        assert!(ex.s274_value_dist.lock_safe().contains_key("orders.status"));
     }
     #[test]
     fn test_s274_clear_empties_map() {
@@ -30781,7 +31170,7 @@ mod tests {
         ex.execute("REFRESH VALUE DISTRIBUTION FOR orders.status")
             .unwrap();
         ex.execute("CLEAR VALUE DISTRIBUTION").unwrap();
-        assert!(ex.s274_value_dist.lock().unwrap().is_empty());
+        assert!(ex.s274_value_dist.lock_safe().is_empty());
     }
 
     // â”€â”€ S275 â€" Query circuit breaker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30814,7 +31203,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET CIRCUIT BREAKER ON orders THRESHOLD 15")
             .unwrap();
-        let cb = ex.s275_circuit_breakers.lock().unwrap();
+        let cb = ex.s275_circuit_breakers.lock_safe();
         assert_eq!(cb.get("orders").unwrap().0, 15);
     }
     #[test]
@@ -30823,7 +31212,7 @@ mod tests {
         ex.execute("SET CIRCUIT BREAKER ON orders THRESHOLD 10")
             .unwrap();
         ex.execute("RESET CIRCUIT BREAKER FOR orders").unwrap();
-        assert!(ex.s275_circuit_breakers.lock().unwrap().is_empty());
+        assert!(ex.s275_circuit_breakers.lock_safe().is_empty());
     }
 
     // â”€â”€ S276 â€" Table checksum â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30903,7 +31292,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET QUERY BATCH SIZE 250").unwrap();
         ex.execute("RESET QUERY BATCH SIZE").unwrap();
-        assert_eq!(*ex.s277_batch_size.lock().unwrap(), 1);
+        assert_eq!(*ex.s277_batch_size.lock_safe(), 1);
     }
 
     // â”€â”€ S278 â€" Schema lock â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30931,14 +31320,14 @@ mod tests {
     fn test_s278_locks_contain_schema() {
         let (ex, _dir) = setup();
         ex.execute("LOCK SCHEMA public").unwrap();
-        assert!(ex.s278_schema_locks.lock().unwrap().contains("public"));
+        assert!(ex.s278_schema_locks.lock_safe().contains("public"));
     }
     #[test]
     fn test_s278_unlock_removes_entry() {
         let (ex, _dir) = setup();
         ex.execute("LOCK SCHEMA public").unwrap();
         ex.execute("UNLOCK SCHEMA public").unwrap();
-        assert!(!ex.s278_schema_locks.lock().unwrap().contains("public"));
+        assert!(!ex.s278_schema_locks.lock_safe().contains("public"));
     }
 
     // â”€â”€ S279 â€" Table growth prediction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30968,8 +31357,7 @@ mod tests {
         ex.execute("PREDICT TABLE GROWTH FOR orders").unwrap();
         assert!(
             ex.s279_growth_predictions
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .contains_key("orders")
         );
     }
@@ -30978,7 +31366,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("PREDICT TABLE GROWTH FOR orders").unwrap();
         ex.execute("CLEAR GROWTH PREDICTIONS").unwrap();
-        assert!(ex.s279_growth_predictions.lock().unwrap().is_empty());
+        assert!(ex.s279_growth_predictions.lock_safe().is_empty());
     }
 
     // â”€â”€ S280 â€" Index defrag scheduling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -31011,7 +31399,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SCHEDULE INDEX DEFRAG FOR idx1 AT '2026-01-01'")
             .unwrap();
-        let ds = ex.s280_defrag_schedule.lock().unwrap();
+        let ds = ex.s280_defrag_schedule.lock_safe();
         assert_eq!(ds.get("idx1").unwrap(), "2026-01-01");
     }
     #[test]
@@ -31020,7 +31408,7 @@ mod tests {
         ex.execute("SCHEDULE INDEX DEFRAG FOR idx1 AT '2026-01-01'")
             .unwrap();
         ex.execute("CANCEL INDEX DEFRAG idx1").unwrap();
-        assert!(ex.s280_defrag_schedule.lock().unwrap().is_empty());
+        assert!(ex.s280_defrag_schedule.lock_safe().is_empty());
     }
 
     // â”€â”€ S281 â€" Query result masking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -31053,7 +31441,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET RESULT MASK ON orders.email PATTERN 'XXX'")
             .unwrap();
-        let masks = ex.s281_result_masks.lock().unwrap();
+        let masks = ex.s281_result_masks.lock_safe();
         assert_eq!(
             masks
                 .get(&("orders".to_owned(), "email".to_owned()))
@@ -31067,7 +31455,7 @@ mod tests {
         ex.execute("SET RESULT MASK ON orders.email PATTERN 'XXX'")
             .unwrap();
         ex.execute("DROP RESULT MASK ON orders.email").unwrap();
-        assert!(ex.s281_result_masks.lock().unwrap().is_empty());
+        assert!(ex.s281_result_masks.lock_safe().is_empty());
     }
 
     // â”€â”€ S282 â€" Table replication lag â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -31094,14 +31482,14 @@ mod tests {
     fn test_s282_threshold_value_stored() {
         let (ex, _dir) = setup();
         ex.execute("SET REPLICATION LAG THRESHOLD 5s").unwrap();
-        assert_eq!(ex.s282_repl_lag_threshold.lock().unwrap().unwrap(), 5);
+        assert_eq!(ex.s282_repl_lag_threshold.lock_safe().unwrap(), 5);
     }
     #[test]
     fn test_s282_reset_clears_threshold() {
         let (ex, _dir) = setup();
         ex.execute("SET REPLICATION LAG THRESHOLD 5s").unwrap();
         ex.execute("RESET REPLICATION LAG THRESHOLD").unwrap();
-        assert!(ex.s282_repl_lag_threshold.lock().unwrap().is_none());
+        assert!(ex.s282_repl_lag_threshold.lock_safe().is_none());
     }
 
     // â”€â”€ S283 â€" Connection idle timeout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -31129,14 +31517,14 @@ mod tests {
     fn test_s283_timeout_value_ms() {
         let (ex, _dir) = setup();
         ex.execute("SET CONNECTION IDLE TIMEOUT 30s").unwrap();
-        assert_eq!(ex.s283_idle_timeout_ms.lock().unwrap().unwrap(), 30000);
+        assert_eq!(ex.s283_idle_timeout_ms.lock_safe().unwrap(), 30000);
     }
     #[test]
     fn test_s283_reset_clears_timeout() {
         let (ex, _dir) = setup();
         ex.execute("SET CONNECTION IDLE TIMEOUT 30s").unwrap();
         ex.execute("RESET CONNECTION IDLE TIMEOUT").unwrap();
-        assert!(ex.s283_idle_timeout_ms.lock().unwrap().is_none());
+        assert!(ex.s283_idle_timeout_ms.lock_safe().is_none());
     }
     // ── S284 — Table archival tiering ────────────────────────────────────────────────
     #[test]
@@ -31163,7 +31551,7 @@ mod tests {
     fn test_s284_tier_value_stored() {
         let (ex, _dir) = setup();
         ex.execute("SET ARCHIVAL TIER FOR t TO GLACIER").unwrap();
-        let tiers = ex.s284_archival_tiers.lock().unwrap();
+        let tiers = ex.s284_archival_tiers.lock_safe();
         assert_eq!(tiers.get("t").unwrap(), "GLACIER");
     }
     #[test]
@@ -31171,7 +31559,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET ARCHIVAL TIER FOR t TO GLACIER").unwrap();
         ex.execute("RESET ARCHIVAL TIER FOR t").unwrap();
-        let tiers = ex.s284_archival_tiers.lock().unwrap();
+        let tiers = ex.s284_archival_tiers.lock_safe();
         assert!(tiers.get("t").is_none());
     }
     // ── S285 — Query plan diffing ────────────────────────────────────────────────
@@ -31199,7 +31587,7 @@ mod tests {
     fn test_s285_diff_stored() {
         let (ex, _dir) = setup();
         ex.execute("DIFF QUERY PLAN v1 AGAINST v2").unwrap();
-        let diffs = ex.s285_plan_diffs.lock().unwrap();
+        let diffs = ex.s285_plan_diffs.lock_safe();
         assert_eq!(diffs.len(), 1);
     }
     #[test]
@@ -31207,7 +31595,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("DIFF QUERY PLAN v1 AGAINST v2").unwrap();
         ex.execute("CLEAR PLAN DIFFS").unwrap();
-        let diffs = ex.s285_plan_diffs.lock().unwrap();
+        let diffs = ex.s285_plan_diffs.lock_safe();
         assert!(diffs.is_empty());
     }
     // ── S286 — Table access audit v2 ────────────────────────────────────────────────
@@ -31235,14 +31623,14 @@ mod tests {
     fn test_s286_enable_sets_flag() {
         let (ex, _dir) = setup();
         ex.execute("ENABLE ACCESS AUDIT ON t").unwrap();
-        assert!(ex.s286_access_audit.lock().unwrap().contains("t"));
+        assert!(ex.s286_access_audit.lock_safe().contains("t"));
     }
     #[test]
     fn test_s286_disable_clears_flag() {
         let (ex, _dir) = setup();
         ex.execute("ENABLE ACCESS AUDIT ON t").unwrap();
         ex.execute("DISABLE ACCESS AUDIT ON t").unwrap();
-        assert!(!ex.s286_access_audit.lock().unwrap().contains("t"));
+        assert!(!ex.s286_access_audit.lock_safe().contains("t"));
     }
     // ── S287 — Index bloat detection ────────────────────────────────────────────────
     #[test]
@@ -31276,7 +31664,7 @@ mod tests {
     fn test_s287_clear_empties_map() {
         let (ex, _dir) = setup();
         ex.execute("CLEAR INDEX BLOAT STATS").unwrap();
-        assert!(ex.s287_index_bloat.lock().unwrap().is_empty());
+        assert!(ex.s287_index_bloat.lock_safe().is_empty());
     }
     // ── S288 — Query priority queue ────────────────────────────────────────────────
     #[test]
@@ -31301,14 +31689,14 @@ mod tests {
     fn test_s288_promote_increments_priority() {
         let (ex, _dir) = setup();
         ex.execute("PROMOTE QUERY 1 IN QUEUE").unwrap();
-        let pq = ex.s288_priority_queue.lock().unwrap();
+        let pq = ex.s288_priority_queue.lock_safe();
         assert_eq!(*pq.get(&1).unwrap(), 1);
     }
     #[test]
     fn test_s288_demote_decrements_priority() {
         let (ex, _dir) = setup();
         ex.execute("DEMOTE QUERY 1 IN QUEUE").unwrap();
-        let pq = ex.s288_priority_queue.lock().unwrap();
+        let pq = ex.s288_priority_queue.lock_safe();
         assert_eq!(*pq.get(&1).unwrap(), -1);
     }
     // ── S289 — Table statistics export v2 ────────────────────────────────────────────────
@@ -31335,14 +31723,14 @@ mod tests {
     fn test_s289_format_stored() {
         let (ex, _dir) = setup();
         ex.execute("EXPORT TABLE STATS FOR t FORMAT JSON").unwrap();
-        assert_eq!(*ex.s289_export_format.lock().unwrap(), "JSON");
+        assert_eq!(*ex.s289_export_format.lock_safe(), "JSON");
     }
     #[test]
     fn test_s289_reset_clears_log() {
         let (ex, _dir) = setup();
         ex.execute("EXPORT TABLE STATS FOR t FORMAT JSON").unwrap();
         ex.execute("RESET STATS EXPORT FORMAT V2").unwrap();
-        assert!(ex.s289_export_log.lock().unwrap().is_empty());
+        assert!(ex.s289_export_log.lock_safe().is_empty());
     }
     // ── S290 — Schema compatibility check ────────────────────────────────────────────────
     #[test]
@@ -31369,14 +31757,14 @@ mod tests {
     fn test_s290_report_populated() {
         let (ex, _dir) = setup();
         ex.execute("CHECK SCHEMA COMPATIBILITY s1 WITH s2").unwrap();
-        assert!(ex.s290_compat_report.lock().unwrap().is_some());
+        assert!(ex.s290_compat_report.lock_safe().is_some());
     }
     #[test]
     fn test_s290_clear_empties_report() {
         let (ex, _dir) = setup();
         ex.execute("CHECK SCHEMA COMPATIBILITY s1 WITH s2").unwrap();
         ex.execute("CLEAR COMPATIBILITY REPORT").unwrap();
-        assert!(ex.s290_compat_report.lock().unwrap().is_none());
+        assert!(ex.s290_compat_report.lock_safe().is_none());
     }
     // ── S291 — Table row estimation ────────────────────────────────────────────────
     #[test]
@@ -31407,7 +31795,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("ESTIMATE ROW COUNT FOR t").unwrap();
-        let est = ex.s291_row_estimates.lock().unwrap();
+        let est = ex.s291_row_estimates.lock_safe();
         assert_eq!(*est.get("t").unwrap(), 0);
     }
     #[test]
@@ -31415,7 +31803,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE TABLE t (pk U64, val U64)").unwrap();
         ex.execute("REFRESH ROW COUNT ESTIMATE FOR t").unwrap();
-        assert!(ex.s291_row_estimates.lock().unwrap().contains_key("t"));
+        assert!(ex.s291_row_estimates.lock_safe().contains_key("t"));
     }
     // ── S292 — Query timeout escalation ────────────────────────────────────────────────
     #[test]
@@ -31445,7 +31833,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET QUERY TIMEOUT ESCALATION '10s,30s,60s'")
             .unwrap();
-        let vals = ex.s292_timeout_escalation.lock().unwrap();
+        let vals = ex.s292_timeout_escalation.lock_safe();
         assert_eq!(vals.len(), 3);
     }
     #[test]
@@ -31454,7 +31842,7 @@ mod tests {
         ex.execute("SET QUERY TIMEOUT ESCALATION '10s,30s,60s'")
             .unwrap();
         ex.execute("RESET TIMEOUT ESCALATION POLICY").unwrap();
-        assert!(ex.s292_timeout_escalation.lock().unwrap().is_empty());
+        assert!(ex.s292_timeout_escalation.lock_safe().is_empty());
     }
     // ── S293 — Index usage forecasting ────────────────────────────────────────────────
     #[test]
@@ -31481,14 +31869,14 @@ mod tests {
     fn test_s293_forecast_stored() {
         let (ex, _dir) = setup();
         ex.execute("FORECAST INDEX USAGE FOR idx").unwrap();
-        assert!(ex.s293_usage_forecast.lock().unwrap().contains_key("idx"));
+        assert!(ex.s293_usage_forecast.lock_safe().contains_key("idx"));
     }
     #[test]
     fn test_s293_clear_empties_map() {
         let (ex, _dir) = setup();
         ex.execute("FORECAST INDEX USAGE FOR idx").unwrap();
         ex.execute("CLEAR INDEX USAGE FORECAST").unwrap();
-        assert!(ex.s293_usage_forecast.lock().unwrap().is_empty());
+        assert!(ex.s293_usage_forecast.lock_safe().is_empty());
     }
     // ── S294 — Table snapshot diffing ────────────────────────────────────────────────
     #[test]
@@ -31515,14 +31903,14 @@ mod tests {
     fn test_s294_diff_stored() {
         let (ex, _dir) = setup();
         ex.execute("DIFF SNAPSHOT s1 AGAINST s2 FOR t").unwrap();
-        assert_eq!(ex.s294_snapshot_diffs.lock().unwrap().len(), 1);
+        assert_eq!(ex.s294_snapshot_diffs.lock_safe().len(), 1);
     }
     #[test]
     fn test_s294_clear_empties_diffs() {
         let (ex, _dir) = setup();
         ex.execute("DIFF SNAPSHOT s1 AGAINST s2 FOR t").unwrap();
         ex.execute("CLEAR SNAPSHOT DIFFS").unwrap();
-        assert!(ex.s294_snapshot_diffs.lock().unwrap().is_empty());
+        assert!(ex.s294_snapshot_diffs.lock_safe().is_empty());
     }
     // ── S295 — Query resource limits ────────────────────────────────────────────────
     #[test]
@@ -31548,17 +31936,14 @@ mod tests {
     fn test_s295_limit_stored() {
         let (ex, _dir) = setup();
         ex.execute("SET QUERY MEMORY LIMIT 512MB").unwrap();
-        assert_eq!(
-            ex.s295_memory_limit.lock().unwrap().clone().unwrap(),
-            "512MB"
-        );
+        assert_eq!(ex.s295_memory_limit.lock_safe().clone().unwrap(), "512MB");
     }
     #[test]
     fn test_s295_reset_clears_limit() {
         let (ex, _dir) = setup();
         ex.execute("SET QUERY MEMORY LIMIT 512MB").unwrap();
         ex.execute("RESET QUERY RESOURCE LIMITS").unwrap();
-        assert!(ex.s295_memory_limit.lock().unwrap().is_none());
+        assert!(ex.s295_memory_limit.lock_safe().is_none());
     }
     // ── S296 — Table partition pruning stats ────────────────────────────────────────────────
     #[test]
@@ -31593,12 +31978,9 @@ mod tests {
     #[test]
     fn test_s296_reset_removes_entry() {
         let (ex, _dir) = setup();
-        ex.s296_pruning_stats
-            .lock()
-            .unwrap()
-            .insert("t".to_owned(), 5);
+        ex.s296_pruning_stats.lock_safe().insert("t".to_owned(), 5);
         ex.execute("RESET PARTITION PRUNING STATS FOR t").unwrap();
-        assert!(ex.s296_pruning_stats.lock().unwrap().get("t").is_none());
+        assert!(ex.s296_pruning_stats.lock_safe().get("t").is_none());
     }
     // ── S297 — Schema validation rules ────────────────────────────────────────────────
     #[test]
@@ -31630,7 +32012,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("CREATE SCHEMA VALIDATION RULE r ON s CHECK 'expr'")
             .unwrap();
-        let rules = ex.s297_validation_rules.lock().unwrap();
+        let rules = ex.s297_validation_rules.lock_safe();
         assert_eq!(rules.get("r").unwrap().0, "s");
     }
     #[test]
@@ -31639,7 +32021,7 @@ mod tests {
         ex.execute("CREATE SCHEMA VALIDATION RULE r ON s CHECK 'expr'")
             .unwrap();
         ex.execute("DROP SCHEMA VALIDATION RULE r").unwrap();
-        assert!(ex.s297_validation_rules.lock().unwrap().get("r").is_none());
+        assert!(ex.s297_validation_rules.lock_safe().get("r").is_none());
     }
     // ── S298 — Query explain history ────────────────────────────────────────────────
     #[test]
@@ -31666,14 +32048,14 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SHOW EXPLAIN HISTORY FOR 'SELECT 1'").unwrap();
         ex.execute("SHOW EXPLAIN HISTORY FOR 'SELECT 2'").unwrap();
-        assert_eq!(ex.s298_explain_history.lock().unwrap().len(), 2);
+        assert_eq!(ex.s298_explain_history.lock_safe().len(), 2);
     }
     #[test]
     fn test_s298_clear_empties_history() {
         let (ex, _dir) = setup();
         ex.execute("SHOW EXPLAIN HISTORY FOR 'SELECT 1'").unwrap();
         ex.execute("CLEAR EXPLAIN HISTORY").unwrap();
-        assert!(ex.s298_explain_history.lock().unwrap().is_empty());
+        assert!(ex.s298_explain_history.lock_safe().is_empty());
     }
     // ── S299 — Table compression ratio ────────────────────────────────────────────────
     #[test]
@@ -31703,7 +32085,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET COMPRESSION ALGORITHM FOR t TO ZSTD")
             .unwrap();
-        let algos = ex.s299_compression_algo.lock().unwrap();
+        let algos = ex.s299_compression_algo.lock_safe();
         assert_eq!(algos.get("t").unwrap(), "ZSTD");
     }
     #[test]
@@ -31776,20 +32158,20 @@ mod tests {
         ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 1'").unwrap();
         let r = ex.execute("CLEAR QUERY FINGERPRINTS").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s301_fingerprints.lock().unwrap().is_empty());
+        assert!(ex.s301_fingerprints.lock_safe().is_empty());
     }
     #[test]
     fn test_s301_fingerprint_stored_in_map() {
         let (ex, _dir) = setup();
         ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 2'").unwrap();
-        assert_eq!(ex.s301_fingerprints.lock().unwrap().len(), 1);
+        assert_eq!(ex.s301_fingerprints.lock_safe().len(), 1);
     }
     #[test]
     fn test_s301_multiple_fingerprints_accumulate() {
         let (ex, _dir) = setup();
         ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 1'").unwrap();
         ex.execute("COMPUTE QUERY FINGERPRINT 'SELECT 2'").unwrap();
-        assert_eq!(ex.s301_fingerprints.lock().unwrap().len(), 2);
+        assert_eq!(ex.s301_fingerprints.lock_safe().len(), 2);
     }
 
     // ── S302 — Table column reordering ───────────────────────────────────────
@@ -31826,7 +32208,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("ALTER TABLE orders REORDER COLUMNS (a,b,c)")
             .unwrap();
-        let m = ex.s302_column_order.lock().unwrap();
+        let m = ex.s302_column_order.lock_safe();
         assert_eq!(
             m.get("orders").unwrap(),
             &vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
@@ -31866,18 +32248,18 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET INDEX BUILD PARALLELISM 8").unwrap();
         ex.execute("RESET INDEX BUILD PARALLELISM").unwrap();
-        assert_eq!(*ex.s303_index_build_parallelism.lock().unwrap(), 1);
+        assert_eq!(*ex.s303_index_build_parallelism.lock_safe(), 1);
     }
     #[test]
     fn test_s303_default_parallelism_is_one() {
         let (ex, _dir) = setup();
-        assert_eq!(*ex.s303_index_build_parallelism.lock().unwrap(), 1);
+        assert_eq!(*ex.s303_index_build_parallelism.lock_safe(), 1);
     }
     #[test]
     fn test_s303_set_parallelism_updates_field() {
         let (ex, _dir) = setup();
         ex.execute("SET INDEX BUILD PARALLELISM 16").unwrap();
-        assert_eq!(*ex.s303_index_build_parallelism.lock().unwrap(), 16);
+        assert_eq!(*ex.s303_index_build_parallelism.lock_safe(), 16);
     }
 
     // ── S304 — Query result sampling ─────────────────────────────────────────
@@ -31903,18 +32285,18 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET QUERY RESULT SAMPLE RATE 0.2").unwrap();
         ex.execute("RESET QUERY RESULT SAMPLE RATE").unwrap();
-        assert_eq!(*ex.s304_sample_rate.lock().unwrap(), 1.0);
+        assert_eq!(*ex.s304_sample_rate.lock_safe(), 1.0);
     }
     #[test]
     fn test_s304_default_sample_rate_is_one() {
         let (ex, _dir) = setup();
-        assert_eq!(*ex.s304_sample_rate.lock().unwrap(), 1.0);
+        assert_eq!(*ex.s304_sample_rate.lock_safe(), 1.0);
     }
     #[test]
     fn test_s304_set_sample_rate_updates_field() {
         let (ex, _dir) = setup();
         ex.execute("SET QUERY RESULT SAMPLE RATE 0.75").unwrap();
-        assert_eq!(*ex.s304_sample_rate.lock().unwrap(), 0.75);
+        assert_eq!(*ex.s304_sample_rate.lock_safe(), 0.75);
     }
 
     // ── S305 — Table storage quotas ──────────────────────────────────────────
@@ -31937,18 +32319,14 @@ mod tests {
         ex.execute("SET STORAGE QUOTA FOR orders TO 10GB").unwrap();
         let r = ex.execute("DROP STORAGE QUOTA FOR orders").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s305_storage_quotas.lock().unwrap().is_empty());
+        assert!(ex.s305_storage_quotas.lock_safe().is_empty());
     }
     #[test]
     fn test_s305_quota_value_stored() {
         let (ex, _dir) = setup();
         ex.execute("SET STORAGE QUOTA FOR orders TO 5GB").unwrap();
         assert_eq!(
-            ex.s305_storage_quotas
-                .lock()
-                .unwrap()
-                .get("orders")
-                .unwrap(),
+            ex.s305_storage_quotas.lock_safe().get("orders").unwrap(),
             "5GB"
         );
     }
@@ -31957,7 +32335,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET STORAGE QUOTA FOR orders TO 5GB").unwrap();
         ex.execute("SET STORAGE QUOTA FOR users TO 1GB").unwrap();
-        assert_eq!(ex.s305_storage_quotas.lock().unwrap().len(), 2);
+        assert_eq!(ex.s305_storage_quotas.lock_safe().len(), 2);
     }
 
     // ── S306 — Schema migration rollback points ──────────────────────────────
@@ -31997,7 +32375,7 @@ mod tests {
         ex.execute("CREATE MIGRATION ROLLBACK POINT rp2 FOR sales")
             .unwrap();
         assert_eq!(
-            ex.s306_rollback_points.lock().unwrap().get("rp2").unwrap(),
+            ex.s306_rollback_points.lock_safe().get("rp2").unwrap(),
             "sales"
         );
     }
@@ -32026,7 +32404,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("CLEAR EXECUTION GRAPHS").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s307_execution_graphs.lock().unwrap().is_empty());
+        assert!(ex.s307_execution_graphs.lock_safe().is_empty());
     }
     #[test]
     fn test_s307_graph_path_stored() {
@@ -32035,8 +32413,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ex.s307_execution_graphs
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get("SELECT 2")
                 .unwrap(),
             "/tmp/h.json"
@@ -32049,7 +32426,7 @@ mod tests {
             .unwrap();
         ex.execute("EXPORT EXECUTION GRAPH FOR 'SELECT 2' TO '/tmp/b.json'")
             .unwrap();
-        assert_eq!(ex.s307_execution_graphs.lock().unwrap().len(), 2);
+        assert_eq!(ex.s307_execution_graphs.lock_safe().len(), 2);
     }
 
     // ── S308 — Table access rate limiting v2 ─────────────────────────────────
@@ -32076,7 +32453,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("DROP ACCESS RATE LIMIT FOR orders").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s308_access_rate_limits.lock().unwrap().is_empty());
+        assert!(ex.s308_access_rate_limits.lock_safe().is_empty());
     }
     #[test]
     fn test_s308_limit_value_stored() {
@@ -32085,8 +32462,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ex.s308_access_rate_limits
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get("orders")
                 .unwrap(),
             "50 PER SECOND"
@@ -32099,7 +32475,7 @@ mod tests {
             .unwrap();
         ex.execute("SET TABLE users ACCESS RATE LIMIT 10 PER SECOND")
             .unwrap();
-        assert_eq!(ex.s308_access_rate_limits.lock().unwrap().len(), 2);
+        assert_eq!(ex.s308_access_rate_limits.lock_safe().len(), 2);
     }
 
     // ── S309 — Column null ratio stats ───────────────────────────────────────
@@ -32122,7 +32498,7 @@ mod tests {
         ex.execute("COMPUTE NULL RATIO FOR orders.total").unwrap();
         let r = ex.execute("CLEAR NULL RATIOS").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s309_null_ratios.lock().unwrap().is_empty());
+        assert!(ex.s309_null_ratios.lock_safe().is_empty());
     }
     #[test]
     fn test_s309_ratio_key_stored() {
@@ -32130,8 +32506,7 @@ mod tests {
         ex.execute("COMPUTE NULL RATIO FOR orders.total").unwrap();
         assert!(
             ex.s309_null_ratios
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .contains_key(&("orders".to_owned(), "total".to_owned()))
         );
     }
@@ -32140,7 +32515,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("COMPUTE NULL RATIO FOR orders.total").unwrap();
         ex.execute("COMPUTE NULL RATIO FOR orders.name").unwrap();
-        assert_eq!(ex.s309_null_ratios.lock().unwrap().len(), 2);
+        assert_eq!(ex.s309_null_ratios.lock_safe().len(), 2);
     }
 
     // ── S310 — Query plan cost comparison ────────────────────────────────────
@@ -32163,13 +32538,13 @@ mod tests {
         ex.execute("COMPARE QUERY PLAN COST v1 WITH v2").unwrap();
         let r = ex.execute("CLEAR PLAN COST COMPARISONS").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s310_plan_cost_comparisons.lock().unwrap().is_empty());
+        assert!(ex.s310_plan_cost_comparisons.lock_safe().is_empty());
     }
     #[test]
     fn test_s310_comparison_values_stored() {
         let (ex, _dir) = setup();
         ex.execute("COMPARE QUERY PLAN COST va WITH vb").unwrap();
-        let comps = ex.s310_plan_cost_comparisons.lock().unwrap();
+        let comps = ex.s310_plan_cost_comparisons.lock_safe();
         assert_eq!(comps[0], ("va".to_owned(), "vb".to_owned()));
     }
     #[test]
@@ -32177,7 +32552,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("COMPARE QUERY PLAN COST v1 WITH v2").unwrap();
         ex.execute("COMPARE QUERY PLAN COST v3 WITH v4").unwrap();
-        assert_eq!(ex.s310_plan_cost_comparisons.lock().unwrap().len(), 2);
+        assert_eq!(ex.s310_plan_cost_comparisons.lock_safe().len(), 2);
     }
 
     // ── S311 — Table replica lag alerts ──────────────────────────────────────
@@ -32204,7 +32579,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("CLEAR REPLICA LAG ALERT FOR orders").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s311_replica_lag_alerts.lock().unwrap().is_empty());
+        assert!(ex.s311_replica_lag_alerts.lock_safe().is_empty());
     }
     #[test]
     fn test_s311_threshold_value_stored() {
@@ -32213,8 +32588,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ex.s311_replica_lag_alerts
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get("orders")
                 .unwrap(),
             "10s"
@@ -32227,7 +32601,7 @@ mod tests {
             .unwrap();
         ex.execute("SET REPLICA LAG ALERT THRESHOLD FOR users TO 3s")
             .unwrap();
-        assert_eq!(ex.s311_replica_lag_alerts.lock().unwrap().len(), 2);
+        assert_eq!(ex.s311_replica_lag_alerts.lock_safe().len(), 2);
     }
 
     // ── S312 — Index selectivity stats ───────────────────────────────────────
@@ -32254,25 +32628,20 @@ mod tests {
             .unwrap();
         let r = ex.execute("CLEAR INDEX SELECTIVITY").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s312_index_selectivity.lock().unwrap().is_empty());
+        assert!(ex.s312_index_selectivity.lock_safe().is_empty());
     }
     #[test]
     fn test_s312_selectivity_key_stored() {
         let (ex, _dir) = setup();
         ex.execute("COMPUTE INDEX SELECTIVITY FOR idx_a").unwrap();
-        assert!(
-            ex.s312_index_selectivity
-                .lock()
-                .unwrap()
-                .contains_key("idx_a")
-        );
+        assert!(ex.s312_index_selectivity.lock_safe().contains_key("idx_a"));
     }
     #[test]
     fn test_s312_multiple_selectivities() {
         let (ex, _dir) = setup();
         ex.execute("COMPUTE INDEX SELECTIVITY FOR idx_a").unwrap();
         ex.execute("COMPUTE INDEX SELECTIVITY FOR idx_b").unwrap();
-        assert_eq!(ex.s312_index_selectivity.lock().unwrap().len(), 2);
+        assert_eq!(ex.s312_index_selectivity.lock_safe().len(), 2);
     }
 
     // ── S313 — Query result row limits ───────────────────────────────────────
@@ -32297,18 +32666,18 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET GLOBAL QUERY ROW LIMIT 5000").unwrap();
         ex.execute("RESET GLOBAL QUERY ROW LIMIT").unwrap();
-        assert!(ex.s313_global_row_limit.lock().unwrap().is_none());
+        assert!(ex.s313_global_row_limit.lock_safe().is_none());
     }
     #[test]
     fn test_s313_default_row_limit_is_none() {
         let (ex, _dir) = setup();
-        assert!(ex.s313_global_row_limit.lock().unwrap().is_none());
+        assert!(ex.s313_global_row_limit.lock_safe().is_none());
     }
     #[test]
     fn test_s313_set_row_limit_updates_field() {
         let (ex, _dir) = setup();
         ex.execute("SET GLOBAL QUERY ROW LIMIT 42").unwrap();
-        assert_eq!(*ex.s313_global_row_limit.lock().unwrap(), Some(42));
+        assert_eq!(*ex.s313_global_row_limit.lock_safe(), Some(42));
     }
 
     // ── S314 — Table vacuum scheduling ───────────────────────────────────────
@@ -32335,7 +32704,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("CANCEL VACUUM SCHEDULE FOR orders").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s314_vacuum_schedule.lock().unwrap().is_empty());
+        assert!(ex.s314_vacuum_schedule.lock_safe().is_empty());
     }
     #[test]
     fn test_s314_schedule_value_stored() {
@@ -32343,11 +32712,7 @@ mod tests {
         ex.execute("SCHEDULE VACUUM FOR orders AT '2026-02-02 00:00'")
             .unwrap();
         assert_eq!(
-            ex.s314_vacuum_schedule
-                .lock()
-                .unwrap()
-                .get("orders")
-                .unwrap(),
+            ex.s314_vacuum_schedule.lock_safe().get("orders").unwrap(),
             "2026-02-02 00:00"
         );
     }
@@ -32358,7 +32723,7 @@ mod tests {
             .unwrap();
         ex.execute("SCHEDULE VACUUM FOR users AT '2026-01-02 00:00'")
             .unwrap();
-        assert_eq!(ex.s314_vacuum_schedule.lock().unwrap().len(), 2);
+        assert_eq!(ex.s314_vacuum_schedule.lock_safe().len(), 2);
     }
 
     // ── S315 — Schema object dependencies ────────────────────────────────────
@@ -32388,14 +32753,14 @@ mod tests {
     fn test_s315_clear_dependency_cache_increments_counter() {
         let (ex, _dir) = setup();
         ex.execute("CLEAR DEPENDENCY CACHE").unwrap();
-        assert_eq!(*ex.s315_dependency_cache_clears.lock().unwrap(), 1);
+        assert_eq!(*ex.s315_dependency_cache_clears.lock_safe(), 1);
     }
     #[test]
     fn test_s315_clear_dependency_cache_multiple_times() {
         let (ex, _dir) = setup();
         ex.execute("CLEAR DEPENDENCY CACHE").unwrap();
         ex.execute("CLEAR DEPENDENCY CACHE").unwrap();
-        assert_eq!(*ex.s315_dependency_cache_clears.lock().unwrap(), 2);
+        assert_eq!(*ex.s315_dependency_cache_clears.lock_safe(), 2);
     }
 
     // ── S316 — Query connection tagging ──────────────────────────────────────
@@ -32418,20 +32783,20 @@ mod tests {
         ex.execute("SET CONNECTION TAG 'reporting'").unwrap();
         let r = ex.execute("CLEAR CONNECTION TAG").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s316_connection_tags.lock().unwrap().is_empty());
+        assert!(ex.s316_connection_tags.lock_safe().is_empty());
     }
     #[test]
     fn test_s316_tag_value_stored() {
         let (ex, _dir) = setup();
         ex.execute("SET CONNECTION TAG 'etl'").unwrap();
-        assert_eq!(ex.s316_connection_tags.lock().unwrap()[0], "etl");
+        assert_eq!(ex.s316_connection_tags.lock_safe()[0], "etl");
     }
     #[test]
     fn test_s316_multiple_tags_accumulate() {
         let (ex, _dir) = setup();
         ex.execute("SET CONNECTION TAG 'a'").unwrap();
         ex.execute("SET CONNECTION TAG 'b'").unwrap();
-        assert_eq!(ex.s316_connection_tags.lock().unwrap().len(), 2);
+        assert_eq!(ex.s316_connection_tags.lock_safe().len(), 2);
     }
 
     // ── S317 — Table data skew detection ─────────────────────────────────────
@@ -32454,25 +32819,20 @@ mod tests {
         ex.execute("DETECT DATA SKEW FOR orders.total").unwrap();
         let r = ex.execute("CLEAR DATA SKEW REPORT").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s317_data_skew_report.lock().unwrap().is_empty());
+        assert!(ex.s317_data_skew_report.lock_safe().is_empty());
     }
     #[test]
     fn test_s317_report_key_stored() {
         let (ex, _dir) = setup();
         ex.execute("DETECT DATA SKEW FOR orders.total").unwrap();
-        assert!(
-            ex.s317_data_skew_report
-                .lock()
-                .unwrap()
-                .contains_key("orders")
-        );
+        assert!(ex.s317_data_skew_report.lock_safe().contains_key("orders"));
     }
     #[test]
     fn test_s317_multiple_skew_reports() {
         let (ex, _dir) = setup();
         ex.execute("DETECT DATA SKEW FOR orders.total").unwrap();
         ex.execute("DETECT DATA SKEW FOR users.age").unwrap();
-        assert_eq!(ex.s317_data_skew_report.lock().unwrap().len(), 2);
+        assert_eq!(ex.s317_data_skew_report.lock_safe().len(), 2);
     }
 
     // ── S318 — Index rebuild triggers ────────────────────────────────────────
@@ -32499,7 +32859,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("DROP INDEX REBUILD TRIGGER idx_orders").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s318_index_rebuild_triggers.lock().unwrap().is_empty());
+        assert!(ex.s318_index_rebuild_triggers.lock_safe().is_empty());
     }
     #[test]
     fn test_s318_trigger_value_stored() {
@@ -32508,8 +32868,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             *ex.s318_index_rebuild_triggers
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get("idx_a")
                 .unwrap(),
             30
@@ -32522,7 +32881,7 @@ mod tests {
             .unwrap();
         ex.execute("SET INDEX REBUILD TRIGGER idx_b AT BLOAT 40")
             .unwrap();
-        assert_eq!(ex.s318_index_rebuild_triggers.lock().unwrap().len(), 2);
+        assert_eq!(ex.s318_index_rebuild_triggers.lock_safe().len(), 2);
     }
 
     // ── S319 — Query plan cache eviction ─────────────────────────────────────
@@ -32549,14 +32908,14 @@ mod tests {
             .unwrap();
         let r = ex.execute("CLEAR PLAN CACHE EVICTIONS").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s319_plan_cache_evictions.lock().unwrap().is_empty());
+        assert!(ex.s319_plan_cache_evictions.lock_safe().is_empty());
     }
     #[test]
     fn test_s319_eviction_value_stored() {
         let (ex, _dir) = setup();
         ex.execute("EVICT QUERY PLAN CACHE ENTRY 'SELECT 2'")
             .unwrap();
-        assert_eq!(ex.s319_plan_cache_evictions.lock().unwrap()[0], "SELECT 2");
+        assert_eq!(ex.s319_plan_cache_evictions.lock_safe()[0], "SELECT 2");
     }
     #[test]
     fn test_s319_multiple_evictions_accumulate() {
@@ -32565,7 +32924,7 @@ mod tests {
             .unwrap();
         ex.execute("EVICT QUERY PLAN CACHE ENTRY 'SELECT 2'")
             .unwrap();
-        assert_eq!(ex.s319_plan_cache_evictions.lock().unwrap().len(), 2);
+        assert_eq!(ex.s319_plan_cache_evictions.lock_safe().len(), 2);
     }
 
     // ── S320 — Table write throttling ────────────────────────────────────────
@@ -32592,7 +32951,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("DROP WRITE THROTTLE FOR orders").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s320_write_throttles.lock().unwrap().is_empty());
+        assert!(ex.s320_write_throttles.lock_safe().is_empty());
     }
     #[test]
     fn test_s320_throttle_value_stored() {
@@ -32600,11 +32959,7 @@ mod tests {
         ex.execute("SET TABLE orders WRITE THROTTLE 500 PER SECOND")
             .unwrap();
         assert_eq!(
-            ex.s320_write_throttles
-                .lock()
-                .unwrap()
-                .get("orders")
-                .unwrap(),
+            ex.s320_write_throttles.lock_safe().get("orders").unwrap(),
             "500 PER SECOND"
         );
     }
@@ -32615,7 +32970,7 @@ mod tests {
             .unwrap();
         ex.execute("SET TABLE users WRITE THROTTLE 200 PER SECOND")
             .unwrap();
-        assert_eq!(ex.s320_write_throttles.lock().unwrap().len(), 2);
+        assert_eq!(ex.s320_write_throttles.lock_safe().len(), 2);
     }
 
     // ── S321 — Column cardinality estimation ─────────────────────────────────
@@ -32638,7 +32993,7 @@ mod tests {
         ex.execute("ESTIMATE CARDINALITY FOR orders.total").unwrap();
         let r = ex.execute("CLEAR CARDINALITY ESTIMATES").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s321_cardinality_estimates.lock().unwrap().is_empty());
+        assert!(ex.s321_cardinality_estimates.lock_safe().is_empty());
     }
     #[test]
     fn test_s321_estimate_key_stored() {
@@ -32646,8 +33001,7 @@ mod tests {
         ex.execute("ESTIMATE CARDINALITY FOR orders.total").unwrap();
         assert!(
             ex.s321_cardinality_estimates
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .contains_key(&("orders".to_owned(), "total".to_owned()))
         );
     }
@@ -32656,7 +33010,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("ESTIMATE CARDINALITY FOR orders.total").unwrap();
         ex.execute("ESTIMATE CARDINALITY FOR orders.name").unwrap();
-        assert_eq!(ex.s321_cardinality_estimates.lock().unwrap().len(), 2);
+        assert_eq!(ex.s321_cardinality_estimates.lock_safe().len(), 2);
     }
 
     // ── S322 — Query session variables v2 ────────────────────────────────────
@@ -32679,14 +33033,14 @@ mod tests {
         ex.execute("SET SESSION VAR2 mode = 'fast'").unwrap();
         let r = ex.execute("UNSET SESSION VAR2 mode").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s322_session_vars2.lock().unwrap().is_empty());
+        assert!(ex.s322_session_vars2.lock_safe().is_empty());
     }
     #[test]
     fn test_s322_var_value_stored() {
         let (ex, _dir) = setup();
         ex.execute("SET SESSION VAR2 lang = 'rust'").unwrap();
         assert_eq!(
-            ex.s322_session_vars2.lock().unwrap().get("lang").unwrap(),
+            ex.s322_session_vars2.lock_safe().get("lang").unwrap(),
             "rust"
         );
     }
@@ -32695,7 +33049,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET SESSION VAR2 a = '1'").unwrap();
         ex.execute("SET SESSION VAR2 b = '2'").unwrap();
-        assert_eq!(ex.s322_session_vars2.lock().unwrap().len(), 2);
+        assert_eq!(ex.s322_session_vars2.lock_safe().len(), 2);
     }
 
     // ── S323 — Table backup scheduling ───────────────────────────────────────
@@ -32718,18 +33072,14 @@ mod tests {
         ex.execute("SCHEDULE BACKUP FOR orders EVERY '1d'").unwrap();
         let r = ex.execute("CANCEL BACKUP SCHEDULE FOR orders").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s323_backup_schedule.lock().unwrap().is_empty());
+        assert!(ex.s323_backup_schedule.lock_safe().is_empty());
     }
     #[test]
     fn test_s323_schedule_value_stored() {
         let (ex, _dir) = setup();
         ex.execute("SCHEDULE BACKUP FOR orders EVERY '2d'").unwrap();
         assert_eq!(
-            ex.s323_backup_schedule
-                .lock()
-                .unwrap()
-                .get("orders")
-                .unwrap(),
+            ex.s323_backup_schedule.lock_safe().get("orders").unwrap(),
             "2d"
         );
     }
@@ -32738,7 +33088,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SCHEDULE BACKUP FOR orders EVERY '1d'").unwrap();
         ex.execute("SCHEDULE BACKUP FOR users EVERY '7d'").unwrap();
-        assert_eq!(ex.s323_backup_schedule.lock().unwrap().len(), 2);
+        assert_eq!(ex.s323_backup_schedule.lock_safe().len(), 2);
     }
 
     // ── S324 — Index fragmentation alerts ────────────────────────────────────
@@ -32767,12 +33117,7 @@ mod tests {
             .execute("CLEAR INDEX FRAGMENTATION ALERT FOR idx_orders")
             .unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(
-            ex.s324_index_fragmentation_alerts
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(ex.s324_index_fragmentation_alerts.lock_safe().is_empty());
     }
     #[test]
     fn test_s324_threshold_value_stored() {
@@ -32781,8 +33126,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             *ex.s324_index_fragmentation_alerts
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get("idx_a")
                 .unwrap(),
             40
@@ -32795,7 +33139,7 @@ mod tests {
             .unwrap();
         ex.execute("SET INDEX FRAGMENTATION ALERT idx_b AT 50")
             .unwrap();
-        assert_eq!(ex.s324_index_fragmentation_alerts.lock().unwrap().len(), 2);
+        assert_eq!(ex.s324_index_fragmentation_alerts.lock_safe().len(), 2);
     }
 
     // ── S325 — Query result set limits ───────────────────────────────────────
@@ -32820,19 +33164,19 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET RESULT SET SIZE LIMIT 5MB").unwrap();
         ex.execute("RESET RESULT SET SIZE LIMIT").unwrap();
-        assert!(ex.s325_result_set_size_limit.lock().unwrap().is_none());
+        assert!(ex.s325_result_set_size_limit.lock_safe().is_none());
     }
     #[test]
     fn test_s325_default_limit_is_none() {
         let (ex, _dir) = setup();
-        assert!(ex.s325_result_set_size_limit.lock().unwrap().is_none());
+        assert!(ex.s325_result_set_size_limit.lock_safe().is_none());
     }
     #[test]
     fn test_s325_limit_updates_field() {
         let (ex, _dir) = setup();
         ex.execute("SET RESULT SET SIZE LIMIT 1MB").unwrap();
         assert_eq!(
-            ex.s325_result_set_size_limit.lock().unwrap().clone(),
+            ex.s325_result_set_size_limit.lock_safe().clone(),
             Some("1MB".to_owned())
         );
     }
@@ -32857,25 +33201,20 @@ mod tests {
         ex.execute("DETECT HOT KEYS FOR orders").unwrap();
         let r = ex.execute("CLEAR HOT KEY REPORT").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s326_hot_key_report.lock().unwrap().is_empty());
+        assert!(ex.s326_hot_key_report.lock_safe().is_empty());
     }
     #[test]
     fn test_s326_report_key_stored() {
         let (ex, _dir) = setup();
         ex.execute("DETECT HOT KEYS FOR orders").unwrap();
-        assert!(
-            ex.s326_hot_key_report
-                .lock()
-                .unwrap()
-                .contains_key("orders")
-        );
+        assert!(ex.s326_hot_key_report.lock_safe().contains_key("orders"));
     }
     #[test]
     fn test_s326_multiple_reports() {
         let (ex, _dir) = setup();
         ex.execute("DETECT HOT KEYS FOR orders").unwrap();
         ex.execute("DETECT HOT KEYS FOR users").unwrap();
-        assert_eq!(ex.s326_hot_key_report.lock().unwrap().len(), 2);
+        assert_eq!(ex.s326_hot_key_report.lock_safe().len(), 2);
     }
 
     // ── S327 — Schema change approval workflow ───────────────────────────────
@@ -32949,14 +33288,14 @@ mod tests {
     fn test_s328_detect_anomalies_empty_by_default() {
         let (ex, _dir) = setup();
         ex.execute("DETECT QUERY COST ANOMALIES").unwrap();
-        assert!(ex.s328_cost_anomalies.lock().unwrap().is_empty());
+        assert!(ex.s328_cost_anomalies.lock_safe().is_empty());
     }
     #[test]
     fn test_s328_clear_after_detect() {
         let (ex, _dir) = setup();
         ex.execute("DETECT QUERY COST ANOMALIES").unwrap();
         ex.execute("CLEAR COST ANOMALIES").unwrap();
-        assert!(ex.s328_cost_anomalies.lock().unwrap().is_empty());
+        assert!(ex.s328_cost_anomalies.lock_safe().is_empty());
     }
 
     // ── S329 — Table read replica promotion ──────────────────────────────────
@@ -32979,20 +33318,20 @@ mod tests {
         ex.execute("PROMOTE READ REPLICA 'host1:5432'").unwrap();
         let r = ex.execute("CLEAR REPLICA PROMOTION HISTORY").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s329_replica_promotions.lock().unwrap().is_empty());
+        assert!(ex.s329_replica_promotions.lock_safe().is_empty());
     }
     #[test]
     fn test_s329_promotion_value_stored() {
         let (ex, _dir) = setup();
         ex.execute("PROMOTE READ REPLICA 'host2:5432'").unwrap();
-        assert_eq!(ex.s329_replica_promotions.lock().unwrap()[0], "host2:5432");
+        assert_eq!(ex.s329_replica_promotions.lock_safe()[0], "host2:5432");
     }
     #[test]
     fn test_s329_multiple_promotions_accumulate() {
         let (ex, _dir) = setup();
         ex.execute("PROMOTE READ REPLICA 'host1:5432'").unwrap();
         ex.execute("PROMOTE READ REPLICA 'host2:5432'").unwrap();
-        assert_eq!(ex.s329_replica_promotions.lock().unwrap().len(), 2);
+        assert_eq!(ex.s329_replica_promotions.lock_safe().len(), 2);
     }
 
     // ── S330 — Index usage heatmap ────────────────────────────────────────────
@@ -33028,7 +33367,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("REFRESH INDEX USAGE HEATMAP").unwrap();
         ex.execute("CLEAR INDEX USAGE HEATMAP").unwrap();
-        assert!(ex.s330_index_usage_heatmap.lock().unwrap().is_empty());
+        assert!(ex.s330_index_usage_heatmap.lock_safe().is_empty());
     }
 
     // ── S331 — Query batch retry policy ──────────────────────────────────────
@@ -33057,19 +33396,19 @@ mod tests {
         ex.execute("SET BATCH RETRY POLICY max=3 backoff=200ms")
             .unwrap();
         ex.execute("RESET BATCH RETRY POLICY").unwrap();
-        assert!(ex.s331_batch_retry_policy.lock().unwrap().is_none());
+        assert!(ex.s331_batch_retry_policy.lock_safe().is_none());
     }
     #[test]
     fn test_s331_default_policy_is_none() {
         let (ex, _dir) = setup();
-        assert!(ex.s331_batch_retry_policy.lock().unwrap().is_none());
+        assert!(ex.s331_batch_retry_policy.lock_safe().is_none());
     }
     #[test]
     fn test_s331_policy_updates_field() {
         let (ex, _dir) = setup();
         ex.execute("SET BATCH RETRY POLICY max=5").unwrap();
         assert_eq!(
-            ex.s331_batch_retry_policy.lock().unwrap().clone(),
+            ex.s331_batch_retry_policy.lock_safe().clone(),
             Some("max=5".to_owned())
         );
     }
@@ -33098,7 +33437,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("CLEAR STORAGE COMPRESSION STATS").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s332_storage_compression_stats.lock().unwrap().is_empty());
+        assert!(ex.s332_storage_compression_stats.lock_safe().is_empty());
     }
     #[test]
     fn test_s332_stats_stored_after_refresh() {
@@ -33107,8 +33446,7 @@ mod tests {
             .unwrap();
         assert!(
             ex.s332_storage_compression_stats
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .contains_key("orders")
         );
     }
@@ -33149,19 +33487,19 @@ mod tests {
             .unwrap();
         let r = ex.execute("CLEAR SCHEMA DRIFT REPORT").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s333_schema_drift_report.lock().unwrap().is_none());
+        assert!(ex.s333_schema_drift_report.lock_safe().is_none());
     }
     #[test]
     fn test_s333_default_report_is_none() {
         let (ex, _dir) = setup();
-        assert!(ex.s333_schema_drift_report.lock().unwrap().is_none());
+        assert!(ex.s333_schema_drift_report.lock_safe().is_none());
     }
     #[test]
     fn test_s333_report_contains_schemas() {
         let (ex, _dir) = setup();
         ex.execute("DETECT SCHEMA DRIFT BETWEEN dev AND prod")
             .unwrap();
-        let report = ex.s333_schema_drift_report.lock().unwrap().clone().unwrap();
+        let report = ex.s333_schema_drift_report.lock_safe().clone().unwrap();
         assert!(report.contains("dev") && report.contains("prod"));
     }
 
@@ -33189,7 +33527,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("CLEAR PLAN STABILITY REPORT").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s334_plan_stability_report.lock().unwrap().is_empty());
+        assert!(ex.s334_plan_stability_report.lock_safe().is_empty());
     }
     #[test]
     fn test_s334_tracked_query_key_stored() {
@@ -33198,8 +33536,7 @@ mod tests {
             .unwrap();
         assert!(
             ex.s334_plan_stability_report
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .contains_key("SELECT 2")
         );
     }
@@ -33210,7 +33547,7 @@ mod tests {
             .unwrap();
         ex.execute("TRACK QUERY PLAN STABILITY FOR 'SELECT 2'")
             .unwrap();
-        assert_eq!(ex.s334_plan_stability_report.lock().unwrap().len(), 2);
+        assert_eq!(ex.s334_plan_stability_report.lock_safe().len(), 2);
     }
 
     // ── S335 — Table connection draining ─────────────────────────────────────
@@ -33233,20 +33570,20 @@ mod tests {
         ex.execute("DRAIN CONNECTIONS FOR orders").unwrap();
         let r = ex.execute("CANCEL DRAIN FOR orders").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s335_draining_tables.lock().unwrap().is_empty());
+        assert!(ex.s335_draining_tables.lock_safe().is_empty());
     }
     #[test]
     fn test_s335_table_marked_draining() {
         let (ex, _dir) = setup();
         ex.execute("DRAIN CONNECTIONS FOR orders").unwrap();
-        assert!(ex.s335_draining_tables.lock().unwrap().contains("orders"));
+        assert!(ex.s335_draining_tables.lock_safe().contains("orders"));
     }
     #[test]
     fn test_s335_multiple_draining_tables() {
         let (ex, _dir) = setup();
         ex.execute("DRAIN CONNECTIONS FOR orders").unwrap();
         ex.execute("DRAIN CONNECTIONS FOR users").unwrap();
-        assert_eq!(ex.s335_draining_tables.lock().unwrap().len(), 2);
+        assert_eq!(ex.s335_draining_tables.lock_safe().len(), 2);
     }
 
     // ── S336 — Index build resource limits ───────────────────────────────────
@@ -33273,29 +33610,19 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET INDEX BUILD MEMORY LIMIT 256MB").unwrap();
         ex.execute("RESET INDEX BUILD RESOURCE LIMITS").unwrap();
-        assert!(
-            ex.s336_index_build_resource_limits
-                .lock()
-                .unwrap()
-                .is_none()
-        );
+        assert!(ex.s336_index_build_resource_limits.lock_safe().is_none());
     }
     #[test]
     fn test_s336_default_limit_is_none() {
         let (ex, _dir) = setup();
-        assert!(
-            ex.s336_index_build_resource_limits
-                .lock()
-                .unwrap()
-                .is_none()
-        );
+        assert!(ex.s336_index_build_resource_limits.lock_safe().is_none());
     }
     #[test]
     fn test_s336_limit_updates_field() {
         let (ex, _dir) = setup();
         ex.execute("SET INDEX BUILD MEMORY LIMIT 512MB").unwrap();
         assert_eq!(
-            ex.s336_index_build_resource_limits.lock().unwrap().clone(),
+            ex.s336_index_build_resource_limits.lock_safe().clone(),
             Some("512MB".to_owned())
         );
     }
@@ -33337,7 +33664,7 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SET STREAMING V2 MODE ON").unwrap();
         ex.execute("SET STREAMING V2 MODE OFF").unwrap();
-        assert!(!*ex.s337_streaming_v2_mode.lock().unwrap());
+        assert!(!*ex.s337_streaming_v2_mode.lock_safe());
     }
 
     // ── S338 — Table shard split/merge ───────────────────────────────────────
@@ -33365,13 +33692,13 @@ mod tests {
         let (ex, _dir) = setup();
         ex.execute("SPLIT SHARD FOR orders AT KEY 'k100'").unwrap();
         ex.execute("MERGE SHARDS FOR orders").unwrap();
-        assert_eq!(ex.s338_shard_split_merge_history.lock().unwrap().len(), 2);
+        assert_eq!(ex.s338_shard_split_merge_history.lock_safe().len(), 2);
     }
     #[test]
     fn test_s338_split_event_format() {
         let (ex, _dir) = setup();
         ex.execute("SPLIT SHARD FOR orders AT KEY 'k1'").unwrap();
-        assert!(ex.s338_shard_split_merge_history.lock().unwrap()[0].contains("SPLIT"));
+        assert!(ex.s338_shard_split_merge_history.lock_safe()[0].contains("SPLIT"));
     }
 
     // ── S339 — Schema object tagging ─────────────────────────────────────────
@@ -33398,7 +33725,7 @@ mod tests {
             .unwrap();
         let r = ex.execute("REMOVE TAG FROM public.orders").unwrap();
         assert!(matches!(r, QueryResult::Ok(_)));
-        assert!(ex.s339_object_tags.lock().unwrap().is_empty());
+        assert!(ex.s339_object_tags.lock_safe().is_empty());
     }
     #[test]
     fn test_s339_tag_value_stored() {
@@ -33407,8 +33734,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ex.s339_object_tags
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get("public.orders")
                 .unwrap()[0],
             "sensitive"
@@ -33423,8 +33749,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ex.s339_object_tags
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .get("public.orders")
                 .unwrap()
                 .len(),
@@ -35478,5 +35803,405 @@ mod tests {
         } else {
             panic!();
         }
+    }
+}
+
+/// Batch B correctness gaps: B5 CHECK, B6 FOREIGN KEY, B7 triggers, B8
+/// statement timeout, B9 savepoints, B10 string-row WHERE, B11 autocommit
+/// commit lock, B16 poison-tolerant locks.
+#[cfg(test)]
+mod gaps_batch_b_tests {
+    use super::*;
+    use vectorvolt_engine::EngineOptions;
+
+    fn setup() -> (SqlExecutor, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
+        (SqlExecutor::new(registry), dir)
+    }
+
+    fn rows(r: QueryResult) -> Vec<Vec<String>> {
+        match r {
+            QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn sorted_rows(ex: &SqlExecutor, sql: &str) -> Vec<Vec<String>> {
+        let mut r = rows(ex.execute(sql).unwrap());
+        r.sort();
+        r
+    }
+
+    fn assert_sqlstate(r: &QueryResult, code: &str) {
+        assert!(
+            matches!(r, QueryResult::Error(e) if e.starts_with(&format!("[{code}]"))),
+            "expected SQLSTATE {code}, got {r:?}"
+        );
+    }
+
+    fn values_list(n: u64) -> String {
+        (1..=n)
+            .map(|i| format!("({i}, {i})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    // ── B5 — CHECK ────────────────────────────────────────────────────────
+
+    #[test]
+    fn b5_compound_check_enforced_on_insert() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE ck (pk U64, score U64 CHECK (score >= 10 AND score <= 100))")
+            .unwrap();
+        ex.execute("INSERT INTO ck (pk, score) VALUES (1, 50)")
+            .unwrap();
+        let r = ex
+            .execute("INSERT INTO ck (pk, score) VALUES (2, 500)")
+            .unwrap();
+        assert_sqlstate(&r, "23514");
+        assert!(matches!(&r, QueryResult::Error(e) if e.contains("score")));
+        let r = ex
+            .execute("INSERT INTO ck (pk, score) VALUES (3, 5)")
+            .unwrap();
+        assert_sqlstate(&r, "23514");
+        assert_eq!(sorted_rows(&ex, "SELECT pk FROM ck"), vec![vec!["1"]]);
+    }
+
+    #[test]
+    fn b5_check_enforced_on_update_and_upsert() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE cu2 (pk U64, score U64 CHECK (score >= 10))")
+            .unwrap();
+        ex.execute("INSERT INTO cu2 (pk, score) VALUES (1, 50)")
+            .unwrap();
+        let r = ex.execute("UPDATE cu2 SET score = 1 WHERE pk = 1").unwrap();
+        assert_sqlstate(&r, "23514");
+        let r = ex
+            .execute(
+                "INSERT INTO cu2 (pk, score) VALUES (1, 60) ON CONFLICT DO UPDATE SET score = 2",
+            )
+            .unwrap();
+        assert_sqlstate(&r, "23514");
+        assert_eq!(
+            sorted_rows(&ex, "SELECT score FROM cu2 WHERE pk = 1"),
+            vec![vec!["50"]]
+        );
+        ex.execute("UPDATE cu2 SET score = 70 WHERE pk = 1")
+            .unwrap();
+        assert_eq!(
+            sorted_rows(&ex, "SELECT score FROM cu2 WHERE pk = 1"),
+            vec![vec!["70"]]
+        );
+    }
+
+    #[test]
+    fn b5_unsupported_check_rejected_at_create() {
+        let (ex, _dir) = setup();
+        let r = ex
+            .execute("CREATE TABLE cx (pk U64, v U64 CHECK (v IN (SELECT pk FROM cx)))")
+            .unwrap();
+        assert_sqlstate(&r, "0A000");
+        let r = ex
+            .execute("CREATE TABLE cy (pk U64, v U64 CHECK (nosuch > 0))")
+            .unwrap();
+        assert_sqlstate(&r, "0A000");
+        assert!(
+            ex.execute("SELECT * FROM cx").is_err(),
+            "table must not exist"
+        );
+    }
+
+    // ── B6 — FOREIGN KEY ──────────────────────────────────────────────────
+
+    #[test]
+    fn b6_parent_delete_restricted_while_referenced() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE fp (pk U64)").unwrap();
+        ex.execute("CREATE TABLE fc (pk U64, pid U64, FOREIGN KEY (pid) REFERENCES fp (pk))")
+            .unwrap();
+        ex.execute("INSERT INTO fp (pk) VALUES (1)").unwrap();
+        ex.execute("INSERT INTO fp (pk) VALUES (2)").unwrap();
+        ex.execute("INSERT INTO fc (pk, pid) VALUES (10, 1)")
+            .unwrap();
+        let r = ex.execute("DELETE FROM fp WHERE pk = 1").unwrap();
+        assert_sqlstate(&r, "23503");
+        assert_eq!(sorted_rows(&ex, "SELECT pk FROM fp").len(), 2);
+        // Unreferenced parent rows can go; once the child is gone so can 1.
+        ex.execute("DELETE FROM fp WHERE pk = 2").unwrap();
+        ex.execute("DELETE FROM fc WHERE pk = 10").unwrap();
+        let r = ex.execute("DELETE FROM fp WHERE pk = 1").unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)), "{r:?}");
+    }
+
+    #[test]
+    fn b6_child_update_and_parent_key_update_checked() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE pp (pk U64, code U64)").unwrap();
+        ex.execute(
+            "CREATE TABLE cc (pk U64, code_ref U64, FOREIGN KEY (code_ref) REFERENCES pp (code))",
+        )
+        .unwrap();
+        ex.execute("INSERT INTO pp (pk, code) VALUES (1, 7)")
+            .unwrap();
+        ex.execute("INSERT INTO cc (pk, code_ref) VALUES (1, 7)")
+            .unwrap();
+        let r = ex
+            .execute("UPDATE cc SET code_ref = 999 WHERE pk = 1")
+            .unwrap();
+        assert_sqlstate(&r, "23503");
+        let r = ex.execute("UPDATE pp SET code = 8 WHERE pk = 1").unwrap();
+        assert_sqlstate(&r, "23503");
+        assert_eq!(sorted_rows(&ex, "SELECT code FROM pp"), vec![vec!["7"]]);
+    }
+
+    #[test]
+    fn b6_parent_staged_in_same_txn_is_visible() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE tp (pk U64)").unwrap();
+        ex.execute("CREATE TABLE tc (pk U64, pid U64, FOREIGN KEY (pid) REFERENCES tp (pk))")
+            .unwrap();
+        ex.execute("BEGIN").unwrap();
+        ex.execute("INSERT INTO tp (pk) VALUES (5)").unwrap();
+        let r = ex
+            .execute("INSERT INTO tc (pk, pid) VALUES (1, 5)")
+            .unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)), "{r:?}");
+        ex.execute("COMMIT").unwrap();
+        assert_eq!(sorted_rows(&ex, "SELECT pid FROM tc"), vec![vec!["5"]]);
+    }
+
+    // ── B7 — triggers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn b7_row_triggers_fire_with_new_and_old() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE tt (pk U64, v U64)").unwrap();
+        ex.execute("CREATE TABLE tlog (pk U64, v U64)").unwrap();
+        ex.execute(
+            "CREATE PROCEDURE log_ins AS BEGIN INSERT INTO tlog (pk, v) VALUES (NEW.pk, NEW.v); END",
+        )
+        .unwrap();
+        ex.execute(
+            "CREATE PROCEDURE log_upd AS BEGIN INSERT INTO tlog (pk, v) VALUES (100, OLD.v); END",
+        )
+        .unwrap();
+        ex.execute("CREATE PROCEDURE log_del AS BEGIN DELETE FROM tlog WHERE pk = OLD.pk; END")
+            .unwrap();
+        for sql in [
+            "CREATE TRIGGER a_ins AFTER INSERT ON tt FOR EACH ROW EXECUTE FUNCTION log_ins()",
+            "CREATE TRIGGER b_upd BEFORE UPDATE ON tt FOR EACH ROW EXECUTE FUNCTION log_upd()",
+            "CREATE TRIGGER c_del AFTER DELETE ON tt FOR EACH ROW EXECUTE FUNCTION log_del()",
+        ] {
+            let r = ex.execute(sql).unwrap();
+            assert!(matches!(r, QueryResult::Created), "{sql}: {r:?}");
+        }
+        ex.execute("INSERT INTO tt (pk, v) VALUES (7, 70)").unwrap();
+        assert_eq!(
+            sorted_rows(&ex, "SELECT * FROM tlog"),
+            vec![vec!["7", "70"]]
+        );
+        ex.execute("UPDATE tt SET v = 71 WHERE pk = 7").unwrap();
+        assert_eq!(
+            sorted_rows(&ex, "SELECT * FROM tlog"),
+            vec![vec!["100", "70"], vec!["7", "70"]]
+        );
+        ex.execute("DELETE FROM tt WHERE pk = 7").unwrap();
+        assert_eq!(
+            sorted_rows(&ex, "SELECT * FROM tlog"),
+            vec![vec!["100", "70"]]
+        );
+    }
+
+    #[test]
+    fn b7_failing_before_trigger_aborts_statement() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE ta1 (pk U64)").unwrap();
+        ex.execute("CREATE TABLE guard (pk U64, v U64 CHECK (v > 0))")
+            .unwrap();
+        ex.execute(
+            "CREATE PROCEDURE deny AS BEGIN INSERT INTO guard (pk, v) VALUES (NEW.pk, 0); END",
+        )
+        .unwrap();
+        ex.execute(
+            "CREATE TRIGGER deny_t BEFORE INSERT ON ta1 FOR EACH ROW EXECUTE FUNCTION deny()",
+        )
+        .unwrap();
+        let r = ex.execute("INSERT INTO ta1 (pk) VALUES (1)").unwrap();
+        assert_sqlstate(&r, "23514");
+        assert!(sorted_rows(&ex, "SELECT * FROM ta1").is_empty());
+    }
+
+    #[test]
+    fn b7_recursive_trigger_hits_depth_limit() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE rec (pk U64, v U64)").unwrap();
+        ex.execute("INSERT INTO rec (pk, v) VALUES (1, 0)").unwrap();
+        // An AFTER UPDATE trigger that updates its own row recurses forever.
+        ex.execute("CREATE PROCEDURE again AS BEGIN UPDATE rec SET v = 1 WHERE pk = NEW.pk; END")
+            .unwrap();
+        ex.execute(
+            "CREATE TRIGGER again_t AFTER UPDATE ON rec FOR EACH ROW EXECUTE FUNCTION again()",
+        )
+        .unwrap();
+        let r = ex.execute("UPDATE rec SET v = 2 WHERE pk = 1").unwrap();
+        assert_sqlstate(&r, "54001");
+    }
+
+    #[test]
+    fn b7_unsupported_trigger_function_rejected() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE tu (pk U64)").unwrap();
+        ex.execute("CREATE FUNCTION ident(r) RETURNS VOID AS 'r'")
+            .unwrap();
+        let r = ex
+            .execute("CREATE TRIGGER tu_t AFTER INSERT ON tu FOR EACH ROW EXECUTE FUNCTION ident()")
+            .unwrap();
+        assert_sqlstate(&r, "0A000");
+        let r = ex
+            .execute("CREATE TRIGGER tu_m AFTER INSERT ON tu FOR EACH ROW EXECUTE FUNCTION nope()")
+            .unwrap();
+        assert_sqlstate(&r, "0A000");
+        assert!(ex.triggers.lock_safe().is_empty());
+    }
+
+    // ── B8 — statement timeout ────────────────────────────────────────────
+
+    #[test]
+    fn b8_timeout_cancels_long_join_mid_execution() {
+        let (ex, _dir) = setup();
+        for t in ["ja", "jb", "jc"] {
+            ex.execute(&format!("CREATE TABLE {t} (pk U64, v U64)"))
+                .unwrap();
+            ex.execute(&format!(
+                "INSERT INTO {t} (pk, v) VALUES {}",
+                values_list(80)
+            ))
+            .unwrap();
+        }
+        let sql = "SELECT * FROM ja CROSS JOIN jb CROSS JOIN jc";
+        let t0 = std::time::Instant::now();
+        let full = ex.execute(sql).unwrap();
+        let baseline = t0.elapsed();
+        assert_eq!(rows(full).len(), 80 * 80 * 80);
+
+        ex.execute("SET STATEMENT_TIMEOUT 10").unwrap();
+        let t0 = std::time::Instant::now();
+        let r = ex.execute(sql).unwrap();
+        let cancelled_after = t0.elapsed();
+        assert_sqlstate(&r, "57014");
+        assert!(matches!(&r, QueryResult::Error(e) if e.contains("statement timeout")));
+        assert!(
+            cancelled_after < baseline / 2,
+            "cancelled after {cancelled_after:?}, full run took {baseline:?}"
+        );
+        // The session is usable afterwards.
+        ex.execute("SET STATEMENT_TIMEOUT 999999").unwrap();
+        assert_eq!(rows(ex.execute("SELECT * FROM ja").unwrap()).len(), 80);
+    }
+
+    // ── B9 — ROLLBACK TO SAVEPOINT ────────────────────────────────────────
+
+    #[test]
+    fn b9_rollback_to_reverts_later_changes_to_earlier_tables() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE sp_t (pk U64, v U64)").unwrap();
+        ex.execute("CREATE TABLE sp_u (pk U64, v U64)").unwrap();
+        ex.execute("BEGIN").unwrap();
+        ex.execute("INSERT INTO sp_t (pk, v) VALUES (1, 10)")
+            .unwrap();
+        ex.execute("SAVEPOINT s").unwrap();
+        ex.execute("INSERT INTO sp_t (pk, v) VALUES (1, 99)")
+            .unwrap();
+        ex.execute("INSERT INTO sp_t (pk, v) VALUES (2, 20)")
+            .unwrap();
+        ex.execute("INSERT INTO sp_u (pk, v) VALUES (3, 30)")
+            .unwrap();
+        let r = ex.execute("ROLLBACK TO SAVEPOINT s").unwrap();
+        assert!(matches!(r, QueryResult::TxRollback), "{r:?}");
+        ex.execute("INSERT INTO sp_u (pk, v) VALUES (4, 40)")
+            .unwrap();
+        ex.execute("COMMIT").unwrap();
+        assert_eq!(
+            sorted_rows(&ex, "SELECT * FROM sp_t"),
+            vec![vec!["1", "10"]]
+        );
+        assert_eq!(
+            sorted_rows(&ex, "SELECT * FROM sp_u"),
+            vec![vec!["4", "40"]]
+        );
+    }
+
+    // ── B10 — WHERE over views / CTEs / materialized views ───────────────
+
+    #[test]
+    fn b10_view_predicates_filter_or_error() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE vt (pk U64, v U64)").unwrap();
+        ex.execute(&format!("INSERT INTO vt (pk, v) VALUES {}", values_list(5)))
+            .unwrap();
+        ex.execute("CREATE VIEW vw AS SELECT pk, v FROM vt")
+            .unwrap();
+        assert_eq!(
+            sorted_rows(&ex, "SELECT pk FROM vw WHERE pk IN (2, 4)"),
+            vec![vec!["2"], vec!["4"]]
+        );
+        assert_eq!(
+            sorted_rows(&ex, "SELECT pk FROM vw WHERE v BETWEEN 2 AND 3"),
+            vec![vec!["2"], vec!["3"]]
+        );
+        assert_eq!(
+            sorted_rows(&ex, "SELECT pk FROM vw WHERE pk = 1 OR v > 4"),
+            vec![vec!["1"], vec!["5"]]
+        );
+        let r = ex
+            .execute("SELECT pk FROM vw WHERE pk IN (SELECT pk FROM vt WHERE v = 1)")
+            .unwrap();
+        assert_sqlstate(&r, "0A000");
+    }
+
+    // ── B11 — autocommit writes take SQL_COMMIT_LOCK ─────────────────────
+
+    #[test]
+    fn b11_autocommit_write_waits_for_commit_lock() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE ac (pk U64, v U64)").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            // Simulate a SERIALIZABLE commit in progress.
+            let held = SQL_COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let ex = &ex;
+            scope.spawn(move || {
+                let r = ex.execute("INSERT INTO ac (pk, v) VALUES (1, 1)");
+                tx.send(r.is_ok()).unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "autocommit write must not apply while a commit holds the lock"
+            );
+            drop(held);
+            assert!(rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap());
+        });
+        // Reads never take the lock.
+        let held = SQL_COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(rows(ex.execute("SELECT * FROM ac").unwrap()).len(), 1);
+        drop(held);
+    }
+
+    // ── B16 — poison-tolerant locks ──────────────────────────────────────
+
+    #[test]
+    fn b16_poisoned_mutex_does_not_wedge_executor() {
+        let (ex, _dir) = setup();
+        ex.execute("CREATE TABLE pz (pk U64)").unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = ex.views.lock().unwrap();
+            panic!("poison the views mutex");
+        }));
+        assert!(ex.views.is_poisoned());
+        ex.execute("CREATE VIEW pzv AS SELECT pk FROM pz").unwrap();
+        ex.execute("INSERT INTO pz (pk) VALUES (1)").unwrap();
+        assert_eq!(rows(ex.execute("SELECT * FROM pzv").unwrap()).len(), 1);
     }
 }

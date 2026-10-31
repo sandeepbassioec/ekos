@@ -10,6 +10,7 @@ use crate::error::{WalError, WalResult};
 use crate::frame::{Frame, GENESIS_HASH, PayloadType};
 use crate::segment::{SegmentReader, SegmentWriter, list_segment_ids, segment_path};
 use parking_lot::Mutex;
+use std::fs::File;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
@@ -25,9 +26,28 @@ pub struct WalTip {
 
 struct WriterInner {
     config: WalConfig,
+    /// Always constructed with its own `fsync = false`: it only ever pushes the
+    /// userspace buffer to the OS. Durability is done through `sync_file`, so
+    /// that the `fsync` can run without holding this mutex (Concept 3.2).
     segment: SegmentWriter,
+    /// A second handle on the current segment file, used only for
+    /// `sync_data`. Shared out of the lock by `flush`; replaced on rotation
+    /// (an in-flight sync keeps the old segment's handle alive through the Arc).
+    sync_file: Arc<File>,
     next_seq: u64,
     chain_hash: [u8; 32],
+    /// Test hook run by `flush` after releasing the lock, before the fsync.
+    #[cfg(test)]
+    before_sync: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// Open a write-capable handle on `path` for `sync_data` (FlushFileBuffers on
+/// Windows needs write access). It neither truncates nor shares a cursor with
+/// the appending handle.
+fn open_sync_handle(path: &std::path::Path) -> WalResult<Arc<File>> {
+    Ok(Arc::new(
+        std::fs::OpenOptions::new().write(true).open(path)?,
+    ))
 }
 
 impl WriterInner {
@@ -41,6 +61,12 @@ impl WriterInner {
     /// Rotate to a new segment file.
     fn rotate(&mut self) -> WalResult<()> {
         self.segment.flush()?;
+        // The old segment must be durable before the writer moves on: later
+        // `flush` calls only sync the *current* segment's handle. Rotation is
+        // rare, so syncing under the lock here is acceptable.
+        if self.config.fsync {
+            self.sync_file.sync_data()?;
+        }
         let new_id = self.segment.id + 1;
         info!(
             old_segment = self.segment.id,
@@ -52,8 +78,9 @@ impl WriterInner {
             new_id,
             self.next_seq,
             self.config.segment_max_bytes,
-            self.config.fsync,
+            false,
         )?;
+        self.sync_file = open_sync_handle(&self.segment.path)?;
         Ok(())
     }
 
@@ -114,8 +141,7 @@ impl WalWriter {
 
         let (segment, next_seq, chain_hash) = if ids.is_empty() {
             // Fresh WAL.
-            let seg =
-                SegmentWriter::create(&config.dir, 0, 1, config.segment_max_bytes, config.fsync)?;
+            let seg = SegmentWriter::create(&config.dir, 0, 1, config.segment_max_bytes, false)?;
             info!(dir = %config.dir.display(), "created new WAL");
             (seg, 1u64, GENESIS_HASH)
         } else {
@@ -166,17 +192,21 @@ impl WalWriter {
                 byte_offset,
                 frames.len() as u64,
                 config.segment_max_bytes,
-                config.fsync,
+                false,
             );
             (seg, next_seq, chain_hash)
         };
 
+        let sync_file = open_sync_handle(&segment.path)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(WriterInner {
                 config,
                 segment,
+                sync_file,
                 next_seq,
                 chain_hash,
+                #[cfg(test)]
+                before_sync: None,
             })),
         })
     }
@@ -188,8 +218,43 @@ impl WalWriter {
     }
 
     /// Flush OS write buffers + optional fsync for everything written so far.
+    ///
+    /// Only the userspace-buffer flush happens under the append lock; the
+    /// `fsync` runs after the lock is released, so appends from other threads
+    /// proceed while the sync is in flight. Everything appended before this
+    /// call is covered when it returns `Ok`.
     pub fn flush(&self) -> WalResult<()> {
-        self.inner.lock().segment.flush()
+        self.flush_covering().map(|_| ())
+    }
+
+    /// Like [`flush`](Self::flush), and returns the tip it covers: every frame
+    /// with `sequence <= tip.sequence` is on stable storage (when fsync is
+    /// enabled) once this returns `Ok`. Frames appended concurrently, after the
+    /// buffer flush, may or may not be covered and are never claimed.
+    pub fn flush_covering(&self) -> WalResult<WalTip> {
+        let (sync_file, covered) = {
+            let mut g = self.inner.lock();
+            g.segment.flush()?;
+            let covered = WalTip {
+                sequence: g.next_seq.saturating_sub(1),
+                frame_hash: g.chain_hash,
+                segment_id: g.segment.id,
+            };
+            if !g.config.fsync {
+                return Ok(covered);
+            }
+            #[cfg(test)]
+            let hook = g.before_sync.take();
+            let file = Arc::clone(&g.sync_file);
+            drop(g);
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
+            (file, covered)
+        };
+        sync_file.sync_data()?;
+        Ok(covered)
     }
 
     /// Directory this writer's segments live in.
@@ -230,6 +295,72 @@ mod tests {
     use super::*;
     use crate::config::WalConfig;
     use tempfile::TempDir;
+
+    /// B26 / Concept 3.2: an append must complete while another thread's
+    /// flush is inside its fsync phase. The hook parks the flushing thread
+    /// after it released the append lock; the append must not wait for it.
+    #[test]
+    fn append_proceeds_while_flush_is_syncing() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let cfg = WalConfig::default().with_dir(dir.path()).with_fsync(true);
+        let writer = WalWriter::open(cfg.clone()).unwrap();
+        writer.append(b"before".to_vec()).unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        writer.inner.lock().before_sync = Some(Box::new(move || {
+            entered_tx.send(()).unwrap();
+            // Bounded so a regression fails the assertion instead of hanging.
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        }));
+
+        let flusher = {
+            let w = writer.clone();
+            std::thread::spawn(move || w.flush_covering().unwrap())
+        };
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // The flusher is parked in its sync phase. Appending must not block.
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let w = writer.clone();
+            std::thread::spawn(move || done_tx.send(w.append(b"during".to_vec())).unwrap());
+        }
+        let appended = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("append blocked behind an in-progress fsync");
+        assert_eq!(appended.unwrap().sequence, 2);
+
+        release_tx.send(()).unwrap();
+        let covered = flusher.join().unwrap();
+        // The flush covers only what was appended before it, never the
+        // concurrent append.
+        assert_eq!(covered.sequence, 1);
+
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(WalWriter::open(cfg).unwrap().tip().sequence, 2);
+    }
+
+    #[test]
+    fn rotation_with_fsync_keeps_every_frame() {
+        let dir = TempDir::new().unwrap();
+        let cfg = WalConfig::default()
+            .with_dir(dir.path())
+            .with_fsync(true)
+            .with_segment_max_bytes(512);
+        let writer = WalWriter::open(cfg.clone()).unwrap();
+        for _ in 0..20 {
+            writer.append(vec![7u8; 64]).unwrap();
+            writer.flush().unwrap();
+        }
+        assert!(list_segment_ids(dir.path()).unwrap().len() > 1);
+        drop(writer);
+        assert_eq!(WalWriter::open(cfg).unwrap().tip().sequence, 20);
+    }
 
     #[test]
     fn append_and_recover() {

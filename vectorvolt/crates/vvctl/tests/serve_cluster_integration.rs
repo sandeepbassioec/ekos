@@ -40,6 +40,8 @@ fn start_with_cluster(dir: &TempDir, seeds: Vec<SocketAddr>) -> (u16, impl FnOnc
         max_connections: 32,
         secret: None,
         key_id: "default".into(),
+        key_scope: None,
+        key_file: None,
         cert: None,
         key: None,
         multi: true,

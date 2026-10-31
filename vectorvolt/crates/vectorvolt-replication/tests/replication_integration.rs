@@ -220,3 +220,38 @@ fn disconnected_follower_is_pruned_from_leader() {
         "disconnected follower must be pruned"
     );
 }
+
+// ── concurrent writers (B19) ──────────────────────────────────────────────────
+
+#[test]
+fn concurrent_writers_follower_matches_leader() {
+    let ld = TempDir::new().unwrap();
+    let rd = TempDir::new().unwrap();
+    let leader = Leader::new(engine(&ld));
+    let follower = leader.connect_replica(engine(&rd));
+
+    const KEYS: u64 = 4;
+    std::thread::scope(|s| {
+        for t in 0..8u64 {
+            let leader = &leader;
+            s.spawn(move || {
+                for i in 0..200u64 {
+                    let pk = (t + i) % KEYS;
+                    if i % 7 == 3 {
+                        leader.delete(pk).unwrap();
+                    } else {
+                        leader.insert(pk, vec![pk, t * 1_000 + i]).unwrap();
+                    }
+                }
+            });
+        }
+    });
+    follower.catchup().unwrap();
+
+    for pk in 0..KEYS {
+        let l = leader.get(pk).unwrap().map(|r| r.values);
+        let f = follower.get(pk).unwrap().map(|r| r.values);
+        assert_eq!(l, f, "follower diverged from leader at pk {pk}");
+    }
+    assert_eq!(follower.last_seq(), Some(8 * 200 - 1));
+}

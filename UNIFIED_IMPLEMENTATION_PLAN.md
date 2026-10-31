@@ -683,37 +683,37 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 
 | # | Gap | Where | Ref | Size | Status |
 |---|---|---|---|---|---|
-| B1 | No per-pk write ordering | `txn/manager.rs` | PP-23 | L | ⬜ |
-| B2 | MVCC history wrong after restart (one version per row on disk) | txn/storage | PP-24 | L | ⬜ |
-| B3 | PITR restore is not point-in-time | `pitr.rs` | PP-12b | M | ⬜ |
-| B4 | PITR ignores its flush result | `pitr.rs:25` | — | S | ⬜ |
-| B5 | CHECK constraints never checked | `executor.rs:14226` | S59 | M | ⬜ |
-| B6 | FOREIGN KEY constraints never checked | `executor.rs:14233` | S60 | M | ⬜ |
-| B7 | Triggers never fire | `executor.rs:15368` | S66 | M | ⬜ |
-| B8 | Statement timeout checked after the query finishes | `executor.rs:1542` | S106 | M | ⬜ |
-| B9 | ROLLBACK TO SAVEPOINT misses tables opened before the savepoint | `executor.rs:15562` | S53 | M | ⬜ |
-| B10 | Unsupported view/join predicates evaluate to true | `executor.rs:14350` | — | S | ⬜ |
-| B11 | Autocommit SQL writes take no commit lock | executor | PP-25 | S | ⬜ |
-| B12 | pgwire panics on a message length < 4 or negative | `reader/wire.rs:73-80` | — | S | ⬜ |
-| B13 | pgwire assumes one read per message (no reassembly, > 64 KB breaks) | `reader/session.rs:68` | PP-35 | M | ⬜ |
-| B14 | SQL TCP server: no auth, unbounded `read_line` | `tcp_server.rs` | — | S | ⬜ |
-| B15 | NaN in vector search panics | `vector/hnsw.rs:81` | — | S | ⬜ |
-| B16 | 1,084 `Mutex.lock().unwrap()` in the executor (poisoning) | `executor.rs` | — | M | ⬜ |
-| B17 | CDC log append errors ignored | `engine.rs:763,794,841,1669,1688` | — | S | ⬜ |
-| B18 | Index-rebuild insert errors ignored | `engine.rs:1337` | — | S | ⬜ |
-| B19 | Replication leader assigns seq after the write (reordering) | `replication/leader.rs:47-75` | — | S | ⬜ |
-| B20 | Network FK check trusts the Cuckoo filter; filter never grows | `TableEngine::fk_exists` | PP-39 | M | ⬜ |
-| B21 | pk `u64::MAX` collides with the empty-slot sentinel | index | PP-40 | S | ⬜ |
-| B22 | Secondary scan doesn't re-check values; `pk as u32` truncation | query | VV-QRY-003.5 | M | ⬜ |
-| B23 | Deletes don't remove rows from flushed `.vvsst` | `txn/manager.rs:551` | — | M | ⬜ |
-| B24 | Compaction holds the write lock for the whole run | storage | — | M | ⬜ |
-| B25 | `TxnManager::get` reopens/CRC-checks per call; SQL UPDATE/DELETE O(N) | txn/query | VV-QRY-001.4 | M | ⬜ |
-| B26 | `WalWriter::flush` holds the append lock across fsync | wal | 3.2 | M | ⬜ |
-| B27 | io_uring WAL appender truncates on open | `wal/uring_writer.rs` | 3.1 | S | ⬜ |
-| B28 | Webhook sink always returns Ok | events | PP-66 | S | ⬜ |
-| B29 | CDC sink bridge re-reads the whole WAL per poll | sink/bridge | — | M | ⬜ |
-| B30 | `--secret` key scope blocks `--multi` with auth | `serve.rs`, `net/server.rs` | PP-30 | S | ⬜ |
-| B31 | OTel panics on a bad endpoint; 4/7 metrics never populated | otel | PP-69 | S | ⬜ |
+| B1 | No per-pk write ordering | `txn/manager.rs` | PP-23 | L | ✅ 64 per-pk stripe locks held from WAL append through apply; commit_ts = WAL sequence. Same-stripe writers serialise through fsync. |
+| B2 | MVCC history wrong after restart (one version per row on disk) | txn/storage | PP-24 | L | ✅ Version history rebuilt from the WAL on open (no format bump); valid while the WAL is kept in full — G10 must persist versions before truncating. |
+| B3 | PITR restore is not point-in-time | `pitr.rs` | PP-12b | M | ✅ `restore_to_lsn` / `_marker` / `_timestamp` into a fresh dir via WAL fold up to X. Open: retention deletes aren't WAL-logged, so restore after retention brings those rows back. |
+| B4 | PITR ignores its flush result | `pitr.rs:25` | — | S | ✅ Flush error returned; no marker after a failed flush. |
+| B5 | CHECK constraints never checked | `executor.rs:14226` | S59 | M | ✅ CHECK evaluated on INSERT/upsert/UPDATE/INSERT…SELECT (23514); unenforceable CHECKs rejected at DDL. |
+| B6 | FOREIGN KEY constraints never checked | `executor.rs:14233` | S60 | M | 🟡 Child-side FK check (23503) and parent RESTRICT on DELETE/UPDATE. ON DELETE CASCADE / SET NULL not parsed yet. |
+| B7 | Triggers never fire | `executor.rs:15368` | S66 | M | 🟡 BEFORE/AFTER × INSERT/UPDATE/DELETE fire per row (SQL-body procs), depth cap 16. Not yet: modifying NEW; firing for INSERT…SELECT/COPY. |
+| B8 | Statement timeout checked after the query finishes | `executor.rs:1542` | S106 | M | ✅ Deadline checked inside scan/filter/join/aggregate/update/delete/insert loops → 57014. |
+| B9 | ROLLBACK TO SAVEPOINT misses tables opened before the savepoint | `executor.rs:15562` | S53 | M | ✅ SAVEPOINT snapshots every table's staged writes; ROLLBACK TO restores them; 3B001 / 25P01 errors. |
+| B10 | Unsupported view/join predicates evaluate to true | `executor.rs:14350` | — | S | ✅ `eval_str_where` returns errors (0A000) for unsupported forms; adds IN, BETWEEN, LIKE/ILIKE, qualified names. |
+| B11 | Autocommit SQL writes take no commit lock | executor | PP-25 | S | ✅ Autocommit writes take the (re-entrant) SQL commit lock; reads don't. |
+| B12 | pgwire panics on a message length < 4 or negative | `reader/wire.rs:73-80` | — | S | ✅ Message length must be 4…1 MiB; fuzz test (20k hostile inputs) never panics. |
+| B13 | pgwire assumes one read per message (no reassembly, > 64 KB breaks) | `reader/session.rs:68` | PP-35 | M | ✅ Buffered framing: pipelined, split and large (≤ 1 MiB) messages handled in order; bad framing → FATAL 08P01. |
+| B14 | SQL TCP server: no auth, unbounded `read_line` | `tcp_server.rs` | — | S | 🟡 1 MiB line cap; optional `AUTH <secret>` first line. No server path constructs `SqlTcpServer` with a secret yet. |
+| B15 | NaN in vector search panics | `vector/hnsw.rs:81` | — | S | ✅ `try_insert`/`try_search` reject NaN/inf; `total_cmp`; engine `insert_vector`/`search_vector` now return `InvalidVector`. |
+| B16 | 1,084 `Mutex.lock().unwrap()` in the executor (poisoning) | `executor.rs` | — | M | ✅ `lock_safe()` recovers poisoned mutexes across all ~1,331 call sites. |
+| B17 | CDC log append errors ignored | `engine.rs:763,794,841,1669,1688` | — | S | 🟡 CDC append failures logged, counted and exposed as a gap range (`cdc_health()`); partial records repaired. Not yet: rebuilding the CDC log from the WAL. |
+| B18 | Index-rebuild insert errors ignored | `engine.rs:1337` | — | S | ✅ Index rebuild returns insert errors. |
+| B19 | Replication leader assigns seq after the write (reordering) | `replication/leader.rs:47-75` | — | S | ✅ Leader holds the sender lock across write, seq assignment and send. |
+| B20 | Network FK check trusts the Cuckoo filter; filter never grows | `TableEngine::fk_exists` | PP-39 | M | ✅ Filter positives confirmed against the pk index; filter rebuilt at 2× live count; deleted keys dropped at rebuild. |
+| B21 | pk `u64::MAX` collides with the empty-slot sentinel | index | PP-40 | S | ✅ `u64::MAX` stored in a dedicated slot; works as a normal key. |
+| B22 | Secondary scan doesn't re-check values; `pk as u32` truncation | query | VV-QRY-003.5 | M | ✅ Candidates re-checked against real values; u64 pks; batched fetch. |
+| B23 | Deletes don't remove rows from flushed `.vvsst` | `txn/manager.rs:551` | — | M | ✅ Deletes survive flush, compaction and restart; compaction install no longer undoes racing writes. |
+| B24 | Compaction holds the write lock for the whole run | storage | — | M | ✅ Merge built without partition locks (`prepare_compaction`); locks held only for `install_compaction`. |
+| B25 | `TxnManager::get` reopens/CRC-checks per call; SQL UPDATE/DELETE O(N) | txn/query | VV-QRY-001.4 | M | ✅ Cached, CRC-checked partition readers with epoch invalidation: 109.8 µs → 12.4 µs per flushed read (8.9×). |
+| B26 | `WalWriter::flush` holds the append lock across fsync | wal | 3.2 | M | ✅ fsync runs outside the append lock on a cloned handle; `flush_covering()` reports only synced tips. |
+| B27 | io_uring WAL appender truncates on open | `wal/uring_writer.rs` | 3.1 | S | ✅ io_uring appender opens without truncating and appends at the end. |
+| B28 | Webhook sink always returns Ok | events | PP-66 | S | ✅ Webhook `send` returns the real delivery result after retries; `send_fire_and_forget` kept separately. |
+| B29 | CDC sink bridge re-reads the whole WAL per poll | sink/bridge | — | M | ✅ Bridge keeps a cursor; new polls read only new frames, across segment rotation. |
+| B30 | `--secret` key scope blocks `--multi` with auth | `serve.rs`, `net/server.rs` | PP-30 | S | ✅ `--key-scope` (Admin default with `--multi`) and `--key-file` (`key_id scope hex` lines). |
+| B31 | OTel panics on a bad endpoint; 4/7 metrics never populated | otel | PP-69 | S | 🟡 Bad endpoint returns an error/no-op instead of panicking. Not yet: the 4 unpopulated metrics (live in vectorvolt-metrics/serve); `--features otlp` doesn't compile against opentelemetry 0.26. |
 
 ### C — Encryption at rest (path-to-production item #1)
 
@@ -897,3 +897,4 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 
 - 2026-10-31: register created. PR #647 (PP-01…13, 20–22, 25, 31, 32 + CI green-up) precedes batch A.
 - 2026-10-31: **Batch A** (branch `feat/gaps-batch-a`): A1, A3–A13 ✅; A2 and A14 🟡 (remainders folded into C1 and B30). New tests in query, reader, net, engine, wal, store, ledger/orders/workflow, control.
+- 2026-10-31: **Batch B** (branch `feat/gaps-batch-b`): 26 of 31 ✅; B6, B7, B14, B17, B31 🟡 with the remainder written in each row.

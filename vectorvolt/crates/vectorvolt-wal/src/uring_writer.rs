@@ -35,14 +35,19 @@ mod inner {
 
     impl UringWalAppender {
         /// Open `path` for appending with an io_uring of `ring_size` entries.
+        ///
+        /// An existing file is **never truncated**: writes start at its current
+        /// end. (Opening used to truncate, so pointing the appender at an
+        /// existing WAL silently destroyed it.)
         pub fn open(path: &Path, ring_size: u32) -> io::Result<Self> {
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
-                .truncate(true)
+                .truncate(false)
                 .open(path)?;
+            let pos = file.metadata()?.len();
             let ring = IoUring::new(ring_size.max(1))?;
-            Ok(Self { ring, file, pos: 0 })
+            Ok(Self { ring, file, pos })
         }
 
         /// Append `data` to the WAL.  Submits one write SQE, waits for its CQE,
@@ -132,15 +137,17 @@ mod inner {
     }
 
     impl UringWalAppender {
+        /// Open `path` for appending. An existing file is never truncated;
+        /// writes go to its end.
         pub fn open(path: &Path, _ring_size: u32) -> io::Result<Self> {
             let file = std::fs::OpenOptions::new()
-                .write(true)
+                .append(true)
                 .create(true)
-                .truncate(true)
                 .open(path)?;
+            let pos = file.metadata()?.len();
             Ok(Self {
                 writer: BufWriter::new(file),
-                pos: 0,
+                pos,
             })
         }
 
@@ -312,6 +319,30 @@ mod tests {
         let p = tmp_path();
         let mut w = UringWalAppender::open(&p, 256).expect("open ring_size=256");
         w.append(b"b").expect("append");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // 14 — reopening an existing WAL keeps its contents and appends at the end (B27)
+    #[test]
+    fn uring_reopen_does_not_truncate() {
+        let p = tmp_path();
+        let mut w = UringWalAppender::open(&p, 32).expect("open");
+        w.append(b"first-").expect("append");
+        w.fsync().expect("fsync");
+        w.close().expect("close");
+
+        let mut w = UringWalAppender::open(&p, 32).expect("reopen");
+        assert_eq!(w.pos(), 6, "reopen must start at the existing end");
+        assert_eq!(w.append(b"second").expect("append"), 12);
+        w.fsync().expect("fsync");
+        w.close().expect("close");
+
+        let mut buf = Vec::new();
+        std::fs::File::open(&p)
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        assert_eq!(&buf, b"first-second");
         let _ = std::fs::remove_file(&p);
     }
 

@@ -38,6 +38,8 @@ impl E2EHarness {
             max_connections: 32,
             secret: None,
             key_id: "default".into(),
+            key_scope: None,
+            key_file: None,
             cert: None,
             key: None,
             config: None,

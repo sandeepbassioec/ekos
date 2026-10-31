@@ -14,8 +14,47 @@ pub enum WireError {
     UnknownMessageType(u8),
     #[error("invalid protocol version: {0}")]
     InvalidVersion(i32),
+    #[error("invalid message length: {0}")]
+    InvalidLength(i32),
     #[error("utf8 error: {0}")]
     Utf8(#[from] std::str::Utf8Error),
+}
+
+/// Largest frontend message accepted after startup, as the value of its
+/// Int32 length field (which counts itself but not the type byte). Larger
+/// messages are a protocol violation: the session answers with a FATAL
+/// ErrorResponse (08P01) and closes, so a client cannot make the server
+/// buffer an unbounded amount of memory.
+pub const MAX_MESSAGE_LEN: usize = 1024 * 1024;
+
+/// Validate the Int32 length field of a typed frontend message: it counts
+/// itself, so it must be at least 4, and it may not exceed `max`.
+fn checked_len(raw: i32, max: usize) -> Result<usize, WireError> {
+    match usize::try_from(raw) {
+        Ok(l) if l >= 4 && l <= max => Ok(l),
+        _ => Err(WireError::InvalidLength(raw)),
+    }
+}
+
+/// Split one complete typed frontend message (`Byte1(type) Int32(len)
+/// payload`) off the front of `buf`.
+///
+/// Returns `Ok(None)` when more bytes are needed (several messages may sit
+/// in `buf`, or one message may arrive across several reads), and
+/// [`WireError::InvalidLength`] as soon as the header is readable and its
+/// length is outside `4..=max` — before the body is buffered.
+pub fn split_frontend_frame(buf: &mut BytesMut, max: usize) -> Result<Option<BytesMut>, WireError> {
+    if buf.len() < 5 {
+        return Ok(None);
+    }
+    let raw = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    let len = checked_len(raw, max)?;
+    if buf.len() < 1 + len {
+        // Make room for the rest of this message up front.
+        buf.reserve(1 + len - buf.len());
+        return Ok(None);
+    }
+    Ok(Some(buf.split_to(1 + len)))
 }
 
 // ── Frontend message types ─────────────────────────────────────────────────────
@@ -72,22 +111,20 @@ pub fn decode_frontend(buf: &[u8]) -> Result<FrontendMsg, WireError> {
     }
     let msg_type = buf[0];
     let mut b = &buf[1..];
-    let len = b.get_i32() as usize;
+    let len = checked_len(b.get_i32(), MAX_MESSAGE_LEN)?;
     if buf.len() < 1 + len {
         return Err(WireError::Incomplete);
     }
+    // `len >= 4`, so `5 <= 1 + len <= buf.len()`: the slice cannot panic.
+    let payload = &buf[5..1 + len];
     match msg_type {
         b'Q' => {
             // Query: null-terminated string (len includes itself)
-            let payload = &buf[5..1 + len];
             let s = read_cstr_bytes(payload)?;
             Ok(FrontendMsg::Query(s))
         }
         b'X' => Ok(FrontendMsg::Terminate),
-        b'p' => {
-            let payload = &buf[5..1 + len];
-            Ok(FrontendMsg::Password(read_cstr_bytes(payload)?))
-        }
+        b'p' => Ok(FrontendMsg::Password(read_cstr_bytes(payload)?)),
         t => Err(WireError::UnknownMessageType(t)),
     }
 }
@@ -373,6 +410,121 @@ mod tests {
         let b = encode_auth_cleartext_password();
         assert_eq!(b[0], b'R');
         assert_eq!(i32::from_be_bytes([b[5], b[6], b[7], b[8]]), 3);
+    }
+
+    fn header(t: u8, len: i32) -> Vec<u8> {
+        let mut v = vec![t];
+        v.extend_from_slice(&len.to_be_bytes());
+        v
+    }
+
+    /// B12: a length field below 4 (or negative) used to panic in the slice
+    /// `buf[5..1 + len]` / overflow in `1 + len`.
+    #[test]
+    fn test_decode_frontend_rejects_bad_lengths() {
+        for len in [0, 1, 3, -1, -4, i32::MIN, i32::MAX] {
+            let mut buf = header(b'Q', len);
+            buf.extend_from_slice(&[0u8; 16]);
+            assert!(
+                matches!(decode_frontend(&buf), Err(WireError::InvalidLength(l)) if l == len),
+                "len {len}"
+            );
+        }
+        // Over the cap is rejected even if the body is present.
+        let mut buf = header(b'Q', MAX_MESSAGE_LEN as i32 + 1);
+        buf.resize(MAX_MESSAGE_LEN + 2, b'a');
+        assert!(matches!(
+            decode_frontend(&buf),
+            Err(WireError::InvalidLength(_))
+        ));
+    }
+
+    #[test]
+    fn test_split_frontend_frame_partial_and_pipelined() {
+        let q = |sql: &str| {
+            let mut v = header(b'Q', (4 + sql.len() + 1) as i32);
+            v.extend_from_slice(sql.as_bytes());
+            v.push(0);
+            v
+        };
+        let mut all = q("SELECT 1");
+        all.extend(q("SELECT 2"));
+        // Fed byte by byte, exactly two frames come out, in order.
+        let mut buf = BytesMut::new();
+        let mut out = Vec::new();
+        for &byte in &all {
+            buf.put_u8(byte);
+            while let Some(f) = split_frontend_frame(&mut buf, MAX_MESSAGE_LEN).unwrap() {
+                out.push(decode_frontend(&f).unwrap());
+            }
+        }
+        assert_eq!(
+            out,
+            vec![
+                FrontendMsg::Query("SELECT 1".into()),
+                FrontendMsg::Query("SELECT 2".into())
+            ]
+        );
+        assert!(buf.is_empty());
+        // An oversized header is rejected before the body arrives.
+        let mut buf = BytesMut::from(&header(b'Q', 2 * MAX_MESSAGE_LEN as i32)[..]);
+        assert!(split_frontend_frame(&mut buf, MAX_MESSAGE_LEN).is_err());
+        let mut buf = BytesMut::from(&header(b'Q', 3)[..]);
+        assert!(split_frontend_frame(&mut buf, MAX_MESSAGE_LEN).is_err());
+    }
+
+    /// Deterministic xorshift64* generator (no extra dev-dependency).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    /// B12 fuzz-style: no client byte sequence may panic the decoders or the
+    /// framer. Mixes fully random bytes with known type bytes and hostile
+    /// length fields.
+    #[test]
+    fn test_decoders_never_panic_on_hostile_input() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let types = [b'Q', b'X', b'p', b'P', b'Z', 0, 0xFF];
+        let lens = [
+            0,
+            1,
+            3,
+            4,
+            5,
+            8,
+            -1,
+            i32::MIN,
+            i32::MAX,
+            MAX_MESSAGE_LEN as i32,
+            MAX_MESSAGE_LEN as i32 + 1,
+        ];
+        for i in 0..20_000 {
+            let n = (rng.next() % 64) as usize;
+            let mut bytes: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+            if i % 2 == 0 {
+                let mut h = vec![types[(rng.next() as usize) % types.len()]];
+                let len = if i % 4 == 0 {
+                    lens[(rng.next() as usize) % lens.len()]
+                } else {
+                    rng.next() as i32
+                };
+                h.extend_from_slice(&len.to_be_bytes());
+                h.extend(bytes);
+                bytes = h;
+            }
+            let _ = decode_frontend(&bytes);
+            let _ = decode_startup(&bytes);
+            let mut buf = BytesMut::from(&bytes[..]);
+            while let Ok(Some(f)) = split_frontend_frame(&mut buf, MAX_MESSAGE_LEN) {
+                let _ = decode_frontend(&f);
+            }
+        }
     }
 
     #[test]

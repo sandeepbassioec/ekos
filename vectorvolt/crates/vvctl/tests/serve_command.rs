@@ -13,6 +13,8 @@ fn make_args(addr: &str) -> ServeArgs {
         max_connections: 256,
         secret: None,
         key_id: "default".to_string(),
+        key_scope: None,
+        key_file: None,
         cert: None,
         key: None,
         multi: false,

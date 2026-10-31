@@ -63,6 +63,17 @@ pub struct ServeArgs {
     #[arg(long, default_value = "default")]
     pub key_id: String,
 
+    /// Scope of the `--secret` key. Defaults to `admin` with `--multi` (which
+    /// needs it for table selection and DDL) and `read-write` otherwise.
+    #[arg(long, value_enum)]
+    pub key_scope: Option<KeyScope>,
+
+    /// File of additional keys, one per line: `<key_id> <scope> <hex-secret>`,
+    /// where scope is `read-only`, `read-write` or `admin`. Blank lines and
+    /// lines starting with `#` are ignored.
+    #[arg(long)]
+    pub key_file: Option<PathBuf>,
+
     /// PEM certificate file for TLS.
     #[arg(long)]
     pub cert: Option<PathBuf>,
@@ -269,6 +280,8 @@ impl Default for ServeArgs {
             max_connections: 256,
             secret: None,
             key_id: "default".into(),
+            key_scope: None,
+            key_file: None,
             cert: None,
             key: None,
             multi: false,
@@ -406,6 +419,74 @@ fn build_transport_kind(args: &ServeArgs) -> Result<vectorvolt_net::TransportKin
     }
 }
 
+/// Scope of a wire-protocol key, as given on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum KeyScope {
+    ReadOnly,
+    ReadWrite,
+    Admin,
+}
+
+impl From<KeyScope> for Scope {
+    fn from(k: KeyScope) -> Self {
+        match k {
+            KeyScope::ReadOnly => Scope::ReadOnly,
+            KeyScope::ReadWrite => Scope::ReadWrite,
+            KeyScope::Admin => Scope::Admin,
+        }
+    }
+}
+
+fn parse_secret(hex: &str) -> Result<Secret> {
+    let bytes = hex::decode(hex.trim())
+        .with_context(|| "secret must be a hex string (e.g. produced by `openssl rand -hex 32`)")?;
+    Secret::new(bytes).with_context(|| "invalid secret")
+}
+
+/// Wire-protocol credentials from `--secret`/`--key-scope` and `--key-file`.
+fn build_auth(args: &ServeArgs) -> Result<AuthConfig> {
+    let mut auth = AuthConfig::disabled();
+    if let Some(hex) = &args.secret {
+        let scope = match args.key_scope {
+            Some(s) => s.into(),
+            // `--multi` needs Admin for UseTable/DDL (PP-30); single-table
+            // serving keeps the historical read-write key.
+            None if args.multi => Scope::Admin,
+            None => Scope::ReadWrite,
+        };
+        auth = auth.with_scoped_key(args.key_id.clone(), parse_secret(hex)?, scope);
+    }
+    if let Some(path) = &args.key_file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading key file {}", path.display()))?;
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let [key_id, scope, hex] = parts.as_slice() else {
+                anyhow::bail!(
+                    "{}:{}: expected `<key_id> <scope> <hex-secret>`",
+                    path.display(),
+                    n + 1
+                );
+            };
+            let scope = <KeyScope as clap::ValueEnum>::from_str(scope, true).map_err(|_| {
+                anyhow::anyhow!(
+                    "{}:{}: unknown scope {scope:?} (read-only, read-write, admin)",
+                    path.display(),
+                    n + 1
+                )
+            })?;
+            let secret =
+                parse_secret(hex).with_context(|| format!("{}:{}", path.display(), n + 1))?;
+            auth = auth.with_scoped_key(*key_id, secret, scope.into());
+        }
+    }
+    Ok(auth)
+}
+
 pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
     if args.encrypt_at_rest && args.multi {
         bail!(
@@ -517,15 +598,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
     };
 
     // ── Auth ──────────────────────────────────────────────────────────────────
-    let auth = if let Some(hex) = &args.secret {
-        let bytes = hex::decode(hex.trim()).with_context(
-            || "secret must be a hex string (e.g. produced by `openssl rand -hex 32`)",
-        )?;
-        let secret = Secret::new(bytes).with_context(|| "invalid secret")?;
-        AuthConfig::disabled().with_scoped_key(args.key_id.clone(), secret, Scope::ReadWrite)
-    } else {
-        AuthConfig::disabled()
-    };
+    let auth = build_auth(args)?;
 
     // ── TLS ───────────────────────────────────────────────────────────────────
     let tls_enabled = args.cert.is_some();
@@ -819,7 +892,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
         .clone()
         .or_else(|| std::env::var("VECTORVOLT_GRPC_TOKEN").ok())
         .filter(|t| !t.is_empty());
-    let grpc_needs_token = args.secret.is_some() || !args.grpc_host.is_loopback();
+    let grpc_needs_token =
+        args.secret.is_some() || args.key_file.is_some() || !args.grpc_host.is_loopback();
     let grpc_blocked = grpc_needs_token && grpc_token.is_none();
     if grpc_blocked && !args.no_grpc && args.grpc_port > 0 {
         eprintln!(
@@ -1035,4 +1109,82 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     server.serve().with_context(|| "server error")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod key_scope_tests {
+    use super::*;
+
+    const HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn multi_defaults_the_secret_key_to_admin() {
+        let args = ServeArgs {
+            secret: Some(HEX.into()),
+            multi: true,
+            ..ServeArgs::default()
+        };
+        assert_eq!(
+            build_auth(&args).unwrap().scope_of("default"),
+            Some(Scope::Admin)
+        );
+    }
+
+    #[test]
+    fn single_table_keeps_read_write_and_key_scope_overrides() {
+        let mut args = ServeArgs {
+            secret: Some(HEX.into()),
+            ..ServeArgs::default()
+        };
+        assert_eq!(
+            build_auth(&args).unwrap().scope_of("default"),
+            Some(Scope::ReadWrite)
+        );
+        args.key_scope = Some(KeyScope::ReadOnly);
+        assert_eq!(
+            build_auth(&args).unwrap().scope_of("default"),
+            Some(Scope::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn key_file_adds_scoped_keys_and_rejects_bad_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("keys");
+        std::fs::write(
+            &path,
+            format!(
+                "# keys
+
+reader read-only {HEX}
+ops admin {HEX}
+"
+            ),
+        )
+        .unwrap();
+        let args = ServeArgs {
+            key_file: Some(path.clone()),
+            ..ServeArgs::default()
+        };
+        let auth = build_auth(&args).unwrap();
+        assert_eq!(auth.scope_of("reader"), Some(Scope::ReadOnly));
+        assert_eq!(auth.scope_of("ops"), Some(Scope::Admin));
+
+        std::fs::write(
+            &path,
+            format!(
+                "ops superuser {HEX}
+"
+            ),
+        )
+        .unwrap();
+        assert!(build_auth(&args).is_err());
+        std::fs::write(
+            &path,
+            "ops admin
+",
+        )
+        .unwrap();
+        assert!(build_auth(&args).is_err());
+    }
 }

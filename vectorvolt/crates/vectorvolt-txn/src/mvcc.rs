@@ -9,9 +9,19 @@
 //! current-value descriptor has been overwritten, relocated by a flush, or
 //! removed by a delete.
 //!
-//! Phase 1b (a later change) will teach the on-disk format to retain multiple
-//! versions; until then durability for history comes from the WAL, exactly as it
-//! does for the current value today.
+//! ## Timestamps are WAL sequence numbers (PP-23 / PP-24)
+//!
+//! A live mutation's `commit_ts` is the sequence number of the WAL frame that
+//! carries it, assigned while the writer holds the per-pk stripe lock that also
+//! covers the in-memory apply. That makes version order equal WAL order for
+//! every pk, and makes timestamps durable: a snapshot taken before a restart
+//! means the same thing after it.
+//!
+//! History survives a restart by being rebuilt from the WAL on open (see
+//! `TxnManager::rebuild_pk_index_from_partitions`), not from the `.vvsst`
+//! files, which still hold one version per row. That is correct for as long as
+//! the WAL is retained in full, which it is today; WAL truncation, when it is
+//! added, must first persist the versions and tombstones it would discard.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +58,15 @@ impl CommitClock {
     pub fn current(&self) -> u64 {
         self.counter.load(Ordering::SeqCst)
     }
+
+    /// Move the clock forward to `ts` if it is behind; never moves it back.
+    ///
+    /// Used when the timestamp is assigned elsewhere — a WAL sequence number —
+    /// so concurrent committers can publish out of order without the clock
+    /// ever regressing.
+    pub fn advance_to(&self, ts: u64) {
+        self.counter.fetch_max(ts, Ordering::SeqCst);
+    }
 }
 
 /// One version of a row as of a given commit timestamp.
@@ -61,7 +80,7 @@ pub struct VersionEntry {
 }
 
 impl VersionEntry {
-    fn live(commit_ts: u64, values: Vec<u64>) -> Self {
+    pub fn live(commit_ts: u64, values: Vec<u64>) -> Self {
         VersionEntry {
             commit_ts,
             deleted: false,
@@ -69,7 +88,7 @@ impl VersionEntry {
         }
     }
 
-    fn tombstone(commit_ts: u64) -> Self {
+    pub fn tombstone(commit_ts: u64) -> Self {
         VersionEntry {
             commit_ts,
             deleted: true,
@@ -110,6 +129,20 @@ impl VersionIndex {
             .entry(pk)
             .or_default()
             .push(VersionEntry::tombstone(commit_ts));
+    }
+
+    /// Bulk-append versions in the given order (used to rebuild history at
+    /// open). Same ordering contract as [`push_live`](Self::push_live).
+    pub fn extend(&self, versions: impl IntoIterator<Item = (u64, VersionEntry)>) {
+        let mut chains = self.chains.write();
+        for (pk, v) in versions {
+            chains.entry(pk).or_default().push(v);
+        }
+    }
+
+    /// Whether `pk` has any recorded version.
+    pub fn contains(&self, pk: u64) -> bool {
+        self.chains.read().contains_key(&pk)
     }
 
     /// The latest version of `pk` with `commit_ts <= read_ts`, or `None` if no

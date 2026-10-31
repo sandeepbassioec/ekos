@@ -2231,7 +2231,7 @@ impl SqlParser {
                                 }
                                 Token::Str(s) => {
                                     check_str.push('\'');
-                                    check_str.push_str(&s);
+                                    check_str.push_str(&s.replace('\'', "''"));
                                     check_str.push('\'');
                                     check_str.push(' ');
                                 }
@@ -2241,8 +2241,31 @@ impl SqlParser {
                                 Token::Lte => check_str.push_str("<= "),
                                 Token::Eq => check_str.push_str("= "),
                                 Token::Neq => check_str.push_str("<> "),
+                                // B5 — keep the tokens a row predicate needs so
+                                // the executor can re-parse the stored text.
+                                Token::And => check_str.push_str("AND "),
+                                Token::Or => check_str.push_str("OR "),
+                                Token::Not => check_str.push_str("NOT "),
+                                Token::Is => check_str.push_str("IS "),
+                                Token::Null => check_str.push_str("NULL "),
+                                Token::In => check_str.push_str("IN "),
+                                Token::Between => check_str.push_str("BETWEEN "),
+                                Token::Like => check_str.push_str("LIKE "),
+                                Token::ILike => check_str.push_str("ILIKE "),
+                                Token::Boolean(b) => {
+                                    check_str.push_str(if b { "TRUE " } else { "FALSE " })
+                                }
+                                Token::Plus => check_str.push_str("+ "),
+                                Token::Minus => check_str.push_str("- "),
+                                Token::Star => check_str.push_str("* "),
+                                Token::Slash => check_str.push_str("/ "),
+                                Token::Percent => check_str.push_str("% "),
+                                Token::Comma => check_str.push_str(", "),
                                 Token::Eof => break,
-                                _ => {}
+                                // Anything else cannot be represented; leave a
+                                // marker the executor's re-parse rejects so
+                                // CREATE TABLE fails instead of storing a no-op.
+                                _ => check_str.push_str("\u{1} "),
                             }
                         }
                         check = Some(check_str.trim().to_owned());

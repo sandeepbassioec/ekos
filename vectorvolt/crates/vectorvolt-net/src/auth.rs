@@ -192,6 +192,11 @@ impl AuthConfig {
         self
     }
 
+    /// Scope granted to `key_id`, or `None` if no such key is configured.
+    pub fn scope_of(&self, key_id: &str) -> Option<Scope> {
+        self.credentials.get(key_id).map(|(_, scope)| *scope)
+    }
+
     pub fn is_enabled(&self) -> bool {
         !self.credentials.is_empty()
     }

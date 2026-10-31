@@ -90,7 +90,9 @@ pub fn run(args: VectorArgs) -> Result<()> {
                 .get(&a.table)
                 .map_err(|e| anyhow::anyhow!("table '{}': {e}", a.table))?;
             let vector = parse_vec(&a.vec)?;
-            engine.insert_vector(a.col, a.pk, vector);
+            engine
+                .insert_vector(a.col, a.pk, vector)
+                .map_err(|e| anyhow::anyhow!("insert vector: {e}"))?;
             println!("OK  vector inserted for pk={}", a.pk);
         }
         VectorCommand::Search(a) => {
@@ -101,7 +103,9 @@ pub fn run(args: VectorArgs) -> Result<()> {
                 .get(&a.table)
                 .map_err(|e| anyhow::anyhow!("table '{}': {e}", a.table))?;
             let query = parse_vec(&a.vec)?;
-            let results = engine.search_vector(a.col, &query, a.k);
+            let results = engine
+                .search_vector(a.col, &query, a.k)
+                .map_err(|e| anyhow::anyhow!("search: {e}"))?;
             if results.is_empty() {
                 println!("(no results)");
             } else {
@@ -154,7 +158,9 @@ mod tests {
         let d = TempDir::new().unwrap();
         let r = make_table(d.path(), "items");
         let engine = r.get("items").unwrap();
-        engine.insert_vector(1, 42, vec![0.1_f32, 0.2, 0.3]);
+        engine
+            .insert_vector(1, 42, vec![0.1_f32, 0.2, 0.3])
+            .unwrap();
         let got = engine.get_vector(1, 42).unwrap();
         assert_eq!(got, vec![0.1_f32, 0.2, 0.3]);
     }
@@ -164,10 +170,10 @@ mod tests {
         let d = TempDir::new().unwrap();
         let r = make_table(d.path(), "items");
         let engine = r.get("items").unwrap();
-        engine.insert_vector(1, 1, vec![1.0_f32, 0.0, 0.0]);
-        engine.insert_vector(1, 2, vec![0.0_f32, 1.0, 0.0]);
-        engine.insert_vector(1, 3, vec![0.0_f32, 0.0, 1.0]);
-        let results = engine.search_vector(1, &[1.0_f32, 0.0, 0.0], 1);
+        engine.insert_vector(1, 1, vec![1.0_f32, 0.0, 0.0]).unwrap();
+        engine.insert_vector(1, 2, vec![0.0_f32, 1.0, 0.0]).unwrap();
+        engine.insert_vector(1, 3, vec![0.0_f32, 0.0, 1.0]).unwrap();
+        let results = engine.search_vector(1, &[1.0_f32, 0.0, 0.0], 1).unwrap();
         assert_eq!(results[0].0, 1);
     }
 
