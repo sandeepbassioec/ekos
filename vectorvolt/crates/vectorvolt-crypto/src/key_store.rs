@@ -71,7 +71,7 @@ impl KeyStore {
         #[cfg(target_os = "linux")]
         {
             match MemfdSecret::new() {
-                Ok(memfd) => {
+                Ok(mut memfd) => {
                     let dst = memfd.as_mut_slice();
                     dst.copy_from_slice(&key);
                     key.zeroize();
@@ -175,7 +175,7 @@ impl MemfdSecret {
         })
     }
 
-    fn as_mut_slice(&self) -> &mut [u8] {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, KEY_LEN) }
     }
 }

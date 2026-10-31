@@ -91,6 +91,11 @@ impl Umem {
         self.len
     }
 
+    /// True if the UMEM has zero length.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Write `data` into frame `idx` (offset by headroom).
     pub fn write_frame(&mut self, idx: u32, data: &[u8]) -> XdpResult<()> {
         let offset = self.cfg.frame_addr(idx) as usize + self.cfg.headroom as usize;
