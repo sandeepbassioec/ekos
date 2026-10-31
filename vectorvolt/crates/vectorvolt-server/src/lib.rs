@@ -127,17 +127,18 @@ async fn handle_connection(
         if stream.read_exact(&mut hbuf).await.is_err() {
             break;
         }
-        let payload_len = u32::from_le_bytes(hbuf[8..12].try_into().unwrap()) as usize;
-        let mut payload = vec![0u8; payload_len];
-        if payload_len > 0 && stream.read_exact(&mut payload).await.is_err() {
-            break;
-        }
-
-        // Validate header then CRC.
+        // Validate the header (including the payload size limit) before
+        // allocating the payload buffer.
         let header = match WireFrameHeader::decode(&hbuf) {
             Ok(h) => h,
             Err(_) => break,
         };
+        let mut payload = vec![0u8; header.payload_len as usize];
+        if !payload.is_empty() && stream.read_exact(&mut payload).await.is_err() {
+            break;
+        }
+
+        // Validate CRC.
         if header.verify_payload(&payload).is_err() {
             break;
         }

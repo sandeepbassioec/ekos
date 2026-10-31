@@ -192,7 +192,7 @@ impl TableRegistry {
         drop(tables);
         self.log_ddl(Mutation::DdlCreate {
             table_name: name.into(),
-        });
+        })?;
         Ok(engine)
     }
 
@@ -220,7 +220,7 @@ impl TableRegistry {
         drop(tables);
         self.log_ddl(Mutation::DdlCreate {
             table_name: name.into(),
-        });
+        })?;
         Ok(engine)
     }
 
@@ -255,15 +255,22 @@ impl TableRegistry {
     pub fn drop_table(&self, name: &str) -> EngineResult<()> {
         use crate::EngineError;
         let mut tables = self.tables.write();
-        if tables.remove(name).is_none() {
+        if !tables.contains_key(name) {
             return Err(EngineError::TableNotFound(name.into()));
         }
-        // Best-effort: remove schema.txt so the table is not re-opened on restart.
+        // Remove schema.txt so the table is not re-opened on restart. A failure
+        // here would resurrect the dropped table, so it is returned, and the
+        // table stays registered until the file is actually gone.
         let schema_path = self.base_dir.join(name).join(SCHEMA_FILE);
-        let _ = std::fs::remove_file(schema_path);
+        match std::fs::remove_file(schema_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        tables.remove(name);
         self.log_ddl(Mutation::DdlDrop {
             table_name: name.into(),
-        });
+        })?;
         Ok(())
     }
 
@@ -366,15 +373,21 @@ impl TableRegistry {
             table_name: name.into(),
             add_columns: add_names,
             drop_columns: drop_names,
-        });
+        })?;
         Ok(engine)
     }
 
-    fn log_ddl(&self, mutation: Mutation) {
+    /// Append a DDL record to the catalog WAL and flush it.
+    ///
+    /// The schema change is already on disk when this runs, so an error here
+    /// means the catalog log (used by `--restore-catalog`) is missing the
+    /// change. It is returned to the caller rather than dropped.
+    fn log_ddl(&self, mutation: Mutation) -> EngineResult<()> {
         if let Some(wal) = &self.catalog_wal {
             let payload = mutation.encode();
-            let _ = wal.append(payload);
-            let _ = wal.flush();
+            wal.append(payload)?;
+            wal.flush()?;
         }
+        Ok(())
     }
 }

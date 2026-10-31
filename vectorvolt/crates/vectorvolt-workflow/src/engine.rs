@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::error::{WorkflowError, WorkflowResult};
+use crate::persist;
 use crate::workflow::{StepState, Workflow, WorkflowState, WorkflowStep};
 
 /// Persistent workflow engine.
@@ -14,6 +15,9 @@ pub struct WorkflowEngine {
     path: PathBuf,
     store: Arc<RwLock<std::collections::HashMap<u64, Workflow>>>,
     next_id: AtomicU64,
+    /// Serialises `persist`: writers share one `.tmp`, and the snapshot is
+    /// taken under this lock so an older state never overwrites a newer one.
+    persist_lock: Mutex<()>,
 }
 
 impl WorkflowEngine {
@@ -21,23 +25,24 @@ impl WorkflowEngine {
     pub fn open(dir: &Path) -> WorkflowResult<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("workflows.json");
-        let store: std::collections::HashMap<u64, Workflow> = if path.exists() {
-            let raw = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&raw)?
-        } else {
-            std::collections::HashMap::new()
+        let store: std::collections::HashMap<u64, Workflow> = match persist::read_committed(&path)?
+        {
+            Some(raw) => serde_json::from_slice(&raw)?,
+            None => std::collections::HashMap::new(),
         };
         let next_id = store.keys().copied().max().unwrap_or(0) + 1;
         Ok(Self {
             path,
             store: Arc::new(RwLock::new(store)),
             next_id: AtomicU64::new(next_id),
+            persist_lock: Mutex::new(()),
         })
     }
 
     fn persist(&self) -> WorkflowResult<()> {
-        let raw = serde_json::to_string(&*self.store.read())?;
-        std::fs::write(&self.path, raw)?;
+        let _guard = self.persist_lock.lock();
+        let raw = serde_json::to_vec(&*self.store.read())?;
+        persist::write_atomic(&self.path, &raw)?;
         Ok(())
     }
 

@@ -147,3 +147,48 @@ fn get_nonexistent_returns_none() {
     let (store, _dir) = setup();
     assert!(store.get(9999).unwrap().is_none());
 }
+
+// ── Crash-safe persistence (PP-15) ─────────────────────────────────────────
+
+#[test]
+fn partial_tmp_from_crashed_write_is_ignored_on_reopen() {
+    let dir = TempDir::new().unwrap();
+    let id = {
+        let store = OrderStore::open(dir.path()).unwrap();
+        store.create(7, vec![line("A", 1, 100)]).unwrap()
+    };
+    // A crash mid-write leaves a torn temp file next to the committed one.
+    let tmp = dir.path().join("orders.json.tmp");
+    std::fs::write(&tmp, b"{\"1\":{\"id\":1,\"cust").unwrap();
+
+    let store = OrderStore::open(dir.path()).unwrap();
+    assert_eq!(store.get(id).unwrap().unwrap().customer_id, 7);
+    assert!(!tmp.exists(), "stale .tmp should be removed on open");
+}
+
+#[test]
+fn write_error_propagates_and_keeps_previous_state() {
+    let dir = TempDir::new().unwrap();
+    let store = OrderStore::open(dir.path()).unwrap();
+    let id = store.create(7, vec![line("A", 1, 100)]).unwrap();
+
+    // A directory where the temp file must go makes the next write fail.
+    let tmp = dir.path().join("orders.json.tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    assert!(matches!(store.confirm(id), Err(OrderError::Io(_))));
+    std::fs::remove_dir(&tmp).unwrap();
+    drop(store);
+
+    let store = OrderStore::open(dir.path()).unwrap();
+    assert_eq!(store.get(id).unwrap().unwrap().status, OrderStatus::Pending);
+}
+
+#[test]
+fn corrupt_main_file_is_an_error_not_an_empty_store() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("orders.json"), b"{not json").unwrap();
+    assert!(matches!(
+        OrderStore::open(dir.path()),
+        Err(OrderError::Serde(_))
+    ));
+}

@@ -5,11 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::account::AccountStore;
 use crate::error::{LedgerError, LedgerResult};
+use crate::persist;
 
 /// A single double-entry ledger record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,9 @@ pub struct Ledger {
     entries_path: PathBuf,
     entries: Arc<RwLock<Vec<LedgerEntry>>>,
     next_id: AtomicU64,
+    /// Serialises `persist`: writers share one `.tmp`, and the snapshot is
+    /// taken under this lock so an older state never overwrites a newer one.
+    persist_lock: Mutex<()>,
 }
 
 impl Ledger {
@@ -35,11 +39,9 @@ impl Ledger {
     pub fn open(dir: &Path) -> LedgerResult<Self> {
         std::fs::create_dir_all(dir)?;
         let entries_path = dir.join("entries.json");
-        let entries: Vec<LedgerEntry> = if entries_path.exists() {
-            let raw = std::fs::read_to_string(&entries_path)?;
-            serde_json::from_str(&raw)?
-        } else {
-            Vec::new()
+        let entries: Vec<LedgerEntry> = match persist::read_committed(&entries_path)? {
+            Some(raw) => serde_json::from_slice(&raw)?,
+            None => Vec::new(),
         };
         let next_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
         Ok(Self {
@@ -47,12 +49,14 @@ impl Ledger {
             entries_path,
             entries: Arc::new(RwLock::new(entries)),
             next_id: AtomicU64::new(next_id),
+            persist_lock: Mutex::new(()),
         })
     }
 
     fn persist_entries(&self) -> LedgerResult<()> {
-        let raw = serde_json::to_string(&*self.entries.read())?;
-        std::fs::write(&self.entries_path, raw)?;
+        let _guard = self.persist_lock.lock();
+        let raw = serde_json::to_vec(&*self.entries.read())?;
+        persist::write_atomic(&self.entries_path, &raw)?;
         Ok(())
     }
 

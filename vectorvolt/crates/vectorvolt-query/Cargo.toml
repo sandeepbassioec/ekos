@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 vectorvolt-engine = { workspace = true }
+vectorvolt-crypto = { workspace = true }
 vectorvolt-graph = { workspace = true }
 vectorvolt-hal = { workspace = true }
 vectorvolt-index = { workspace = true }
@@ -13,6 +14,7 @@ thiserror = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 rustls     = { workspace = true }
+hex        = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -2,6 +2,7 @@
 
 pub mod engine;
 pub mod error;
+mod persist;
 pub mod workflow;
 
 pub use engine::WorkflowEngine;

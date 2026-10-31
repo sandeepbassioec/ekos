@@ -31,6 +31,8 @@ pub enum FrontendMsg {
     },
     /// Simple query.
     Query(String),
+    /// PasswordMessage (reply to an authentication request).
+    Password(String),
     /// Terminate connection.
     Terminate,
 }
@@ -82,6 +84,10 @@ pub fn decode_frontend(buf: &[u8]) -> Result<FrontendMsg, WireError> {
             Ok(FrontendMsg::Query(s))
         }
         b'X' => Ok(FrontendMsg::Terminate),
+        b'p' => {
+            let payload = &buf[5..1 + len];
+            Ok(FrontendMsg::Password(read_cstr_bytes(payload)?))
+        }
         t => Err(WireError::UnknownMessageType(t)),
     }
 }
@@ -94,6 +100,37 @@ pub fn encode_auth_ok() -> Bytes {
     buf.put_u8(b'R');
     buf.put_i32(8); // length including self
     buf.put_i32(0); // AuthenticationOk
+    buf.freeze()
+}
+
+/// Encode an AuthenticationCleartextPassword request (type 'R', Int32(3)).
+pub fn encode_auth_cleartext_password() -> Bytes {
+    let mut buf = BytesMut::with_capacity(9);
+    buf.put_u8(b'R');
+    buf.put_i32(8); // length including self
+    buf.put_i32(3); // AuthenticationCleartextPassword
+    buf.freeze()
+}
+
+/// Encode a FATAL ErrorResponse carrying a SQLSTATE code (sent just before
+/// the connection is closed, e.g. on a bad startup or failed authentication).
+/// Format: 'E' Int32(len) 'S' FATAL\0 'C' code\0 'M' msg\0 \0
+pub fn encode_fatal_error(code: &str, msg: &str) -> Bytes {
+    let mut payload = BytesMut::new();
+    payload.put_u8(b'S');
+    payload.put("FATAL".as_bytes());
+    payload.put_u8(0);
+    payload.put_u8(b'C');
+    payload.put(code.as_bytes());
+    payload.put_u8(0);
+    payload.put_u8(b'M');
+    payload.put(msg.as_bytes());
+    payload.put_u8(0);
+    payload.put_u8(0); // terminator
+    let mut buf = BytesMut::with_capacity(1 + 4 + payload.len());
+    buf.put_u8(b'E');
+    buf.put_i32((4 + payload.len()) as i32);
+    buf.put(payload);
     buf.freeze()
 }
 
@@ -318,6 +355,24 @@ mod tests {
         buf.put_i32(4);
         let r = decode_frontend(&buf);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_decode_frontend_password() {
+        let pw = b"hunter2\0";
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'p');
+        buf.put_i32((4 + pw.len()) as i32);
+        buf.put(pw.as_ref());
+        let msg = decode_frontend(&buf).unwrap();
+        assert_eq!(msg, FrontendMsg::Password("hunter2".into()));
+    }
+
+    #[test]
+    fn test_encode_auth_cleartext_password() {
+        let b = encode_auth_cleartext_password();
+        assert_eq!(b[0], b'R');
+        assert_eq!(i32::from_be_bytes([b[5], b[6], b[7], b[8]]), 3);
     }
 
     #[test]

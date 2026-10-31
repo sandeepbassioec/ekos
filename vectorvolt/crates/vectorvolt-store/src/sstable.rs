@@ -48,8 +48,14 @@ const VAL_TYPE_TOMBSTONE: u8 = 1;
 // --------------------------------------------------------------------------
 
 /// Builds an SSTable file from a sorted sequence of MemEntry.
+///
+/// Entries are written to `<path>.tmp`; `finish` fsyncs it, renames it to
+/// `path` and fsyncs the directory. A table therefore appears under its real
+/// name only once complete and durable, so a crash mid-write can never leave
+/// a torn `.vvsst` that would stop the store from opening.
 pub struct SsTableWriter {
     path: PathBuf,
+    tmp_path: PathBuf,
     writer: BufWriter<File>,
     data_offset: u64,
     /// (key, data_offset) collected during write for the index
@@ -59,10 +65,21 @@ pub struct SsTableWriter {
 
 impl SsTableWriter {
     pub fn create(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path = path.as_ref();
+        // Never overwrite a live table.
+        if path.exists() {
+            return Err(StoreError::Io(format!(
+                "SSTable already exists: {}",
+                path.display()
+            )));
+        }
+        let tmp_path = sstable_tmp_path(path);
+        // A leftover temp file is from a write that crashed; truncate it.
         let file = OpenOptions::new()
             .write(true)
-            .create_new(true)
-            .open(path.as_ref())
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
             .map_err(|e| StoreError::Io(e.to_string()))?;
         let mut writer = BufWriter::new(file);
         // Write placeholder header (will be seeked back to fill count)
@@ -76,7 +93,8 @@ impl SsTableWriter {
             .write_u32::<BigEndian>(0)
             .map_err(|e| StoreError::Io(e.to_string()))?; // pad
         Ok(SsTableWriter {
-            path: path.as_ref().to_path_buf(),
+            path: path.to_path_buf(),
+            tmp_path,
             writer,
             data_offset: HEADER_LEN,
             index_entries: Vec::new(),
@@ -125,7 +143,8 @@ impl SsTableWriter {
         Ok(())
     }
 
-    /// Finalize: write index + footer, rewrite count in header, sync.
+    /// Finalize: write index + footer, rewrite count in header, sync, then
+    /// atomically publish the file under its real name.
     pub fn finish(mut self) -> StoreResult<PathBuf> {
         let index_offset = self.data_offset;
 
@@ -169,6 +188,11 @@ impl SsTableWriter {
                 // `w` drops here, releasing the mutable borrow on `file`
             }
             file.sync_all().map_err(|e| StoreError::Io(e.to_string()))?;
+        }
+
+        std::fs::rename(&self.tmp_path, &self.path).map_err(|e| StoreError::Io(e.to_string()))?;
+        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            sync_dir(dir).map_err(|e| StoreError::Io(e.to_string()))?;
         }
 
         Ok(self.path)
@@ -354,6 +378,27 @@ impl SsTable {
 /// Canonical SSTable file name from a monotonic id.
 pub fn sstable_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("{id:020}.vvsst"))
+}
+
+/// Name of an in-progress SSTable (`<id>.vvsst.tmp`); see [`SsTableWriter`].
+pub(crate) fn sstable_tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// fsync a directory so a create/rename inside it survives a crash. Windows has
+/// no directory fsync (NTFS journals the metadata), so it is a no-op there.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
