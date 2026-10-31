@@ -150,22 +150,18 @@ impl WriteService for GrpcWriteService {
         };
         self.txns.remove(&txn_id);
 
-        let mut applied = 0u64;
-        for op in ops {
-            match op {
-                crate::PendingOp::Insert { pk, values } => {
-                    self.engine
-                        .insert(pk, values)
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                }
-                crate::PendingOp::Delete { pk } => {
-                    self.engine
-                        .delete(pk)
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                }
-            }
-            applied += 1;
-        }
+        // All ops as one atomic WAL record (see `TableEngine::apply_batch`).
+        let applied = ops.len() as u64;
+        let batch = ops
+            .into_iter()
+            .map(|op| match op {
+                crate::PendingOp::Insert { pk, values } => (pk, Some(values)),
+                crate::PendingOp::Delete { pk } => (pk, None),
+            })
+            .collect();
+        self.engine
+            .apply_batch(batch)
+            .map_err(|e| Status::internal(format!("commit failed, nothing applied: {e}")))?;
         Ok(Response::new(CommitReply {
             status: "committed".into(),
             ops: applied,
@@ -191,6 +187,33 @@ impl WriteService for GrpcWriteService {
 pub struct GrpcServer {
     addr: SocketAddr,
     svc: GrpcWriteService,
+    /// When set, every RPC must carry `authorization: Bearer <token>`.
+    token: Option<Arc<str>>,
+}
+
+/// Constant-time equality, so a wrong token cannot be found byte by byte by
+/// timing the rejection.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Reject any request whose bearer token does not match `expected`.
+///
+/// `Status` is large, but it is the error type tonic interceptors must return.
+#[allow(clippy::result_large_err)]
+fn check_token(expected: &str, req: &Request<()>) -> Result<(), Status> {
+    let presented = req
+        .metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(t) if ct_eq(t.as_bytes(), expected.as_bytes()) => Ok(()),
+        _ => Err(Status::unauthenticated("missing or invalid bearer token")),
+    }
 }
 
 impl GrpcServer {
@@ -203,7 +226,14 @@ impl GrpcServer {
         Self {
             addr,
             svc: GrpcWriteService::new(engine, txns, txn_seq),
+            token: None,
         }
+    }
+
+    /// Require `authorization: Bearer <token>` on every RPC.
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(Arc::from(token.into()));
+        self
     }
 
     /// Convenience constructor that creates its own MVCC txn state.
@@ -214,9 +244,16 @@ impl GrpcServer {
     }
 
     /// Serve until `shutdown_rx` fires.
+    #[allow(clippy::result_large_err)] // the interceptor closure must return tonic's `Status`
     pub async fn run(self, shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> anyhow::Result<()> {
+        let token = self.token.clone();
+        let svc =
+            WriteServiceServer::with_interceptor(self.svc, move |req: Request<()>| match &token {
+                Some(t) => check_token(t, &req).map(|()| req),
+                None => Ok(req),
+            });
         Server::builder()
-            .add_service(WriteServiceServer::new(self.svc))
+            .add_service(svc)
             .serve_with_shutdown(self.addr, async {
                 let _ = shutdown_rx.await;
             })

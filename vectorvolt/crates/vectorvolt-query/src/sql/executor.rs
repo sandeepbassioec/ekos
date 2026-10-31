@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 use vectorvolt_engine::{
-    ColumnDef, ColumnType, EngineRow, TableRegistry, TableSchema, TableTxn, TxnId, TxnIntentLog,
-    TypedValue,
+    ColumnDef, ColumnType, EngineRow, TableRegistry, TableSchema, TableTxn, TableWriteSet, TxnId,
+    TxnIntentLog, TypedValue,
 };
 
 use crate::sql::ast::*;
@@ -66,6 +66,9 @@ pub enum QueryResult {
 }
 
 // S86 â€” SQLSTATE error code helper
+/// Serialises transactional SQL commits process-wide (see `exec_commit`).
+static SQL_COMMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn sql_error(code: &str, msg: &str) -> QueryResult {
     QueryResult::Error(format!("[{}] {}", code, msg))
 }
@@ -11824,6 +11827,12 @@ impl SqlExecutor {
         drop(guard);
         let mvcc_state = self.mvcc_txn.lock().unwrap().take();
 
+        // Held from the conflict check through the last table commit, so no
+        // other transactional commit can land between "nothing conflicts" and
+        // "our writes are applied" (PP-25). Single-statement autocommit writes
+        // do not take it; they are not checked for conflicts either.
+        let _commit_guard = SQL_COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         // MVCC Phase 2 — SERIALIZABLE write-write conflict detection. For
         // every pk this transaction wrote, compare the value visible at its
         // fixed read_ts against the value committed right now (before we
@@ -11887,11 +11896,37 @@ impl SqlExecutor {
                 .txn_uuid_counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let txn_uuid = format!("{}-{}-{n}", std::process::id(), Self::now_ns());
+
+            // The write sets go into PREPARE so recovery does not depend on
+            // the in-memory staging buffers surviving (they do not survive a
+            // crash) or on per-table txn ids (they restart at zero).
+            let mut write_set = Vec::with_capacity(txn_map.len());
+            for (table, txn_id) in &txn_map {
+                let engine = self
+                    .registry
+                    .get(table)
+                    .map_err(|_| ExecError::TableNotFound(table.clone()))?;
+                // A txn id the engine no longer knows was already applied (or
+                // never staged anything): there is nothing left to record.
+                let ops = match engine.txn_write_set(*txn_id) {
+                    Ok(ops) => ops,
+                    Err(vectorvolt_engine::EngineError::TxnNotFound(_)) => Vec::new(),
+                    Err(e) => return Err(ExecError::Engine(e.to_string())),
+                };
+                write_set.push(TableWriteSet {
+                    table: table.clone(),
+                    ops,
+                });
+            }
             self.txn_intent_log
-                .prepare(&txn_uuid, tables.clone())
+                .prepare_with_write_set(&txn_uuid, tables.clone(), write_set.clone())
                 .map_err(|e| ExecError::Engine(e.to_string()))?;
 
             // Phase B (COMMIT ALL): apply every table's buffered mutations.
+            // Each table commit is one atomic WAL record; progress is logged
+            // after each so recovery re-applies only the tables that had not
+            // landed.
+            let mut applied = Vec::with_capacity(txn_map.len());
             for (table, txn_id) in &txn_map {
                 let engine = self
                     .registry
@@ -11899,18 +11934,25 @@ impl SqlExecutor {
                     .map_err(|_| ExecError::TableNotFound(table.clone()))?;
                 if let Err(e) = engine.commit_txn(*txn_id) {
                     // Do NOT write a COMMITTED record — the dangling
-                    // PREPARING record is the source of truth for recovery.
-                    // We deliberately don't try to hand-roll a rollback of
-                    // whatever already committed here: some tables in
-                    // `txn_map` may already be durably committed, and
-                    // "un-committing" them isn't possible — that's the whole
-                    // reason PREPARE happens first.
+                    // PREPARING record is the source of truth for recovery,
+                    // which re-applies this table's write set from the log.
                     return Ok(sql_error(
                         "40003",
                         &format!(
                             "cross-table commit failed on table '{table}': {e}; transaction intent {txn_uuid} left pending for recovery"
                         ),
                     ));
+                }
+                applied.push(table.clone());
+                if txn_map.len() > 1 {
+                    self.txn_intent_log
+                        .mark_tables_applied(
+                            &txn_uuid,
+                            tables.clone(),
+                            write_set.clone(),
+                            applied.clone(),
+                        )
+                        .map_err(|e| ExecError::Engine(e.to_string()))?;
                 }
             }
 

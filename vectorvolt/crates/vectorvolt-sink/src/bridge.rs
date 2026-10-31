@@ -122,6 +122,23 @@ fn mutation_to_events(table: &str, mutation: &Mutation) -> Vec<SinkEvent> {
                 values: values.clone(),
             })
             .collect(),
+        Mutation::TxnBatch { ops } => ops
+            .iter()
+            .map(|(pk, op)| match op {
+                Some(values) => SinkEvent {
+                    table: table.to_string(),
+                    kind: SinkEventKind::Update,
+                    pk: *pk,
+                    values: values.clone(),
+                },
+                None => SinkEvent {
+                    table: table.to_string(),
+                    kind: SinkEventKind::Delete,
+                    pk: *pk,
+                    values: vec![],
+                },
+            })
+            .collect(),
         Mutation::DdlCreate { .. }
         | Mutation::DdlDrop { .. }
         | Mutation::DdlAlter { .. }

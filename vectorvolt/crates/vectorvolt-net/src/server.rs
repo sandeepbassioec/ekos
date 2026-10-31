@@ -681,18 +681,25 @@ fn serve_request(
                             };
                         }
                     };
+                    // One atomic WAL record for the whole transaction: after a
+                    // crash it is replayed entirely or not at all. A failure is
+                    // reported, and then nothing of the transaction is applied.
                     let n = t.ops.len() as u64;
-                    for op in t.ops {
-                        match op {
-                            TxnOp::Insert { pk, values } => {
-                                let _ = engine.insert(pk, values);
-                            }
-                            TxnOp::Delete { pk } => {
-                                let _ = engine.delete(pk);
-                            }
-                        }
+                    let ops = t
+                        .ops
+                        .into_iter()
+                        .map(|op| match op {
+                            TxnOp::Insert { pk, values } => (pk, Some(values)),
+                            TxnOp::Delete { pk } => (pk, None),
+                        })
+                        .collect();
+                    match engine.apply_batch(ops) {
+                        Ok(_) => Response::Ok { affected: n },
+                        Err(e) => Response::Error {
+                            code: error_code::ENGINE,
+                            message: format!("commit failed, nothing applied: {e}"),
+                        },
                     }
-                    Response::Ok { affected: n }
                 }
             };
         }

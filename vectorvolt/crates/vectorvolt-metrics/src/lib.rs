@@ -106,12 +106,23 @@ impl MetricsServer {
         Self { registry }
     }
 
-    /// Bind and serve forever. Intended to be spawned with `tokio::spawn`.
+    /// Bind `127.0.0.1:<port>` and serve forever. Intended to be spawned with
+    /// `tokio::spawn`.
+    ///
+    /// Loopback by default: metrics reveal table activity and must not be
+    /// reachable from the network unless the operator asks for it via
+    /// [`MetricsServer::serve_on`].
     pub async fn serve(self, port: u16) {
+        self.serve_on(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+    }
+
+    /// Bind `addr` and serve forever.
+    pub async fn serve_on(self, addr: std::net::SocketAddr) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let addr = format!("0.0.0.0:{port}");
+        let addr = addr.to_string();
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => {
                 tracing::info!(addr = %addr, "metrics endpoint listening");

@@ -12,7 +12,7 @@ use crate::segment::{SegmentReader, SegmentWriter, list_segment_ids, segment_pat
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ── State shared between WalWriter and GroupCommitBatcher ─────────────────────
 
@@ -123,12 +123,35 @@ impl WalWriter {
             let last_id = *ids.last().unwrap();
             let last_path = segment_path(&config.dir, last_id);
             let mut reader = SegmentReader::open(&last_path)?;
-            let frames = reader.all_frames()?;
+            // A crash mid-append leaves a partial final frame. Opening must
+            // survive that, so the torn bytes are cut back to the last intact
+            // frame; anything else that fails to decode is real corruption and
+            // still refuses to open (see `SegmentReader::intact_prefix`).
+            let (frames, intact_end, torn) = reader.intact_prefix()?;
+            drop(reader);
+            if torn {
+                let f = std::fs::OpenOptions::new().write(true).open(&last_path)?;
+                let old_len = f.metadata()?.len();
+                f.set_len(intact_end)?;
+                f.sync_all()?;
+                warn!(
+                    segment = last_id,
+                    discarded_bytes = old_len - intact_end,
+                    "truncated torn WAL tail"
+                );
+            }
+            let reader = SegmentReader::open(&last_path)?;
 
             let (next_seq, chain_hash) = if let Some(last) = frames.last() {
                 (last.sequence + 1, last.frame_hash)
             } else {
-                (reader.header.base_seq, GENESIS_HASH)
+                // An empty last segment (crash right after rotation) must still
+                // chain from the previous segment, or `verify` reports a break
+                // at the first frame written after reopening.
+                (
+                    reader.header.base_seq,
+                    previous_segment_hash(&config.dir, &ids)?,
+                )
             };
 
             info!(last_segment = last_id, next_seq, "recovered WAL");
@@ -180,6 +203,18 @@ impl WalWriter {
     }
 }
 
+/// Hash of the last frame in the newest non-empty segment before the last one,
+/// or `GENESIS_HASH` when there is none.
+fn previous_segment_hash(dir: &std::path::Path, ids: &[u64]) -> WalResult<[u8; 32]> {
+    for &id in ids.iter().rev().skip(1) {
+        let mut reader = SegmentReader::open(&segment_path(dir, id))?;
+        if let Some(last) = reader.all_frames()?.last() {
+            return Ok(last.frame_hash);
+        }
+    }
+    Ok(GENESIS_HASH)
+}
+
 // ── SegmentWriter fields need pub for recovery above ─────────────────────────
 
 // The fields used in recovery are re-exported via the pub struct in segment.rs.
@@ -208,6 +243,125 @@ mod tests {
         let writer2 = WalWriter::open(cfg).unwrap();
         let tip = writer2.tip();
         assert_eq!(tip.sequence, 2);
+    }
+
+    fn last_segment(dir: &std::path::Path) -> std::path::PathBuf {
+        let ids = list_segment_ids(dir).unwrap();
+        segment_path(dir, *ids.last().unwrap())
+    }
+
+    #[test]
+    fn torn_tail_is_truncated_on_open() {
+        let dir = TempDir::new().unwrap();
+        let cfg = WalConfig::default().with_dir(dir.path()).with_fsync(false);
+        let writer = WalWriter::open(cfg.clone()).unwrap();
+        writer.append(b"one".to_vec()).unwrap();
+        writer.append(b"two".to_vec()).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        // Simulate a crash mid-append: half of a third frame reaches disk.
+        let path = last_segment(dir.path());
+        let mut frame = Frame {
+            sequence: 3,
+            timestamp_ns: 0,
+            prev_hash: GENESIS_HASH,
+            payload_type: PayloadType::Data,
+            payload: b"three-is-torn".to_vec(),
+            frame_hash: [0u8; 32],
+        };
+        let bytes = frame.encode();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, &bytes[..bytes.len() / 2]).unwrap();
+        drop(f);
+
+        let writer = WalWriter::open(cfg.clone()).unwrap();
+        assert_eq!(writer.tip().sequence, 2);
+        let tip = writer.append(b"three".to_vec()).unwrap();
+        assert_eq!(tip.sequence, 3);
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(crate::WalReader::open(cfg).verify().unwrap(), 3);
+    }
+
+    #[test]
+    fn zero_filled_tail_is_truncated_on_open() {
+        let dir = TempDir::new().unwrap();
+        let cfg = WalConfig::default().with_dir(dir.path()).with_fsync(false);
+        let writer = WalWriter::open(cfg.clone()).unwrap();
+        writer.append(b"one".to_vec()).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let path = last_segment(dir.path());
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, &[0u8; 300]).unwrap();
+        drop(f);
+
+        let writer = WalWriter::open(cfg).unwrap();
+        assert_eq!(writer.tip().sequence, 1);
+    }
+
+    #[test]
+    fn corruption_before_the_tail_still_refuses_to_open() {
+        let dir = TempDir::new().unwrap();
+        let cfg = WalConfig::default().with_dir(dir.path()).with_fsync(false);
+        let writer = WalWriter::open(cfg.clone()).unwrap();
+        writer.append(b"aaaaaaaaaaaaaaaa".to_vec()).unwrap();
+        writer.append(b"bbbbbbbbbbbbbbbb".to_vec()).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        // Flip a payload byte in the first frame: an intact-length frame with a
+        // bad checksum, followed by a valid one. That is not a torn write.
+        let path = last_segment(dir.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        let pos = crate::segment::SEG_HEADER_SIZE as usize + 70;
+        bytes[pos] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(WalWriter::open(cfg).is_err());
+    }
+
+    #[test]
+    fn empty_last_segment_chains_from_previous_segment() {
+        let dir = TempDir::new().unwrap();
+        let cfg = WalConfig::default()
+            .with_dir(dir.path())
+            .with_fsync(false)
+            .with_segment_max_bytes(512);
+        let writer = WalWriter::open(cfg.clone()).unwrap();
+        for i in 0..6u64 {
+            writer.append(format!("payload-{i}").into_bytes()).unwrap();
+        }
+        writer.flush().unwrap();
+        let next = writer.tip().sequence + 1;
+        drop(writer);
+
+        // Crash right after rotation: a new segment with a header and no frames.
+        let ids = list_segment_ids(dir.path()).unwrap();
+        let mut seg = crate::segment::SegmentWriter::create(
+            dir.path(),
+            ids.last().unwrap() + 1,
+            next,
+            512,
+            false,
+        )
+        .unwrap();
+        seg.flush().unwrap();
+        drop(seg);
+
+        let writer = WalWriter::open(cfg.clone()).unwrap();
+        writer.append(b"after".to_vec()).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(crate::WalReader::open(cfg).verify().unwrap(), next);
     }
 
     #[test]

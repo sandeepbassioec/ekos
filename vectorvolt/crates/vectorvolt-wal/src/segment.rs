@@ -232,6 +232,53 @@ impl SegmentReader {
         self.seek_to(SEG_HEADER_SIZE)
     }
 
+    /// Read every intact frame, tolerating an incomplete final frame.
+    ///
+    /// Returns the frames, the byte offset just past the last intact frame, and
+    /// whether the bytes after it look like a torn write. A torn write is a
+    /// final frame that ends early (`UnexpectedEof`) or a tail of zero bytes —
+    /// the two shapes an interrupted append leaves behind. Any other decode
+    /// failure is real corruption and is returned as an error: truncating it
+    /// would silently discard frames that may already have been acknowledged.
+    pub fn intact_prefix(&mut self) -> WalResult<(Vec<Frame>, u64, bool)> {
+        self.rewind()?;
+        let file_len = self.file.metadata()?.len();
+        let mut frames = Vec::new();
+        loop {
+            let pos = self.file.stream_position()?;
+            if pos >= file_len {
+                return Ok((frames, pos, false));
+            }
+            match self.next_frame() {
+                Ok(Some(f)) => frames.push(f),
+                Ok(None) => return Ok((frames, pos, false)),
+                Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok((frames, pos, true));
+                }
+                Err(e) => {
+                    if self.rest_is_zero(pos)? {
+                        return Ok((frames, pos, true));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    fn rest_is_zero(&mut self, from: u64) -> WalResult<bool> {
+        self.file.seek(SeekFrom::Start(from))?;
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = std::io::Read::read(&mut self.file, &mut buf)?;
+            if n == 0 {
+                return Ok(true);
+            }
+            if buf[..n].iter().any(|&b| b != 0) {
+                return Ok(false);
+            }
+        }
+    }
+
     /// Return all frames in this segment (used by verify + inspect).
     pub fn all_frames(&mut self) -> WalResult<Vec<Frame>> {
         self.rewind()?;

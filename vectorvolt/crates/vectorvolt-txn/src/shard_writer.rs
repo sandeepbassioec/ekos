@@ -51,6 +51,30 @@ use crate::{TxnError, TxnResult};
 
 // ── Protocol ──────────────────────────────────────────────────────────────────
 
+/// A row handed to a flush, with the pending offset recorded for it in
+/// `pk_index` when it was buffered.
+#[derive(Debug, Clone)]
+pub struct DrainedRow {
+    pub pk: u64,
+    pub values: Vec<u64>,
+    pub offset: u32,
+}
+
+/// Drain the ring, tagging each row with its absolute push sequence — the same
+/// value `Insert` wrote into the row's pending descriptor.
+fn drain_with_offsets(ring: &RingBuffer) -> Vec<DrainedRow> {
+    let start = ring.head() - ring.len();
+    ring.drain()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (pk, values))| DrainedRow {
+            pk,
+            values,
+            offset: (start + i) as u32,
+        })
+        .collect()
+}
+
 /// Messages sent from calling threads to the writer thread.
 ///
 /// Each variant carries a one-shot reply channel so the caller can wait for
@@ -65,7 +89,7 @@ enum WriterOp {
     /// Drain all buffered rows.  Also inserts every drained row into `in_flight`
     /// before replying, so subsequent `RowFor` queries see them there.
     Drain {
-        reply: mpsc::SyncSender<Vec<(u64, Vec<u64>)>>,
+        reply: mpsc::SyncSender<Vec<DrainedRow>>,
     },
     /// Query the current ring-buffer length.
     Len { reply: mpsc::SyncSender<usize> },
@@ -112,6 +136,10 @@ impl ShardWriter {
             .name("vv-shard-writer".into())
             .spawn(move || {
                 let ring = RingBuffer::new(flush_threshold, schema_width);
+                // Rows forced out of a physically full ring before the Drain
+                // that was meant for them arrived. They must ride along with the
+                // next Drain, or no flush ever writes them (PP-11).
+                let mut overflow: Vec<DrainedRow> = Vec::new();
 
                 while let Ok(op) = rx.recv() {
                     match op {
@@ -123,13 +151,14 @@ impl ShardWriter {
                             // channel first.  The Drain that follows will see an
                             // empty ring and short-circuit — correct behaviour.
                             if ring.is_ring_full() {
-                                let rows = ring.drain();
+                                let rows = drain_with_offsets(&ring);
                                 if !rows.is_empty() {
                                     let mut inf = in_flight.lock();
-                                    for (dpk, dvals) in &rows {
-                                        inf.insert(*dpk, dvals.clone());
+                                    for r in &rows {
+                                        inf.insert(r.pk, r.values.clone());
                                     }
                                 }
+                                overflow.extend(rows);
                             }
 
                             // Compute offset BEFORE push — this is the absolute
@@ -157,16 +186,18 @@ impl ShardWriter {
                         }
 
                         WriterOp::Drain { reply } => {
-                            let rows = ring.drain();
-                            if !rows.is_empty() {
+                            let mut rows = std::mem::take(&mut overflow);
+                            let fresh = drain_with_offsets(&ring);
+                            if !fresh.is_empty() {
                                 // Populate in_flight BEFORE sending the reply so
                                 // that any RowFor arriving afterwards finds the row
                                 // there (writer-thread FIFO ordering guarantees this).
                                 let mut inf = in_flight.lock();
-                                for (pk, vals) in &rows {
-                                    inf.insert(*pk, vals.clone());
+                                for r in &fresh {
+                                    inf.insert(r.pk, r.values.clone());
                                 }
                             }
+                            rows.extend(fresh);
                             let _ = reply.send(rows);
                         }
 
@@ -208,7 +239,11 @@ impl ShardWriter {
     }
 
     /// Drain all buffered rows (also populates `in_flight`).
-    pub fn drain(&self) -> TxnResult<Vec<(u64, Vec<u64>)>> {
+    ///
+    /// Rows come back oldest first, each with the pending offset its
+    /// `pk_index` descriptor was given, so a flush can tell whether the
+    /// descriptor still refers to this exact row before replacing it.
+    pub fn drain(&self) -> TxnResult<Vec<DrainedRow>> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.tx
             .send(WriterOp::Drain { reply: reply_tx })

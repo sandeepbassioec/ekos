@@ -63,6 +63,9 @@ pub struct TableEngine {
     write_options: WriteOptions,
     /// What manifest recovery found at open. See [`TableEngine::manifest_recovery`].
     manifest_recovery: ManifestRecovery,
+    /// Partition files moved to `data/quarantine/` at open because they could
+    /// not be read. See [`TableEngine::quarantined_partitions`].
+    quarantined: Vec<PathBuf>,
     /// MVCC transaction store â€” open transactions live here until commit/rollback.
     mvcc: std::sync::Arc<MvccStore>,
     /// Serialises conditional write operations (CAS, insert-if-absent, upsert).
@@ -254,6 +257,13 @@ impl EngineOptions {
     }
 }
 
+/// `(file_id, partition_id)` from a `{file_id:05}_{partition_id:05}.vvsst` name.
+fn parse_partition_name(name: &str) -> Option<(u16, u16)> {
+    let stem = name.strip_suffix(".vvsst")?;
+    let (f, p) = stem.split_once('_')?;
+    Some((f.parse().ok()?, p.parse().ok()?))
+}
+
 impl TableEngine {
     /// Open or create a table at `data_dir`, **durable by default**.
     ///
@@ -352,31 +362,53 @@ impl TableEngine {
         std::fs::create_dir_all(&wal_dir)?;
         std::fs::create_dir_all(&partition_dir)?;
 
-        // If a snapshot marker exists, the WAL is redundant â€” all rows are in
-        // compacted partition files.  Truncate the WAL dir before WalWriter opens
-        // so startup does not replay stale entries already captured in partitions.
+        // A snapshot marker records the WAL sequence through which every
+        // mutation is already captured in partition files. Replay skips frames
+        // at or below it. The WAL itself is never deleted here: an earlier
+        // version truncated the whole directory on every open while a marker
+        // existed, which silently discarded every write made after the
+        // snapshot that had not been flushed yet (PP-01).
         let snapshot_path = partition_dir.join("snapshot.vvss");
-        if snapshot_path.exists() {
-            crate::snapshot::truncate_wal_dir(&wal_dir)?;
-        }
+        let replay_after = crate::snapshot::read_marker(&snapshot_path)?
+            .map(|m| m.wal_seq)
+            .unwrap_or(0);
 
         let cfg = WalConfig::default()
             .with_dir(&wal_dir)
             .with_fsync(durability.wal_fsync());
         let wal = WalWriter::open(cfg)?;
 
-        // Recover previously-flushed partitions.
+        // Recover previously-flushed partitions. A file that fails to open is
+        // moved aside rather than failing the whole table: its rows are rebuilt
+        // from the WAL below wherever the WAL still holds them, and the move is
+        // reported through `quarantined_partitions` (PP-13).
         let mut partitions = HashMap::new();
+        let mut quarantined = Vec::new();
         let mut max_partition_id: u16 = 0;
         for entry in std::fs::read_dir(&partition_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("vvsst") {
-                let reader = PartitionReader::open(&path)?;
-                if reader.partition_id() >= max_partition_id {
-                    max_partition_id = reader.partition_id() + 1;
+                match PartitionReader::open(&path) {
+                    Ok(reader) => {
+                        if reader.partition_id() >= max_partition_id {
+                            max_partition_id = reader.partition_id().wrapping_add(1);
+                        }
+                        partitions.insert((reader.file_id(), reader.partition_id()), reader);
+                    }
+                    Err(e) => {
+                        let qdir = partition_dir.join("quarantine");
+                        std::fs::create_dir_all(&qdir)?;
+                        let dest = qdir.join(entry.file_name());
+                        std::fs::rename(&path, &dest)?;
+                        tracing::warn!(
+                            file = %path.display(),
+                            error = %e,
+                            "quarantined unreadable partition file"
+                        );
+                        quarantined.push(dest);
+                    }
                 }
-                partitions.insert((reader.file_id(), reader.partition_id()), reader);
             }
         }
 
@@ -390,105 +422,15 @@ impl TableEngine {
             flush_threshold,
             max_partition_id,
         )
-        .with_sync_on_commit(durability.sync_on_commit());
+        .with_sync_on_commit(durability.sync_on_commit())
+        .with_durable_flush(durability.wal_fsync());
         if let Some(ref key) = wal_key {
             txn = txn.with_wal_encryption(Arc::clone(key));
         }
 
-        // Rebuild pk_index from existing partition files so reads work across
-        // process restarts (Phase 2 crash recovery).
-        let rows_on_disk: u64 = partitions.values().map(|r| r.row_count() as u64).sum();
-        txn.rebuild_pk_index_from_partitions(&partitions)?;
-
-        // Phase 4 WAL recovery: replay all mutations that are not yet in an SST.
-        //
-        // Processing order matters: Insert and Delete records are replayed in WAL
-        // sequence order so re-inserts after deletes and interleaved mutations
-        // converge to the correct state.
-        //
-        // Insert: if the pk is already in pk_index (rebuilt from SST above), the
-        // row reached an SST before the crash â€” skip it.  Otherwise call
-        // replay_insert(), which populates the write buffer and in-memory indexes
-        // exactly as a fresh insert would but without writing to the WAL again.
-        //
-        // Delete: unconditionally remove from pk_index.  A delete for a row that
-        // was already removed (e.g. compaction raced with the delete) is a no-op.
-        //
-        // Checkpoint / flush strings: Mutation::decode returns Err, so they fall
-        // through silently.  Torn frames at the WAL tail are also ignored â€” a torn
-        // tail is a normal consequence of an unclean shutdown; the WAL verifier
-        // handles them when WalReader::read_all stops at the first decode error.
-        let wal_cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
-        if let Ok(frames) = WalReader::open(wal_cfg).read_all() {
-            for frame in frames {
-                // When WAL encryption is enabled, `frame.payload` is ciphertext —
-                // decrypt before attempting to decode it as a Mutation. A decrypt
-                // failure (e.g. a torn frame at the WAL tail from an unclean
-                // shutdown) is treated the same as a decode failure: skip silently,
-                // exactly like the pre-existing `Err(_) => {}` arm below.
-                let decoded = match &wal_key {
-                    Some(key) => vectorvolt_crypto::decrypt(key, &frame.payload).ok(),
-                    None => Some(frame.payload.clone()),
-                };
-                let Some(payload) = decoded else {
-                    continue;
-                };
-                match Mutation::decode(&payload) {
-                    Ok(Mutation::Insert { pk, values }) => {
-                        if txn.pk_index.read().get(pk).is_none() {
-                            let _ = txn.replay_insert(pk, values);
-                        }
-                    }
-                    Ok(Mutation::Delete { pk }) => {
-                        txn.pk_index.write().remove(pk);
-                    }
-                    Ok(Mutation::Upsert { pk, values }) => {
-                        txn.pk_index.write().remove(pk);
-                        let _ = txn.replay_insert(pk, values);
-                    }
-                    Ok(Mutation::InsertBatch { rows }) => {
-                        for (pk, values) in rows {
-                            let _ = txn.replay_insert(pk, values);
-                        }
-                    }
-                    Ok(Mutation::DeleteBatch { pks }) => {
-                        let mut idx = txn.pk_index.write();
-                        for pk in pks {
-                            idx.remove(pk);
-                        }
-                    }
-                    Ok(Mutation::UpsertBatch { rows }) => {
-                        for (pk, values) in rows {
-                            txn.pk_index.write().remove(pk);
-                            let _ = txn.replay_insert(pk, values);
-                        }
-                    }
-                    Ok(Mutation::Update { pk, values }) => {
-                        // Replay as delete + insert: tombstone the old descriptor
-                        // so the old physical row is not surfaced, then re-insert
-                        // under the same PK with the new values.
-                        txn.pk_index.write().remove(pk);
-                        let _ = txn.replay_insert(pk, values);
-                    }
-                    Ok(Mutation::Checkpoint { .. }) => {
-                        // No-op during replay: the checkpoint records that all rows
-                        // up to its LSN are already in SST files.  Those rows were
-                        // already loaded from the partition directory above.
-                    }
-                    Ok(Mutation::DdlCreate { .. })
-                    | Ok(Mutation::DdlDrop { .. })
-                    | Ok(Mutation::DdlAlter { .. }) => {}
-                    Err(_) => {}
-                }
-            }
-        }
-
-        // Seed the flushed-rows counter so stats() is accurate after a restart.
-        txn.set_total_rows_flushed(rows_on_disk);
-
         // The manifest is enabled unconditionally here, unlike in TxnManager where
         // it is opt-in. TableEngine is the top-level type and its `compact`,
-        // `apply_retention`, and `verify` all read from it â€” without one they
+        // `apply_retention`, and `verify` all read from it — without one they
         // would silently do nothing, which is a far worse failure than the open
         // returning an error.
         //
@@ -496,6 +438,10 @@ impl TableEngine {
         // unclean shutdown; a large discard is not, and the difference cannot be
         // told from the bytes (see `ManifestRecovery`). It is recorded on the
         // engine so a caller can inspect it rather than having it swallowed.
+        //
+        // It is enabled before the pk index is rebuilt so that orphan files are
+        // excluded first; otherwise an orphan's rows could become the indexed
+        // copy and then vanish when its reader is dropped.
         let manifest_recovery = txn.enable_manifest()?;
 
         // Adopt partitions found on disk ONLY when the manifest is empty.
@@ -506,7 +452,7 @@ impl TableEngine {
         //
         // - **Empty manifest**: a table written before the manifest existed. Every
         //   file is real data and must be adopted, or the table appears empty.
-        // - **Populated manifest**: an orphan from an interrupted compaction â€”
+        // - **Populated manifest**: an orphan from an interrupted compaction —
         //   inputs still on disk with the manifest already naming only the output.
         //   Adopting one DOUBLES every row it holds, silently, in every scan.
         //
@@ -527,7 +473,7 @@ impl TableEngine {
                     size_bytes,
                     row_count: reader.row_count(),
                     // Unknown, and 0 is the honest answer: it sorts these first for
-                    // age-based retention, which is right â€” they predate everything
+                    // age-based retention, which is right — they predate everything
                     // the manifest has seen.
                     created_at_millis: 0,
                     min_key,
@@ -546,6 +492,121 @@ impl TableEngine {
                 .collect();
             partitions.retain(|k, _| known.contains(k));
         }
+        // A quarantined file must also leave the manifest, or compaction and
+        // retention would keep planning work against a file that is gone.
+        for path in &quarantined {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if let Some((file_id, partition_id)) = parse_partition_name(name) {
+                txn.record(ManifestEdit::Remove {
+                    file_id,
+                    partition_id,
+                })?;
+            }
+        }
+
+        // Rebuild pk_index from existing partition files so reads work across
+        // process restarts (Phase 2 crash recovery).
+        let rows_on_disk: u64 = partitions.values().map(|r| r.row_count() as u64).sum();
+        txn.rebuild_pk_index_from_partitions(&partitions)?;
+
+        // WAL recovery.
+        //
+        // Pass 1 folds every frame after `replay_after` into the final state of
+        // each pk it touches, in WAL order — exactly the order the live writes
+        // were applied. Pass 2 reconciles that state with what the partitions
+        // already hold: a pk whose indexed on-disk row already equals its final
+        // value is left alone; anything else is re-buffered (or removed).
+        //
+        // Comparing against partition contents, instead of guessing from which
+        // pks happen to be indexed, is what keeps an UPDATE/CAS/upsert written
+        // after a flush from being dropped on restart (PP-08), keeps upserts from
+        // being re-flushed on every open (PP-10), and makes the outcome
+        // independent of which duplicate copy the index rebuild picked (PP-09).
+        //
+        // A frame that fails its checksum is an error, not a reason to skip the
+        // rest of the log: torn tails were already cut back by `WalWriter::open`,
+        // so anything still undecodable here is real corruption (PP-02).
+        // Payloads that are not mutations (legacy flush strings, snapshot
+        // markers) and frames that do not decrypt are skipped, as before.
+        let mut final_state: HashMap<u64, Option<Vec<u64>>> = HashMap::new();
+        let wal_cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
+        WalReader::open(wal_cfg).scan(vectorvolt_wal::WalCursor::beginning(), |frame| {
+            if frame.sequence <= replay_after {
+                return true;
+            }
+            let payload = match &wal_key {
+                Some(key) => match vectorvolt_crypto::decrypt(key, &frame.payload) {
+                    Ok(p) => p,
+                    Err(_) => return true,
+                },
+                None => frame.payload,
+            };
+            match Mutation::decode(&payload) {
+                Ok(Mutation::Insert { pk, values })
+                | Ok(Mutation::Upsert { pk, values })
+                | Ok(Mutation::Update { pk, values }) => {
+                    final_state.insert(pk, Some(values));
+                }
+                Ok(Mutation::Delete { pk }) => {
+                    final_state.insert(pk, None);
+                }
+                Ok(Mutation::InsertBatch { rows }) | Ok(Mutation::UpsertBatch { rows }) => {
+                    for (pk, values) in rows {
+                        final_state.insert(pk, Some(values));
+                    }
+                }
+                Ok(Mutation::DeleteBatch { pks }) => {
+                    for pk in pks {
+                        final_state.insert(pk, None);
+                    }
+                }
+                Ok(Mutation::TxnBatch { ops }) => {
+                    for (pk, op) in ops {
+                        final_state.insert(pk, op);
+                    }
+                }
+                Ok(Mutation::Checkpoint { .. })
+                | Ok(Mutation::DdlCreate { .. })
+                | Ok(Mutation::DdlDrop { .. })
+                | Ok(Mutation::DdlAlter { .. })
+                | Err(_) => {}
+            }
+            true
+        })?;
+
+        for (pk, state) in final_state {
+            let current = txn.pk_index.read().get(pk);
+            match state {
+                None => {
+                    if current.is_some() {
+                        txn.pk_index.write().remove(pk);
+                    }
+                }
+                Some(values) => {
+                    let already_on_disk = current.is_some_and(|d| {
+                        partitions
+                            .get(&(d.file_id(), d.partition_id()))
+                            .and_then(|r| r.read_row(d.row_offset() as usize).ok())
+                            .is_some_and(|row| row == values)
+                    });
+                    if already_on_disk {
+                        continue;
+                    }
+                    if current.is_some() {
+                        txn.pk_index.write().remove(pk);
+                    }
+                    match txn.replay_insert(pk, values) {
+                        // A row logged before an ALTER changed the column count
+                        // cannot be re-buffered; that was skipped before too.
+                        Ok(()) | Err(vectorvolt_txn::TxnError::SchemaMismatch { .. }) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+        }
+
+        // Seed the flushed-rows counter so stats() is accurate after a restart.
+        txn.set_total_rows_flushed(rows_on_disk);
 
         let catalog_path = index_catalog::catalog_path(&data_dir);
         let cdc_log_path = data_dir.join("cdc.log");
@@ -562,6 +623,7 @@ impl TableEngine {
             compaction_strategy: options.compaction_strategy,
             write_options: options.write_options,
             manifest_recovery,
+            quarantined,
             mvcc: MvccStore::new(),
             cas_lock: parking_lot::Mutex::new(()),
             auto_compact_threshold: options.auto_compact_threshold,
@@ -610,21 +672,25 @@ impl TableEngine {
     /// Flush all pending rows, compact all partitions into one, and write a
     /// `snapshot.vvss` marker into the partition directory.
     ///
-    /// On the next `open_with`, the marker causes the WAL directory to be
-    /// cleared before `WalWriter::open`, so replay starts from a clean slate.
-    /// All rows are already durable in the compacted partition file, so no
-    /// data is lost.
+    /// The marker records the WAL position the compacted files cover. On the
+    /// next open, replay skips frames up to that position and still applies
+    /// every frame written after the snapshot.
     pub fn take_snapshot(&self) -> EngineResult<crate::snapshot::SnapshotMeta> {
         // pk_index is the authoritative map of live rows.  Read the count BEFORE
         // flush so that buffered deletes (not yet written to a partition) are
         // reflected correctly -- flush would otherwise re-insert them.
         let row_count = self.txn.pk_index.read().len() as u64;
+        // Every WAL frame at or below `wal_seq` is fully applied in memory at
+        // this instant, so the flush below writes all of their effects out.
+        // Recovery may then skip those frames; later ones are always replayed.
+        let wal_seq = self.txn.quiesced_tip();
         self.flush()?;
         self.compact()?;
         let byte_size = crate::snapshot::partition_dir_byte_size(&self.partition_dir)?;
         let meta = crate::snapshot::SnapshotMeta {
             row_count,
             byte_size,
+            wal_seq,
         };
         let marker = self.partition_dir.join("snapshot.vvss");
         crate::snapshot::write_marker(&marker, &meta)?;
@@ -1140,6 +1206,15 @@ impl TableEngine {
         self.manifest_recovery
     }
 
+    /// Partition files that failed to open and were moved aside at startup.
+    ///
+    /// Empty on a healthy table. Rows they held are recovered from the WAL
+    /// where it still covers them; anything older than the last snapshot is
+    /// only in the quarantined file, so a non-empty list needs attention.
+    pub fn quarantined_partitions(&self) -> &[PathBuf] {
+        &self.quarantined
+    }
+
     /// Every partition the manifest knows about.
     pub fn partition_meta(&self) -> Vec<PartitionMeta> {
         self.txn.partitions()
@@ -1229,7 +1304,19 @@ impl TableEngine {
 
     /// Verify every live partition, individually and against each other.
     pub fn verify(&self) -> EngineResult<VerifyReport> {
-        Ok(verify_partitions(&self.txn.partitions())?)
+        let mut report = verify_partitions(&self.txn.partitions())?;
+        // Files quarantined at open are no longer in the manifest, so the
+        // check above cannot see them — but the damage is real and must not
+        // verify clean.
+        for path in &self.quarantined {
+            report
+                .findings
+                .push(vectorvolt_storage::VerifyFinding::Unreadable {
+                    path: path.clone(),
+                    error: "unreadable at open; moved to quarantine".into(),
+                });
+        }
+        Ok(report)
     }
 
     /// Rebuild the PK index from the given readers.
@@ -1241,7 +1328,10 @@ impl TableEngine {
         let mut idx = self.txn.pk_index.write();
         *idx = vectorvolt_index::CuckooMap::with_capacity(64);
         let mut total: u64 = 0;
-        for ((file_id, partition_id), reader) in parts {
+        // Ascending partition id so the newest copy of a pk wins.
+        let mut ordered: Vec<_> = parts.iter().collect();
+        ordered.sort_by_key(|(k, _)| **k);
+        for ((file_id, partition_id), reader) in ordered {
             for row in 0..reader.row_count() as usize {
                 let pk = reader.read_value(0, row)?;
                 let _ = idx.insert(pk, RowDescriptor::new(*file_id, *partition_id, row as u32));
@@ -1516,17 +1606,94 @@ impl TableEngine {
     /// engine in a partially-updated state.
     pub fn commit_txn(&self, txn_id: TxnId) -> EngineResult<()> {
         let mutations = self.mvcc.drain_commit(txn_id)?;
-        for (pk, intent) in mutations {
-            match intent {
+        let mut ops: Vec<(u64, Option<Vec<u64>>)> = mutations.into_iter().collect();
+        ops.sort_unstable_by_key(|(pk, _)| *pk);
+        self.apply_batch(ops)?;
+        Ok(())
+    }
+
+    /// The staged write set of an open transaction, without committing it.
+    ///
+    /// Cross-table commit records this in its intent log before touching any
+    /// table, so recovery can re-apply it even though the staging buffer
+    /// itself lives only in memory.
+    pub fn txn_write_set(&self, txn_id: TxnId) -> EngineResult<Vec<(u64, Option<Vec<u64>>)>> {
+        let mut ops = self.mvcc.peek(txn_id)?;
+        ops.sort_unstable_by_key(|(pk, _)| *pk);
+        Ok(ops)
+    }
+
+    /// Apply a set of puts (`Some(values)`) and deletes (`None`) atomically.
+    ///
+    /// All of them reach the WAL as a single record, so a crash can never
+    /// leave some applied and others not. Every row is validated first; on
+    /// error nothing is written. Ops are final states — re-applying the same
+    /// batch is a no-op in effect — and a delete of an absent pk is ignored.
+    ///
+    /// This is the commit path for every transaction surface (engine MVCC,
+    /// the wire protocol, gRPC, HTTP multi-table, SQL).
+    pub fn apply_batch(&self, ops: Vec<(u64, Option<Vec<u64>>)>) -> EngineResult<WalTip> {
+        for (_, op) in &ops {
+            if let Some(values) = op {
+                self.schema.validate_row(values)?;
+            }
+        }
+
+        let maintain_indexes = !self.secondary_indexes.read().is_empty();
+        let mut old_rows = Vec::new();
+        if maintain_indexes {
+            for (pk, _) in &ops {
+                old_rows.push(self.get(*pk)?);
+            }
+        }
+
+        let flushed_before = self.txn.total_rows_flushed();
+        let tip = self.txn.apply_batch(ops.clone())?;
+        if self.txn.total_rows_flushed() > flushed_before {
+            self.sync_partitions()?;
+            self.maybe_compact()?;
+        }
+
+        for (i, (pk, op)) in ops.into_iter().enumerate() {
+            let old = old_rows.get(i).and_then(|r| r.as_ref());
+            match op {
                 Some(values) => {
-                    self.insert(pk, values)?;
+                    if maintain_indexes {
+                        self.secondary_maintain_insert(pk, old, &values);
+                    }
+                    let lsn = self
+                        .lsn_counter
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    let ev = ChangeEvent::insert(lsn, pk, values.clone());
+                    let _ = self.cdc_log.append(&ev);
+                    let _ = self.changes_tx.send(ev);
+                    self.projections
+                        .lock()
+                        .fan_out(&vectorvolt_txn::Mutation::Insert { pk, values });
                 }
                 None => {
-                    self.delete(pk)?;
+                    // Deleting an absent pk changed nothing; emit nothing.
+                    if maintain_indexes {
+                        match old {
+                            Some(row) => self.secondary_maintain_delete(pk, row),
+                            None => continue,
+                        }
+                    }
+                    let lsn = self
+                        .lsn_counter
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    let ev = ChangeEvent::delete(lsn, pk);
+                    let _ = self.cdc_log.append(&ev);
+                    let _ = self.changes_tx.send(ev);
+                    self.projections
+                        .lock()
+                        .fan_out(&vectorvolt_txn::Mutation::Delete { pk });
                 }
             }
         }
-        Ok(())
+        Ok(tip)
     }
 
     /// Discard all pending mutations for `txn_id` without applying them.

@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vectorvolt_wal::{SnapshotMarker, WalConfig, WalReader, WalWriter};
+use vectorvolt_wal::{SnapshotMarker, WalConfig, WalReader};
 
 use crate::{EngineResult, engine::TableEngine};
 
@@ -33,20 +33,15 @@ impl TableEngine {
             })
             .unwrap_or_default();
 
-        let wal_dir = self
-            .partition_dir
-            .parent()
-            .unwrap_or(&self.partition_dir)
-            .join("wal");
-        let cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
-        let wal = WalWriter::open(cfg)?;
-
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        let lsn = wal.tip().sequence;
+        // The marker goes through this engine's own WAL writer. Opening a
+        // second writer on the live directory forked the sequence numbers and
+        // the hash chain (PP-12).
+        let lsn = self.txn.quiesced_tip();
 
         let marker = SnapshotMarker {
             snapshot_id: timestamp_ns,
@@ -56,8 +51,7 @@ impl TableEngine {
             tier_files,
         };
 
-        wal.write_snapshot_marker(&marker)?;
-        wal.flush()?;
+        self.txn.append_marker(marker.encode())?;
         Ok(marker)
     }
 

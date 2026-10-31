@@ -255,11 +255,71 @@ async fn grpc_insert_with_all_columns() {
     let (addr, _sd) = start(&dir).await;
     let mut c = client(addr).await;
     let r = c
-        .insert(InsertRequest { pk: 77, values: vec![77, 30] })
+        .insert(InsertRequest {
+            pk: 77,
+            values: vec![77, 30],
+        })
         .await
         .unwrap()
         .into_inner();
     assert_eq!(r.status, "ok");
     let q = c.query(QueryRequest { pk: 77 }).await.unwrap().into_inner();
     assert!(q.found);
+}
+
+// ── bearer-token auth (PP-31) ─────────────────────────────────────────────────
+
+async fn start_with_token(
+    dir: &tempfile::TempDir,
+    token: &str,
+) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let engine = std::sync::Arc::new(
+        vectorvolt_engine::TableEngine::open(
+            vec!["pk".to_string(), "age".to_string()],
+            dir.path(),
+            1_000_000,
+        )
+        .unwrap(),
+    );
+    let srv = vectorvolt_server::GrpcServer::standalone(addr, engine).with_token(token);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = srv.run(rx).await;
+    });
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    (addr, tx)
+}
+
+#[tokio::test]
+async fn grpc_with_token_rejects_missing_and_wrong_tokens() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (addr, _sd) = start_with_token(&dir, "s3cret-token").await;
+    let mut c = client(addr).await;
+
+    let err = c.ping(PingRequest {}).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    let mut req = tonic::Request::new(PingRequest {});
+    req.metadata_mut()
+        .insert("authorization", "Bearer wrong".parse().unwrap());
+    assert_eq!(
+        c.ping(req).await.unwrap_err().code(),
+        tonic::Code::Unauthenticated
+    );
+
+    let mut req = tonic::Request::new(PingRequest {});
+    req.metadata_mut()
+        .insert("authorization", "Bearer s3cret-token".parse().unwrap());
+    assert!(c.ping(req).await.is_ok());
 }
