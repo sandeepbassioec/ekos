@@ -52,33 +52,122 @@ pub struct CdcLogStats {
     pub max_lsn: u64,
 }
 
+/// Completeness of a table's persisted CDC stream; see
+/// `TableEngine::cdc_health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CdcHealth {
+    /// CDC appends that failed after their mutation was committed.
+    pub append_failures: u64,
+    /// Lowest LSN missing from the log because its append failed.
+    pub gap_first_lsn: Option<u64>,
+    /// Highest LSN missing from the log because its append failed.
+    pub gap_last_lsn: Option<u64>,
+}
+
 // ── log ───────────────────────────────────────────────────────────────────────
 
 /// Append-only log of [`ChangeEvent`]s for one table.
 pub struct CdcLog {
     path: PathBuf,
-    writer: Mutex<std::io::BufWriter<File>>,
+    writer: Mutex<LogWriter>,
+    /// Test-only fault injection: the next N appends fail before writing.
+    #[cfg(test)]
+    pub(crate) fail_next: std::sync::atomic::AtomicU32,
+}
+
+/// The append handle plus the byte length of the log through the last
+/// fully-flushed record, so a failed append can be cut back to it.
+struct LogWriter {
+    w: std::io::BufWriter<File>,
+    len: u64,
 }
 
 impl CdcLog {
     /// Open or create the log at `path`.
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let len = file.metadata()?.len();
         Ok(Self {
             path,
-            writer: Mutex::new(std::io::BufWriter::new(file)),
+            writer: Mutex::new(LogWriter {
+                w: std::io::BufWriter::new(file),
+                len,
+            }),
+            #[cfg(test)]
+            fail_next: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
     /// Append a [`ChangeEvent`] to the log.  The write is flushed immediately
     /// so the entry is visible to concurrent readers.
+    ///
+    /// On failure the log is cut back to the end of the last complete record
+    /// and the buffered bytes are discarded, so a failed append leaves a clean
+    /// LSN gap rather than a torn record that would desynchronise every reader
+    /// after it — or a stale record that a later flush writes out of order.
     pub fn append(&self, event: &ChangeEvent) -> std::io::Result<()> {
         let json = serde_json::to_vec(event).map_err(std::io::Error::other)?;
-        let mut w = self.writer.lock();
-        w.write_all(&event.lsn.to_le_bytes())?;
-        w.write_all(&(json.len() as u32).to_le_bytes())?;
-        w.write_all(&json)?;
+        let mut record = Vec::with_capacity(12 + json.len());
+        record.extend_from_slice(&event.lsn.to_le_bytes());
+        record.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        record.extend_from_slice(&json);
+        let mut guard = self.writer.lock();
+        let result = self.write_record(&mut guard.w, &record);
+        match result {
+            Ok(()) => {
+                guard.len += record.len() as u64;
+                Ok(())
+            }
+            Err(e) => {
+                self.repair(&mut guard);
+                Err(e)
+            }
+        }
+    }
+
+    fn write_record(&self, w: &mut std::io::BufWriter<File>, record: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            // Simulate a write that got partway before failing.
+            w.write_all(&record[..record.len() / 2])?;
+            return Err(std::io::Error::other("injected CDC append failure"));
+        }
+        w.write_all(record)?;
         w.flush()
+    }
+
+    /// Drop unflushed bytes and truncate the file back to the last complete
+    /// record. Best effort: if this fails too, the next open still reads up
+    /// to the first torn record.
+    fn repair(&self, guard: &mut LogWriter) {
+        let fresh = match OpenOptions::new().append(true).open(&self.path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(path = %self.path.display(), error = %e, "CDC log repair: reopen failed");
+                return;
+            }
+        };
+        // Swap in the new handle; `into_parts` on the old writer discards its
+        // buffered bytes instead of flushing them later.
+        let old = std::mem::replace(&mut guard.w, std::io::BufWriter::new(fresh));
+        drop(old.into_parts());
+        // Cut off any partial record that already reached the OS. A separate
+        // write handle: an append-only handle cannot change the file length.
+        let truncated = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .and_then(|f| f.set_len(guard.len));
+        if let Err(e) = truncated {
+            tracing::error!(path = %self.path.display(), error = %e, "CDC log repair: truncate failed");
+        }
     }
 
     /// Return all events with `lsn >= from_lsn`, in order.
@@ -276,7 +365,11 @@ impl CdcLog {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        *_guard = std::io::BufWriter::new(new_file);
+        let len = new_file.metadata()?.len();
+        *_guard = LogWriter {
+            w: std::io::BufWriter::new(new_file),
+            len,
+        };
 
         Ok(dropped)
     }

@@ -624,6 +624,123 @@ mod tests {
         assert!(n > 0);
     }
 
+    // ── B13: message framing ─────────────────────────────────────────────────
+
+    /// Read whole backend messages until `n` ReadyForQuery ('Z') messages
+    /// have arrived (or the server closes). Returns the message type bytes.
+    async fn read_until_ready(stream: &mut tokio::net::TcpStream, n: usize) -> Vec<u8> {
+        let mut raw = Vec::new();
+        let mut types = Vec::new();
+        let mut pos = 0;
+        let mut buf = vec![0u8; 8192];
+        while types.iter().filter(|&&t| t == b'Z').count() < n {
+            // Consume every complete message already buffered.
+            if raw.len() >= pos + 5 {
+                let len =
+                    i32::from_be_bytes([raw[pos + 1], raw[pos + 2], raw[pos + 3], raw[pos + 4]])
+                        as usize;
+                if raw.len() >= pos + 1 + len {
+                    types.push(raw[pos]);
+                    pos += 1 + len;
+                    continue;
+                }
+            }
+            let got =
+                tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf))
+                    .await
+                    .expect("timed out waiting for server reply")
+                    .unwrap_or(0);
+            if got == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..got]);
+        }
+        types
+    }
+
+    /// Start a no-auth server, complete startup and drain the greeting.
+    async fn ready_session(dir: &std::path::Path) -> tokio::net::TcpStream {
+        let (server, listener, addr) = open_server_on_ephemeral(dir).await;
+        tokio::spawn(async move {
+            let _ = server.accept_one(&listener).await;
+        });
+        let mut stream = connect_and_startup(addr).await;
+        let greet = read_until_ready(&mut stream, 1).await;
+        assert_eq!(greet.last(), Some(&b'Z'), "{greet:?}");
+        stream
+    }
+
+    #[tokio::test]
+    async fn test_two_queries_in_one_write_get_two_responses() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stream = ready_session(dir.path()).await;
+        let mut both = make_query_msg("CREATE TABLE pipe (pk U64)");
+        both.extend(make_query_msg("SELECT * FROM pipe"));
+        stream.write_all(&both).await.unwrap();
+        let types = read_until_ready(&mut stream, 2).await;
+        // CommandComplete + Z, then RowDescription + CommandComplete + Z.
+        assert_eq!(types, vec![b'C', b'Z', b'T', b'C', b'Z'], "{types:?}");
+    }
+
+    #[tokio::test]
+    async fn test_query_split_byte_by_byte_gets_one_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stream = ready_session(dir.path()).await;
+        stream.set_nodelay(true).unwrap();
+        for byte in make_query_msg("CREATE TABLE split (pk U64)") {
+            stream.write_all(&[byte]).await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        let types = read_until_ready(&mut stream, 1).await;
+        assert_eq!(types, vec![b'C', b'Z'], "{types:?}");
+        // The session is still in sync for the next query.
+        stream
+            .write_all(&make_query_msg("SELECT * FROM split"))
+            .await
+            .unwrap();
+        let types = read_until_ready(&mut stream, 1).await;
+        assert_eq!(types, vec![b'T', b'C', b'Z'], "{types:?}");
+    }
+
+    #[tokio::test]
+    async fn test_200kb_query_is_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stream = ready_session(dir.path()).await;
+        // > 64 KiB (the old single-read buffer) but under MAX_MESSAGE_LEN.
+        let sql = format!("CREATE TABLE big (pk U64){}", " ".repeat(200 * 1024));
+        stream.write_all(&make_query_msg(&sql)).await.unwrap();
+        let types = read_until_ready(&mut stream, 1).await;
+        assert_eq!(types, vec![b'C', b'Z'], "{types:?}");
+        stream
+            .write_all(&make_query_msg("SELECT * FROM big"))
+            .await
+            .unwrap();
+        let types = read_until_ready(&mut stream, 1).await;
+        assert_eq!(types, vec![b'T', b'C', b'Z'], "{types:?}");
+    }
+
+    #[tokio::test]
+    async fn test_bad_message_length_rejected_with_08p01() {
+        for len in [3i32, -1, i32::MIN, crate::wire::MAX_MESSAGE_LEN as i32 + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut stream = ready_session(dir.path()).await;
+            let mut msg = vec![b'Q'];
+            msg.extend_from_slice(&len.to_be_bytes());
+            stream.write_all(&msg).await.unwrap();
+            let mut reply = Vec::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                stream.read_to_end(&mut reply),
+            )
+            .await
+            .expect("server must close the connection");
+            assert_eq!(reply.first(), Some(&b'E'), "len {len}: {reply:?}");
+            let text = String::from_utf8_lossy(&reply);
+            assert!(text.contains("08P01"), "len {len}: {text}");
+        }
+    }
+
     #[tokio::test]
     async fn test_wire_encode_decode_roundtrip() {
         use crate::wire::{encode_command_complete, encode_data_row, encode_row_description};

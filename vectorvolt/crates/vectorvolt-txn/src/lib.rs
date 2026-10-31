@@ -38,7 +38,9 @@ pub mod routing;
 pub mod shard_writer;
 
 pub use error::{TxnError, TxnResult};
-pub use manager::{FlushResult, PENDING_FILE_ID, TxnManager, WalTip};
+pub use manager::{
+    CompactionHook, FlushResult, PENDING_FILE_ID, PreparedCompaction, TxnManager, WalTip,
+};
 pub use mvcc::{CommitClock, VersionEntry};
 pub use ops::Mutation;
 pub use routing::select_partition;

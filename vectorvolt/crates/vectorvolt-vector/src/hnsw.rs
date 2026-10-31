@@ -8,6 +8,26 @@ use std::collections::HashMap;
 
 use crate::distance;
 
+/// Errors returned by the fallible [`HnswIndex`] entry points.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VectorError {
+    /// The vector contains a NaN or infinite component at `index`.
+    ///
+    /// Non-finite components make distances NaN, which has no total order
+    /// against real distances, so such vectors are rejected outright rather
+    /// than silently poisoning the neighbour graph or the result ordering.
+    #[error("vector component {index} is not finite (NaN or infinity)")]
+    NonFinite { index: usize },
+}
+
+/// Reject vectors containing NaN or infinite components.
+fn check_finite(vector: &[f32]) -> Result<(), VectorError> {
+    match vector.iter().position(|x| !x.is_finite()) {
+        Some(index) => Err(VectorError::NonFinite { index }),
+        None => Ok(()),
+    }
+}
+
 /// HNSW approximate nearest-neighbour index.
 ///
 /// Each inserted vector is assigned an id (`u64`) and stored in a flat map.
@@ -41,7 +61,19 @@ impl HnswIndex {
     ///
     /// Finds the `m` nearest existing neighbours by Euclidean distance and
     /// creates bidirectional edges. Sets the entry point if the index is empty.
+    ///
+    /// A vector with a NaN or infinite component is not inserted (it is
+    /// ignored); use [`HnswIndex::try_insert`] to observe the rejection.
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
+        let _ = self.try_insert(id, vector);
+    }
+
+    /// Insert a vector with the given id, rejecting non-finite vectors.
+    ///
+    /// Returns [`VectorError::NonFinite`] (and leaves the index unchanged) if
+    /// any component is NaN or infinite.
+    pub fn try_insert(&mut self, id: u64, vector: Vec<f32>) -> Result<(), VectorError> {
+        check_finite(&vector)?;
         self.vectors.insert(id, vector.clone());
         // Find m nearest neighbours
         let mut neighbours: Vec<(u64, f32)> = self
@@ -50,7 +82,7 @@ impl HnswIndex {
             .filter(|&(&nid, _)| nid != id)
             .map(|(&nid, v)| (nid, distance::euclidean_distance(&vector, v)))
             .collect();
-        neighbours.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        neighbours.sort_by(|a, b| a.1.total_cmp(&b.1));
         neighbours.truncate(self.m);
         let neighbour_ids: Vec<u64> = neighbours.iter().map(|(nid, _)| *nid).collect();
         // Add reverse edges (up to m)
@@ -67,20 +99,32 @@ impl HnswIndex {
         if self.entry_point.is_none() {
             self.entry_point = Some(id);
         }
+        Ok(())
     }
 
     /// Search for the `k` nearest neighbours to `query`.
     ///
     /// Returns a list of `(id, distance)` pairs sorted by ascending distance.
+    /// A query with a NaN or infinite component matches nothing (empty
+    /// result); use [`HnswIndex::try_search`] to observe the rejection.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.try_search(query, k).unwrap_or_default()
+    }
+
+    /// Search for the `k` nearest neighbours to `query`, rejecting a
+    /// non-finite query with [`VectorError::NonFinite`].
+    pub fn try_search(&self, query: &[f32], k: usize) -> Result<Vec<(u64, f32)>, VectorError> {
+        check_finite(query)?;
         let mut results: Vec<(u64, f32)> = self
             .vectors
             .iter()
             .map(|(&id, v)| (id, distance::euclidean_distance(query, v)))
             .collect();
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        // `total_cmp` never panics; distances between finite vectors can still
+        // overflow to +inf, which it orders after every finite distance.
+        results.sort_by(|a, b| a.1.total_cmp(&b.1));
         results.truncate(k);
-        results
+        Ok(results)
     }
 
     /// Number of vectors in the index.
@@ -241,5 +285,59 @@ mod tests {
         let idx = HnswIndex::new(16, 200);
         assert_eq!(idx.ef_construction(), 200);
         assert_eq!(idx.m(), 16);
+    }
+
+    #[test]
+    fn test_try_insert_rejects_nan_and_inf() {
+        let mut idx = HnswIndex::new(4, 50);
+        idx.insert(1, vec![0.0, 0.0]);
+        assert_eq!(
+            idx.try_insert(2, vec![1.0, f32::NAN]),
+            Err(VectorError::NonFinite { index: 1 })
+        );
+        assert_eq!(
+            idx.try_insert(3, vec![f32::INFINITY, 0.0]),
+            Err(VectorError::NonFinite { index: 0 })
+        );
+        assert_eq!(
+            idx.try_insert(4, vec![0.0, f32::NEG_INFINITY]),
+            Err(VectorError::NonFinite { index: 1 })
+        );
+        assert_eq!(idx.len(), 1);
+        // The infallible wrapper must not panic and must not insert either.
+        idx.insert(5, vec![f32::NAN, f32::NAN]);
+        assert!(!idx.contains(5));
+        // Search over the index still works (previously panicked on NaN).
+        let r = idx.search(&[0.0, 0.0], 5);
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn test_try_search_rejects_nan_query() {
+        let mut idx = HnswIndex::new(4, 50);
+        idx.insert(1, vec![0.0, 0.0]);
+        idx.insert(2, vec![1.0, 1.0]);
+        assert_eq!(
+            idx.try_search(&[f32::NAN, 0.0], 2),
+            Err(VectorError::NonFinite { index: 0 })
+        );
+        assert_eq!(
+            idx.try_search(&[0.0, f32::INFINITY], 2),
+            Err(VectorError::NonFinite { index: 1 })
+        );
+        // The infallible wrapper returns nothing instead of panicking.
+        assert!(idx.search(&[f32::NAN, f32::NAN], 2).is_empty());
+        assert_eq!(idx.try_search(&[0.0, 0.0], 2).unwrap()[0].0, 1);
+    }
+
+    #[test]
+    fn test_search_orders_overflowing_distance_last() {
+        let mut idx = HnswIndex::new(4, 50);
+        idx.insert(1, vec![f32::MAX, f32::MAX]);
+        idx.insert(2, vec![0.0, 0.0]);
+        // Distance to point 1 overflows to +inf; to point 2 it is finite.
+        let r = idx.try_search(&[1.0, 1.0], 2).unwrap();
+        assert_eq!(r[0].0, 2);
+        assert!(r[1].1.is_infinite());
     }
 }

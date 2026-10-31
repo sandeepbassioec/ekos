@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use vectorvolt_index::RowDescriptor;
 
 use crate::{QueryResult, catalog::TableCatalog, error::QueryError, row::QueryRow};
@@ -6,11 +8,25 @@ use crate::{QueryResult, catalog::TableCatalog, error::QueryError, row::QueryRow
 /// and FK existence checks against a [`TableCatalog`].
 pub struct QueryEngine {
     catalog: TableCatalog,
+    /// Lower 32 bits → every PK above `u32::MAX` with those lower bits.
+    ///
+    /// The secondary index's bitmaps hold only the lower 32 bits of each PK,
+    /// so a bitmap entry `x` stands for PK `x` *and* for every PK
+    /// `x + k·2³²`. This map lets `secondary_scan` resolve an entry to all of
+    /// its full-width candidates instead of silently treating it as `x`.
+    /// Built once from the (immutable) catalog; empty when every PK fits u32.
+    wide_pks: HashMap<u32, Vec<u64>>,
 }
 
 impl QueryEngine {
     pub fn new(catalog: TableCatalog) -> Self {
-        QueryEngine { catalog }
+        let mut wide_pks: HashMap<u32, Vec<u64>> = HashMap::new();
+        for (pk, _) in catalog.pk_index.iter() {
+            if pk > u64::from(u32::MAX) {
+                wide_pks.entry(pk as u32).or_default().push(pk);
+            }
+        }
+        QueryEngine { catalog, wide_pks }
     }
 
     // ── Point lookup ──────────────────────────────────────────────────────────
@@ -68,25 +84,53 @@ impl QueryEngine {
 
     // ── Secondary index scan ──────────────────────────────────────────────────
 
-    /// Return all rows whose indexed column hashes to `value_hash`.
+    /// Return all rows whose column `col_idx` equals `value`, using the
+    /// secondary index bucket `value_hash` (the caller's hash of `value`).
     ///
-    /// The SecondaryIndex stores `(value_hash → RoaringBitmap of u32 PKs)`.
-    /// Each PK in the bitmap is resolved to a full row via the CuckooMap.
+    /// The SecondaryIndex stores `(value_hash → RoaringBitmap of the lower 32
+    /// bits of each PK)`, so a bucket is only a *candidate* set:
     ///
-    /// Hash collisions may produce false positives — callers should re-check
-    /// the actual column value if exact match is required.
-    pub fn secondary_scan(&self, value_hash: u32) -> QueryResult<Vec<QueryRow>> {
+    /// * two values can share a hash (collision), and an entry can be stale
+    ///   (the row was updated or deleted after it was indexed) — so every
+    ///   fetched row's actual column value is re-checked against `value`;
+    /// * a bitmap entry `x` may stand for PK `x` or any PK `x + k·2³²`, so it
+    ///   is expanded to every full-width PK present in the table (`wide_pks`)
+    ///   and resolved as a `u64` — never truncated.
+    ///
+    /// Candidates are resolved with one batched `get_batch` probe
+    /// (VV-QRY-003.5). Rows come back in ascending PK order.
+    pub fn secondary_scan(
+        &self,
+        col_idx: usize,
+        value: u64,
+        value_hash: u32,
+    ) -> QueryResult<Vec<QueryRow>> {
         let Some(iter) = self.catalog.secondary_index.get(value_hash) else {
             return Ok(Vec::new());
         };
 
-        // Collect all matching PKs first, then issue a single batched lookup
-        // (VV-QRY-003.5). This replaces N individual CuckooMap probes with one
-        // vectorized `get_batch` call, cutting the secondary-scan probe cost
-        // from O(N × CuckooMap-probe) to O(1 batch + N × read_value).
-        let pks: Vec<u64> = iter.map(|pk32| pk32 as u64).collect();
-        let rows = self.pk_lookup_batch(&pks)?;
-        Ok(rows.into_iter().flatten().collect())
+        let mut pks: Vec<u64> = Vec::new();
+        for low in iter {
+            pks.push(u64::from(low));
+            if let Some(wide) = self.wide_pks.get(&low) {
+                pks.extend_from_slice(wide);
+            }
+        }
+        pks.sort_unstable();
+        pks.dedup();
+
+        let mut out = Vec::with_capacity(pks.len());
+        for row in self.pk_lookup_batch(&pks)?.into_iter().flatten() {
+            let col_count = row.values.len();
+            let Some(&actual) = row.values.get(col_idx) else {
+                return Err(QueryError::ColIdxOutOfRange { col_idx, col_count });
+            };
+            // Drop hash-collision false positives and stale index entries.
+            if actual == value {
+                out.push(row);
+            }
+        }
+        Ok(out)
     }
 
     // ── FK existence check ────────────────────────────────────────────────────
@@ -412,6 +456,71 @@ mod tests {
         assert_eq!(rows[0].values[1], 25);
         assert_eq!(rows[1].pk, 2);
         assert_eq!(rows[1].values[1], 30);
+    }
+
+    #[test]
+    fn secondary_scan_returns_exact_match() {
+        let engine = simple_engine();
+        // simple_engine indexes age=30 under hash 30 with bitmap entry 2 (pk=2).
+        let rows = engine.secondary_scan(1, 30, 30).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pk, 2);
+        assert!(engine.secondary_scan(1, 31, 31).unwrap().is_empty());
+        assert!(matches!(
+            engine.secondary_scan(9, 30, 30),
+            Err(QueryError::ColIdxOutOfRange { .. })
+        ));
+    }
+
+    /// B22: hash collisions, stale entries and PKs above u32::MAX.
+    #[test]
+    fn secondary_scan_rechecks_values_and_keeps_u64_pks() {
+        const BIG: u64 = (1u64 << 32) + 7; // lower 32 bits = 7
+        // pk=1 age=10, pk=2 age=20, pk=7 age=99, pk=BIG age=10
+        let pks = [1u64, 2, 7, BIG];
+        let ages = [10u64, 20, 99, 10];
+        let reader = build_partition(0, 0, &pks, &ages);
+
+        let mut pk_index = CuckooMap::with_capacity(8);
+        for (offset, &pk) in pks.iter().enumerate() {
+            pk_index
+                .insert(pk, RowDescriptor::new(0, 0, offset as u32))
+                .unwrap();
+        }
+
+        // Force everything into one hash bucket H = 5:
+        //  - pk=1 (age 10): true match
+        //  - pk=2 (age 20): hash collision — different value, same bucket
+        //  - entry 7: lower bits of BIG (age 10, a true match) but also
+        //    pk=7 itself (age 99) — a stale/colliding entry
+        const H: u32 = 5;
+        let mut secondary_index = SecondaryIndex::new();
+        secondary_index.insert(H, 1);
+        secondary_index.insert(H, 2);
+        secondary_index.insert(H, BIG as u32);
+        // Stale entry: pk=3 no longer exists at all.
+        secondary_index.insert(H, 3);
+
+        let mut partitions = HashMap::new();
+        partitions.insert((0u16, 0u16), reader);
+        let catalog = TableCatalog::new(
+            pk_index,
+            secondary_index,
+            ZoneMap::new(),
+            CuckooFilter::with_capacity(16),
+            partitions,
+        );
+        let engine = QueryEngine::new(catalog);
+
+        let rows = engine.secondary_scan(1, 10, H).unwrap();
+        let got: Vec<(u64, u64)> = rows.iter().map(|r| (r.pk, r.values[1])).collect();
+        assert_eq!(got, vec![(1, 10), (BIG, 10)]);
+        // The BIG row must carry its own full-width PK column too.
+        assert_eq!(rows[1].values[0], BIG);
+
+        let rows = engine.secondary_scan(1, 99, H).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pk, 7);
     }
 
     #[test]

@@ -161,7 +161,7 @@ fn test_vector_insert_and_get() {
     e.execute("CREATE TABLE items (id u64, emb vector(3))")
         .unwrap();
     let engine = registry.get("items").unwrap();
-    engine.insert_vector(1, 1, vec![1.0_f32, 0.0, 0.0]);
+    engine.insert_vector(1, 1, vec![1.0_f32, 0.0, 0.0]).unwrap();
     let got = engine.get_vector(1, 1).unwrap();
     assert_eq!(got.len(), 3);
     assert!((got[0] - 1.0).abs() < 1e-6);
@@ -176,10 +176,10 @@ fn test_vector_search_nearest() {
     e.execute("CREATE TABLE items (id u64, emb vector(2))")
         .unwrap();
     let engine = registry.get("items").unwrap();
-    engine.insert_vector(1, 1, vec![1.0_f32, 0.0]);
-    engine.insert_vector(1, 2, vec![0.0_f32, 1.0]);
-    engine.insert_vector(1, 3, vec![-1.0_f32, 0.0]);
-    let results = engine.search_vector(1, &[1.0_f32, 0.0], 1);
+    engine.insert_vector(1, 1, vec![1.0_f32, 0.0]).unwrap();
+    engine.insert_vector(1, 2, vec![0.0_f32, 1.0]).unwrap();
+    engine.insert_vector(1, 3, vec![-1.0_f32, 0.0]).unwrap();
+    let results = engine.search_vector(1, &[1.0_f32, 0.0], 1).unwrap();
     assert_eq!(results[0].0, 1);
 }
 

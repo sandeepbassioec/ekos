@@ -97,7 +97,7 @@ pub use catalog_tag::{clear_tags, get_tags, remove_tag, set_tag};
 pub use catalog_validate::{CatalogValidationReport, TableIssue, validate_catalog};
 pub use catalog_watch::{WatchControl, WatchEvent, watch_catalog};
 pub use cdc::{ChangeEvent, ChangeKind};
-pub use cdc_log::{CdcLog, CdcLogStats};
+pub use cdc_log::{CdcHealth, CdcLog, CdcLogStats};
 pub use compact::CompactResult;
 pub use cond::UpsertResult;
 pub use config::{

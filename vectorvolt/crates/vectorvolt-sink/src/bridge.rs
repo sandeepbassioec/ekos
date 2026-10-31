@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use parking_lot::Mutex;
 use vectorvolt_txn::Mutation;
-use vectorvolt_wal::{WalConfig, WalReader};
+use vectorvolt_wal::{Frame, SegmentReader, WalConfig, WalCursor, list_segment_ids, segment_path};
 
 use crate::{
     error::SinkResult,
@@ -14,10 +15,18 @@ use crate::{
 
 /// Reads new WAL frames since the last poll and fans decoded mutations to the
 /// attached [`SinkRegistry`].
+///
+/// The bridge keeps a byte-level [`WalCursor`] (segment + offset just past the
+/// last frame it has dispatched), so each poll reads only frames appended since
+/// the previous one instead of re-reading the whole WAL (B29). `last_lsn` is
+/// still checked per frame as a second guard against re-emission.
 pub struct WalSinkBridge {
     wal_config: WalConfig,
     registry: Arc<SinkRegistry>,
     last_lsn: AtomicU64,
+    /// Where the next poll resumes reading. Advanced only after every frame
+    /// up to it was dispatched successfully (at-least-once on sink errors).
+    cursor: Mutex<WalCursor>,
     table_name: String,
 }
 
@@ -27,21 +36,54 @@ impl WalSinkBridge {
             wal_config,
             registry,
             last_lsn: AtomicU64::new(0),
+            cursor: Mutex::new(WalCursor::beginning()),
             table_name: table_name.to_string(),
         }
     }
 
-    /// Scan new frames, decode mutations, and fan events to the registry.
+    /// Read every complete frame at or after `from`, returning them and the
+    /// cursor just past the last one read.
+    ///
+    /// Unlike `WalReader::scan`, whose end-of-WAL cursor points *past* the
+    /// last segment (so resuming from it would skip frames later appended to
+    /// that still-active segment), the returned cursor stays inside the last
+    /// segment, at its current end.
+    fn read_from(&self, from: WalCursor) -> SinkResult<(Vec<Frame>, WalCursor)> {
+        let io = |e: vectorvolt_wal::WalError| crate::error::SinkError::Io(e.to_string());
+        let ids = list_segment_ids(&self.wal_config.dir).map_err(io)?;
+        let start_idx = ids.partition_point(|&id| id < from.segment_id);
+
+        let mut frames = Vec::new();
+        let mut cur = from;
+        for &seg_id in &ids[start_idx..] {
+            let mut reader =
+                SegmentReader::open(&segment_path(&self.wal_config.dir, seg_id)).map_err(io)?;
+            if seg_id == from.segment_id {
+                reader.seek_to(from.offset).map_err(io)?;
+            } else {
+                reader.rewind().map_err(io)?;
+            }
+            while let Some(frame) = reader.next_frame().map_err(io)? {
+                frames.push(frame);
+            }
+            cur = WalCursor {
+                segment_id: seg_id,
+                offset: reader.file_position().map_err(io)?,
+            };
+        }
+        Ok((frames, cur))
+    }
+
+    /// Scan frames appended since the last poll, decode mutations, and fan
+    /// events to the registry.
     pub async fn poll_once(&self) -> SinkResult<usize> {
-        let reader = WalReader::open(self.wal_config.clone());
         let last = self.last_lsn.load(Ordering::Acquire);
+        let from = *self.cursor.lock();
 
         let mut dispatched = 0usize;
         let mut max_seq = last;
 
-        let frames = reader
-            .read_all()
-            .map_err(|e| crate::error::SinkError::Io(e.to_string()))?;
+        let (frames, next_cursor) = self.read_from(from)?;
 
         for frame in frames {
             if frame.sequence > last {
@@ -61,7 +103,13 @@ impl WalSinkBridge {
         }
 
         self.last_lsn.store(max_seq, Ordering::Release);
+        *self.cursor.lock() = next_cursor;
         Ok(dispatched)
+    }
+
+    /// Position the next poll resumes reading from.
+    pub fn cursor(&self) -> WalCursor {
+        *self.cursor.lock()
     }
 
     pub fn last_lsn(&self) -> u64 {
@@ -400,6 +448,108 @@ mod tests {
         let bridge = WalSinkBridge::new(cfg, reg, "t");
         assert_eq!(bridge.poll_once().await.unwrap(), 1);
         assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    /// B29: a second poll must neither re-emit old events nor re-read old
+    /// frames. The already-consumed frames are overwritten with garbage after
+    /// the first poll: a full re-read would fail to decode them, a resumed
+    /// read never touches them.
+    #[tokio::test]
+    async fn second_poll_resumes_from_cursor() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = TempDir::new().unwrap();
+        let (wal, cfg) = setup(&dir);
+        for i in 0..3u64 {
+            wal.append(
+                Mutation::Insert {
+                    pk: i,
+                    values: vec![i],
+                }
+                .encode(),
+            )
+            .unwrap();
+        }
+        wal.flush().unwrap();
+
+        let reg = Arc::new(SinkRegistry::new());
+        let (sink, count) = CountSink::new("s");
+        reg.register(sink);
+        let bridge = WalSinkBridge::new(cfg.clone(), reg, "t");
+        assert_eq!(bridge.poll_once().await.unwrap(), 3);
+        let after_first = bridge.cursor();
+
+        // Nothing new: nothing re-emitted, cursor unchanged.
+        assert_eq!(bridge.poll_once().await.unwrap(), 0);
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+        assert_eq!(bridge.cursor(), after_first);
+
+        // Corrupt the consumed frames in place.
+        let seg = vectorvolt_wal::segment_path(dir.path(), after_first.segment_id);
+        let header = vectorvolt_wal::WalCursor::beginning().offset;
+        let mut f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+        f.seek(SeekFrom::Start(header)).unwrap();
+        f.write_all(&vec![0xAB; (after_first.offset - header) as usize])
+            .unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        assert!(
+            vectorvolt_wal::WalReader::open(cfg.clone())
+                .read_all()
+                .is_err(),
+            "precondition: a full re-read must now fail"
+        );
+
+        // New frames are picked up from the cursor, old ones never re-read.
+        for i in 10..12u64 {
+            wal.append(
+                Mutation::Insert {
+                    pk: i,
+                    values: vec![i],
+                }
+                .encode(),
+            )
+            .unwrap();
+        }
+        wal.flush().unwrap();
+        assert_eq!(bridge.poll_once().await.unwrap(), 2);
+        assert_eq!(count.load(Ordering::Relaxed), 5);
+        assert_eq!(bridge.last_lsn(), 5);
+        assert!(bridge.cursor().offset > after_first.offset);
+    }
+
+    #[tokio::test]
+    async fn cursor_follows_segment_rotation() {
+        let dir = TempDir::new().unwrap();
+        let cfg = WalConfig::default()
+            .with_dir(dir.path())
+            .with_fsync(false)
+            .with_segment_max_bytes(256);
+        let wal = WalWriter::open(cfg.clone()).unwrap();
+        let reg = Arc::new(SinkRegistry::new());
+        let (sink, count) = CountSink::new("s");
+        reg.register(sink);
+        let bridge = WalSinkBridge::new(cfg, reg, "t");
+
+        let mut expected = 0u64;
+        for round in 0..4u64 {
+            for i in 0..5u64 {
+                let pk = round * 100 + i;
+                wal.append(
+                    Mutation::Insert {
+                        pk,
+                        values: vec![pk; 4],
+                    }
+                    .encode(),
+                )
+                .unwrap();
+            }
+            wal.flush().unwrap();
+            expected += 5;
+            assert_eq!(bridge.poll_once().await.unwrap(), 5, "round {round}");
+            assert_eq!(count.load(Ordering::Relaxed), expected);
+        }
+        assert!(bridge.cursor().segment_id > 0, "test must cross a rotation");
     }
 
     #[tokio::test]

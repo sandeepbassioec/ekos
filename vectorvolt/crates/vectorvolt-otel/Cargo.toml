@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 # Enable OTLP gRPC exporter (requires a running collector at the configured endpoint).
 # Without this feature the crate compiles to a pure no-op — zero external deps.
-otlp = ["opentelemetry-otlp"]
+otlp = ["opentelemetry-otlp", "dep:tokio"]
 
 [dependencies]
 tracing            = { workspace = true }
@@ -19,6 +19,11 @@ opentelemetry_sdk  = { workspace = true }
 thiserror          = { workspace = true }
 
 [dependencies.opentelemetry-otlp]
+workspace = true
+optional  = true
+
+# Only to detect a missing runtime before the OTLP batch exporter would panic.
+[dependencies.tokio]
 workspace = true
 optional  = true
 

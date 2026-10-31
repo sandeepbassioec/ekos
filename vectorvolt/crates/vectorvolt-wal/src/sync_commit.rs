@@ -149,18 +149,19 @@ impl SyncCommitter {
             state.syncing = true;
             drop(state); // never hold the state lock across the syscall
 
-            // Read the tip BEFORE syncing, so the mark we publish can only lag
-            // reality, never lead it. An append landing between here and the sync
-            // gets flushed but not credited — safe, and it merely costs one extra
-            // sync later.
-            let high_water = self.wal.tip().sequence;
-            let result = self.wal.flush();
+            // `flush_covering` reads the tip under the same append lock as its
+            // buffer flush, and returns it only once the fsync that follows
+            // (outside that lock, so appends keep flowing) has completed. The
+            // mark we publish can therefore only lag reality, never lead it: an
+            // append landing after the buffer flush is not credited — safe, and
+            // it merely costs one extra sync later.
+            let result = self.wal.flush_covering().map(|tip| tip.sequence);
             self.syncs.fetch_add(1, Ordering::Relaxed);
 
             let covered = {
                 let mut state = self.state.lock();
                 state.syncing = false;
-                if result.is_ok() {
+                if let Ok(high_water) = result {
                     state.synced_upto = state.synced_upto.max(high_water);
                 }
                 // Wake everyone: those we covered return, the rest re-evaluate and
@@ -182,8 +183,7 @@ impl SyncCommitter {
 
     /// Flush and sync unconditionally, regardless of what is already durable.
     pub fn flush(&self) -> WalResult<()> {
-        let high_water = self.wal.tip().sequence;
-        self.wal.flush()?;
+        let high_water = self.wal.flush_covering()?.sequence;
         self.syncs.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock();
         state.synced_upto = state.synced_upto.max(high_water);

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use vectorvolt_engine::{EngineOptions, TableRegistry};
@@ -9,9 +10,10 @@ use vectorvolt_engine::{EngineOptions, TableRegistry};
 use subtle::ConstantTimeEq;
 
 use crate::wire::{
-    FrontendMsg, decode_frontend, decode_startup, encode_auth_cleartext_password, encode_auth_ok,
-    encode_command_complete, encode_data_row, encode_error_response, encode_fatal_error,
-    encode_param_status, encode_ready_for_query, encode_row_description,
+    FrontendMsg, MAX_MESSAGE_LEN, WireError, decode_frontend, decode_startup,
+    encode_auth_cleartext_password, encode_auth_ok, encode_command_complete, encode_data_row,
+    encode_error_response, encode_fatal_error, encode_param_status, encode_ready_for_query,
+    encode_row_description, split_frontend_frame,
 };
 use vectorvolt_query::sql::executor::{QueryResult, SqlExecutor};
 
@@ -151,15 +153,31 @@ impl PgSession {
         self.state = SessionState::Idle;
 
         // ── query loop ─────────────────────────────────────────────────────────
+        // Bytes are accumulated in `rbuf` and complete messages are split off
+        // its front, so one read may carry several (pipelined) messages and
+        // one message may span several reads. Every message is processed in
+        // arrival order. A length outside `4..=MAX_MESSAGE_LEN` is rejected
+        // as soon as its header arrives, before the body is buffered.
+        let mut rbuf = BytesMut::with_capacity(8192);
         loop {
-            let mut buf = vec![0u8; 65536];
-            let n = self.stream.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            let msg = match decode_frontend(&buf[..n]) {
+            let frame = match split_frontend_frame(&mut rbuf, MAX_MESSAGE_LEN) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    if self.stream.read_buf(&mut rbuf).await? == 0 {
+                        break; // EOF (a trailing partial message is dropped)
+                    }
+                    continue;
+                }
+                Err(WireError::InvalidLength(len)) => {
+                    let msg =
+                        format!("invalid message length {len} (must be 4..={MAX_MESSAGE_LEN})");
+                    return self.fail("08P01", &msg).await;
+                }
+                Err(e) => return self.fail("08P01", &e.to_string()).await,
+            };
+            let msg = match decode_frontend(&frame) {
                 Ok(m) => m,
-                Err(_) => break,
+                Err(e) => return self.fail("08P01", &e.to_string()).await,
             };
 
             match msg {
@@ -175,7 +193,7 @@ impl PgSession {
                 }
                 FrontendMsg::Startup { .. } | FrontendMsg::Password(_) => {
                     // Unexpected second startup / stray password message
-                    break;
+                    return self.fail("08P01", "unexpected message").await;
                 }
             }
         }

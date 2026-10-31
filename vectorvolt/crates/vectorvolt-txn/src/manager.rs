@@ -2,7 +2,9 @@
 //!
 //! ## Write sequence (INSERT)
 //!
-//! 1. Serialize mutation → WAL `append()` (durability before in-memory change).
+//! 0. Lock the pk's write stripe (held through step 6, PP-23).
+//! 1. Serialize mutation → WAL `append()` (durability before in-memory change);
+//!    the frame's sequence number is the mutation's MVCC commit timestamp.
 //! 2. Reserve a row_offset for this PK (buffer length before push).
 //! 3. Update CuckooMap: pk → RowDescriptor(PENDING, 0, row_offset).
 //! 4. Update SecondaryIndex for every non-PK column.
@@ -18,12 +20,12 @@
 //! 4. Rebuild RowDescriptors in CuckooMap → real (file_id, partition_id).
 //! 5. Update ZoneMap with PK min/max for the new partition.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use vectorvolt_index::{CuckooFilter, CuckooMap, RowDescriptor, SecondaryIndex, ZoneMap};
 use vectorvolt_storage::{ColumnValues, MicroPartition, PartitionReader, write_partition};
@@ -34,7 +36,7 @@ use vectorvolt_storage::{
 pub use vectorvolt_wal::WalTip;
 use vectorvolt_wal::{SyncCommitter, SyncStats, WalWriter};
 
-use crate::mvcc::{CommitClock, VersionIndex};
+use crate::mvcc::{CommitClock, VersionEntry, VersionIndex};
 use crate::routing::select_partition;
 use crate::shard_writer::{DrainedRow, ShardWriter};
 use crate::{TxnError, TxnResult, ops::Mutation};
@@ -43,6 +45,38 @@ use crate::{TxnError, TxnResult, ops::Mutation};
 /// `file_id` marking a descriptor that points into the write buffer rather than
 /// a partition file.
 pub const PENDING_FILE_ID: u16 = u16::MAX;
+
+/// Number of per-pk write stripes (PP-23). A power of two; pks hash onto one.
+const WRITE_STRIPES: usize = 64;
+
+/// Test hook run by [`TxnManager::run_compaction`] after the merged outputs are
+/// built and before they are installed.
+pub type CompactionHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Compaction outputs built but not yet installed.
+///
+/// Returned by [`TxnManager::prepare_compaction`], which does the expensive part
+/// (reading the inputs and writing the merged files) without blocking readers
+/// or writers. Holds the manager's compaction lock, so two compactions never
+/// plan the same inputs; hand it to [`TxnManager::install_compaction`] to swap
+/// the outputs in. Dropping it without installing leaves orphan output files,
+/// which the manifest never names (a disk leak, never data loss).
+pub struct PreparedCompaction<'a> {
+    _serial: MutexGuard<'a, ()>,
+    built: Vec<CompactionOutcome>,
+}
+
+impl PreparedCompaction<'_> {
+    /// Number of merged outputs waiting to be installed.
+    pub fn len(&self) -> usize {
+        self.built.len()
+    }
+
+    /// Whether the planner found nothing to do.
+    pub fn is_empty(&self) -> bool {
+        self.built.is_empty()
+    }
+}
 
 /// Metadata returned after a successful partition flush.
 #[derive(Debug, Clone)]
@@ -137,6 +171,26 @@ pub struct TxnManager {
     /// effect is applied; taken exclusively by [`TxnManager::quiesced_tip`].
     /// That gives a snapshot a WAL position at which no mutation is half done.
     apply_gate: RwLock<()>,
+    /// Per-pk write ordering (PP-23). A mutation holds the stripe of every pk it
+    /// touches from before its WAL append until its in-memory effect is applied,
+    /// so for any one pk the WAL order, the commit timestamps and the order the
+    /// index / version chain / write buffer see the writes are all the same.
+    /// Writers of pks on different stripes do not contend.
+    write_stripes: Box<[Mutex<()>]>,
+    /// Opened, CRC-verified partition readers, by `(file_id, partition_id)`
+    /// (B25). Entries are evicted whenever a file under that id is replaced or
+    /// removed (flush, compaction), so an id that is later reused never serves
+    /// the old file's bytes.
+    readers: RwLock<HashMap<(u16, u16), Arc<PartitionReader>>>,
+    /// Bumped by every eviction; a reader opened across one is not cached.
+    reader_epoch: AtomicU64,
+    /// Set once version history has been rebuilt from the WAL at open, after
+    /// which recovery's `replay_insert` must not add versions of its own.
+    history_loaded: AtomicBool,
+    /// Serialises compactions with each other (never with reads or writes).
+    compaction_lock: Mutex<()>,
+    /// See [`CompactionHook`].
+    compaction_hook: Mutex<Option<CompactionHook>>,
 }
 
 impl TxnManager {
@@ -193,7 +247,41 @@ impl TxnManager {
             seal: None,
             durable_flush: true,
             apply_gate: RwLock::new(()),
+            write_stripes: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
+            readers: RwLock::new(HashMap::new()),
+            reader_epoch: AtomicU64::new(0),
+            history_loaded: AtomicBool::new(false),
+            compaction_lock: Mutex::new(()),
+            compaction_hook: Mutex::new(None),
         }
+    }
+
+    /// Lock the write stripes covering `pks`, in ascending stripe order so two
+    /// multi-pk writers can never deadlock.
+    fn lock_stripes(&self, pks: impl IntoIterator<Item = u64>) -> Vec<MutexGuard<'_, ()>> {
+        let mut ids: Vec<usize> = pks.into_iter().map(stripe_of).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .map(|i| self.write_stripes[i].lock())
+            .collect()
+    }
+
+    /// Apply a committed live version of `pk` to every in-memory structure.
+    /// Returns whether the write buffer reached its flush threshold.
+    fn apply_live(&self, pk: u64, values: Vec<u64>, commit_ts: u64) -> TxnResult<bool> {
+        // MVCC: record this version before anything else observes it.
+        self.version_index.push_live(pk, commit_ts, values.clone());
+        {
+            let mut sec = self.secondary_index.write();
+            for (col_idx, &val) in values.iter().enumerate().skip(1) {
+                sec.insert(col_value_hash(col_idx, val), pk as u32);
+            }
+        }
+        self.fk_filter.write().insert(pk)?;
+        // The writer thread is the single producer for the ring buffer: it
+        // computes the offset, writes the PENDING index entry, then pushes.
+        self.writer.insert(pk, values)
     }
 
     /// Whether flushed partition files are synced to disk before they are
@@ -325,40 +413,24 @@ impl TxnManager {
             });
         }
 
-        // 1. WAL first.
+        // WAL append and in-memory apply happen under this pk's stripe, so a
+        // concurrent writer of the same pk can neither commit between them nor
+        // apply out of WAL order (PP-23). The frame's sequence is the commit_ts.
         let mutation = Mutation::Insert {
             pk,
             values: values.clone(),
         };
-        let _applying = self.apply_gate.read_recursive();
-        let tip = self.commit(mutation.encode())?;
+        let (tip, full) = {
+            let _applying = self.apply_gate.read_recursive();
+            let _stripe = self.lock_stripes([pk]);
+            let tip = self.commit(mutation.encode())?;
+            let full = self.apply_live(pk, values, tip.sequence)?;
+            self.clock.advance_to(tip.sequence);
+            (tip, full)
+        };
 
-        // MVCC Phase 1: record this version before anything else observes it.
-        let commit_ts = self.clock.next();
-        self.version_index.push_live(pk, commit_ts, values.clone());
-
-        // 2. SecondaryIndex: one entry per non-PK column. Done before the row is
-        //    buffered, while `values` is still borrowable.
-        {
-            let mut sec = self.secondary_index.write();
-            for (col_idx, &val) in values.iter().enumerate().skip(1) {
-                sec.insert(col_value_hash(col_idx, val), pk as u32);
-            }
-        }
-
-        // 3. CuckooFilter.
-        self.fk_filter.write().insert(pk)?;
-
-        // 4-5. Delegate buffer offset, index entry, and push to the writer thread.
-        //
-        // The writer thread is the single producer for the ring buffer. It computes
-        // the offset, writes the pk_index entry (BEFORE the push), and then pushes
-        // the row — all as one atomic sequence with no other thread racing on these
-        // three operations. This eliminates the ABBA-style concurrency bug the old
-        // Mutex path had when two threads interleaved their read-offset / push steps.
-        let full = self.writer.insert(pk, values)?;
-
-        // 6. Auto-flush if the buffer filled.
+        // Auto-flush if the buffer filled. Outside the stripe: a flush is file
+        // I/O and must not stall writers of unrelated pks.
         if full {
             self.flush()?;
         }
@@ -388,28 +460,21 @@ impl TxnManager {
             let _ = i;
         }
 
-        // Single WAL commit for the entire batch.
+        // Single WAL commit for the entire batch. Every row shares the frame's
+        // sequence as its commit_ts, so the batch becomes visible atomically to
+        // snapshot readers.
         let mutation = Mutation::InsertBatch { rows: rows.clone() };
-        let _applying = self.apply_gate.read_recursive();
-        let tip = self.commit(mutation.encode())?;
-
-        // Apply each row to in-memory structures.
-        let mut any_full = false;
-        for (pk, values) in rows {
-            let commit_ts = self.clock.next();
-            self.version_index.push_live(pk, commit_ts, values.clone());
-            {
-                let mut sec = self.secondary_index.write();
-                for (col_idx, &val) in values.iter().enumerate().skip(1) {
-                    sec.insert(col_value_hash(col_idx, val), pk as u32);
-                }
+        let (tip, any_full) = {
+            let _applying = self.apply_gate.read_recursive();
+            let _stripes = self.lock_stripes(rows.iter().map(|(pk, _)| *pk));
+            let tip = self.commit(mutation.encode())?;
+            let mut any_full = false;
+            for (pk, values) in rows {
+                any_full |= self.apply_live(pk, values, tip.sequence)?;
             }
-            self.fk_filter.write().insert(pk)?;
-            let full = self.writer.insert(pk, values)?;
-            if full {
-                any_full = true;
-            }
-        }
+            self.clock.advance_to(tip.sequence);
+            (tip, any_full)
+        };
 
         if any_full {
             self.flush()?;
@@ -433,37 +498,89 @@ impl TxnManager {
     ///    there.
     /// 2. **Flushed**: row lives in a `.vvsst` partition file.  The file is
     ///    opened via `PartitionReader`, which validates the magic and CRC
-    ///    before any column is read.
+    ///    before any column is read. The opened reader is cached, so only the
+    ///    first read of a partition pays for the open and the CRC check (B25).
     pub fn get(&self, pk: u64) -> TxnResult<Option<Vec<u64>>> {
-        let desc = match self.pk_index.read().get(pk) {
+        let mut desc = match self.pk_index.read().get(pk) {
             Some(d) => d,
             None => return Ok(None),
         };
 
+        // A concurrent flush or compaction can move the row and retire the
+        // place the descriptor named between our index read and the row read.
+        // That is not a missing row: re-read the descriptor and follow it.
+        let mut attempts = 0;
+        loop {
+            match self.read_at(pk, desc) {
+                Ok(values) => return Ok(Some(values)),
+                Err(e) => {
+                    attempts += 1;
+                    match self.pk_index.read().get(pk) {
+                        None => return Ok(None),
+                        Some(fresh) if fresh != desc && attempts < 3 => desc = fresh,
+                        Some(_) => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve one descriptor to its row values.
+    fn read_at(&self, pk: u64, desc: RowDescriptor) -> TxnResult<Vec<u64>> {
         let row_offset = desc.row_offset() as usize;
 
         if desc.file_id() == PENDING_FILE_ID {
             // Try in_flight map first (row handed to writer thread but not yet
             // flushed to disk).
             if let Some(values) = self.in_flight.lock().get(&pk).cloned() {
-                return Ok(Some(values));
+                return Ok(values);
             }
             // Fall back to the ring buffer (row still buffered locally).
-            let values = self
+            return self
                 .writer
                 .row_for(pk, row_offset)
-                .ok_or(TxnError::PkNotFound(pk))?;
-            return Ok(Some(values));
+                .ok_or(TxnError::PkNotFound(pk));
         }
 
-        // Flushed path: open the .vvsst file and read the row.
-        let file_id = desc.file_id();
-        let partition_id = desc.partition_id();
-        let filename = format!("{file_id:05}_{partition_id:05}.vvsst");
-        let path = self.flush_dir.join(&filename);
-        let reader = PartitionReader::open(&path)?;
-        let values = reader.read_row(row_offset)?;
-        Ok(Some(values))
+        let reader = self.partition_reader(desc.file_id(), desc.partition_id())?;
+        Ok(reader.read_row(row_offset)?)
+    }
+
+    /// The cached reader for a flushed partition, opening (and CRC-checking)
+    /// it on first use.
+    fn partition_reader(&self, file_id: u16, partition_id: u16) -> TxnResult<Arc<PartitionReader>> {
+        if let Some(r) = self.readers.read().get(&(file_id, partition_id)) {
+            return Ok(Arc::clone(r));
+        }
+        let path = self
+            .flush_dir
+            .join(format!("{file_id:05}_{partition_id:05}.vvsst"));
+        // Opened outside the lock: the open maps and checksums the whole file,
+        // and reads of other partitions must not wait on it. An eviction that
+        // lands while we open means the file may already be retired, so the
+        // reader then serves this one read (consistent with the descriptor it
+        // was opened for) but is not cached.
+        let epoch = self.reader_epoch.load(Ordering::Acquire);
+        let reader = Arc::new(PartitionReader::open(&path)?);
+        let mut cache = self.readers.write();
+        if self.reader_epoch.load(Ordering::Acquire) != epoch {
+            return Ok(reader);
+        }
+        Ok(Arc::clone(
+            cache.entry((file_id, partition_id)).or_insert(reader),
+        ))
+    }
+
+    /// Drop cached readers for partitions whose file is being replaced or
+    /// removed. Must run before the file is deleted (a live mapping blocks
+    /// deletion on Windows) and after a new file is published under an id, so
+    /// a reused id never serves an older file's bytes.
+    fn evict_readers(&self, keys: impl IntoIterator<Item = (u16, u16)>) {
+        let mut cache = self.readers.write();
+        self.reader_epoch.fetch_add(1, Ordering::AcqRel);
+        for k in keys {
+            cache.remove(&k);
+        }
     }
 
     /// Return all primary keys currently present in the index.
@@ -571,9 +688,17 @@ impl TxnManager {
     /// Remove a row from the in-memory index. WAL-logged.
     ///
     /// Returns `Err(PkNotFound)` if the pk does not exist in the CuckooMap.
-    /// Does not remove the row from any flushed `.vvsst` file — that requires
-    /// compaction (deferred to a later phase).
+    /// The row's bytes stay in any flushed `.vvsst` file until compaction drops
+    /// them (the index, not the file, decides visibility). The delete stays in
+    /// force across a restart because the index rebuild honours the WAL's
+    /// newest record for every pk (see `rebuild_pk_index_from_partitions`), and
+    /// a compaction racing the delete never re-points the deleted pk (B23).
     pub fn delete(&self, pk: u64) -> TxnResult<WalTip> {
+        let _applying = self.apply_gate.read_recursive();
+        // The existence check is under the stripe too: checked outside it, a
+        // concurrent delete of the same pk could pass the check, and both would
+        // log a Delete for a row only one of them removed.
+        let _stripe = self.lock_stripes([pk]);
         // The descriptor is captured BEFORE the row leaves the index, because it
         // is the only record of which partition the dead row lives in. Without it
         // compaction has no way to know a partition is mostly garbage, and
@@ -583,15 +708,14 @@ impl TxnManager {
         };
         let home = (desc.file_id(), desc.partition_id());
 
-        let _applying = self.apply_gate.read_recursive();
         let tip = self.commit(Mutation::Delete { pk }.encode())?;
         self.pk_index.write().remove(pk);
         *self.pending_tombstones.lock().entry(home).or_insert(0) += 1;
 
-        // MVCC Phase 1: append a tombstone rather than losing the pre-delete
-        // value — old readers holding an earlier snapshot must still see it.
-        let commit_ts = self.clock.next();
-        self.version_index.push_tombstone(pk, commit_ts);
+        // MVCC: append a tombstone rather than losing the pre-delete value —
+        // old readers holding an earlier snapshot must still see it.
+        self.version_index.push_tombstone(pk, tip.sequence);
+        self.clock.advance_to(tip.sequence);
 
         Ok(tip)
     }
@@ -616,29 +740,19 @@ impl TxnManager {
             }
         }
 
-        let _applying = self.apply_gate.read_recursive();
-        let tip = self.commit(Mutation::UpsertBatch { rows: rows.clone() }.encode())?;
-
-        let mut any_full = false;
-        for (pk, values) in rows {
-            // Remove old index entry if present (upsert semantics).
-            self.pk_index.write().remove(pk);
-
-            let commit_ts = self.clock.next();
-            self.version_index.push_live(pk, commit_ts, values.clone());
-
-            {
-                let mut sec = self.secondary_index.write();
-                for (col_idx, &val) in values.iter().enumerate().skip(1) {
-                    sec.insert(col_value_hash(col_idx, val), pk as u32);
-                }
+        let (tip, any_full) = {
+            let _applying = self.apply_gate.read_recursive();
+            let _stripes = self.lock_stripes(rows.iter().map(|(pk, _)| *pk));
+            let tip = self.commit(Mutation::UpsertBatch { rows: rows.clone() }.encode())?;
+            let mut any_full = false;
+            for (pk, values) in rows {
+                // Remove old index entry if present (upsert semantics).
+                self.pk_index.write().remove(pk);
+                any_full |= self.apply_live(pk, values, tip.sequence)?;
             }
-            self.fk_filter.write().insert(pk)?;
-            let full = self.writer.insert(pk, values)?;
-            if full {
-                any_full = true;
-            }
-        }
+            self.clock.advance_to(tip.sequence);
+            (tip, any_full)
+        };
 
         if any_full {
             self.flush()?;
@@ -675,7 +789,9 @@ impl TxnManager {
         let mut any_full = false;
         let tip = {
             let _applying = self.apply_gate.read_recursive();
+            let _stripes = self.lock_stripes(ops.iter().map(|(pk, _)| *pk));
             let tip = self.commit(Mutation::TxnBatch { ops: ops.clone() }.encode())?;
+            let ts = tip.sequence;
             for (pk, op) in ops {
                 let existing = self.pk_index.read().get(pk);
                 match op {
@@ -683,18 +799,7 @@ impl TxnManager {
                         if existing.is_some() {
                             self.pk_index.write().remove(pk);
                         }
-                        let commit_ts = self.clock.next();
-                        self.version_index.push_live(pk, commit_ts, values.clone());
-                        {
-                            let mut sec = self.secondary_index.write();
-                            for (col_idx, &val) in values.iter().enumerate().skip(1) {
-                                sec.insert(col_value_hash(col_idx, val), pk as u32);
-                            }
-                        }
-                        self.fk_filter.write().insert(pk)?;
-                        if self.writer.insert(pk, values)? {
-                            any_full = true;
-                        }
+                        any_full |= self.apply_live(pk, values, ts)?;
                     }
                     None => {
                         let Some(desc) = existing else {
@@ -706,11 +811,11 @@ impl TxnManager {
                             .lock()
                             .entry((desc.file_id(), desc.partition_id()))
                             .or_insert(0) += 1;
-                        let commit_ts = self.clock.next();
-                        self.version_index.push_tombstone(pk, commit_ts);
+                        self.version_index.push_tombstone(pk, ts);
                     }
                 }
             }
+            self.clock.advance_to(ts);
             tip
         };
 
@@ -732,6 +837,9 @@ impl TxnManager {
     /// On error, no rows from the batch are removed (all-or-nothing validation
     /// happens before the WAL commit).
     pub fn delete_batch(&self, pks: Vec<u64>) -> TxnResult<WalTip> {
+        let _applying = self.apply_gate.read_recursive();
+        let _stripes = self.lock_stripes(pks.iter().copied());
+
         // Validate all PKs exist and capture tombstone homes before mutating.
         let mut homes = Vec::with_capacity(pks.len());
         {
@@ -743,7 +851,6 @@ impl TxnManager {
         }
 
         // Single WAL commit for the entire batch.
-        let _applying = self.apply_gate.read_recursive();
         let tip = self.commit(Mutation::DeleteBatch { pks: pks.clone() }.encode())?;
 
         // Remove each PK from the index and accumulate tombstones.
@@ -753,10 +860,10 @@ impl TxnManager {
             for (pk, home) in homes {
                 idx.remove(pk);
                 *tombstones.entry(home).or_insert(0) += 1;
-                let commit_ts = self.clock.next();
-                self.version_index.push_tombstone(pk, commit_ts);
+                self.version_index.push_tombstone(pk, tip.sequence);
             }
         }
+        self.clock.advance_to(tip.sequence);
 
         Ok(tip)
     }
@@ -781,29 +888,21 @@ impl TxnManager {
             pk,
             values: values.clone(),
         };
-        let _applying = self.apply_gate.read_recursive();
-        let tip = self.commit(mutation.encode())?;
+        let (tip, full) = {
+            let _applying = self.apply_gate.read_recursive();
+            let _stripe = self.lock_stripes([pk]);
+            let tip = self.commit(mutation.encode())?;
 
-        // Remove stale index entry if the pk already exists.
-        if self.pk_index.read().get(pk).is_some() {
-            self.pk_index.write().remove(pk);
-        }
-
-        // MVCC Phase 1.
-        let commit_ts = self.clock.next();
-        self.version_index.push_live(pk, commit_ts, values.clone());
-
-        // Secondary index + filter.
-        {
-            let mut sec = self.secondary_index.write();
-            for (col_idx, &val) in values.iter().enumerate().skip(1) {
-                sec.insert(col_value_hash(col_idx, val), pk as u32);
+            // Remove stale index entry if the pk already exists.
+            if self.pk_index.read().get(pk).is_some() {
+                self.pk_index.write().remove(pk);
             }
-        }
-        self.fk_filter.write().insert(pk)?;
+            let full = self.apply_live(pk, values, tip.sequence)?;
+            self.clock.advance_to(tip.sequence);
+            (tip, full)
+        };
 
-        // Push to the writer thread; auto-flush on threshold.
-        let full = self.writer.insert(pk, values)?;
+        // Auto-flush on threshold.
         if full {
             self.flush()?;
         }
@@ -824,35 +923,30 @@ impl TxnManager {
                 got: values.len(),
             });
         }
-        // PK must exist — update is not an insert.
-        if self.pk_index.read().get(pk).is_none() {
-            return Err(TxnError::PkNotFound(pk));
-        }
-        // WAL first — single Update record covers the tombstone + re-insert.
-        let _applying = self.apply_gate.read_recursive();
-        let tip = self.commit(
-            Mutation::Update {
-                pk,
-                values: values.clone(),
+        let (tip, full) = {
+            let _applying = self.apply_gate.read_recursive();
+            let _stripe = self.lock_stripes([pk]);
+            // PK must exist — update is not an insert. Checked under the stripe
+            // so a concurrent delete cannot slip in between check and commit.
+            if self.pk_index.read().get(pk).is_none() {
+                return Err(TxnError::PkNotFound(pk));
             }
-            .encode(),
-        )?;
-        // Tombstone the old descriptor.
-        self.pk_index.write().remove(pk);
-        // MVCC Phase 1: append the new version (update never leaves a gap where
-        // the row is invisible — the old version stays reachable via get_at).
-        let commit_ts = self.clock.next();
-        self.version_index.push_live(pk, commit_ts, values.clone());
-        // Secondary index + filter.
-        {
-            let mut sec = self.secondary_index.write();
-            for (col_idx, &val) in values.iter().enumerate().skip(1) {
-                sec.insert(col_value_hash(col_idx, val), pk as u32);
-            }
-        }
-        self.fk_filter.write().insert(pk)?;
-        // Push new row to writer thread.
-        let full = self.writer.insert(pk, values)?;
+            // WAL first — single Update record covers the tombstone + re-insert.
+            let tip = self.commit(
+                Mutation::Update {
+                    pk,
+                    values: values.clone(),
+                }
+                .encode(),
+            )?;
+            // Tombstone the old descriptor. The new version is appended (update
+            // never leaves a gap where the row is invisible — the old version
+            // stays reachable via get_at).
+            self.pk_index.write().remove(pk);
+            let full = self.apply_live(pk, values, tip.sequence)?;
+            self.clock.advance_to(tip.sequence);
+            (tip, full)
+        };
         if full {
             self.flush()?;
         }
@@ -983,13 +1077,48 @@ impl TxnManager {
         strategy: CompactionStrategy,
         write_options: WriteOptions,
     ) -> TxnResult<Vec<CompactionOutcome>> {
+        let prepared = self.prepare_compaction(strategy, write_options)?;
+        let hook = self.compaction_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.install_compaction(prepared)
+    }
+
+    /// Install a hook that [`run_compaction`](Self::run_compaction) runs between
+    /// building and installing its outputs. For tests that need to act while a
+    /// compaction is in flight; `None` removes it.
+    #[doc(hidden)]
+    pub fn set_compaction_hook(&self, hook: Option<CompactionHook>) {
+        *self.compaction_hook.lock() = hook;
+    }
+
+    /// The expensive half of compaction: plan, read the inputs, and write the
+    /// merged outputs (B24).
+    ///
+    /// Takes no lock that reads or writes wait on — only the compaction lock,
+    /// which serialises compactions with each other. Readers keep resolving
+    /// rows from the input files throughout; nothing they can see changes until
+    /// [`install_compaction`](Self::install_compaction). A caller that holds its
+    /// own partition readers should call this without its partition lock, then
+    /// take that lock (and release its mappings) only around the install.
+    pub fn prepare_compaction(
+        &self,
+        strategy: CompactionStrategy,
+        write_options: WriteOptions,
+    ) -> TxnResult<PreparedCompaction<'_>> {
+        let serial = self.compaction_lock.lock();
+
         // Flush pending tombstone counts first, so the plan is computed from a
         // manifest that reflects every delete so far.
         self.persist_tombstones()?;
 
         let partitions = self.partitions();
         if partitions.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PreparedCompaction {
+                _serial: serial,
+                built: Vec::new(),
+            });
         }
 
         // A WORM-locked partition must not be rewritten: the hold applies to those
@@ -1002,7 +1131,7 @@ impl TxnManager {
             .collect();
         let jobs = strategy.plan(&eligible);
 
-        let mut outcomes = Vec::new();
+        let mut built = Vec::new();
         for job in jobs {
             let file_id = self.next_file_id.load(Ordering::Relaxed);
             let partition_id = self.alloc_partition_id()?;
@@ -1015,7 +1144,38 @@ impl TxnManager {
             };
 
             let liveness = IndexLiveness { txn: self };
-            let outcome = vectorvolt_storage::execute_job(&job, &self.schema, &liveness, &opts)?;
+            match vectorvolt_storage::execute_job(&job, &self.schema, &liveness, &opts) {
+                Ok(outcome) => built.push(outcome),
+                Err(e) => {
+                    // Nothing built so far is installed; remove it rather than
+                    // leave orphans behind a failed run.
+                    for o in &built {
+                        let _ = std::fs::remove_file(&o.output.path);
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(PreparedCompaction {
+            _serial: serial,
+            built,
+        })
+    }
+
+    /// The cheap half of compaction: swap prepared outputs in (B24).
+    ///
+    /// Per job: re-point the PK index, swap the manifest, evict cached readers,
+    /// delete the inputs. Only the PK index write lock is held, and only while
+    /// re-pointing.
+    pub fn install_compaction(
+        &self,
+        prepared: PreparedCompaction<'_>,
+    ) -> TxnResult<Vec<CompactionOutcome>> {
+        let mut outcomes = Vec::new();
+        for outcome in prepared.built {
+            let file_id = outcome.output.file_id;
+            let partition_id = outcome.output.partition_id;
+            let inputs: HashSet<(u16, u16)> = outcome.removed.iter().copied().collect();
 
             // Re-point the PK index at the merged partition BEFORE the manifest
             // swap makes it the live one.
@@ -1024,11 +1184,25 @@ impl TxnManager {
             // (file_id, partition_id, row_offset). An index still holding the old
             // coordinates addresses rows in a file that is about to be deleted —
             // so every point lookup for a compacted key would fail or, worse, read
-            // a stale offset in a recycled id. This is the step whose absence makes
-            // compaction silently destructive rather than merely wasteful.
+            // a stale offset in a recycled id.
+            //
+            // Only a key the index still places in one of the inputs is moved.
+            // The merge ran without blocking writers, so since it judged a row
+            // live the key may have been deleted (no descriptor) or written again
+            // (a pending or newer-partition descriptor). Re-pointing those would
+            // resurrect the delete or roll back the newer write (B23); the merged
+            // copy is garbage instead, and is counted as such.
+            let mut stale = 0u32;
             {
                 let mut idx = self.pk_index.write();
                 for (row_offset, pk) in outcome.output_pks.iter().enumerate() {
+                    let still_input = idx
+                        .get(*pk)
+                        .is_some_and(|d| inputs.contains(&(d.file_id(), d.partition_id())));
+                    if !still_input {
+                        stale += 1;
+                        continue;
+                    }
                     // Same reasoning as the flush path: a key that fails to
                     // re-index after compaction points at partitions that are
                     // about to be deleted. Silently dropping it loses the row.
@@ -1054,16 +1228,29 @@ impl TxnManager {
                 removes: outcome.removed.clone(),
             })?;
 
-            // The merged output has no dead rows by construction, and the inputs
-            // no longer exist. Any tombstone count that accumulated for them
-            // during the merge would otherwise be attributed to a partition id
-            // that may later be reused.
+            // The inputs no longer exist. Any tombstone count that accumulated
+            // for them during the merge would otherwise be attributed to a
+            // partition id that may later be reused. Rows that went stale while
+            // the merge ran are the output's garbage.
             {
                 let mut pending = self.pending_tombstones.lock();
                 for key in &outcome.removed {
                     pending.remove(key);
                 }
+                if stale > 0 {
+                    *pending.entry((file_id, partition_id)).or_insert(0) += stale;
+                }
             }
+
+            // Release cached mappings of the inputs before deleting them, and of
+            // the output id in case it was reused.
+            self.evict_readers(
+                outcome
+                    .removed
+                    .iter()
+                    .copied()
+                    .chain([(file_id, partition_id)]),
+            );
 
             // Only now are the inputs safe to remove. A failure here is not
             // fatal — the manifest no longer names them, so they are already
@@ -1168,6 +1355,8 @@ impl TxnManager {
             if self.durable_flush {
                 sync_dir(&self.flush_dir)?;
             }
+            // The id may be one compaction freed; never serve its old bytes.
+            self.evict_readers([(file_id, pid)]);
 
             // Typed checkpoint (VV-WAL-011). Recovery does not depend on it —
             // replay reconciles against partition contents — but it gives the
@@ -1293,10 +1482,15 @@ impl TxnManager {
             });
         }
 
-        // MVCC Phase 1: WAL replay reconstructs the version chain exactly like a
-        // live insert would have, so a restarted process keeps its history.
-        let commit_ts = self.clock.next();
-        self.version_index.push_live(pk, commit_ts, values.clone());
+        // MVCC: once history has been rebuilt from the WAL at open, every
+        // version this replay re-buffers is already in the chain under its
+        // real commit_ts. Without that history, record the row as of the
+        // recovery point — `current()`, not `next()`, so no timestamp that a
+        // live WAL frame will use is consumed.
+        if !self.history_loaded.load(Ordering::Acquire) {
+            self.version_index
+                .push_live(pk, self.clock.current(), values.clone());
+        }
 
         // SecondaryIndex — one entry per non-PK column.
         {
@@ -1323,10 +1517,28 @@ impl TxnManager {
     /// PartitionReaders.  Call this after `with_starting_partition` when
     /// re-opening a table that has existing `.vvsst` files on disk so that
     /// `get()` can find rows from previous sessions.
+    ///
+    /// Also rebuilds MVCC history (PP-24) and honours durable deletes (B23):
+    ///
+    /// - Every mutation frame in this table's WAL becomes a version (or a
+    ///   tombstone) at `commit_ts = frame sequence`, so `get_at`/`scan_at` with a
+    ///   timestamp taken before the restart answer exactly as they did before
+    ///   it, and the clock resumes past every sequence already used.
+    /// - A pk whose newest WAL record is a delete is not indexed, whatever
+    ///   partition file still holds an older copy of it. Deletes are not written
+    ///   into `.vvsst` files, so without this a delete covered by a snapshot
+    ///   marker (and therefore skipped by replay) came back after a restart.
+    /// - A row on disk with no WAL history at all (a table whose WAL predates
+    ///   this, or was removed) gets one base version at timestamp 0.
+    ///
+    /// The WAL is read best-effort: if it cannot be read or decrypted, no
+    /// history is loaded and the index is rebuilt from the partitions alone, as
+    /// before — the caller's own replay reports the error.
     pub fn rebuild_pk_index_from_partitions(
         &self,
         partitions: &std::collections::HashMap<(u16, u16), vectorvolt_storage::PartitionReader>,
     ) -> TxnResult<()> {
+        let history = self.load_wal_history();
         let mut idx = self.pk_index.write();
         let mut flt = self.fk_filter.write();
         // Newest wins: partition ids are allocated in increasing order, so
@@ -1345,7 +1557,120 @@ impl TxnManager {
                 flt.insert(pk)?;
             }
         }
+
+        let Some(latest_deleted) = history else {
+            return Ok(());
+        };
+        let indexed: Vec<(u64, RowDescriptor)> = idx.iter().collect();
+        let mut base = Vec::new();
+        for (pk, desc) in indexed {
+            match latest_deleted.get(&pk) {
+                Some(true) => {
+                    idx.remove(pk);
+                    *self
+                        .pending_tombstones
+                        .lock()
+                        .entry((desc.file_id(), desc.partition_id()))
+                        .or_insert(0) += 1;
+                }
+                Some(false) => {}
+                None => {
+                    if let Some(row) = partitions
+                        .get(&(desc.file_id(), desc.partition_id()))
+                        .and_then(|r| r.read_row(desc.row_offset() as usize).ok())
+                    {
+                        base.push((pk, VersionEntry::live(0, row)));
+                    }
+                }
+            }
+        }
+        self.version_index.extend(base);
         Ok(())
+    }
+
+    /// Rebuild the version chains from the WAL (see
+    /// [`rebuild_pk_index_from_partitions`](Self::rebuild_pk_index_from_partitions)).
+    ///
+    /// Returns, per pk, whether its newest record is a delete; `None` if the
+    /// WAL could not be read in full, in which case nothing was loaded.
+    fn load_wal_history(&self) -> Option<HashMap<u64, bool>> {
+        if self.history_loaded.load(Ordering::Acquire) {
+            return None;
+        }
+        let cfg = vectorvolt_wal::WalConfig::default()
+            .with_dir(self.wal.wal().dir())
+            .with_fsync(false);
+        let width = self.schema.len();
+        let mut versions: Vec<(u64, VersionEntry)> = Vec::new();
+        let mut latest_deleted: HashMap<u64, bool> = HashMap::new();
+        let mut max_seq = 0u64;
+        let mut ok = true;
+        let scanned = vectorvolt_wal::WalReader::open(cfg).scan(
+            vectorvolt_wal::WalCursor::beginning(),
+            |frame| {
+                max_seq = max_seq.max(frame.sequence);
+                let payload = if vectorvolt_crypto::is_encrypted(&frame.payload) {
+                    let Some(key) = &self.wal_key else {
+                        ok = false;
+                        return false;
+                    };
+                    match vectorvolt_crypto::decrypt(key, &frame.payload) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            ok = false;
+                            return false;
+                        }
+                    }
+                } else {
+                    frame.payload
+                };
+                let ts = frame.sequence;
+                let mut put = |pk: u64, op: Option<Vec<u64>>| {
+                    latest_deleted.insert(pk, op.is_none());
+                    match op {
+                        None => versions.push((pk, VersionEntry::tombstone(ts))),
+                        // A row logged before an ALTER changed the column count
+                        // cannot be served at the current width; recovery skips
+                        // it too. It still counts as "not deleted".
+                        Some(v) if v.len() == width => {
+                            versions.push((pk, VersionEntry::live(ts, v)));
+                        }
+                        Some(_) => {}
+                    }
+                };
+                match Mutation::decode(&payload) {
+                    Ok(Mutation::Insert { pk, values })
+                    | Ok(Mutation::Upsert { pk, values })
+                    | Ok(Mutation::Update { pk, values }) => put(pk, Some(values)),
+                    Ok(Mutation::Delete { pk }) => put(pk, None),
+                    Ok(Mutation::InsertBatch { rows }) | Ok(Mutation::UpsertBatch { rows }) => {
+                        for (pk, values) in rows {
+                            put(pk, Some(values));
+                        }
+                    }
+                    Ok(Mutation::DeleteBatch { pks }) => {
+                        for pk in pks {
+                            put(pk, None);
+                        }
+                    }
+                    Ok(Mutation::TxnBatch { ops }) => {
+                        for (pk, op) in ops {
+                            put(pk, op);
+                        }
+                    }
+                    // Checkpoints, DDL, markers and legacy payloads carry no row.
+                    _ => {}
+                }
+                true
+            },
+        );
+        if scanned.is_err() || !ok {
+            return None;
+        }
+        self.version_index.extend(versions);
+        self.clock.advance_to(max_seq);
+        self.history_loaded.store(true, Ordering::Release);
+        Some(latest_deleted)
     }
 
     // ── Accessors ──────────────────────────────────────────────────────────────
@@ -1408,6 +1733,13 @@ impl TxnManager {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// The write stripe a pk belongs to (PP-23). Fibonacci hashing, so sequential
+/// pks spread over every stripe instead of clustering.
+#[inline]
+fn stripe_of(pk: u64) -> usize {
+    (pk.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - WRITE_STRIPES.trailing_zeros())) as usize
+}
 
 /// Stable per-column value hash for SecondaryIndex bucket keys.
 #[inline]

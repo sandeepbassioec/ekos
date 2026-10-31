@@ -78,6 +78,10 @@ impl HttpWebhookSink {
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_s))
+            // Each blocking `send` drives the request on its own short-lived
+            // runtime; a pooled connection bound to an earlier (dropped)
+            // runtime would fail on reuse, so keep no idle connections.
+            .pool_max_idle_per_host(0)
             .build()
             .expect("webhook http client");
         Self {
@@ -100,42 +104,82 @@ impl HttpWebhookSink {
     }
 }
 
+impl HttpWebhookSink {
+    /// Deliver `body` (with retries) and return the final outcome.
+    fn deliver_blocking(&self, body: &str, sig: Option<&str>) -> SinkResult {
+        let run = || -> SinkResult {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| SinkError::Http(format!("webhook runtime: {e}")))?
+                .block_on(webhook_post_with_retry(
+                    &self.client,
+                    &self.url,
+                    body,
+                    sig,
+                    self.retry_max,
+                    self.retry_backoff,
+                ))
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Inside a runtime a nested `block_on` would panic, so drive the
+            // request on a helper thread and wait for its result. This blocks
+            // the calling thread — the price of a synchronous `send` that
+            // reports the real outcome.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(run)
+                    .join()
+                    .unwrap_or_else(|_| Err(SinkError::Http("webhook delivery panicked".into())))
+            })
+        } else {
+            run()
+        }
+    }
+
+    /// Fire-and-forget delivery: returns as soon as the request is scheduled
+    /// and never reports HTTP failures (they are only logged).
+    ///
+    /// This is the old behaviour of [`EventSink::send`]; it is kept for
+    /// callers that explicitly do not want delivery feedback. Anything that
+    /// routes failures to an outbox/DLQ must use `send` instead.
+    pub fn send_fire_and_forget(&self, envelope: &DomainEventEnvelope) -> SinkResult {
+        let body = serde_json::to_string(envelope)?;
+        let sig = self.sign(&body);
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let retry_max = self.retry_max;
+        let backoff = self.retry_backoff;
+        let task = async move {
+            // Failures are already logged inside; nothing to report to.
+            let _ =
+                webhook_post_with_retry(&client, &url, &body, sig.as_deref(), retry_max, backoff)
+                    .await;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(task);
+        } else {
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(task);
+                }
+            });
+        }
+        Ok(())
+    }
+}
+
 impl EventSink for HttpWebhookSink {
+    /// POST the envelope, retrying up to `retry_max` attempts, and return the
+    /// real outcome: `Err(SinkError::Http)` if every attempt failed, so the
+    /// outbox can move the envelope to the DLQ (PP-66). Blocks until done.
     fn send(&self, envelope: &DomainEventEnvelope) -> SinkResult {
         let body = serde_json::to_string(envelope)?;
         let sig = self.sign(&body);
-
-        let rt = tokio::runtime::Handle::try_current();
-        if rt.is_ok() {
-            // async context — fire-and-forget via spawn; caller gets Ok immediately
-            let client = self.client.clone();
-            let url = self.url.clone();
-            let body2 = body.clone();
-            let sig2 = sig.clone();
-            let retry_max = self.retry_max;
-            let backoff = self.retry_backoff;
-            tokio::spawn(async move {
-                webhook_post_with_retry(&client, &url, &body2, sig2.as_deref(), retry_max, backoff)
-                    .await;
-            });
-            return Ok(());
-        }
-
-        // blocking context
-        tokio::runtime::Runtime::new()
-            .expect("tokio")
-            .block_on(async {
-                webhook_post_with_retry(
-                    &self.client,
-                    &self.url,
-                    &body,
-                    sig.as_deref(),
-                    self.retry_max,
-                    self.retry_backoff,
-                )
-                .await;
-            });
-        Ok(())
+        self.deliver_blocking(&body, sig.as_deref())
     }
 }
 
@@ -146,7 +190,7 @@ async fn webhook_post_with_retry(
     sig: Option<&str>,
     retry_max: u32,
     backoff: Duration,
-) {
+) -> SinkResult {
     let mut attempt = 0u32;
     loop {
         let mut req = client
@@ -156,18 +200,22 @@ async fn webhook_post_with_retry(
         if let Some(s) = sig {
             req = req.header("X-VV-Signature", s);
         }
-        match req.send().await {
-            Ok(resp) if resp.status().is_success() => return,
+        let failure = match req.send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
             Ok(resp) => {
                 tracing::warn!("webhook {url} returned {}", resp.status());
+                format!("webhook {url} returned {}", resp.status())
             }
             Err(e) => {
                 tracing::warn!("webhook {url} error: {e}");
+                format!("webhook {url} error: {e}")
             }
-        }
+        };
         attempt += 1;
         if attempt >= retry_max {
-            break;
+            return Err(SinkError::Http(format!(
+                "{failure} (gave up after {attempt} attempt(s))"
+            )));
         }
         let delay = backoff * 2u32.pow(attempt - 1);
         tokio::time::sleep(delay).await;

@@ -21,6 +21,8 @@ fn base_args(dir: &TempDir) -> ServeArgs {
         max_connections: 64,
         secret: None,
         key_id: "default".into(),
+        key_scope: None,
+        key_file: None,
         cert: None,
         key: None,
         multi: false,
