@@ -5,6 +5,11 @@ pub enum WalError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The WAL no longer matches its keyed tail seal (PP-38): it was
+    /// truncated, rewritten, or the seal was forged or made with another key.
+    #[error("WAL tail seal check failed: {reason}")]
+    SealMismatch { reason: String },
+
     #[error("Corrupt frame at segment {segment} offset {offset}: {reason}")]
     CorruptFrame {
         segment: u64,

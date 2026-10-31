@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use vectorvolt_engine::TableRegistry;
+use vectorvolt_query::sql::executor::SqlExecutor;
 
 use crate::session::{PgSession, open_registry};
 
@@ -39,21 +40,45 @@ impl PgConfig {
 /// PostgreSQL wire protocol server.
 ///
 /// Listens for incoming TCP connections and spawns a `PgSession` per client.
+/// Every session runs on a [`SqlExecutor::new_session`] of one shared
+/// executor, so SQL security state (policies, table tokens, read-only mode,
+/// masks, grants, ...) is server-wide and survives reconnects, while
+/// transactions stay per connection.
 pub struct PgServer {
     config: PgConfig,
-    registry: Arc<TableRegistry>,
+    executor: Arc<SqlExecutor>,
+    /// Cleartext password every client must present; `None` = no auth.
+    password: Option<String>,
 }
 
 impl PgServer {
     /// Create a new server with the given config. Opens the registry from `config.data_dir`.
     pub fn new(config: PgConfig) -> std::io::Result<Self> {
         let registry = open_registry(&config.data_dir)?;
-        Ok(Self { config, registry })
+        Ok(Self::with_registry(config, registry))
     }
 
     /// Create a server with an already-open registry (useful for tests).
     pub fn with_registry(config: PgConfig, registry: Arc<TableRegistry>) -> Self {
-        Self { config, registry }
+        let executor = Arc::new(SqlExecutor::new(registry));
+        Self {
+            config,
+            executor,
+            password: None,
+        }
+    }
+
+    /// Require clients to authenticate with this password
+    /// (AuthenticationCleartextPassword, constant-time compare). `None`
+    /// disables authentication.
+    pub fn with_password(mut self, password: Option<String>) -> Self {
+        self.password = password;
+        self
+    }
+
+    /// The shared executor whose security state every session sees.
+    pub fn executor(&self) -> &Arc<SqlExecutor> {
+        &self.executor
     }
 
     /// Bind and return the listener and the actual bound address (useful when
@@ -68,7 +93,8 @@ impl PgServer {
     /// Useful for tests.
     pub async fn accept_one(&self, listener: &TcpListener) -> std::io::Result<()> {
         let (stream, _) = listener.accept().await?;
-        let mut session = PgSession::new(stream, Arc::clone(&self.registry));
+        let mut session =
+            PgSession::new(stream, self.executor.new_session(), self.password.clone());
         session.run().await
     }
 
@@ -76,13 +102,13 @@ impl PgServer {
     pub async fn serve(self) -> std::io::Result<()> {
         let (listener, addr) = self.bind().await?;
         tracing::info!("PgServer listening on {addr}");
-        let registry = Arc::clone(&self.registry);
         loop {
             let (stream, peer) = listener.accept().await?;
             tracing::debug!("accepted connection from {peer}");
-            let reg = Arc::clone(&registry);
+            let executor = self.executor.new_session();
+            let password = self.password.clone();
             tokio::spawn(async move {
-                let mut session = PgSession::new(stream, reg);
+                let mut session = PgSession::new(stream, executor, password);
                 if let Err(e) = session.run().await {
                     tracing::warn!("session error: {e}");
                 }
@@ -99,14 +125,22 @@ impl PgServer {
         shutdown: impl std::future::Future<Output = ()>,
     ) -> std::io::Result<()> {
         let (listener, addr) = self.bind().await?;
-        Self::accept_loop_until(Arc::clone(&self.registry), listener, addr, shutdown).await
+        Self::accept_loop_until(
+            Arc::clone(&self.executor),
+            self.password.clone(),
+            listener,
+            addr,
+            shutdown,
+        )
+        .await
     }
 
     /// Same accept-loop as [`serve_until`](Self::serve_until), but takes an
     /// already-bound listener — lets tests learn the real ephemeral port before
     /// the loop starts, the same way [`accept_one`](Self::accept_one) does.
     pub async fn accept_loop_until(
-        registry: Arc<TableRegistry>,
+        executor: Arc<SqlExecutor>,
+        password: Option<String>,
         listener: TcpListener,
         addr: SocketAddr,
         shutdown: impl std::future::Future<Output = ()>,
@@ -118,9 +152,10 @@ impl PgServer {
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted?;
                     tracing::debug!("accepted connection from {peer}");
-                    let reg = Arc::clone(&registry);
+                    let session_exec = executor.new_session();
+                    let password = password.clone();
                     tokio::spawn(async move {
-                        let mut session = PgSession::new(stream, reg);
+                        let mut session = PgSession::new(stream, session_exec, password);
                         if let Err(e) = session.run().await {
                             tracing::warn!("session error: {e}");
                         }
@@ -181,9 +216,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (server, listener, addr) = open_server_on_ephemeral(dir.path()).await;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let registry = server.registry.clone();
+        let executor = server.executor.clone();
         let handle = tokio::spawn(async move {
-            PgServer::accept_loop_until(registry, listener, addr, async {
+            PgServer::accept_loop_until(executor, None, listener, addr, async {
                 let _ = rx.await;
             })
             .await
@@ -204,10 +239,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (server, listener, addr) = open_server_on_ephemeral(dir.path()).await;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let registry = server.registry.clone();
+        let executor = server.executor.clone();
         // Fire shutdown immediately, before any connection is made.
         tx.send(()).unwrap();
-        let result = PgServer::accept_loop_until(registry, listener, addr, async {
+        let result = PgServer::accept_loop_until(executor, None, listener, addr, async {
             let _ = rx.await;
         })
         .await;
@@ -354,6 +389,204 @@ mod tests {
         term.put_u8(b'X');
         term.put_i32(4);
         stream.write_all(&term).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    // ── A3: password authentication ─────────────────────────────────────────
+
+    /// Read until the reply ends with ReadyForQuery, or the server closes.
+    async fn read_reply(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                return out;
+            }
+            out.extend_from_slice(&buf[..n]);
+            if out.len() >= 6 && out[out.len() - 6] == b'Z' {
+                return out;
+            }
+        }
+    }
+
+    fn password_msg(pw: &str) -> Vec<u8> {
+        let mut buf = bytes::BytesMut::new();
+        buf.put_u8(b'p');
+        buf.put_i32((4 + pw.len() + 1) as i32);
+        buf.put(pw.as_bytes());
+        buf.put_u8(0);
+        buf.to_vec()
+    }
+
+    async fn auth_server(dir: &std::path::Path) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let config = PgConfig::new("127.0.0.1:0".parse().unwrap(), dir.to_path_buf());
+        let server = PgServer::new(config)
+            .unwrap()
+            .with_password(Some("s3cret".to_owned()));
+        let (listener, addr) = server.bind().await.unwrap();
+        let handle = tokio::spawn(async move {
+            server.accept_one(&listener).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    /// Request code carried by the first AuthenticationXxx ('R') message.
+    fn auth_code(reply: &[u8]) -> i32 {
+        assert_eq!(reply[0], b'R', "{reply:?}");
+        i32::from_be_bytes([reply[5], reply[6], reply[7], reply[8]])
+    }
+
+    #[tokio::test]
+    async fn test_password_auth_good_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, handle) = auth_server(dir.path()).await;
+        let mut stream = connect_and_startup(addr).await;
+        let mut buf = vec![0u8; 9];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(auth_code(&buf), 3); // AuthenticationCleartextPassword
+        stream.write_all(&password_msg("s3cret")).await.unwrap();
+        let reply = read_reply(&mut stream).await;
+        assert_eq!(auth_code(&reply), 0); // AuthenticationOk
+        assert_eq!(reply[reply.len() - 6], b'Z');
+        stream
+            .write_all(&make_query_msg("CREATE TABLE t (pk U64)"))
+            .await
+            .unwrap();
+        let reply = read_reply(&mut stream).await;
+        assert_eq!(reply[0], b'C');
+        drop(stream);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_password_auth_bad_password_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, handle) = auth_server(dir.path()).await;
+        let mut stream = connect_and_startup(addr).await;
+        let mut buf = vec![0u8; 9];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(auth_code(&buf), 3);
+        stream.write_all(&password_msg("wrong")).await.unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.unwrap(); // server closes
+        assert_eq!(reply[0], b'E');
+        assert!(reply.windows(5).any(|w| w == b"28P01"));
+        assert!(!reply.contains(&b'Z'));
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_password_auth_query_instead_of_password_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, handle) = auth_server(dir.path()).await;
+        let mut stream = connect_and_startup(addr).await;
+        let mut buf = vec![0u8; 9];
+        stream.read_exact(&mut buf).await.unwrap();
+        stream
+            .write_all(&make_query_msg("SELECT * FROM t"))
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply[0], b'E');
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_malformed_startup_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            // length shorter than the header itself
+            vec![0u8, 0, 0, 3],
+            // protocol 2.0
+            {
+                let mut b = bytes::BytesMut::new();
+                b.put_i32(9);
+                b.put_i32(2 << 16);
+                b.put_u8(0);
+                b.to_vec()
+            },
+            // params not NUL-terminated
+            {
+                let mut b = bytes::BytesMut::new();
+                b.put_i32(12);
+                b.put_i32(3 << 16);
+                b.put(&b"user"[..]);
+                b.to_vec()
+            },
+        ] {
+            let (srv, listener, addr) = open_server_on_ephemeral(dir.path()).await;
+            let handle = tokio::spawn(async move {
+                srv.accept_one(&listener).await.unwrap();
+            });
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&bad).await.unwrap();
+            let mut reply = Vec::new();
+            stream.read_to_end(&mut reply).await.unwrap();
+            assert_eq!(reply.first(), Some(&b'E'), "{bad:?}");
+            assert!(!reply.contains(&b'Z'), "{bad:?}");
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssl_request_declined_then_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, listener, addr) = open_server_on_ephemeral(dir.path()).await;
+        tokio::spawn(async move {
+            server.accept_one(&listener).await.unwrap();
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut ssl = bytes::BytesMut::new();
+        ssl.put_i32(8);
+        ssl.put_i32(80_877_103);
+        stream.write_all(&ssl).await.unwrap();
+        let mut n = [0u8; 1];
+        stream.read_exact(&mut n).await.unwrap();
+        assert_eq!(n[0], b'N');
+        let params = b"user\0postgres\0\0";
+        let mut buf = bytes::BytesMut::new();
+        buf.put_i32((8 + params.len()) as i32);
+        buf.put_i32(3 << 16);
+        buf.put(params.as_ref());
+        stream.write_all(&buf).await.unwrap();
+        let reply = read_reply(&mut stream).await;
+        assert_eq!(auth_code(&reply), 0);
+    }
+
+    // ── A4: SQL security state is shared across connections ─────────────────
+    #[tokio::test]
+    async fn test_restriction_survives_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, listener, addr) = open_server_on_ephemeral(dir.path()).await;
+        let handle = tokio::spawn(async move {
+            server.accept_one(&listener).await.unwrap();
+            server.accept_one(&listener).await.unwrap();
+        });
+        let terminate = [b'X', 0, 0, 0, 4];
+
+        let mut c1 = connect_and_startup(addr).await;
+        read_reply(&mut c1).await;
+        for sql in ["CREATE TABLE ro (pk U64, v U64)", "SET READ ONLY"] {
+            c1.write_all(&make_query_msg(sql)).await.unwrap();
+            read_reply(&mut c1).await;
+        }
+        c1.write_all(&terminate).await.unwrap();
+        drop(c1);
+
+        let mut c2 = connect_and_startup(addr).await;
+        read_reply(&mut c2).await;
+        c2.write_all(&make_query_msg("INSERT INTO ro (pk, v) VALUES (1, 1)"))
+            .await
+            .unwrap();
+        let reply = read_reply(&mut c2).await;
+        assert!(
+            reply.windows(5).any(|w| w == b"25006"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        c2.write_all(&terminate).await.unwrap();
         handle.await.unwrap();
     }
 

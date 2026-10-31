@@ -21,6 +21,7 @@ async fn start_server(port: u16, token: &str) {
     let cfg = ControlConfig {
         bind_addr: format!("127.0.0.1:{port}"),
         token: token.to_string(),
+        users: vec![],
     };
     let server = ControlServer::new(cfg);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))

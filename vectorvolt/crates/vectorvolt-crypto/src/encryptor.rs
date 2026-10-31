@@ -19,6 +19,13 @@ const MAGIC: &[u8; 4] = b"VVE1";
 const NONCE_LEN: usize = 12;
 const HEADER_LEN: usize = 4 + NONCE_LEN; // 16 bytes
 
+/// True if `blob` has the shape of an [`encrypt`] output (magic prefix and room
+/// for nonce + tag). Lets readers tell encrypted records from plaintext ones
+/// (e.g. metadata written unencrypted) without trying a key.
+pub fn is_encrypted(blob: &[u8]) -> bool {
+    blob.len() >= HEADER_LEN + 16 && &blob[..4] == MAGIC
+}
+
 /// Encrypt `plaintext` with the given key, returning `[magic || nonce || ciphertext+tag]`.
 pub fn encrypt(key: &KeyStore, plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_bytes()));

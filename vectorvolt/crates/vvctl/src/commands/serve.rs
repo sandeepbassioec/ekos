@@ -882,6 +882,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
         };
         let pgwire_addr: SocketAddr = format!("127.0.0.1:{pgwire_port}").parse().unwrap();
         let pg_dir = args.dir.clone();
+        // A3: `--secret` also gates pgwire (clients send it as their password).
+        let pg_password = args.secret.as_ref().map(|s| s.trim().to_owned());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         pgwire_shutdown = Some(tx);
         std::thread::Builder::new()
@@ -891,7 +893,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async move {
                     let config = PgConfig::new(pgwire_addr, pg_dir);
-                    let server = PgServer::with_registry(config, pg_reg);
+                    let server = PgServer::with_registry(config, pg_reg).with_password(pg_password);
                     eprintln!("  pgwire    : postgres://{pgwire_addr}");
                     let shutdown = async move {
                         let _ = rx.await;

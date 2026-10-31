@@ -143,3 +143,63 @@ fn entries_sorted_by_timestamp() {
     sorted.sort();
     assert_eq!(ts, sorted);
 }
+
+// ── Crash-safe persistence (PP-15) ─────────────────────────────────────────
+
+#[test]
+fn partial_tmp_from_crashed_write_is_ignored_on_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = Ledger::open(dir.path()).unwrap();
+        ledger.accounts.create(1, "Alice", "USD").unwrap();
+        ledger.accounts.create(2, "Bob", "USD").unwrap();
+        ledger.post(1, 2, 500, "rent").unwrap();
+    }
+    // A crash mid-write leaves torn temp files next to the committed ones.
+    let tmps = [
+        dir.path().join("entries.json.tmp"),
+        dir.path().join("accounts.json.tmp"),
+    ];
+    for tmp in &tmps {
+        std::fs::write(tmp, b"[{\"id\":1,\"deb").unwrap();
+    }
+
+    let ledger = Ledger::open(dir.path()).unwrap();
+    assert_eq!(ledger.entries_for(1).unwrap().len(), 1);
+    assert_eq!(ledger.balance(2).unwrap(), 500);
+    for tmp in &tmps {
+        assert!(!tmp.exists(), "stale .tmp should be removed on open");
+    }
+}
+
+#[test]
+fn write_error_propagates_and_keeps_previous_state() {
+    let dir = TempDir::new().unwrap();
+    let ledger = Ledger::open(dir.path()).unwrap();
+    ledger.accounts.create(1, "Alice", "USD").unwrap();
+    ledger.accounts.create(2, "Bob", "USD").unwrap();
+
+    // A directory where the temp file must go makes the next write fail.
+    let tmp = dir.path().join("entries.json.tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    assert!(matches!(
+        ledger.post(1, 2, 500, "rent"),
+        Err(LedgerError::Io(_))
+    ));
+    std::fs::remove_dir(&tmp).unwrap();
+    drop(ledger);
+
+    let ledger = Ledger::open(dir.path()).unwrap();
+    assert!(ledger.entries_for(1).unwrap().is_empty());
+    assert_eq!(ledger.balance(2).unwrap(), 0);
+}
+
+#[test]
+fn corrupt_main_file_is_an_error_not_an_empty_store() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("entries.json"), b"[not json").unwrap();
+    assert!(matches!(
+        Ledger::open(dir.path()),
+        Err(LedgerError::Serde(_))
+    ));
+}

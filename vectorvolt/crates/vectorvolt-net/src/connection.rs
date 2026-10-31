@@ -71,17 +71,16 @@ impl Connection {
         let mut hbuf = vec![0u8; WIRE_HEADER_SIZE];
         self.stream.read_exact(&mut hbuf).await?;
 
-        // Peek at payload_len from raw bytes to know how much more to read.
-        let payload_len = u32::from_le_bytes(hbuf[8..12].try_into().unwrap()) as usize;
+        // Decode the header first: it rejects a payload_len above
+        // WIRE_MAX_PAYLOAD before we allocate a buffer of that size.
+        let header = WireFrameHeader::decode(&hbuf)?;
 
         // Read payload.
-        let mut payload = vec![0u8; payload_len];
-        if payload_len > 0 {
+        let mut payload = vec![0u8; header.payload_len as usize];
+        if !payload.is_empty() {
             self.stream.read_exact(&mut payload).await?;
         }
 
-        // Decode and validate header + CRC.
-        let header = WireFrameHeader::decode(&hbuf)?;
         header.verify_payload(&payload)?;
 
         Ok((header, payload))
@@ -130,6 +129,28 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         (l, addr)
+    }
+
+    #[tokio::test]
+    async fn oversized_payload_len_is_rejected_before_allocating() {
+        let (listener, addr) = listen().await;
+        let srv = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let header = WireFrameHeader::new(Opcode::PingAck, b"", 1).unwrap();
+            let mut wire = header.encode_with_payload(b"");
+            // Claim a 4 GiB payload and send nothing after the header.
+            wire[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+            stream.write_all(&wire).await.unwrap();
+            // Hold the socket open so a reader waiting for the payload would hang.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let mut client = Connection::connect(addr).await.unwrap();
+        let err = timeout(Duration::from_secs(2), client.recv_frame())
+            .await
+            .expect("recv_frame must fail fast, not wait for 4 GiB")
+            .unwrap_err();
+        assert!(matches!(err, NetError::PayloadTooLarge { .. }), "{err:?}");
+        srv.abort();
     }
 
     #[tokio::test]

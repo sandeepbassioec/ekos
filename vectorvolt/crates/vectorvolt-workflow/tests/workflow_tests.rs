@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tempfile::TempDir;
-use vectorvolt_workflow::{StepState, WorkflowEngine, WorkflowState};
+use vectorvolt_workflow::{StepState, WorkflowEngine, WorkflowError, WorkflowState};
 
 fn setup() -> (WorkflowEngine, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -168,4 +168,52 @@ fn concurrent_complete_step_calls_safe() {
         h.join().unwrap();
     }
     assert!(engine.is_complete(id).unwrap());
+}
+
+// ── Crash-safe persistence (PP-15) ─────────────────────────────────────────
+
+#[test]
+fn partial_tmp_from_crashed_write_is_ignored_on_reopen() {
+    let dir = TempDir::new().unwrap();
+    let id = {
+        let engine = WorkflowEngine::open(dir.path()).unwrap();
+        engine.create("wf", vec![("s0".into(), vec![])]).unwrap()
+    };
+    // A crash mid-write leaves a torn temp file next to the committed one.
+    let tmp = dir.path().join("workflows.json.tmp");
+    std::fs::write(&tmp, b"{\"1\":{\"id\":1,\"na").unwrap();
+
+    let engine = WorkflowEngine::open(dir.path()).unwrap();
+    assert_eq!(engine.get(id).unwrap().unwrap().name, "wf");
+    assert!(!tmp.exists(), "stale .tmp should be removed on open");
+}
+
+#[test]
+fn write_error_propagates_and_keeps_previous_state() {
+    let dir = TempDir::new().unwrap();
+    let engine = WorkflowEngine::open(dir.path()).unwrap();
+    let id = engine.create("wf", vec![("s0".into(), vec![])]).unwrap();
+
+    // A directory where the temp file must go makes the next write fail.
+    let tmp = dir.path().join("workflows.json.tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    assert!(matches!(engine.start(id), Err(WorkflowError::Io(_))));
+    std::fs::remove_dir(&tmp).unwrap();
+    drop(engine);
+
+    let engine = WorkflowEngine::open(dir.path()).unwrap();
+    assert_eq!(
+        engine.get(id).unwrap().unwrap().state,
+        WorkflowState::Created
+    );
+}
+
+#[test]
+fn corrupt_main_file_is_an_error_not_an_empty_store() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("workflows.json"), b"{not json").unwrap();
+    assert!(matches!(
+        WorkflowEngine::open(dir.path()),
+        Err(WorkflowError::Serde(_))
+    ));
 }

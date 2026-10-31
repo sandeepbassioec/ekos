@@ -111,6 +111,7 @@ pub fn run_start(args: ControlStartArgs) -> Result<()> {
     let cfg = ControlConfig {
         bind_addr: args.bind.clone(),
         token: args.token.clone(),
+        users: vec![],
     };
     let server = ControlServer::new(cfg);
     let rt = tokio::runtime::Runtime::new()?;

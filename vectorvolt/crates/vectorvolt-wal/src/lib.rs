@@ -43,6 +43,7 @@ pub mod frame;
 pub mod group_commit;
 pub mod metrics;
 pub mod reader;
+pub mod seal;
 pub mod segment;
 pub mod snapshot;
 pub mod sync_commit;

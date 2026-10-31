@@ -14,7 +14,8 @@ use std::{
 use bytes::Bytes;
 use parking_lot::RwLock;
 
-use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
+use tracing::warn;
+use vectorvolt_wal::{WalConfig, WalReader, WalWriter, list_segment_ids, segment_path};
 
 use crate::{
     StoreError, StoreResult,
@@ -35,8 +36,13 @@ pub struct StoreConfig {
     pub memtable_flush_threshold: usize,
     /// Trigger compaction when the SSTable count exceeds this number.
     pub compaction_trigger: usize,
-    /// fsync WAL on flush (disable for tests to go faster).
+    /// fsync WAL on every put/delete (disable for tests to go faster). When
+    /// off, writes still reach the OS before returning, so they survive a
+    /// process crash but not a power loss.
     pub fsync: bool,
+    /// Rotate WAL segments at this size. Sealed segments are deleted once a
+    /// memtable flush has made their contents durable in SSTables.
+    pub wal_segment_max_bytes: u64,
 }
 
 impl StoreConfig {
@@ -46,6 +52,7 @@ impl StoreConfig {
             memtable_flush_threshold: 4 * 1024 * 1024, // 4 MiB
             compaction_trigger: 4,
             fsync: true,
+            wal_segment_max_bytes: WalConfig::default().segment_max_bytes,
         }
     }
 
@@ -61,6 +68,11 @@ impl StoreConfig {
 
     pub fn with_fsync(mut self, v: bool) -> Self {
         self.fsync = v;
+        self
+    }
+
+    pub fn with_wal_segment_max_bytes(mut self, bytes: u64) -> Self {
+        self.wal_segment_max_bytes = bytes;
         self
     }
 }
@@ -82,6 +94,13 @@ impl Manifest {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let s = name.to_string_lossy();
+                // Leftover from a flush/compaction that crashed before its
+                // rename: never part of the committed table set.
+                if s.ends_with(".vvsst.tmp") {
+                    std::fs::remove_file(entry.path())
+                        .map_err(|e| StoreError::Io(e.to_string()))?;
+                    continue;
+                }
                 if let Some(stem) = s.strip_suffix(".vvsst")
                     && let Ok(id) = stem.parse::<u64>()
                 {
@@ -126,42 +145,97 @@ struct StoreInner {
 }
 
 impl StoreInner {
+    /// Append `rec` to the WAL and flush it (fsync when `cfg.fsync`) before
+    /// the caller applies it, so an acknowledged write survives a crash.
+    fn append_wal(&mut self, rec: LogRecord) -> StoreResult<()> {
+        self.wal
+            .append(rec.encode().to_vec())
+            .map_err(|e| StoreError::Wal(e.to_string()))?;
+        self.wal.flush().map_err(|e| StoreError::Wal(e.to_string()))
+    }
+
     fn flush_active(&mut self) -> StoreResult<()> {
         if self.active.is_empty() {
             return Ok(());
         }
-        let table = std::mem::take(&mut self.active);
         let id = self.manifest.next_id();
         let path = sstable_path(&self.cfg.dir, id);
 
+        // Write from a borrow: if the flush fails the memtable stays intact.
         let mut writer = SsTableWriter::create(&path)?;
-        for entry in table.into_entries() {
+        for entry in self.active.iter() {
             writer.append(&entry)?;
         }
         writer.finish()?;
 
         let sst = SsTable::open(&path)?;
         self.manifest.tables.push((sst, id));
+        self.active = MemTable::new();
+        self.truncate_wal();
         Ok(())
+    }
+
+    /// Delete sealed WAL segments. Called right after a flush, when every
+    /// record in the WAL is in a durable SSTable (`finish` fsyncs the table and
+    /// its directory entry; `immutable` is always empty).
+    ///
+    /// Only segments older than the active one go: `WalWriter` has no API to
+    /// reset its open segment, so that one is kept and replayed again on open.
+    /// Replaying already-flushed records is harmless as long as what remains
+    /// is a *suffix* of the log, since the last write to each key in a suffix
+    /// is also its last write overall. Deleting oldest-first and stopping at
+    /// the first failure preserves that through a crash or an I/O error.
+    fn truncate_wal(&self) {
+        let active = self.wal.tip().segment_id;
+        let ids = match list_segment_ids(&self.cfg.dir) {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(error = %e, "WAL truncation: cannot list segments");
+                return;
+            }
+        };
+        for id in ids.into_iter().filter(|&id| id < active) {
+            if let Err(e) = std::fs::remove_file(segment_path(&self.cfg.dir, id)) {
+                warn!(segment = id, error = %e, "WAL truncation: cannot delete segment");
+                return;
+            }
+        }
     }
 
     fn maybe_compact(&mut self) -> StoreResult<()> {
         if self.manifest.tables.len() < self.cfg.compaction_trigger {
             return Ok(());
         }
-        // Compact all current SSTables into one
+        // Compact all current SSTables into one. Failure-atomic: until the
+        // swap below the in-memory manifest is untouched and the old tables
+        // stay on disk, so an error at any step leaves the store as it was.
+        //
+        // The on-disk manifest is the set of `.vvsst` files. `compact` writes
+        // the output under the highest id via tmp + fsync + rename + dir
+        // fsync, so it is the commit point: once it exists, any suffix of the
+        // old tables plus the output reads the same as the full set.
         let id = self.manifest.next_id();
-        let tables = std::mem::take(&mut self.manifest.tables);
         // Bottom-most compaction — safe to drop tombstones
-        let result = compact(&tables, &self.cfg.dir, id, true)?;
+        let result = compact(&self.manifest.tables, &self.cfg.dir, id, true)?;
+        let sst = match SsTable::open(&result.output_path) {
+            Ok(sst) => sst,
+            Err(e) => {
+                let _ = std::fs::remove_file(&result.output_path);
+                return Err(e);
+            }
+        };
+        let old = std::mem::replace(&mut self.manifest.tables, vec![(sst, id)]);
 
-        // Remove old files
-        for (old_sst, _) in &tables {
-            let _ = std::fs::remove_file(&old_sst.path);
+        // Remove old files oldest-first, stopping at the first failure so the
+        // survivors remain a suffix (deleting a newer table holding a
+        // tombstone while an older one holding the value survived would
+        // resurrect the value on reopen). Leftovers are re-compacted later.
+        for (old_sst, old_id) in &old {
+            if let Err(e) = std::fs::remove_file(&old_sst.path) {
+                warn!(sstable = old_id, error = %e, "compaction: cannot delete input SSTable");
+                break;
+            }
         }
-
-        let sst = SsTable::open(&result.output_path)?;
-        self.manifest.tables = vec![(sst, id)];
         Ok(())
     }
 
@@ -201,7 +275,8 @@ impl KvStore {
 
         let wal_cfg = WalConfig::default()
             .with_dir(&cfg.dir)
-            .with_fsync(cfg.fsync);
+            .with_fsync(cfg.fsync)
+            .with_segment_max_bytes(cfg.wal_segment_max_bytes);
         let wal = WalWriter::open(wal_cfg.clone()).map_err(|e| StoreError::Wal(e.to_string()))?;
 
         let manifest = Manifest::scan_dir(&cfg.dir)?;
@@ -244,9 +319,7 @@ impl KvStore {
         };
 
         let mut g = self.inner.write();
-        g.wal
-            .append(rec.encode().to_vec())
-            .map_err(|e| StoreError::Wal(e.to_string()))?;
+        g.append_wal(rec)?;
         g.active.put(key, value);
 
         let threshold = g.cfg.memtable_flush_threshold;
@@ -262,9 +335,7 @@ impl KvStore {
         let rec = LogRecord::Delete { key: key.clone() };
 
         let mut g = self.inner.write();
-        g.wal
-            .append(rec.encode().to_vec())
-            .map_err(|e| StoreError::Wal(e.to_string()))?;
+        g.append_wal(rec)?;
         g.active.delete(key);
         Ok(())
     }

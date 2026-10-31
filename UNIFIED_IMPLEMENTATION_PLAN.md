@@ -649,3 +649,251 @@ Decisions D-01…D-12 should be taken before Sprint P-B: D-02 and D-07 affect th
 | `docs/MASTER_IMPLEMENTATION_PLAN.md`, `docs/status/*`, `docs/VECTORVOLT_FEATURE_MATRIX.md`, `docs/vectorvolt-tasks/*` | Mark as historical snapshots (2026-07), or regenerate from code. |
 | `docs/traceability/catalog.yaml` | Covers only early WAL/store work; its IDs clash with feature-matrix IDs (e.g. VV-WAL-012). Re-key it to the VV-* feature IDs and add PP-* items. |
 | Vision docs | Fix internal contradictions (partition size 100K vs 1M; RowDescriptor 12/20/32 vs 16/16/32; tier naming L0–L4 vs Tier 1–3; "no cost-based optimizer" vs `planner.rs` cost-based; phase numbers) when each area is next touched. |
+
+---
+
+## 10. Gap register (code audit 2026-10-31)
+
+Everything still open for VectorVolt to be complete, from the plan above plus a code sweep (stubs, swallowed errors, panics, state-only features). Each row cross-references its existing ID where one exists, so §3–§5A stay the design detail and this table is the **execution tracker**. Batches run in order A → N; each batch lands as one PR and its rows flip to ✅ here.
+
+Priority: **P0** data loss / security · **P1** wrong results / crash · **P2** missing or fake feature · **P3** cleanup, docs, CI. Size: S = hours, M = days, L = week+. Status: ⬜ open · 🟡 partial · ✅ done · ⏸ needs owner decision.
+
+Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
+
+### A — P0 data loss and security
+
+| # | Gap | Where | Ref | Size | Status |
+|---|---|---|---|---|---|
+| A1 | Row-level security policies stored, never applied | `sql/executor.rs:1695` | S78 | M | ✅ SELECT, JOIN right side, UPDATE, DELETE all filtered; unsupported policy expressions rejected `[0A000]`. No user/role model yet, so policies apply to every session. |
+| A2 | "Column encryption" reverses the string | `executor.rs:3505-3535` | S142 | M | 🟡 Real AES-256-GCM, ciphertext bound to table.col.pk; fails without a key. The servers don't set a key yet → wire with C1. |
+| A3 | pgwire has no authentication (always AuthenticationOk) | `reader/session.rs:54` | PP-35 | M | ✅ Cleartext password = `--secret`, constant-time check, FATAL 28P01; malformed startup → 08P01; SSLRequest answered `N`. Cleartext is loopback-only until D1 TLS. |
+| A4 | SQL security state is per connection; reconnect clears restrictions | `tcp_server.rs:94,125`, `reader/session.rs:40` | — | L | ✅ One shared executor state per server (`new_session()`); txn/cursors/prepared stay per connection. Any client can still change shared settings via SQL until a privilege model exists. |
+| A5 | Table tokens / rate limits only checked on SELECT | `executor.rs:12053,12062` | S81/S82 | S | ✅ `check_table_access()` on SELECT, INSERT, INSERT…SELECT, UPDATE, DELETE, TRUNCATE, COPY FROM. |
+| A6 | Wire protocol allocates client-declared length (≤ 4 GiB) before the limit check | `net/connection.rs:75`, `server/lib.rs:130` | — | S | ✅ VVNE header decoded (size-checked) before the payload buffer is allocated. |
+| A7 | DDL WAL append/flush errors ignored | `engine/registry.rs:376` | — | S | ✅ `log_ddl` returns errors; `drop_table` keeps the table registered if `schema.txt` can't be removed. |
+| A8 | Undecryptable WAL frames silently skipped on replay | `engine.rs:539` | PP-52 | M | ✅ Encrypted frame must decrypt; wrong key or missing key → `WalDecrypt`; plaintext (markers, pre-encryption) frames still replay. |
+| A9 | ledger/orders/workflow rewrite JSON without fsync/atomic rename | `ledger.rs:55`, `workflow/engine.rs:40` | PP-15 | M | ✅ tmp + fsync + rename + dir fsync in ledger/orders/workflow (and ledger accounts). Open: `Ledger::post` writes two files non-atomically. |
+| A10 | `vectorvolt-store` put never flushes its WAL buffer | `store.rs` | PP-14 | S | ✅ put/delete flush (fsync per config); sealed WAL segments truncated after SST flush (open segment kept). |
+| A11 | Store compaction empties the manifest on mid-way failure | `store.rs:148-164` | — | S | ✅ SST written as `.tmp` → rename + dir fsync; manifest swapped only after success; leftover `.tmp` cleaned on open. |
+| A12 | WAL hash chain unkeyed (tail edits / truncation undetected) | wal | PP-38 | M | ✅ Keyed tail seal (`wal/seal.rs`) written after each synced commit when encryption is on; truncation/rewrite/forged seal fail the open. |
+| A13 | HTTP/control tokens compared with `==`; tenant tokens plaintext | `http/server.rs:125`, `control/server.rs:60` | PP-34 | S | ✅ Constant-time bearer compare (HTTP, control); tenant tokens stored as SHA-256, never serialized. |
+| A14 | RBAC store never enforced by any listener | control + listeners | PP-37 | L | 🟡 Control plane enforces RBAC per route (users + roles in config; 401/403). HTTP/gRPC/pgwire still single-credential → per-user roles land with B30. |
+
+### B — P1 correctness and crashes
+
+| # | Gap | Where | Ref | Size | Status |
+|---|---|---|---|---|---|
+| B1 | No per-pk write ordering | `txn/manager.rs` | PP-23 | L | ⬜ |
+| B2 | MVCC history wrong after restart (one version per row on disk) | txn/storage | PP-24 | L | ⬜ |
+| B3 | PITR restore is not point-in-time | `pitr.rs` | PP-12b | M | ⬜ |
+| B4 | PITR ignores its flush result | `pitr.rs:25` | — | S | ⬜ |
+| B5 | CHECK constraints never checked | `executor.rs:14226` | S59 | M | ⬜ |
+| B6 | FOREIGN KEY constraints never checked | `executor.rs:14233` | S60 | M | ⬜ |
+| B7 | Triggers never fire | `executor.rs:15368` | S66 | M | ⬜ |
+| B8 | Statement timeout checked after the query finishes | `executor.rs:1542` | S106 | M | ⬜ |
+| B9 | ROLLBACK TO SAVEPOINT misses tables opened before the savepoint | `executor.rs:15562` | S53 | M | ⬜ |
+| B10 | Unsupported view/join predicates evaluate to true | `executor.rs:14350` | — | S | ⬜ |
+| B11 | Autocommit SQL writes take no commit lock | executor | PP-25 | S | ⬜ |
+| B12 | pgwire panics on a message length < 4 or negative | `reader/wire.rs:73-80` | — | S | ⬜ |
+| B13 | pgwire assumes one read per message (no reassembly, > 64 KB breaks) | `reader/session.rs:68` | PP-35 | M | ⬜ |
+| B14 | SQL TCP server: no auth, unbounded `read_line` | `tcp_server.rs` | — | S | ⬜ |
+| B15 | NaN in vector search panics | `vector/hnsw.rs:81` | — | S | ⬜ |
+| B16 | 1,084 `Mutex.lock().unwrap()` in the executor (poisoning) | `executor.rs` | — | M | ⬜ |
+| B17 | CDC log append errors ignored | `engine.rs:763,794,841,1669,1688` | — | S | ⬜ |
+| B18 | Index-rebuild insert errors ignored | `engine.rs:1337` | — | S | ⬜ |
+| B19 | Replication leader assigns seq after the write (reordering) | `replication/leader.rs:47-75` | — | S | ⬜ |
+| B20 | Network FK check trusts the Cuckoo filter; filter never grows | `TableEngine::fk_exists` | PP-39 | M | ⬜ |
+| B21 | pk `u64::MAX` collides with the empty-slot sentinel | index | PP-40 | S | ⬜ |
+| B22 | Secondary scan doesn't re-check values; `pk as u32` truncation | query | VV-QRY-003.5 | M | ⬜ |
+| B23 | Deletes don't remove rows from flushed `.vvsst` | `txn/manager.rs:551` | — | M | ⬜ |
+| B24 | Compaction holds the write lock for the whole run | storage | — | M | ⬜ |
+| B25 | `TxnManager::get` reopens/CRC-checks per call; SQL UPDATE/DELETE O(N) | txn/query | VV-QRY-001.4 | M | ⬜ |
+| B26 | `WalWriter::flush` holds the append lock across fsync | wal | 3.2 | M | ⬜ |
+| B27 | io_uring WAL appender truncates on open | `wal/uring_writer.rs` | 3.1 | S | ⬜ |
+| B28 | Webhook sink always returns Ok | events | PP-66 | S | ⬜ |
+| B29 | CDC sink bridge re-reads the whole WAL per poll | sink/bridge | — | M | ⬜ |
+| B30 | `--secret` key scope blocks `--multi` with auth | `serve.rs`, `net/server.rs` | PP-30 | S | ⬜ |
+| B31 | OTel panics on a bad endpoint; 4/7 metrics never populated | otel | PP-69 | S | ⬜ |
+
+### C — Encryption at rest (path-to-production item #1)
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| C1 | `--encrypt-at-rest` with `--multi` / `TableRegistry` | PP-51 | M | ⬜ |
+| C2 | Key ID + flag in segment header; fail loudly on mismatch; AAD = (segment, seq) | PP-52 | M | ⬜ |
+| C3 | `.vvsst` encryption (format bump) | PP-53 | L | ⬜ |
+| C4 | Encrypt CDC log, manifest, intent log, PITR markers, sidecars | PP-54 | M | ⬜ |
+| C5 | KeyStore: no heap copy, mlock, rotation, nonce accounting | PP-55 | M | ⬜ |
+| C6 | Encrypted + compressed snapshots | PP-56 | M | ⬜ |
+
+### D — Network and security hardening
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| D1 | TLS for HTTP, gRPC, pgwire; optional mTLS | PP-36 | L | ⬜ |
+| D2 | pgwire SCRAM/MD5, SSLRequest, extended protocol | PP-35 | L | ⬜ |
+| D3 | `--pgwire-host` flag (hardcoded 127.0.0.1) | VA-07 | S | ⬜ |
+| D4 | IP allowlist (S83) never called; `max_connections` (S116) not enforced | — | S | ⬜ |
+| D5 | Masking, grants, freeze, schema lock, idle timeout, memory limit never enforced | S159/252/273/278/283/295 | L | ⬜ |
+
+### E — Stand-ins presented as real
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| E1 | ~300 of 353 executor settings are state-only; implement or return unsupported | PP-70 | L | ⬜ |
+| E2 | Split the 34,955-line `executor.rs` | PP-70 | L | ⬜ |
+| E3 | Control API returns hardcoded data | PP-60 | M | ⬜ |
+| E4 | vvctl ping/status/disconnect/bench-net/server/projection only print | PP-61 | M | ⬜ |
+| E5 | Orphan vvctl modules | PP-62 | S | ⬜ |
+| E6 | `table_*_stub.rs` tests test nothing they're named for | PP-65 | S | ⬜ |
+| E7 | "HNSW" is brute force | PP-66 | L | ⬜ |
+| E8 | Kafka sink is mpsc; Postgres sink collects strings; flush no-op | PP-66 | L | ⬜ |
+| E9 | Redis Streams sink / Redis cache have no client | PP-66, VV-PRJ-016 | M | ⬜ |
+| E10 | Outbox and DLQ in memory, not in WAL | VV-EVT-008/012 | M | ⬜ |
+| E11 | XDP: no eBPF program, TX frame 0, busy-spin | PP-67, 4.6 | L | ⬜ |
+| E12 | Python/Go/TS SDKs speak a protocol no server implements | PP-63 | L | ⬜ |
+| E13 | Rust SDK connection per call breaks transactions | PP-64 | M | ⬜ |
+| E14 | CRC-32C comments over IEEE CRC-32 | PP-68 | S | ⬜ |
+
+### F — Cluster, Raft, replication (D-02: Raft required)
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| F1 | Cluster network transport (gossip + Raft RPC) | 6.11 | L | ⬜ |
+| F2 | Real Raft: persisted term/vote/log, network replication, snapshot install | LD-SWIM | L | ⬜ |
+| F3 | SWIM probe always Suspect | 6.11 | M | ⬜ |
+| F4 | `--cluster-seeds` recorded only; `cluster join/leave/init` local only | — | M | ⬜ |
+| F5 | Replication: network, catch-up, acks/sync, replication factor | §6.3 | L | ⬜ |
+| F6 | Epoch fencing + < 2 s failover | 6.5 | L | ⬜ |
+| F7 | Shard split, auto-scale, live migration, drain | 6.8/6.9 | L | ⬜ |
+| F8 | Cross-shard sagas; cluster versionstamps | §5.9, 6.15 | L | ⬜ |
+
+### G — Engine core (Phase 2–3)
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| G1 | True single writer owns the whole mutation | 2.1 | L | ⬜ |
+| G2 | Ring buffer claim/publish, no per-op mpsc round-trip | 2.2 | M | ⬜ |
+| G3 | Sleeping wait strategy; per-consumer config | 2.3 | S | ⬜ |
+| G4 | Consumer DAG | 2.4 | L | ⬜ |
+| G5 | Back-pressure (block/reject/drop-oldest, per tenant, 429) | 2.5 | M | ⬜ |
+| G6 | Idempotency keys | 2.6 | M | ⬜ |
+| G7 | Two-phase pending/post/void/timeout | 2.7 | L | ⬜ |
+| G8 | YAML command compiler | 2.11, D-07 | L | ⏸ |
+| G9 | Engine-generated IDs | LD-ID-01 | M | ⬜ |
+| G10 | Physical WAL truncation after snapshot | 3.5 | M | ⬜ |
+| G11 | Tiering L0–L4, archive before delete | 3.5 | L | ⬜ |
+| G12 | Direct I/O + io_uring behind config | 3.1 | M | ⬜ |
+| G13 | Offline WAL compiler (`vvctl migrate import`) | 3.6 | M | ⬜ |
+| G14 | Projections: durable cursors, real targets, lag metric | 3.7 | L | ⬜ |
+| G15 | Interceptor pipeline | 3.8 | M | ⬜ |
+| G16 | Snapshot scheduling | §5.7 | S | ⬜ |
+| G17 | Determinism guard | LD-REPLAY | M | ⬜ |
+| G18 | TTL reaper + branchless check | 8.5 | S | ⬜ |
+
+### H — Performance and hardware (Phase 1, 4, 5)
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| H1 | 64-B aligned hot structs; false-sharing padding | 1.1/1.2 | M | ⬜ |
+| H2 | Zero-alloc arena on hot path | 1.3 | M | ⬜ |
+| H3 | Linux huge pages, NUMA binding, pinned writers | 1.4/1.5 | M | ⬜ |
+| H4 | AVX-512 / NEON; CPUID 0x1F | 1.6 | M | ⬜ |
+| H5 | OS jitter guide, mlockall, MMCSS | 1.7 | S | ⬜ |
+| H6 | Prefetch + branchless routing | 2.8/2.9 | M | ⬜ |
+| H7 | Zero-copy decode (`bytes::Bytes`) | 4.4 | M | ⬜ |
+| H8 | One wire format (VVNE retire/adopt) | D-04 | M | ⏸ |
+| H9 | Event-loop network server | 4.1 | L | ⬜ |
+| H10 | Compiled predicates | 5.5 | M | ⬜ |
+| H11 | Separate reader binary; stale-by-default reads | 5.1 | M | ⬜ |
+| H12 | Document mode | 5.2 | L | ⬜ |
+| H13 | Hot/warm/cold read routing | 5.6 | M | ⬜ |
+| H14 | Materialized views sync vs eventual; survive restart | 5.7, D-08 | M | ⏸ |
+| H15 | TSC telemetry ring + shadow exporter | 6.10 | M | ⬜ |
+| H16 | DPDK, RIO, RDMA, flow steering, PTP, cloud adapters | 4.2–4.9 | L | ⬜ |
+
+### I — Config, S22, S23
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| I1 | Master config schema | VV-CFG-010 | L | ⬜ |
+| I2 | S22 semantic partitioning wired into serve; pruner | VV-PRJ-010..013 | L | ⬜ |
+| I3 | S22 read models + cache wired; YAML-only | VV-PRJ-014..019 | M | ⬜ |
+| I4 | S23 emitter + YAML routes; computed/nested/lookup fields | VV-EVT-001..016 | M | ⬜ |
+| I5 | S23 replay + DLQ commands; E2E gRPC consumer | VV-EVT-010..012 | M | ⬜ |
+
+### J — Tenancy, control plane, tools (Phase 6)
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| J1 | Multi-tenancy | LD-MT, 6.4 | L | ⬜ |
+| J2 | Shard policy engine | 6.2 | M | ⬜ |
+| J3 | 4096 vnodes + catalog epoch | 6.3 | M | ⬜ |
+| J4 | QoS tiers | 6.14 | M | ⬜ |
+| J5 | TUI + read-only web dashboard | 6.12/6.13, D-06 | M | ⏸ |
+| J6 | vvctl → cluster over gRPC | LD-CLI-02 | M | ⬜ |
+| J7 | Admin ops (pause/resume, force snapshot, rebuild, drain) | §6.6 | M | ⬜ |
+| J8 | Schema registry compatibility rules | 6.7 | S | ⬜ |
+| J9 | Three server binaries | LD-RUNTIME-01 | M | ⬜ |
+
+### K — vv-architect
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| K1 | Root/reference classification | VA-01 | M | ⬜ |
+| K2 | SQLite read-only + hardening | VA-02 | S | ⬜ |
+| K3 | CLI validation; checked sizing math | VA-03 | S | ⬜ |
+| K4 | Consumable `vectorvolt.yaml`; engine consumers | VA-04/06 | M | ⬜ |
+| K5 | Emit S22/S23 YAML | VA-05 | M | ⬜ |
+| K6 | Dockerfile, Helm, fixed K8s manifest, HugePages/pinning | VA-08/09/10/12, PP-82/83 | M | ⬜ |
+| K7 | Terraform realism | VA-13 | M | ⬜ |
+| K8 | Sizing model v2 | VA-14 | M | ⬜ |
+| K9 | Scanner hardening, type-based relationships, Go methods | VA-15/16/17 | L | ⬜ |
+| K10 | Postgres/MySQL scan; Python, OpenAPI/Proto | VA-18/24 | L | ⬜ |
+| K11 | Method classification, .NET DLL, stub gen, `migrate analyze` | VA-20..23 | L | ⬜ |
+| K12 | Raft/cluster wiring in manifests | VA-11 | M | ⬜ |
+
+### L — Testing, sample app, migration (Phase 7)
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| L1 | DST through engine + WAL (mock clock/disk/net) | 7.1 | L | ⬜ |
+| L2 | Replay-equivalence test | 3.4 | M | ⬜ |
+| L3 | Chaos suite | 7.4 | L | ⬜ |
+| L4 | Sample apps on the engine | 7.2 | L | ⬜ |
+| L5 | E2E load tests; perf gate in CI | 7.3, PP-85 | M | ⬜ |
+| L6 | CDC reverse ingestion; backfill; migration demo | 7.5.4/7.5.5 | L | ⬜ |
+| L7 | Reference Java app testbed | 7.6 | L | ⬜ |
+| L8 | Full suite green on Linux CI | — | M | 🟡 |
+| L9 | Privileged Linux CI job for root/network tests | — | S | ⬜ |
+| L10 | Benchmarks with methodology + comparisons | 7.8 | M | ⬜ |
+
+### M — Build, CI, release
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| M1 | Move `vectorvolt/.github/workflows` to the repo root | PP-80 | M | ⬜ |
+| M2 | Split TPM out of release lint | PP-81 | S | ⬜ |
+| M3 | systemd unit, default config, image; real Brew sha256 | PP-82 | M | ⬜ |
+| M4 | `.cargo/config.toml` hardcoded MSVC path | PP-84 | S | ⬜ |
+| M5 | Pin toolchain (`rust-toolchain.toml`, CI uses 1.99) | — | S | ⬜ |
+| M6 | `ekos/target/` files tracked in git | — | S | ⬜ |
+| M7 | musl static builds | locked | M | ⬜ |
+| M8 | Rolling upgrades + format versioning | §6.6 | M | ⬜ |
+
+### N — Decisions and docs
+
+| # | Gap | Ref | Size | Status |
+|---|---|---|---|---|
+| N1 | Decisions D-04…D-12 | §2 | S | ⏸ |
+| N2 | REQUIREMENTS.md v4.0 | D-01..03 | M | ⬜ |
+| N3 | Path-to-production items #2…#N | §8 | S | ⏸ |
+| N4 | SLO hardware tier | §8 | S | ⏸ |
+| N5 | EKOS future | §8 | S | ⏸ |
+| N6 | README limitations, CHANGELOG, historical doc banners | §9 | S | ⬜ |
+| N7 | Traceability catalog re-key | §9 | S | ⬜ |
+
+### Gap register log
+
+- 2026-10-31: register created. PR #647 (PP-01…13, 20–22, 25, 31, 32 + CI green-up) precedes batch A.
+- 2026-10-31: **Batch A** (branch `feat/gaps-batch-a`): A1, A3–A13 ✅; A2 and A14 🟡 (remainders folded into C1 and B30). New tests in query, reader, net, engine, wal, store, ledger/orders/workflow, control.

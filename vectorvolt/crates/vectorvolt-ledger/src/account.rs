@@ -3,10 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LedgerError, LedgerResult};
+use crate::persist;
 
 /// A single account in the ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,9 @@ pub struct Account {
 pub struct AccountStore {
     path: PathBuf,
     accounts: Arc<RwLock<std::collections::HashMap<u64, Account>>>,
+    /// Serialises `persist`: writers share one `.tmp`, and the snapshot is
+    /// taken under this lock so an older state never overwrites a newer one.
+    persist_lock: Mutex<()>,
 }
 
 impl AccountStore {
@@ -28,21 +32,21 @@ impl AccountStore {
     pub fn open(dir: &Path) -> LedgerResult<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("accounts.json");
-        let accounts = if path.exists() {
-            let raw = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&raw)?
-        } else {
-            std::collections::HashMap::new()
+        let accounts = match persist::read_committed(&path)? {
+            Some(raw) => serde_json::from_slice(&raw)?,
+            None => std::collections::HashMap::new(),
         };
         Ok(Self {
             path,
             accounts: Arc::new(RwLock::new(accounts)),
+            persist_lock: Mutex::new(()),
         })
     }
 
     fn persist(&self) -> LedgerResult<()> {
-        let raw = serde_json::to_string(&*self.accounts.read())?;
-        std::fs::write(&self.path, raw)?;
+        let _guard = self.persist_lock.lock();
+        let raw = serde_json::to_vec(&*self.accounts.read())?;
+        persist::write_atomic(&self.path, &raw)?;
         Ok(())
     }
 

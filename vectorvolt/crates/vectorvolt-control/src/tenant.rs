@@ -7,7 +7,10 @@ use thiserror::Error;
 pub struct Tenant {
     pub id: String,
     pub name: String,
-    pub token: String,
+    /// SHA-256 of the tenant's token. The token itself is never stored, and
+    /// the hash is never serialized into API responses.
+    #[serde(skip_serializing, default)]
+    pub token_hash: [u8; 32],
     pub quota: TenantQuota,
     pub tables: Vec<String>,
     pub created_at_ns: u64,
@@ -40,6 +43,11 @@ pub enum TenantError {
     QuotaExceeded(String),
 }
 
+fn hash_token(token: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes()).into()
+}
+
 pub struct TenantRegistry {
     tenants: DashMap<String, Tenant>,
 }
@@ -64,7 +72,7 @@ impl TenantRegistry {
         let t = Tenant {
             id: id.clone(),
             name,
-            token,
+            token_hash: hash_token(&token),
             quota,
             tables: Vec::new(),
             created_at_ns: SystemTime::now()
@@ -77,8 +85,9 @@ impl TenantRegistry {
     }
 
     pub fn authenticate(&self, id: &str, token: &str) -> Result<Tenant, TenantError> {
+        use subtle::ConstantTimeEq;
         let t = self.tenants.get(id).ok_or(TenantError::NotFound)?;
-        if t.token == token {
+        if bool::from(hash_token(token).ct_eq(&t.token_hash)) {
             Ok(t.clone())
         } else {
             Err(TenantError::NotFound)
@@ -260,6 +269,18 @@ mod tests {
         let r = reg();
         let err = r.remove("nope").unwrap_err();
         assert!(matches!(err, TenantError::NotFound));
+    }
+
+    #[test]
+    fn test_token_is_stored_hashed_and_not_serialized() {
+        let r = reg();
+        let t = r
+            .create("t1".into(), "A".into(), "s3cret-token".into(), quota())
+            .unwrap();
+        assert_ne!(t.token_hash, [0u8; 32]);
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("s3cret-token"));
+        assert!(!json.contains("token"));
     }
 
     #[test]
