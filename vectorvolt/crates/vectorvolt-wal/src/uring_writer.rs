@@ -63,7 +63,7 @@ mod inner {
                 self.ring
                     .submission()
                     .push(&write_e)
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
+                    .map_err(|_| io::Error::other("io_uring SQ full"))?;
             }
             self.ring.submit_and_wait(1)?;
 
@@ -72,7 +72,7 @@ mod inner {
                 .ring
                 .completion()
                 .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring: no CQE"))?;
+                .ok_or_else(|| io::Error::other("io_uring: no CQE"))?;
             let result = cqe.result();
             if result < 0 {
                 return Err(io::Error::from_raw_os_error(-result));
@@ -90,14 +90,14 @@ mod inner {
                 self.ring
                     .submission()
                     .push(&sync_e)
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
+                    .map_err(|_| io::Error::other("io_uring SQ full"))?;
             }
             self.ring.submit_and_wait(1)?;
             let cqe = self
                 .ring
                 .completion()
                 .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring: no CQE"))?;
+                .ok_or_else(|| io::Error::other("io_uring: no CQE"))?;
             let result = cqe.result();
             if result < 0 {
                 Err(io::Error::from_raw_os_error(-result))
