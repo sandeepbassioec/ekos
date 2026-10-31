@@ -50,19 +50,20 @@
 //! option that can restore atomicity across the tables that are still
 //! recoverable.
 //!
-//! ### Known limitation
+//! ### Write sets (crash recovery)
 //!
-//! [`vectorvolt_txn`]'s per-table MVCC write buffer lives in memory only.
-//! Across an actual process crash-and-restart, any table whose `commit_txn`
-//! had not yet run loses its staged mutations entirely (there is nothing to
-//! roll forward *or* back — the intent record can only be marked
-//! `RolledBack` as a best-effort closure). Full crash recovery of the
-//! buffered mutations themselves would require persisting the write-set
-//! payload (not just the table/txn-id list) in this log, which is out of
-//! scope for this phase. Recovery as implemented here is fully correct for
-//! the in-process partial-failure case (e.g. one table's `commit_txn`
-//! erroring out while the process keeps running) and is safe (never
-//! corrupts data) but only "best effort" across a real crash.
+//! The per-table staging buffers live in memory only, and per-table txn ids
+//! restart at zero with the process, so after a real crash `commit_txn` on a
+//! recorded id finds nothing (or the wrong thing). A PREPARE record therefore
+//! also carries each table's full **write set** — the final put/delete for
+//! every pk — and a `TableApplied` progress record is appended after each
+//! table commits. Recovery re-applies the write set of every table not yet
+//! marked applied via [`crate::TableEngine::apply_batch`], which is a single
+//! atomic WAL record per table and idempotent, so a recovered transaction is
+//! complete on every table rather than "closed" with some writes missing.
+//!
+//! Records written before write sets existed are still handled the old way
+//! (roll forward by txn id, treating `TxnNotFound` as already applied).
 
 use crate::error::EngineResult;
 use crate::mvcc::TxnId;
@@ -87,12 +88,27 @@ pub enum IntentState {
     RolledBack,
 }
 
+/// One table's staged changes in a cross-table transaction: the final put
+/// (`Some(values)`) or delete (`None`) for each pk it touched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableWriteSet {
+    pub table: String,
+    pub ops: Vec<(u64, Option<Vec<u64>>)>,
+}
+
 /// A single durable record in the intent log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentRecord {
     pub txn_uuid: String,
     pub tables: Vec<TableTxn>,
     pub state: IntentState,
+    /// Every table's write set, recorded at PREPARE. Empty in records written
+    /// before write sets existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_set: Vec<TableWriteSet>,
+    /// Tables whose write set is already durably applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied: Vec<String>,
 }
 
 /// Outcome of resolving one dangling record during recovery.
@@ -148,33 +164,66 @@ impl TxnIntentLog {
     /// Phase A — durably record the intent to commit `tables` as one atomic
     /// unit, before any table's `commit_txn` is invoked.
     pub fn prepare(&self, txn_uuid: &str, tables: Vec<TableTxn>) -> EngineResult<()> {
+        self.prepare_with_write_set(txn_uuid, tables, Vec::new())
+    }
+
+    /// Durably record a transaction's intent together with its write sets,
+    /// before any table is touched.
+    pub fn prepare_with_write_set(
+        &self,
+        txn_uuid: &str,
+        tables: Vec<TableTxn>,
+        write_set: Vec<TableWriteSet>,
+    ) -> EngineResult<()> {
         self.append(&IntentRecord {
             txn_uuid: txn_uuid.to_owned(),
             tables,
             state: IntentState::Preparing,
+            write_set,
+            applied: Vec::new(),
         })
     }
 
-    /// Phase B — durably record that every table listed under `txn_uuid` has
-    /// been committed.
+    /// Record that the tables in `applied` have committed their write sets.
+    ///
+    /// Appended after each table so recovery re-applies only what had not
+    /// landed yet, instead of overwriting later writes to the same rows.
+    pub fn mark_tables_applied(
+        &self,
+        txn_uuid: &str,
+        tables: Vec<TableTxn>,
+        write_set: Vec<TableWriteSet>,
+        applied: Vec<String>,
+    ) -> EngineResult<()> {
+        self.append(&IntentRecord {
+            txn_uuid: txn_uuid.to_owned(),
+            tables,
+            state: IntentState::Preparing,
+            write_set,
+            applied,
+        })
+    }
+
     pub fn mark_committed(&self, txn_uuid: &str, tables: Vec<TableTxn>) -> EngineResult<()> {
         self.append(&IntentRecord {
             txn_uuid: txn_uuid.to_owned(),
             tables,
             state: IntentState::Committed,
+            write_set: Vec::new(),
+            applied: Vec::new(),
         })
     }
 
-    /// Record that a dangling transaction was resolved by rolling it back.
     pub fn mark_rolled_back(&self, txn_uuid: &str, tables: Vec<TableTxn>) -> EngineResult<()> {
         self.append(&IntentRecord {
             txn_uuid: txn_uuid.to_owned(),
             tables,
             state: IntentState::RolledBack,
+            write_set: Vec::new(),
+            applied: Vec::new(),
         })
     }
 
-    /// Read every record currently in the log, in append order.
     pub fn read_all(&self) -> EngineResult<Vec<IntentRecord>> {
         read_all_records(&self.path)
     }
@@ -250,7 +299,23 @@ where
     for rec in dangling {
         let mut committed = Vec::new();
         let mut failed = Vec::new();
-        for t in &rec.tables {
+        if !rec.write_set.is_empty() {
+            for ws in &rec.write_set {
+                if rec.applied.contains(&ws.table) {
+                    committed.push(ws.table.clone());
+                    continue;
+                }
+                let Some(engine) = resolve(&ws.table) else {
+                    failed.push(ws.table.clone());
+                    continue;
+                };
+                match engine.apply_batch(ws.ops.clone()) {
+                    Ok(_) => committed.push(ws.table.clone()),
+                    Err(_) => failed.push(ws.table.clone()),
+                }
+            }
+        }
+        for t in rec.tables.iter().filter(|_| rec.write_set.is_empty()) {
             let Some(engine) = resolve(&t.table) else {
                 failed.push(t.table.clone());
                 continue;
@@ -278,6 +343,14 @@ where
 
         if resolved_state == IntentState::Committed {
             log.mark_committed(&rec.txn_uuid, rec.tables.clone())?;
+        } else if !rec.write_set.is_empty() {
+            // Remember what did land so a later attempt only retries the rest.
+            log.mark_tables_applied(
+                &rec.txn_uuid,
+                rec.tables.clone(),
+                rec.write_set.clone(),
+                committed.clone(),
+            )?;
         }
 
         actions.push(RecoveryAction {
@@ -296,6 +369,69 @@ mod tests {
     use crate::engine::{EngineOptions, TableEngine};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn write_set_is_reapplied_after_a_restart_lost_the_staging_buffer() {
+        let dir = TempDir::new().unwrap();
+        let a = Arc::new(
+            TableEngine::open(
+                vec!["pk".into(), "v".into()],
+                dir.path().join("a"),
+                1_000_000,
+            )
+            .unwrap(),
+        );
+        let b = Arc::new(
+            TableEngine::open(
+                vec!["pk".into(), "v".into()],
+                dir.path().join("b"),
+                1_000_000,
+            )
+            .unwrap(),
+        );
+        b.insert(9, vec![9, 9]).unwrap();
+        let log = TxnIntentLog::open(log_path(&dir)).unwrap();
+        let tables = vec![
+            TableTxn {
+                table: "a".into(),
+                txn_id: 0,
+            },
+            TableTxn {
+                table: "b".into(),
+                txn_id: 0,
+            },
+        ];
+        let ws = vec![
+            TableWriteSet {
+                table: "a".into(),
+                ops: vec![(1, Some(vec![1, 10]))],
+            },
+            TableWriteSet {
+                table: "b".into(),
+                ops: vec![(9, None), (2, Some(vec![2, 20]))],
+            },
+        ];
+        log.prepare_with_write_set("t", tables.clone(), ws.clone())
+            .unwrap();
+        // Table a committed before the crash; b did not.
+        a.apply_batch(ws[0].ops.clone()).unwrap();
+        log.mark_tables_applied("t", tables, ws, vec!["a".into()])
+            .unwrap();
+        // Something else wrote a's row after the transaction; recovery must not clobber it.
+        a.insert(1, vec![1, 11]).unwrap();
+
+        let actions = recover_pending_transactions(log_path(&dir), |name| match name {
+            "a" => Some(Arc::clone(&a)),
+            "b" => Some(Arc::clone(&b)),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(actions[0].resolved_state, IntentState::Committed);
+        assert_eq!(a.get(1).unwrap().unwrap().values, vec![1, 11]);
+        assert!(b.get(9).unwrap().is_none());
+        assert_eq!(b.get(2).unwrap().unwrap().values, vec![2, 20]);
+        assert!(find_dangling(&log.read_all().unwrap()).is_empty());
+    }
 
     fn log_path(dir: &TempDir) -> PathBuf {
         dir.path().join("txn_intent.log")

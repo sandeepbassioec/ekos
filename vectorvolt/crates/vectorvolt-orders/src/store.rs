@@ -29,7 +29,11 @@ impl OrderStore {
             std::collections::HashMap::new()
         };
         let next_id = store.keys().copied().max().unwrap_or(0) + 1;
-        Ok(Self { path, store: Arc::new(RwLock::new(store)), next_id: AtomicU64::new(next_id) })
+        Ok(Self {
+            path,
+            store: Arc::new(RwLock::new(store)),
+            next_id: AtomicU64::new(next_id),
+        })
     }
 
     fn persist(&self) -> OrderResult<()> {

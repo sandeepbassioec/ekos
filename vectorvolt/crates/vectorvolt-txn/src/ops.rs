@@ -13,6 +13,7 @@
 //! UpsertBatch: op=0x05 | row_count u32 | [(pk u64 | value_count u32 | values [u64; value_count])*]
 //! Checkpoint:  op=0x06 | name_len u32 | name bytes (UTF-8) | lsn u64 | timestamp u64
 //! Update:      op=0x07 | pk u64 | value_count u32 | values [u64; value_count]
+//! TxnBatch:    op=0x08 | op_count u32 | [(pk u64 | kind u8 (0=put, 1=delete) | [value_count u32 | values]?)*]
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read};
@@ -33,6 +34,7 @@ pub const OP_CHECKPOINT: u8 = 0x06;
 /// In-place update: tombstones the old physical row and writes new column values
 /// under the same PK without orphaning the old storage (VV-TXN-004.6).
 pub const OP_UPDATE: u8 = 0x07;
+pub const OP_TXN_BATCH: u8 = 0x08;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mutation {
@@ -82,6 +84,14 @@ pub enum Mutation {
         pk: u64,
         values: Vec<u64>,
     },
+    /// A committed transaction: every put (`Some(values)`) and delete
+    /// (`None`) it made, as ONE frame. The frame is checksummed as a unit, so
+    /// after a crash it is either entirely present or entirely absent — the
+    /// all-or-nothing property a commit needs. Ops are final states, which
+    /// also makes re-applying one idempotent.
+    TxnBatch {
+        ops: Vec<(u64, Option<Vec<u64>>)>,
+    },
 }
 
 impl Mutation {
@@ -98,6 +108,7 @@ impl Mutation {
             | Mutation::DdlAlter { .. }
             | Mutation::Checkpoint { .. } => 0,
             Mutation::Update { pk, .. } => *pk,
+            Mutation::TxnBatch { ops } => ops.first().map(|(pk, _)| *pk).unwrap_or(0),
         }
     }
 
@@ -208,6 +219,23 @@ impl Mutation {
                 buf.write_u32::<LittleEndian>(values.len() as u32).unwrap();
                 for &v in values {
                     buf.write_u64::<LittleEndian>(v).unwrap();
+                }
+            }
+            Mutation::TxnBatch { ops } => {
+                buf.write_u8(OP_TXN_BATCH).unwrap();
+                buf.write_u32::<LittleEndian>(ops.len() as u32).unwrap();
+                for (pk, op) in ops {
+                    buf.write_u64::<LittleEndian>(*pk).unwrap();
+                    match op {
+                        Some(values) => {
+                            buf.write_u8(0).unwrap();
+                            buf.write_u32::<LittleEndian>(values.len() as u32).unwrap();
+                            for &v in values {
+                                buf.write_u64::<LittleEndian>(v).unwrap();
+                            }
+                        }
+                        None => buf.write_u8(1).unwrap(),
+                    }
                 }
             }
         }
@@ -435,6 +463,42 @@ impl Mutation {
                 }
                 Ok(Mutation::Update { pk, values })
             }
+            OP_TXN_BATCH => {
+                let corrupt =
+                    |what: &str| TxnError::CorruptPayload(format!("truncated txn batch {what}"));
+                let count = cur
+                    .read_u32::<LittleEndian>()
+                    .map_err(|_| corrupt("op_count"))? as usize;
+                let mut ops = Vec::with_capacity(count.min(1 << 16));
+                for _ in 0..count {
+                    let pk = cur.read_u64::<LittleEndian>().map_err(|_| corrupt("pk"))?;
+                    let kind = cur.read_u8().map_err(|_| corrupt("kind"))?;
+                    let op = match kind {
+                        0 => {
+                            let n = cur
+                                .read_u32::<LittleEndian>()
+                                .map_err(|_| corrupt("value_count"))?
+                                as usize;
+                            let mut values = Vec::with_capacity(n.min(1 << 16));
+                            for _ in 0..n {
+                                values.push(
+                                    cur.read_u64::<LittleEndian>()
+                                        .map_err(|_| corrupt("value"))?,
+                                );
+                            }
+                            Some(values)
+                        }
+                        1 => None,
+                        k => {
+                            return Err(TxnError::CorruptPayload(format!(
+                                "txn batch op kind {k} is not put/delete"
+                            )));
+                        }
+                    };
+                    ops.push((pk, op));
+                }
+                Ok(Mutation::TxnBatch { ops })
+            }
             b => Err(TxnError::CorruptPayload(format!(
                 "unknown op byte {b:#04x}"
             ))),
@@ -447,6 +511,23 @@ impl Mutation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn txn_batch_round_trips() {
+        let m = Mutation::TxnBatch {
+            ops: vec![(1, Some(vec![1, 2, 3])), (2, None), (3, Some(vec![]))],
+        };
+        assert_eq!(Mutation::decode(&m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn truncated_txn_batch_is_rejected() {
+        let m = Mutation::TxnBatch {
+            ops: vec![(1, Some(vec![1, 2, 3])), (2, None)],
+        };
+        let bytes = m.encode();
+        assert!(Mutation::decode(&bytes[..bytes.len() - 3]).is_err());
+    }
 
     #[test]
     fn insert_round_trip() {

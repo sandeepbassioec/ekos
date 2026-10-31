@@ -9,13 +9,19 @@ fn setup() -> (OrderStore, TempDir) {
 }
 
 fn line(sku: &str, qty: u32, price: i64) -> OrderLine {
-    OrderLine { sku: sku.into(), qty, unit_price_cents: price }
+    OrderLine {
+        sku: sku.into(),
+        qty,
+        unit_price_cents: price,
+    }
 }
 
 #[test]
 fn create_order_computes_total() {
     let (store, _dir) = setup();
-    let id = store.create(1, vec![line("A", 2, 500), line("B", 1, 300)]).unwrap();
+    let id = store
+        .create(1, vec![line("A", 2, 500), line("B", 1, 300)])
+        .unwrap();
     let order = store.get(id).unwrap().unwrap();
     assert_eq!(order.total_cents, 1300); // 2*500 + 1*300
 }

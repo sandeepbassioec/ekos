@@ -56,9 +56,12 @@ fn start_with_cluster(dir: &TempDir, seeds: Vec<SocketAddr>) -> (u16, impl FnOnc
         max_partitions: None,
         grpc_port: 0,
         no_grpc: true,
+        grpc_host: std::net::IpAddr::from([127, 0, 0, 1]),
+        grpc_token: None,
         tpm_unseal: false,
         encrypt_at_rest: false,
         metrics_port: 0,
+        metrics_host: std::net::IpAddr::from([127, 0, 0, 1]),
         pgwire_port: None,
         catalog: false,
         restore_catalog: false,
@@ -157,8 +160,11 @@ fn no_cluster_node_without_flag() {
         addr: ephemeral(),
         multi: true,
         no_grpc: true,
+        grpc_host: std::net::IpAddr::from([127, 0, 0, 1]),
+        grpc_token: None,
         grpc_port: 0,
         metrics_port: 0,
+        metrics_host: std::net::IpAddr::from([127, 0, 0, 1]),
         ..ServeArgs::default()
     };
     assert!(args.cluster_bind.is_none());

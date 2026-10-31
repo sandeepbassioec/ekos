@@ -683,7 +683,7 @@ mod linux_tests {
     // 12 — available_cores count >= 1
     #[test]
     fn linux_available_cores_count_ge_1() {
-        assert!(available_cores().len() >= 1);
+        assert!(!available_cores().is_empty());
     }
 
     // 13 — affinity survives thread spawn

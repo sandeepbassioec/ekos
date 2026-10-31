@@ -73,7 +73,11 @@ fn fallback_single_node() -> NumaTopology {
         .map(|x| x.get())
         .unwrap_or(1);
     NumaTopology {
-        nodes: vec![NumaNode { node_id: 0, cpu_ids: (0..n).collect(), memory_mb: None }],
+        nodes: vec![NumaNode {
+            node_id: 0,
+            cpu_ids: (0..n).collect(),
+            memory_mb: None,
+        }],
     }
 }
 
@@ -115,7 +119,11 @@ mod platform {
 
             let memory_mb = parse_meminfo(&entry.path().join("meminfo"));
 
-            nodes.push(NumaNode { node_id, cpu_ids, memory_mb });
+            nodes.push(NumaNode {
+                node_id,
+                cpu_ids,
+                memory_mb,
+            });
         }
 
         if nodes.is_empty() {

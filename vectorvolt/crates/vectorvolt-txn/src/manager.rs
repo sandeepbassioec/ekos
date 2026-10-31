@@ -36,7 +36,7 @@ use vectorvolt_wal::{SyncCommitter, SyncStats, WalWriter};
 
 use crate::mvcc::{CommitClock, VersionIndex};
 use crate::routing::select_partition;
-use crate::shard_writer::ShardWriter;
+use crate::shard_writer::{DrainedRow, ShardWriter};
 use crate::{TxnError, TxnResult, ops::Mutation};
 
 // Sentinel file_id for rows still in the write buffer.
@@ -127,6 +127,12 @@ pub struct TxnManager {
     /// `wal_key()` below, which callers use to mirror this same key).
     /// `None` preserves the existing on-disk format exactly (opt-in only).
     wal_key: Option<Arc<vectorvolt_crypto::KeyStore>>,
+    /// `fsync` each partition file (and its directory) before it is published.
+    durable_flush: bool,
+    /// Held shared by every mutation from its WAL append until its in-memory
+    /// effect is applied; taken exclusively by [`TxnManager::quiesced_tip`].
+    /// That gives a snapshot a WAL position at which no mutation is half done.
+    apply_gate: RwLock<()>,
 }
 
 impl TxnManager {
@@ -180,7 +186,28 @@ impl TxnManager {
             clock: CommitClock::new(),
             version_index: VersionIndex::new(),
             wal_key: None,
+            durable_flush: true,
+            apply_gate: RwLock::new(()),
         }
+    }
+
+    /// Whether flushed partition files are synced to disk before they are
+    /// published. On by default; `TableEngine` turns it off for the
+    /// non-fsync durability modes, which already accept losing recent writes.
+    pub fn with_durable_flush(mut self, durable: bool) -> Self {
+        self.durable_flush = durable;
+        self
+    }
+
+    /// The WAL sequence number at an instant when every mutation at or below
+    /// it has been fully applied in memory.
+    ///
+    /// A flush that starts after this returns therefore captures the effect of
+    /// every frame up to the returned sequence — which is what lets a snapshot
+    /// record a WAL position recovery can safely skip to.
+    pub fn quiesced_tip(&self) -> u64 {
+        let _exclusive = self.apply_gate.write();
+        self.wal.wal().tip().sequence
     }
 
     /// Opt into WAL/row-data encryption at rest: every mutation payload is
@@ -243,6 +270,17 @@ impl TxnManager {
         }
     }
 
+    /// Append a non-mutation record (e.g. a PITR snapshot marker) through this
+    /// table's one WAL writer and sync it.
+    ///
+    /// Opening a second `WalWriter` on the same directory forks the sequence
+    /// numbers and the hash chain (PP-12). Markers are metadata, not row data,
+    /// and are written unencrypted so `WalReader::scan_snapshot_markers` can
+    /// still find them; replay ignores them because they are not mutations.
+    pub fn append_marker(&self, payload: Vec<u8>) -> TxnResult<WalTip> {
+        Ok(self.wal.append_and_sync(payload)?)
+    }
+
     /// Group-commit counters: commits, `fsync`s issued, and commits served by
     /// another thread's sync. `commits_per_sync() > 1` means batching happened.
     pub fn commit_stats(&self) -> SyncStats {
@@ -268,6 +306,7 @@ impl TxnManager {
             pk,
             values: values.clone(),
         };
+        let _applying = self.apply_gate.read_recursive();
         let tip = self.commit(mutation.encode())?;
 
         // MVCC Phase 1: record this version before anything else observes it.
@@ -327,6 +366,7 @@ impl TxnManager {
 
         // Single WAL commit for the entire batch.
         let mutation = Mutation::InsertBatch { rows: rows.clone() };
+        let _applying = self.apply_gate.read_recursive();
         let tip = self.commit(mutation.encode())?;
 
         // Apply each row to in-memory structures.
@@ -519,6 +559,7 @@ impl TxnManager {
         };
         let home = (desc.file_id(), desc.partition_id());
 
+        let _applying = self.apply_gate.read_recursive();
         let tip = self.commit(Mutation::Delete { pk }.encode())?;
         self.pk_index.write().remove(pk);
         *self.pending_tombstones.lock().entry(home).or_insert(0) += 1;
@@ -551,6 +592,7 @@ impl TxnManager {
             }
         }
 
+        let _applying = self.apply_gate.read_recursive();
         let tip = self.commit(Mutation::UpsertBatch { rows: rows.clone() }.encode())?;
 
         let mut any_full = false;
@@ -581,6 +623,79 @@ impl TxnManager {
         Ok(tip)
     }
 
+    // ── TRANSACTION BATCH ─────────────────────────────────────────────────────
+
+    /// Apply a committed transaction's puts and deletes as ONE WAL record.
+    ///
+    /// This is the commit primitive every transaction path uses (engine MVCC,
+    /// wire protocol, gRPC, HTTP multi-table). One frame means one checksum:
+    /// after a crash the transaction is replayed whole or not at all, never
+    /// half. Each op is a final state — a put overwrites whatever is there and
+    /// a delete of an absent pk is a no-op — so applying the same batch twice
+    /// leaves the same result, which is what cross-table recovery relies on.
+    ///
+    /// Every put is validated before anything is written; on error nothing is
+    /// applied.
+    pub fn apply_batch(&self, ops: Vec<(u64, Option<Vec<u64>>)>) -> TxnResult<WalTip> {
+        for (_, op) in &ops {
+            if let Some(values) = op
+                && values.len() != self.schema.len()
+            {
+                return Err(TxnError::SchemaMismatch {
+                    expected: self.schema.len(),
+                    got: values.len(),
+                });
+            }
+        }
+
+        let mut any_full = false;
+        let tip = {
+            let _applying = self.apply_gate.read_recursive();
+            let tip = self.commit(Mutation::TxnBatch { ops: ops.clone() }.encode())?;
+            for (pk, op) in ops {
+                let existing = self.pk_index.read().get(pk);
+                match op {
+                    Some(values) => {
+                        if existing.is_some() {
+                            self.pk_index.write().remove(pk);
+                        }
+                        let commit_ts = self.clock.next();
+                        self.version_index.push_live(pk, commit_ts, values.clone());
+                        {
+                            let mut sec = self.secondary_index.write();
+                            for (col_idx, &val) in values.iter().enumerate().skip(1) {
+                                sec.insert(col_value_hash(col_idx, val), pk as u32);
+                            }
+                        }
+                        self.fk_filter.write().insert(pk)?;
+                        if self.writer.insert(pk, values)? {
+                            any_full = true;
+                        }
+                    }
+                    None => {
+                        let Some(desc) = existing else {
+                            continue;
+                        };
+                        self.pk_index.write().remove(pk);
+                        *self
+                            .pending_tombstones
+                            .lock()
+                            .entry((desc.file_id(), desc.partition_id()))
+                            .or_insert(0) += 1;
+                        let commit_ts = self.clock.next();
+                        self.version_index.push_tombstone(pk, commit_ts);
+                    }
+                }
+            }
+            tip
+        };
+
+        if any_full {
+            self.flush()?;
+        }
+        Ok(tip)
+    }
+
     // ── DELETE BATCH ──────────────────────────────────────────────────────────
 
     /// Delete multiple rows as a single WAL record.
@@ -604,6 +719,7 @@ impl TxnManager {
         }
 
         // Single WAL commit for the entire batch.
+        let _applying = self.apply_gate.read_recursive();
         let tip = self.commit(Mutation::DeleteBatch { pks: pks.clone() }.encode())?;
 
         // Remove each PK from the index and accumulate tombstones.
@@ -641,6 +757,7 @@ impl TxnManager {
             pk,
             values: values.clone(),
         };
+        let _applying = self.apply_gate.read_recursive();
         let tip = self.commit(mutation.encode())?;
 
         // Remove stale index entry if the pk already exists.
@@ -688,6 +805,7 @@ impl TxnManager {
             return Err(TxnError::PkNotFound(pk));
         }
         // WAL first — single Update record covers the tombstone + re-insert.
+        let _applying = self.apply_gate.read_recursive();
         let tip = self.commit(
             Mutation::Update {
                 pk,
@@ -863,7 +981,7 @@ impl TxnManager {
         let mut outcomes = Vec::new();
         for job in jobs {
             let file_id = self.next_file_id.load(Ordering::Relaxed);
-            let partition_id = self.next_partition_id.fetch_add(1, Ordering::Relaxed);
+            let partition_id = self.alloc_partition_id()?;
             let opts = CompactionOptions {
                 output_dir: self.flush_dir.clone(),
                 output_file_id: file_id,
@@ -974,39 +1092,31 @@ impl TxnManager {
 
         // Group rows by their logical partition (PK-hash routing).
         // With partition_count=1 this is a no-op — all rows land in group 0.
+        // Rows keep their drain order (oldest first) inside each group.
         let pc = self.partition_count;
-        let mut groups: Vec<Vec<(u64, Vec<u64>)>> = vec![Vec::new(); pc];
+        let mut groups: Vec<Vec<DrainedRow>> = vec![Vec::new(); pc];
         for row in &rows {
-            groups[select_partition(row.0, pc)].push(row.clone());
+            groups[select_partition(row.pk, pc)].push(row.clone());
         }
-
-        // Allocate a contiguous block of partition IDs for this flush —
-        // one per non-empty group.  We over-allocate by `pc` in the worst case
-        // (some groups may be empty) but that is harmless: unallocated IDs simply
-        // have no file on disk.
-        let base_partition_id = self
-            .next_partition_id
-            .fetch_add(pc as u16, Ordering::Relaxed);
 
         std::fs::create_dir_all(&self.flush_dir)?;
 
-        // Write one .vvsst file per non-empty group, collect (partition_id, rows)
-        // for the index rebuild that follows.
-        type PartitionGroup = (u16, Vec<(u64, Vec<u64>)>);
-        let mut written: Vec<PartitionGroup> = Vec::with_capacity(pc);
+        let mut written: Vec<(u16, Vec<DrainedRow>)> = Vec::with_capacity(pc);
         let mut total_written = 0usize;
         let mut last_tip = None;
 
-        for (group_idx, group_rows) in groups.into_iter().enumerate() {
+        for group_rows in groups.into_iter() {
             if group_rows.is_empty() {
                 continue;
             }
-            let pid = base_partition_id + group_idx as u16;
+            // One id per written file, skipping any id whose file still exists.
+            // A bare counter wraps at u16::MAX and would overwrite live data.
+            let pid = self.alloc_partition_id()?;
             let group_count = group_rows.len();
 
             let mut mp = MicroPartition::new(file_id, pid);
             for (col_idx, name) in self.schema.iter().enumerate() {
-                let col_vals: Vec<u64> = group_rows.iter().map(|(_, vals)| vals[col_idx]).collect();
+                let col_vals: Vec<u64> = group_rows.iter().map(|r| r.values[col_idx]).collect();
                 let encoded = if col_idx == 0 {
                     ColumnValues::Raw(col_vals)
                 } else {
@@ -1015,7 +1125,10 @@ impl TxnManager {
                 mp.push_column(name.clone(), encoded)?;
             }
 
-            // Atomic temp-then-rename write (see original comment above).
+            // Temp-then-rename so a reader never sees a half-written file. The
+            // data is synced before the rename and the directory after it:
+            // without both, a crash can leave the manifest naming a file whose
+            // contents (or name) never reached the disk.
             let filename = format!("{file_id:05}_{pid:05}.vvsst");
             let tmp_filename = format!("{file_id:05}_{pid:05}.vvsst.tmp");
             let path = self.flush_dir.join(&filename);
@@ -1023,13 +1136,24 @@ impl TxnManager {
             {
                 let mut file = std::fs::File::create(&tmp_path)?;
                 write_partition(&mut file, &mp)?;
+                if self.durable_flush {
+                    file.sync_all()?;
+                }
             }
             std::fs::rename(&tmp_path, &path)?;
+            if self.durable_flush {
+                sync_dir(&self.flush_dir)?;
+            }
 
-            let ckpt = format!(
-                "flush file_id={file_id} partition_id={pid} rows={group_count} path={filename}"
-            );
-            last_tip = Some(self.commit(ckpt.into_bytes())?);
+            // Typed checkpoint (VV-WAL-011). Recovery does not depend on it —
+            // replay reconciles against partition contents — but it gives the
+            // WAL a decodable record of every file a flush produced.
+            let ckpt = Mutation::Checkpoint {
+                table_name: filename,
+                lsn: self.wal.wal().tip().sequence,
+                timestamp: now_millis(),
+            };
+            last_tip = Some(self.commit(ckpt.encode())?);
 
             total_written += group_count;
             written.push((pid, group_rows));
@@ -1042,34 +1166,52 @@ impl TxnManager {
         });
 
         // Rebuild RowDescriptors: pending → real (file_id, partition_id, offset).
+        //
+        // Only a descriptor that still points at *this* buffered row is
+        // replaced. Between the drain and here the pk may have been deleted
+        // (no descriptor) or written again (a newer pending offset); blindly
+        // re-pointing it would resurrect the delete or roll back the newer
+        // write. The flushed copy is then garbage and is counted as such so
+        // compaction can reclaim it.
         let _base = self
             .total_rows_flushed
             .fetch_add(total_written as u64, Ordering::Relaxed);
         {
             let mut idx = self.pk_index.write();
+            let mut tombstones = self.pending_tombstones.lock();
             for (pid, group_rows) in &written {
-                for (off, (pk, _)) in group_rows.iter().enumerate() {
-                    idx.insert(*pk, RowDescriptor::new(file_id, *pid, off as u32))?;
+                for (off, row) in group_rows.iter().enumerate() {
+                    let still_this_row = idx.get(row.pk).is_some_and(|d| {
+                        d.file_id() == PENDING_FILE_ID && d.row_offset() == row.offset
+                    });
+                    if still_this_row {
+                        idx.insert(row.pk, RowDescriptor::new(file_id, *pid, off as u32))?;
+                    } else {
+                        *tombstones.entry((file_id, *pid)).or_insert(0) += 1;
+                    }
                 }
             }
         }
 
         // Every drained row now has a real descriptor, so the in-flight copies can
-        // go. Done after the index rewrite, never before.
+        // go. Done after the index rewrite, never before. A newer copy of the same
+        // pk (forced out of a full ring after this drain) is left in place.
         {
             let mut inf = self.in_flight.lock();
-            for (pk, _) in &rows {
-                inf.remove(pk);
+            for row in &rows {
+                if inf.get(&row.pk) == Some(&row.values) {
+                    inf.remove(&row.pk);
+                }
             }
         }
 
         // ZoneMap + Manifest: one entry per written partition group.
-        let mut first_pid = base_partition_id;
+        let mut first_pid = 0;
         let mut first_path = self.flush_dir.join("none");
 
         for (g_idx, (pid, group_rows)) in written.iter().enumerate() {
-            let pk_min = group_rows.iter().map(|(pk, _)| *pk).min().unwrap_or(0);
-            let pk_max = group_rows.iter().map(|(pk, _)| *pk).max().unwrap_or(0);
+            let pk_min = group_rows.iter().map(|r| r.pk).min().unwrap_or(0);
+            let pk_max = group_rows.iter().map(|r| r.pk).max().unwrap_or(0);
             self.zone_map.write().set(*pid, pk_min, pk_max);
 
             let gpath = self.flush_dir.join(format!("{file_id:05}_{pid:05}.vvsst"));
@@ -1163,7 +1305,12 @@ impl TxnManager {
     ) -> TxnResult<()> {
         let mut idx = self.pk_index.write();
         let mut flt = self.fk_filter.write();
-        for ((file_id, partition_id), reader) in partitions {
+        // Newest wins: partition ids are allocated in increasing order, so
+        // visiting them ascending leaves each pk pointing at its latest copy.
+        // HashMap order would make the winner arbitrary.
+        let mut ordered: Vec<_> = partitions.iter().collect();
+        ordered.sort_by_key(|(k, _)| **k);
+        for ((file_id, partition_id), reader) in ordered {
             let pk_col = reader.read_column(0).map_err(TxnError::Storage)?;
             let pks = pk_col.to_raw_vec();
             for (offset, &pk) in pks.iter().enumerate() {
@@ -1215,9 +1362,24 @@ impl TxnManager {
         self.total_rows_flushed.store(count, Ordering::Relaxed);
     }
 
-    /// Allocate and return the next partition ID, advancing the counter.
-    pub fn alloc_partition_id(&self) -> u16 {
-        self.next_partition_id.fetch_add(1, Ordering::Relaxed)
+    /// Allocate the next free partition ID, advancing the counter.
+    ///
+    /// The id space is `u16`, so the counter wraps; an id is only handed out
+    /// when no partition file (or in-progress temp file) with that id exists,
+    /// so wrapping reuses ids freed by compaction instead of overwriting live
+    /// data. Errors only when every id is in use.
+    pub fn alloc_partition_id(&self) -> TxnResult<u16> {
+        let file_id = self.next_file_id.load(Ordering::Relaxed);
+        for _ in 0..=u16::MAX as u32 {
+            let pid = self.next_partition_id.fetch_add(1, Ordering::Relaxed);
+            let base = format!("{file_id:05}_{pid:05}.vvsst");
+            let taken = self.flush_dir.join(&base).exists()
+                || self.flush_dir.join(format!("{base}.tmp")).exists();
+            if !taken {
+                return Ok(pid);
+            }
+        }
+        Err(TxnError::PartitionIdsExhausted)
     }
 }
 
@@ -1230,6 +1392,23 @@ fn col_value_hash(col_idx: usize, value: u64) -> u32 {
         .wrapping_add(col_idx as u64)
         .wrapping_mul(0x517c_c1b7_2722_0a95);
     (mixed ^ (mixed >> 32)) as u32
+}
+
+/// Make a rename durable by syncing its directory.
+///
+/// POSIX only persists a directory entry once the directory itself is synced.
+/// Windows cannot open a directory for syncing this way and journals the
+/// rename itself, so this is a no-op there.
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
 
 /// Wall-clock milliseconds since the Unix epoch.

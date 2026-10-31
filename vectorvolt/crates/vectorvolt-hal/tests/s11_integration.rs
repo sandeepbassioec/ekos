@@ -17,7 +17,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!("vv_s11_{name}_{}_{}",  std::process::id(), n));
+    p.push(format!("vv_s11_{name}_{}_{}", std::process::id(), n));
     p
 }
 
@@ -148,7 +148,11 @@ fn s11_linux_perf_arena_100k_lt_50ms() {
         }
         i += 1;
     }
-    assert!(t.elapsed().as_millis() < 50, "100k allocs took >50ms: {}ms", t.elapsed().as_millis());
+    assert!(
+        t.elapsed().as_millis() < 50,
+        "100k allocs took >50ms: {}ms",
+        t.elapsed().as_millis()
+    );
 }
 
 // ── 9: (Linux only) Perf — mlock 4MB < 20ms ──────────────────────────────────

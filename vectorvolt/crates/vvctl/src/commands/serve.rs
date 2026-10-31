@@ -173,12 +173,30 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_grpc: bool,
 
+    /// Interface the gRPC server binds (default loopback only).
+    #[arg(long, default_value = "127.0.0.1")]
+    pub grpc_host: std::net::IpAddr,
+
+    /// Bearer token every gRPC call must present (`authorization: Bearer …`).
+    ///
+    /// Required whenever `--secret` protects the wire listener — otherwise gRPC
+    /// would be an unauthenticated way around it — and whenever `--grpc-host`
+    /// is not a loopback address. Without it in those cases gRPC stays off.
+    /// Falls back to the `VECTORVOLT_GRPC_TOKEN` environment variable.
+    #[arg(long)]
+    pub grpc_token: Option<String>,
+
     /// Expose a Prometheus `/metrics` endpoint on this port (default 9100, 0 = disabled).
     ///
     /// Serves connections-accepted, active-connections, requests-total, errors-total,
     /// WAL entries, and byte counters in Prometheus text exposition format.
     #[arg(long, default_value = "9100")]
     pub metrics_port: u16,
+
+    /// Interface the metrics endpoint binds (default loopback only). Use
+    /// `0.0.0.0` to let a remote Prometheus scrape it.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub metrics_host: std::net::IpAddr,
 
     /// Unseal the master key from the TPM blob at `<dir>/tpm_sealed.bin` on startup.
     ///
@@ -269,7 +287,10 @@ impl Default for ServeArgs {
             xdp_ring_size: 256,
             grpc_port: 50051,
             no_grpc: false,
+            grpc_host: std::net::IpAddr::from([127, 0, 0, 1]),
+            grpc_token: None,
             metrics_port: 9100,
+            metrics_host: std::net::IpAddr::from([127, 0, 0, 1]),
             tpm_unseal: false,
             encrypt_at_rest: false,
             pgwire_port: None,
@@ -789,14 +810,35 @@ pub fn run(args: ServeArgs) -> Result<()> {
     }
 
     // ── gRPC write server (optional, VV-NET-004..016 / S16) ──────────────────
+    //
+    // gRPC writes go straight to the engine, so it must never be an open side
+    // door: once the wire listener is protected by `--secret`, or gRPC is bound
+    // beyond loopback, it only starts with a bearer token (`--grpc-token`).
+    let grpc_token = args
+        .grpc_token
+        .clone()
+        .or_else(|| std::env::var("VECTORVOLT_GRPC_TOKEN").ok())
+        .filter(|t| !t.is_empty());
+    let grpc_needs_token = args.secret.is_some() || !args.grpc_host.is_loopback();
+    let grpc_blocked = grpc_needs_token && grpc_token.is_none();
+    if grpc_blocked && !args.no_grpc && args.grpc_port > 0 {
+        eprintln!(
+            "  grpc      : disabled — set --grpc-token (or VECTORVOLT_GRPC_TOKEN) to enable it \
+             alongside --secret or a non-loopback --grpc-host"
+        );
+    }
     let mut grpc_shutdown = if !args.no_grpc
+        && !grpc_blocked
         && args.grpc_port > 0
         && let Some(ref eng) = engine
     {
-        let grpc_addr: SocketAddr = format!("127.0.0.1:{}", args.grpc_port).parse().unwrap();
+        let grpc_addr = SocketAddr::new(args.grpc_host, args.grpc_port);
         let grpc_engine = Arc::clone(eng);
         use vectorvolt_server::GrpcServer;
-        let grpc_srv = GrpcServer::standalone(grpc_addr, grpc_engine);
+        let mut grpc_srv = GrpcServer::standalone(grpc_addr, grpc_engine);
+        if let Some(token) = grpc_token {
+            grpc_srv = grpc_srv.with_token(token);
+        }
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         std::thread::Builder::new()
             .name("grpc-server".into())
@@ -813,7 +855,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .expect("spawn grpc-server thread");
         Some(tx)
     } else {
-        eprintln!("  grpc      : disabled");
+        if !grpc_blocked {
+            eprintln!("  grpc      : disabled");
+        }
         None
     };
 
@@ -933,21 +977,18 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 }
             })
             .expect("spawn metrics-sync thread");
-        let mp = args.metrics_port;
+        let metrics_addr = SocketAddr::new(args.metrics_host, args.metrics_port);
         std::thread::Builder::new()
             .name("metrics-http".into())
             .stack_size(2 * 1024 * 1024)
             .spawn(move || {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async move {
-                    MetricsServer::new(metrics_reg).serve(mp).await;
+                    MetricsServer::new(metrics_reg).serve_on(metrics_addr).await;
                 });
             })
             .expect("spawn metrics-http thread");
-        eprintln!(
-            "  metrics   : http://127.0.0.1:{}/metrics",
-            args.metrics_port
-        );
+        eprintln!("  metrics   : http://{metrics_addr}/metrics");
     } else {
         eprintln!("  metrics   : disabled (use --metrics-port to enable)");
     }

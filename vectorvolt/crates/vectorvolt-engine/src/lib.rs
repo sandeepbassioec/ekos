@@ -118,8 +118,8 @@ pub use snapshot::SnapshotMeta;
 pub use stats::EngineStats;
 pub use system_profile::SystemProfile;
 pub use txn_intent_log::{
-    IntentRecord, IntentState, RecoveryAction, TableTxn, TxnIntentLog, find_dangling,
-    recover_pending_transactions,
+    IntentRecord, IntentState, RecoveryAction, TableTxn, TableWriteSet, TxnIntentLog,
+    find_dangling, recover_pending_transactions,
 };
 pub use views::{ViewDefinition, ViewEntry, ViewKind, ViewRegistry};
 pub use vv_config::{

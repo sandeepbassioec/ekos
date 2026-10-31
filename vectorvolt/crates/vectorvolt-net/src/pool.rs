@@ -162,14 +162,9 @@ mod tests {
             };
             tokio::spawn(async move {
                 let mut conn = Connection { stream, next_id: 1 };
-                loop {
-                    match conn.recv_frame().await {
-                        Ok((_, _)) => {
-                            if conn.send_frame(Opcode::PingAck, b"").await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok((_, _)) = conn.recv_frame().await {
+                    if conn.send_frame(Opcode::PingAck, b"").await.is_err() {
+                        break;
                     }
                 }
             });

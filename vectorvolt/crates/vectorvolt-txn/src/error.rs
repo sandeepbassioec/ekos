@@ -28,6 +28,9 @@ pub enum TxnError {
 
     #[error("WAL encryption error: {0}")]
     Encryption(String),
+
+    #[error("every partition id is in use; compact the table to free some")]
+    PartitionIdsExhausted,
 }
 
 pub type TxnResult<T> = Result<T, TxnError>;

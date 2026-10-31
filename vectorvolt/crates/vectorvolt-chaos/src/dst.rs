@@ -16,12 +16,32 @@ use crate::fault::FaultInjector;
 /// The kind of event processed by the DST harness.
 #[derive(Debug, Clone)]
 pub enum DstEventKind {
-    NetworkSend { from: u64, to: u64, payload: Vec<u8> },
-    NetworkRecv { from: u64, to: u64, payload: Vec<u8> },
-    DiskWrite { node: u64, offset: u64, data: Vec<u8> },
-    DiskRead { node: u64, offset: u64, len: usize },
-    Crash { node: u64 },
-    Recover { node: u64 },
+    NetworkSend {
+        from: u64,
+        to: u64,
+        payload: Vec<u8>,
+    },
+    NetworkRecv {
+        from: u64,
+        to: u64,
+        payload: Vec<u8>,
+    },
+    DiskWrite {
+        node: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    DiskRead {
+        node: u64,
+        offset: u64,
+        len: usize,
+    },
+    Crash {
+        node: u64,
+    },
+    Recover {
+        node: u64,
+    },
     Tick,
 }
 
@@ -198,8 +218,22 @@ mod tests {
     #[test]
     fn network_send_recv_pair() {
         let mut h = DstHarness::new(0);
-        h.schedule(1, DstEventKind::NetworkSend { from: 0, to: 1, payload: vec![1, 2, 3] });
-        h.schedule(2, DstEventKind::NetworkRecv { from: 0, to: 1, payload: vec![1, 2, 3] });
+        h.schedule(
+            1,
+            DstEventKind::NetworkSend {
+                from: 0,
+                to: 1,
+                payload: vec![1, 2, 3],
+            },
+        );
+        h.schedule(
+            2,
+            DstEventKind::NetworkRecv {
+                from: 0,
+                to: 1,
+                payload: vec![1, 2, 3],
+            },
+        );
         h.run_until(10);
         assert_eq!(h.event_count(), 2);
     }
@@ -207,8 +241,22 @@ mod tests {
     #[test]
     fn disk_write_then_read() {
         let mut h = DstHarness::new(0);
-        h.schedule(1, DstEventKind::DiskWrite { node: 0, offset: 0, data: vec![0xAB] });
-        h.schedule(2, DstEventKind::DiskRead { node: 0, offset: 0, len: 1 });
+        h.schedule(
+            1,
+            DstEventKind::DiskWrite {
+                node: 0,
+                offset: 0,
+                data: vec![0xAB],
+            },
+        );
+        h.schedule(
+            2,
+            DstEventKind::DiskRead {
+                node: 0,
+                offset: 0,
+                len: 1,
+            },
+        );
         h.run_until(10);
         assert_eq!(h.event_count(), 2);
     }

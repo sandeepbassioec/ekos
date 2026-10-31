@@ -11,6 +11,7 @@ mod service;
 
 pub mod proto {
     pub mod ekos {
+        #[allow(clippy::result_large_err, clippy::double_must_use)]
         pub mod v1 {
             tonic::include_proto!("ekos.v1");
         }

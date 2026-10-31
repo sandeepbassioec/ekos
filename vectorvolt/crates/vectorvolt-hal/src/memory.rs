@@ -904,7 +904,6 @@ mod linux_mlock_tests {
     #[test]
     fn linux_mlock_non_null_ptr() {
         let mut b = vec![42u8; 4096];
-        assert!(!b.as_ptr().is_null());
         match unsafe { mlock_range(b.as_mut_ptr(), b.len()) } {
             Ok(g) => drop(g),
             Err(MlockError::Os(_)) => {}
@@ -1041,7 +1040,7 @@ mod linux_hugepage_tests {
     #[test]
     fn linux_hugepage_alloc_1_byte_rounds_up() {
         if let Some(b) = alloc_or_skip(1) {
-            assert!(b.len() >= 1);
+            assert!(!b.is_empty());
         }
     }
 
@@ -1079,7 +1078,10 @@ mod linux_hugepage_tests {
     fn linux_hugepage_graceful_fallback() {
         // HugePageBuf always falls back to regular mmap on failure — never panics
         let result = HugePageBuf::alloc(4096);
-        assert!(result.is_ok(), "must succeed via regular fallback: {result:?}");
+        assert!(
+            result.is_ok(),
+            "must succeed via regular fallback: {result:?}"
+        );
     }
 
     // 13 — buf is Send+Sync (compile-time assertion)

@@ -36,7 +36,7 @@ pub fn harden_data_dir(data_dir: &Path) -> std::io::Result<DacReport> {
             chown_recursive(data_dir)?;
             report.chown_skipped = false;
         }
-        return Ok(report);
+        Ok(report)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -125,8 +125,7 @@ pub fn ensure_system_user() -> std::io::Result<bool> {
         ])
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "useradd failed — are you running as root?",
         ));
     }

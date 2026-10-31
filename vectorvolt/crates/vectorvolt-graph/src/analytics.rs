@@ -121,7 +121,7 @@ mod tests {
         let g = CsrGraph::from_edges(&[(1, 2), (1, 3), (2, 3)]);
         let c = degree_centrality(&g);
         for &v in c.values() {
-            assert!(v >= 0.0 && v <= 1.0);
+            assert!((0.0..=1.0).contains(&v));
         }
     }
 

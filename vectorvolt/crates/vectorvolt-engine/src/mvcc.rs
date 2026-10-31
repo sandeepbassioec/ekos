@@ -108,6 +108,17 @@ impl MvccStore {
         Ok(txn.mutations)
     }
 
+    /// Copy of the pending mutations in `txn_id`, leaving the transaction open.
+    pub(crate) fn peek(&self, txn_id: TxnId) -> EngineResult<Vec<(u64, Intent)>> {
+        let guard = self.txns.lock();
+        let txn = guard.get(&txn_id).ok_or(EngineError::TxnNotFound(txn_id))?;
+        Ok(txn
+            .mutations
+            .iter()
+            .map(|(pk, i)| (*pk, i.clone()))
+            .collect())
+    }
+
     /// Discard `txn_id` without applying mutations.
     pub(crate) fn rollback(&self, txn_id: TxnId) -> EngineResult<()> {
         let removed = self.txns.lock().remove(&txn_id);

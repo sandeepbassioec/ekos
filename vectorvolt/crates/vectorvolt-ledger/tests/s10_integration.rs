@@ -12,7 +12,11 @@ fn tmpdir() -> TempDir {
 }
 
 fn line(sku: &str, qty: u32, price: i64) -> OrderLine {
-    OrderLine { sku: sku.into(), qty, unit_price_cents: price }
+    OrderLine {
+        sku: sku.into(),
+        qty,
+        unit_price_cents: price,
+    }
 }
 
 // 1. Ledger: post 10 entries, trial_balance = 0
@@ -70,12 +74,15 @@ fn workflow_diamond_dag_completes() {
     let dir = tmpdir();
     let engine = WorkflowEngine::open(dir.path()).unwrap();
     let id = engine
-        .create("diamond", vec![
-            ("s0".into(), vec![]),
-            ("s1".into(), vec![0]),
-            ("s2".into(), vec![0]),
-            ("s3".into(), vec![1, 2]),
-        ])
+        .create(
+            "diamond",
+            vec![
+                ("s0".into(), vec![]),
+                ("s1".into(), vec![0]),
+                ("s2".into(), vec![0]),
+                ("s3".into(), vec![1, 2]),
+            ],
+        )
         .unwrap();
     engine.start(id).unwrap();
     engine.complete_step(id, 0).unwrap();
@@ -161,7 +168,10 @@ fn ledger_multiple_accounts_trial_balance_zero() {
     let dir = tmpdir();
     let ledger = Ledger::open(dir.path()).unwrap();
     for i in 0..5u64 {
-        ledger.accounts.create(i, &format!("acct{i}"), "USD").unwrap();
+        ledger
+            .accounts
+            .create(i, &format!("acct{i}"), "USD")
+            .unwrap();
     }
     // Post entries in a ring: 0->1, 1->2, 2->3, 3->4, 4->0
     for i in 0..5u64 {
@@ -176,7 +186,10 @@ fn workflow_under_dst_step_order() {
     let dir = tmpdir();
     let engine = WorkflowEngine::open(dir.path()).unwrap();
     let id = engine
-        .create("dst-wf", vec![("s0".into(), vec![]), ("s1".into(), vec![0])])
+        .create(
+            "dst-wf",
+            vec![("s0".into(), vec![]), ("s1".into(), vec![0])],
+        )
         .unwrap();
     engine.start(id).unwrap();
     // Simulate step completion in DST-ordered ticks.
@@ -218,7 +231,10 @@ fn python_sdk_pyproject_exists() {
         .unwrap()
         .join("sdk/python/pyproject.toml");
     let content = std::fs::read_to_string(&p).expect("pyproject.toml not found");
-    assert!(content.contains("version = \"0.1.0\""), "version mismatch in pyproject.toml");
+    assert!(
+        content.contains("version = \"0.1.0\""),
+        "version mismatch in pyproject.toml"
+    );
 }
 
 // 14. Go SDK: go.mod exists and has correct module path

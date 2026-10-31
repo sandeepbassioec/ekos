@@ -320,6 +320,7 @@ pub fn verify_totp_secret(b32: &str, code: &str) -> bool {
 }
 
 /// Prompt the user for input via PAM conversation (no echo — for OTP/password).
+#[allow(dead_code)]
 unsafe fn pam_prompt(pamh: *mut PamHandle, prompt: &str) -> Option<String> {
     let cstr = std::ffi::CString::new(prompt).ok()?;
     let pam_msg = PamMessage {
@@ -463,6 +464,11 @@ unsafe fn get_pam_user(pamh: *mut PamHandle) -> Option<String> {
 }
 
 /// PAM authenticate — check that the user exists in VectorVolt's store.
+///
+/// # Safety
+///
+/// Called by libpam with a valid `pamh` handle and `argc`/`argv` as passed
+/// to the module; must not be called directly.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pam_sm_authenticate(
     pamh: *mut PamHandle,
@@ -616,6 +622,11 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 }
 
 /// PAM setcred — required by PAM framework, return success.
+///
+/// # Safety
+///
+/// Called by libpam with a valid `pamh` handle and `argc`/`argv` as passed
+/// to the module; must not be called directly.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pam_sm_setcred(
     _pamh: *mut PamHandle,
@@ -627,6 +638,11 @@ pub unsafe extern "C" fn pam_sm_setcred(
 }
 
 /// PAM open session — print banner + shard health check.
+///
+/// # Safety
+///
+/// Called by libpam with a valid `pamh` handle and `argc`/`argv` as passed
+/// to the module; must not be called directly.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pam_sm_open_session(
     pamh: *mut PamHandle,
@@ -643,6 +659,11 @@ pub unsafe extern "C" fn pam_sm_open_session(
 }
 
 /// PAM close session — write an audit log entry.
+///
+/// # Safety
+///
+/// Called by libpam with a valid `pamh` handle and `argc`/`argv` as passed
+/// to the module; must not be called directly.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pam_sm_close_session(
     pamh: *mut PamHandle,
@@ -671,6 +692,11 @@ pub unsafe extern "C" fn pam_sm_close_session(
 }
 
 /// PAM account management — always permit.
+///
+/// # Safety
+///
+/// Called by libpam with a valid `pamh` handle and `argc`/`argv` as passed
+/// to the module; must not be called directly.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pam_sm_acct_mgmt(
     _pamh: *mut PamHandle,
@@ -743,6 +769,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_generate_recovery_codes_returns_ten_unique_codes() {
         let user = "test_recovery_gen_unique";
         cleanup_recovery(user);
@@ -755,6 +782,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_verify_recovery_code_valid_then_single_use() {
         let user = "test_recovery_single_use";
         cleanup_recovery(user);
@@ -769,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_verify_recovery_code_rejects_unknown_code() {
         let user = "test_recovery_unknown_code";
         cleanup_recovery(user);
@@ -779,6 +808,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_verify_recovery_code_logs_audit_entry() {
         let user = "test_recovery_audit_log";
         cleanup_recovery(user);
@@ -792,6 +822,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes to /etc/vectorvolt/totp; needs root"]
     fn test_regenerate_recovery_codes_invalidates_old_ones() {
         let user = "test_recovery_regenerate";
         cleanup_recovery(user);

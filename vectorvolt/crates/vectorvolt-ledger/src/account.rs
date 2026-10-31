@@ -34,7 +34,10 @@ impl AccountStore {
         } else {
             std::collections::HashMap::new()
         };
-        Ok(Self { path, accounts: Arc::new(RwLock::new(accounts)) })
+        Ok(Self {
+            path,
+            accounts: Arc::new(RwLock::new(accounts)),
+        })
     }
 
     fn persist(&self) -> LedgerResult<()> {
@@ -49,7 +52,15 @@ impl AccountStore {
         if map.contains_key(&id) {
             return Err(LedgerError::AccountExists(id));
         }
-        map.insert(id, Account { id, name: name.to_string(), balance_cents: 0, currency: currency.to_string() });
+        map.insert(
+            id,
+            Account {
+                id,
+                name: name.to_string(),
+                balance_cents: 0,
+                currency: currency.to_string(),
+            },
+        );
         drop(map);
         self.persist()
     }

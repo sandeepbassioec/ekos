@@ -29,7 +29,7 @@ struct SumReducer {
 }
 
 impl SumReducer {
-    fn new(name: &str) -> Box<dyn Reducer> {
+    fn boxed(name: &str) -> Box<dyn Reducer> {
         Box::new(Self {
             name: name.to_string(),
             totals: HashMap::new(),
@@ -125,7 +125,7 @@ fn restore_from_snapshot_zero_opens_engine() {
 fn projection_attached_sees_inserts() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(SumReducer::new("sums"));
+    eng.attach_projection(SumReducer::boxed("sums"));
     eng.insert(1, vec![10, 20]).unwrap();
     eng.insert(2, vec![5, 5]).unwrap();
     let snap = eng.query_projection("sums").unwrap();
@@ -136,7 +136,7 @@ fn projection_attached_sees_inserts() {
 fn projection_detach_stops_updates() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(SumReducer::new("sums"));
+    eng.attach_projection(SumReducer::boxed("sums"));
     eng.insert(1, vec![1, 2]).unwrap();
     eng.detach_projection("sums");
     eng.insert(2, vec![5, 5]).unwrap();
@@ -148,8 +148,8 @@ fn projection_detach_stops_updates() {
 fn projection_names_returns_registered_names() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(SumReducer::new("p1"));
-    eng.attach_projection(SumReducer::new("p2"));
+    eng.attach_projection(SumReducer::boxed("p1"));
+    eng.attach_projection(SumReducer::boxed("p2"));
     let names = eng.projection_names();
     assert!(names.contains(&"p1".to_string()));
     assert!(names.contains(&"p2".to_string()));
@@ -159,7 +159,7 @@ fn projection_names_returns_registered_names() {
 fn delete_removes_projection_row() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
-    eng.attach_projection(SumReducer::new("sums"));
+    eng.attach_projection(SumReducer::boxed("sums"));
     eng.insert(7, vec![7, 7]).unwrap();
     eng.delete(7).unwrap();
     let snap = eng.query_projection("sums").unwrap();
@@ -231,7 +231,7 @@ fn projection_count_matches_attached() {
     let dir = TempDir::new().unwrap();
     let eng = open(&dir);
     assert_eq!(eng.projection_count(), 0);
-    eng.attach_projection(SumReducer::new("x"));
+    eng.attach_projection(SumReducer::boxed("x"));
     assert_eq!(eng.projection_count(), 1);
 }
 
