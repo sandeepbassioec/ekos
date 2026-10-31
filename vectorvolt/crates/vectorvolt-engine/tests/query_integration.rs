@@ -155,19 +155,16 @@ fn fk_exists_true_after_flush() {
 }
 
 #[test]
-fn fk_exists_true_for_deleted_pk() {
+fn fk_exists_false_for_deleted_pk() {
     let dir = TempDir::new().unwrap();
     let engine = open(&dir);
 
     engine.insert(77, vec![77, 1, 2]).unwrap();
     engine.delete(77).unwrap();
 
-    // The filter is not cleaned on delete (by design — it's write-only).
-    // Callers that need a definitive answer must also check the pk_index.
-    assert!(
-        engine.fk_exists(77),
-        "filter still contains 77 after delete"
-    );
+    // The filter keeps 77, but a positive is confirmed against the pk index,
+    // so the answer is exact (PP-39).
+    assert!(!engine.fk_exists(77), "deleted pk must not be reported");
 }
 
 #[test]
@@ -181,4 +178,38 @@ fn fk_exists_for_many_pks() {
 
     let false_negatives = (1u64..=100).filter(|&pk| !engine.fk_exists(pk)).count();
     assert_eq!(false_negatives, 0, "no false negatives allowed");
+}
+
+/// PP-39: the filter starts with room for 64 keys. Past that it used to answer
+/// "maybe" for ~3% of absent keys, and that raw answer went over the wire.
+#[test]
+fn fk_exists_exact_far_beyond_initial_filter_capacity() {
+    let dir = TempDir::new().unwrap();
+    let engine = open(&dir);
+
+    for i in 0u64..5_000 {
+        let pk = i * 2;
+        engine.insert(pk, vec![pk, 1, 2]).unwrap();
+    }
+    for i in 0u64..5_000 {
+        assert!(engine.fk_exists(i * 2), "inserted pk {} not found", i * 2);
+    }
+    let false_positives = (0u64..5_000)
+        .filter(|i| engine.fk_exists(i * 2 + 1))
+        .count();
+    assert_eq!(false_positives, 0, "absent keys reported present");
+
+    for i in 0u64..1_000 {
+        engine.delete(i * 2).unwrap();
+    }
+    assert!((0u64..1_000).all(|i| !engine.fk_exists(i * 2)));
+    assert!((1_000u64..5_000).all(|i| engine.fk_exists(i * 2)));
+
+    // Still exact across a restart (the filter is rebuilt from partitions).
+    engine.flush().unwrap();
+    drop(engine);
+    let engine = open(&dir);
+    assert!((1_000u64..5_000).all(|i| engine.fk_exists(i * 2)));
+    assert!((0u64..5_000).all(|i| !engine.fk_exists(i * 2 + 1)));
+    assert!((0u64..1_000).all(|i| !engine.fk_exists(i * 2)));
 }

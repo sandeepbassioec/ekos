@@ -16,13 +16,23 @@
 //! on one connection is invisible to another. Server-wide security state
 //! (RLS policies, table tokens, read-only mode, masks, grants, views, ...)
 //! is shared by all connections, so it cannot be reset by reconnecting.
+//!
+//! Limits and authentication:
+//! - A request line longer than [`MAX_LINE_LEN`] bytes is answered with an
+//!   error frame and the connection is closed (bounded read, no memory DoS).
+//! - If the server has an auth secret ([`SqlTcpServer::with_auth_secret`]),
+//!   the first line must be `AUTH <secret>` (constant-time compare); the
+//!   server replies `{"ok":true,"type":"ok","op":"auth"}` and only then
+//!   accepts SQL. Any other first line gets an error frame and a close.
+//!   Without a secret the protocol is unchanged.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
 
 use serde_json::{Value, json};
+use subtle::ConstantTimeEq;
 use vectorvolt_engine::TableRegistry;
 
 use crate::sql::executor::{QueryResult, SqlExecutor};
@@ -38,7 +48,13 @@ use crate::sql::executor::{QueryResult, SqlExecutor};
 /// internally synchronised.
 pub struct SqlTcpServer {
     executor: Arc<SqlExecutor>,
+    /// Secret every connection must present as `AUTH <secret>`; `None` =
+    /// no authentication.
+    auth_secret: Option<Arc<str>>,
 }
+
+/// Largest accepted request line in bytes (excluding the newline).
+pub const MAX_LINE_LEN: usize = 1024 * 1024;
 
 impl SqlTcpServer {
     pub fn new(registry: Arc<TableRegistry>) -> Self {
@@ -48,7 +64,17 @@ impl SqlTcpServer {
     /// Serve connections from sessions of an existing executor, sharing its
     /// security state (e.g. one configured with a column-encryption key).
     pub fn with_executor(executor: Arc<SqlExecutor>) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            auth_secret: None,
+        }
+    }
+
+    /// Require every connection to start with `AUTH <secret>` before any
+    /// SQL is accepted. `None` disables authentication.
+    pub fn with_auth_secret(mut self, secret: Option<String>) -> Self {
+        self.auth_secret = secret.map(Arc::from);
+        self
     }
 
     /// The shared root executor whose state every connection sees.
@@ -63,13 +89,15 @@ impl SqlTcpServer {
     pub fn listen<A: ToSocketAddrs>(&self, addr: A) -> std::io::Result<TcpListener> {
         let listener = TcpListener::bind(addr)?;
         let root = Arc::clone(&self.executor);
+        let secret = self.auth_secret.clone();
         let listener_clone = listener.try_clone()?;
         thread::spawn(move || {
             for stream in listener_clone.incoming() {
                 match stream {
                     Ok(s) => {
                         let root = Arc::clone(&root);
-                        thread::spawn(move || handle_plain(s, root));
+                        let secret = secret.clone();
+                        thread::spawn(move || handle_plain(s, root, secret));
                     }
                     Err(_) => break,
                 }
@@ -86,6 +114,7 @@ impl SqlTcpServer {
     ) -> std::io::Result<TcpListener> {
         let listener = TcpListener::bind(addr)?;
         let root = Arc::clone(&self.executor);
+        let secret = self.auth_secret.clone();
         let listener_clone = listener.try_clone()?;
         thread::spawn(move || {
             for stream in listener_clone.incoming() {
@@ -93,7 +122,8 @@ impl SqlTcpServer {
                     Ok(s) => {
                         let root = Arc::clone(&root);
                         let cfg = Arc::clone(&tls_config);
-                        thread::spawn(move || handle_tls(s, root, cfg));
+                        let secret = secret.clone();
+                        thread::spawn(move || handle_tls(s, root, cfg, secret));
                     }
                     Err(_) => break,
                 }
@@ -105,52 +135,110 @@ impl SqlTcpServer {
 
 // ── Connection handlers ───────────────────────────────────────────────────────
 
-fn handle_plain(stream: TcpStream, root: Arc<SqlExecutor>) {
-    let executor = root.new_session();
-    let mut reader = BufReader::new(stream);
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let response = handle_request(&executor, trimmed);
-        let mut out = response.to_string();
-        out.push('\n');
-        if reader.get_mut().write_all(out.as_bytes()).is_err() {
-            break;
-        }
-    }
+fn handle_plain(stream: TcpStream, root: Arc<SqlExecutor>, secret: Option<Arc<str>>) {
+    serve_lines(BufReader::new(stream), &root, secret.as_deref());
 }
 
-fn handle_tls(stream: TcpStream, root: Arc<SqlExecutor>, tls_config: Arc<rustls::ServerConfig>) {
+fn handle_tls(
+    stream: TcpStream,
+    root: Arc<SqlExecutor>,
+    tls_config: Arc<rustls::ServerConfig>,
+    secret: Option<Arc<str>>,
+) {
     let conn = match rustls::ServerConnection::new(tls_config) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let executor = root.new_session();
     let tls_stream = rustls::StreamOwned::new(conn, stream);
-    let mut reader = BufReader::new(tls_stream);
+    serve_lines(BufReader::new(tls_stream), &root, secret.as_deref());
+}
+
+/// Outcome of one bounded line read.
+enum Line {
+    /// A complete line (or the final unterminated line before EOF).
+    Data(String),
+    /// End of stream, an I/O error or invalid UTF-8: end the connection.
+    Closed,
+    /// The line exceeded [`MAX_LINE_LEN`].
+    TooLong,
+}
+
+/// Read one `\n`-terminated line, buffering at most `max + 1` bytes.
+fn read_bounded_line<R: BufRead>(reader: &mut R, max: usize) -> Line {
+    let mut buf = Vec::new();
+    match reader
+        .by_ref()
+        .take(max as u64 + 1)
+        .read_until(b'\n', &mut buf)
+    {
+        Ok(0) | Err(_) => return Line::Closed,
+        Ok(_) => {}
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    } else if buf.len() > max {
+        return Line::TooLong;
+    }
+    match String::from_utf8(buf) {
+        Ok(s) => Line::Data(s),
+        Err(_) => Line::Closed,
+    }
+}
+
+/// Write one JSON response frame; `false` if the peer has gone away.
+fn send_frame<S: Write>(stream: &mut S, frame: &Value) -> bool {
+    let mut out = frame.to_string();
+    out.push('\n');
+    stream.write_all(out.as_bytes()).is_ok()
+}
+
+/// Does `line` carry `AUTH <secret>`? The secret is compared in constant
+/// time.
+fn auth_line_ok(line: &str, secret: &str) -> bool {
+    match line.trim_end_matches('\r').strip_prefix("AUTH ") {
+        Some(supplied) => bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())),
+        None => false,
+    }
+}
+
+/// Serve one connection: the optional `AUTH` handshake, then one JSON
+/// request per line, each answered with one JSON response line.
+fn serve_lines<S: Read + Write>(
+    mut reader: BufReader<S>,
+    root: &SqlExecutor,
+    secret: Option<&str>,
+) {
+    let executor = root.new_session();
+    let mut authed = secret.is_none();
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
+        let line = match read_bounded_line(&mut reader, MAX_LINE_LEN) {
+            Line::Data(l) => l,
+            Line::Closed => break,
+            Line::TooLong => {
+                let err = format!("request line exceeds {MAX_LINE_LEN} bytes");
+                let _ = send_frame(reader.get_mut(), &json!({"ok": false, "error": err}));
+                break;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
+        if !authed {
+            if secret.is_some_and(|s| auth_line_ok(&line, s)) {
+                authed = true;
+                let ok = json!({"ok": true, "type": "ok", "op": "auth"});
+                if !send_frame(reader.get_mut(), &ok) {
+                    break;
+                }
+                continue;
+            }
+            let err = "authentication required: send AUTH <secret>";
+            let _ = send_frame(reader.get_mut(), &json!({"ok": false, "error": err}));
+            break;
+        }
         let response = handle_request(&executor, trimmed);
-        let mut out = response.to_string();
-        out.push('\n');
-        if reader.get_mut().write_all(out.as_bytes()).is_err() {
+        if !send_frame(reader.get_mut(), &response) {
             break;
         }
     }
@@ -218,6 +306,16 @@ impl SqlSession {
             writer: stream,
             reader,
         })
+    }
+
+    /// Send `AUTH <secret>` and return the parsed JSON response.
+    pub fn auth(&mut self, secret: &str) -> serde_json::Result<Value> {
+        self.writer
+            .write_all(format!("AUTH {secret}\n").as_bytes())
+            .unwrap();
+        let mut line = String::new();
+        self.reader.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim())
     }
 
     /// Send one SQL statement and return the parsed JSON response.
@@ -359,6 +457,95 @@ mod tests {
         assert_eq!(r["ok"], true, "{r}");
         let r = s2.query("SELECT * FROM rls").unwrap();
         assert_eq!(r["ok"], false, "{r}");
+    }
+
+    // ── B14: bounded lines + optional AUTH ───────────────────────────────────
+
+    fn start_auth_server(secret: &str) -> (SqlTcpServer, TcpListener, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let registry = Arc::new(TableRegistry::open(dir.path(), EngineOptions::default()).unwrap());
+        let server =
+            SqlTcpServer::new(Arc::clone(&registry)).with_auth_secret(Some(secret.to_owned()));
+        let listener = server.listen("127.0.0.1:0").unwrap();
+        (server, listener, dir)
+    }
+
+    /// Read whatever the server sends until it closes the connection.
+    fn read_until_close(s: &mut SqlSession) -> String {
+        let mut out = String::new();
+        let _ = s.reader.read_to_string(&mut out);
+        out
+    }
+
+    #[test]
+    fn test_b14_overlong_line_rejected_and_closed() {
+        let (_srv, listener, _dir) = start_server();
+        let mut s = session(&listener);
+        // Exactly MAX_LINE_LEN + 1 bytes with no newline: the server must
+        // stop buffering, answer with an error and close.
+        s.writer.write_all(&vec![b'a'; MAX_LINE_LEN + 1]).unwrap();
+        let reply = read_until_close(&mut s);
+        let v: Value = serde_json::from_str(reply.trim()).unwrap();
+        assert_eq!(v["ok"], false, "{reply}");
+        assert!(v["error"].as_str().unwrap().contains("exceeds"), "{reply}");
+    }
+
+    #[test]
+    fn test_b14_line_under_limit_still_works() {
+        let (_srv, listener, _dir) = start_server();
+        let mut s = session(&listener);
+        // A 200 KB request line is well under MAX_LINE_LEN.
+        let sql = format!("CREATE TABLE wide (pk U64){}", " ".repeat(200 * 1024));
+        let r = s.query(&sql).unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+    }
+
+    #[test]
+    fn test_b14_auth_good_secret_then_sql() {
+        let (_srv, listener, _dir) = start_auth_server("t0ken");
+        let mut s = session(&listener);
+        let r = s.auth("t0ken").unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["op"], "auth");
+        let r = s.query("CREATE TABLE a (pk U64)").unwrap();
+        assert_eq!(r["op"], "created", "{r}");
+    }
+
+    #[test]
+    fn test_b14_auth_bad_secret_rejected_and_closed() {
+        let (_srv, listener, _dir) = start_auth_server("t0ken");
+        let mut s = session(&listener);
+        let r = s.auth("wrong").unwrap();
+        assert_eq!(r["ok"], false, "{r}");
+        // Connection is closed: nothing more arrives.
+        assert_eq!(read_until_close(&mut s), "");
+    }
+
+    #[test]
+    fn test_b14_auth_required_before_sql() {
+        let (_srv, listener, _dir) = start_auth_server("t0ken");
+        let mut s = session(&listener);
+        let r = s.query("CREATE TABLE b (pk U64)").unwrap();
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].as_str().unwrap().contains("AUTH"), "{r}");
+        assert_eq!(read_until_close(&mut s), "");
+        // The rejected statement never ran.
+        let mut s2 = session(&listener);
+        s2.auth("t0ken").unwrap();
+        let r = s2.query("CREATE TABLE b (pk U64)").unwrap();
+        assert_eq!(r["op"], "created", "{r}");
+    }
+
+    #[test]
+    fn test_b14_no_secret_ignores_auth_handshake() {
+        // Without a secret the protocol is unchanged: SQL is accepted
+        // immediately (an AUTH line is just an invalid JSON request).
+        let (_srv, listener, _dir) = start_server();
+        let mut s = session(&listener);
+        let r = s.auth("anything").unwrap();
+        assert_eq!(r["ok"], false, "{r}");
+        let r = s.query("CREATE TABLE c (pk U64)").unwrap();
+        assert_eq!(r["op"], "created", "{r}");
     }
 
     // ── TLS helpers (S36) ─────────────────────────────────────────────────────

@@ -46,6 +46,8 @@ fn start_multi_with_pgwire(
         max_connections: 32,
         secret: None,
         key_id: "default".into(),
+        key_scope: None,
+        key_file: None,
         cert: None,
         key: None,
         multi: true,

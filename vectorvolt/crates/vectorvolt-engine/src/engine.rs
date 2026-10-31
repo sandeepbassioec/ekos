@@ -103,6 +103,15 @@ pub struct TableEngine {
     /// Durable append-only log of every [`ChangeEvent`] published by this
     /// table.  Enables SSE replay (`?from=<lsn>`) and view backfill.
     pub(crate) cdc_log: CdcLog,
+    /// CDC appends that failed after their mutation was already committed
+    /// (B17). See [`TableEngine::cdc_health`].
+    pub(crate) cdc_append_failures: std::sync::atomic::AtomicU64,
+    /// Lowest / highest LSN whose CDC append failed (0 = none).
+    pub(crate) cdc_gap_first: std::sync::atomic::AtomicU64,
+    pub(crate) cdc_gap_last: std::sync::atomic::AtomicU64,
+    /// Held while the fk filter is being rebuilt, so only one rebuild runs
+    /// at a time (B20). See [`TableEngine::fk_exists`].
+    pub(crate) fk_rebuild: parking_lot::Mutex<()>,
     /// CQRS projection store — mutations are fanned to attached reducers.
     pub(crate) projections: parking_lot::Mutex<vectorvolt_projection::ProjectionStore>,
     /// HNSW vector index sidecar — one index per vector column (keyed by col_idx).
@@ -262,6 +271,126 @@ fn parse_partition_name(name: &str) -> Option<(u16, u16)> {
     let stem = name.strip_suffix(".vvsst")?;
     let (f, p) = stem.split_once('_')?;
     Some((f.parse().ok()?, p.parse().ok()?))
+}
+
+/// Result of folding a range of WAL frames into per-pk final states.
+pub(crate) struct WalFold {
+    /// Final state of every pk touched in the range: `Some(values)` for a
+    /// live row, `None` for a delete.
+    pub(crate) state: HashMap<u64, Option<Vec<u64>>>,
+    /// Sequence of the first frame in the log (any payload), if any.
+    pub(crate) first_seq: Option<u64>,
+    /// Sequence of the last frame read (any payload); 0 if none.
+    pub(crate) last_seq: u64,
+}
+
+/// Verify the keyed WAL tail seal when the table is encrypted (PP-38).
+pub(crate) fn verify_wal_seal(
+    wal_dir: &std::path::Path,
+    wal_key: Option<&Arc<vectorvolt_crypto::KeyStore>>,
+) -> EngineResult<()> {
+    if let Some(key) = wal_key {
+        let seal_key = vectorvolt_wal::seal::derive_seal_key(key.as_bytes());
+        vectorvolt_wal::seal::verify_seal(wal_dir, &seal_key)?;
+    }
+    Ok(())
+}
+
+/// Fold every WAL frame with `after < sequence <= upto` into the final state
+/// of each pk it touches, in WAL order — exactly the order the live writes
+/// were applied. Used both by open-time recovery (`upto = u64::MAX`) and by
+/// point-in-time restore (`upto` = the target sequence). Frames above `upto`
+/// are never read.
+///
+/// A frame that fails its checksum is an error, not a reason to skip the rest
+/// of the log: torn tails were already cut back by `WalWriter::open`, so
+/// anything still undecodable is real corruption (PP-02). Payloads that are
+/// not mutations (legacy flush strings, snapshot markers) are skipped.
+///
+/// An encrypted frame must decrypt. A wrong key, a tampered frame, or reading
+/// an encrypted table without its key fails with `WalDecrypt` instead of
+/// silently dropping the rows (A8 / PP-52). Plaintext frames (markers, and
+/// frames written before encryption was turned on) are read as they are.
+pub(crate) fn fold_wal(
+    wal_dir: &std::path::Path,
+    after: u64,
+    upto: u64,
+    wal_key: Option<&Arc<vectorvolt_crypto::KeyStore>>,
+) -> EngineResult<WalFold> {
+    let mut fold = WalFold {
+        state: HashMap::new(),
+        first_seq: None,
+        last_seq: 0,
+    };
+    let mut decrypt_err: Option<EngineError> = None;
+    let wal_cfg = WalConfig::default().with_dir(wal_dir).with_fsync(false);
+    WalReader::open(wal_cfg).scan(vectorvolt_wal::WalCursor::beginning(), |frame| {
+        if frame.sequence > upto {
+            return false;
+        }
+        fold.first_seq.get_or_insert(frame.sequence);
+        fold.last_seq = frame.sequence;
+        if frame.sequence <= after {
+            return true;
+        }
+        let payload = if vectorvolt_crypto::is_encrypted(&frame.payload) {
+            let Some(key) = wal_key else {
+                decrypt_err = Some(EngineError::WalDecrypt {
+                    seq: frame.sequence,
+                    reason: "frame is encrypted but no key was provided".into(),
+                });
+                return false;
+            };
+            match vectorvolt_crypto::decrypt(key, &frame.payload) {
+                Ok(p) => p,
+                Err(e) => {
+                    decrypt_err = Some(EngineError::WalDecrypt {
+                        seq: frame.sequence,
+                        reason: e.to_string(),
+                    });
+                    return false;
+                }
+            }
+        } else {
+            frame.payload
+        };
+        let final_state = &mut fold.state;
+        match Mutation::decode(&payload) {
+            Ok(Mutation::Insert { pk, values })
+            | Ok(Mutation::Upsert { pk, values })
+            | Ok(Mutation::Update { pk, values }) => {
+                final_state.insert(pk, Some(values));
+            }
+            Ok(Mutation::Delete { pk }) => {
+                final_state.insert(pk, None);
+            }
+            Ok(Mutation::InsertBatch { rows }) | Ok(Mutation::UpsertBatch { rows }) => {
+                for (pk, values) in rows {
+                    final_state.insert(pk, Some(values));
+                }
+            }
+            Ok(Mutation::DeleteBatch { pks }) => {
+                for pk in pks {
+                    final_state.insert(pk, None);
+                }
+            }
+            Ok(Mutation::TxnBatch { ops }) => {
+                for (pk, op) in ops {
+                    final_state.insert(pk, op);
+                }
+            }
+            Ok(Mutation::Checkpoint { .. })
+            | Ok(Mutation::DdlCreate { .. })
+            | Ok(Mutation::DdlDrop { .. })
+            | Ok(Mutation::DdlAlter { .. })
+            | Err(_) => {}
+        }
+        true
+    })?;
+    if let Some(e) = decrypt_err {
+        return Err(e);
+    }
+    Ok(fold)
 }
 
 impl TableEngine {
@@ -523,86 +652,11 @@ impl TableEngine {
         // being re-flushed on every open (PP-10), and makes the outcome
         // independent of which duplicate copy the index rebuild picked (PP-09).
         //
-        // A frame that fails its checksum is an error, not a reason to skip the
-        // rest of the log: torn tails were already cut back by `WalWriter::open`,
-        // so anything still undecodable here is real corruption (PP-02).
-        // Payloads that are not mutations (legacy flush strings, snapshot
-        // markers) are skipped.
-        //
-        // An encrypted frame must decrypt. A wrong key, a tampered frame, or
-        // opening an encrypted table without its key stops the open with
-        // `WalDecrypt` instead of silently dropping the rows (A8 / PP-52).
-        // Plaintext frames (markers, and frames written before encryption was
-        // turned on) are read as they are.
+        // Corrupt and undecryptable frames are errors; see `fold_wal`.
         // With a key, the log must still match its keyed tail seal: this is
         // what catches a truncated or rewritten WAL that still chains (PP-38).
-        if let Some(key) = &wal_key {
-            let seal_key = vectorvolt_wal::seal::derive_seal_key(key.as_bytes());
-            vectorvolt_wal::seal::verify_seal(&wal_dir, &seal_key)?;
-        }
-        let mut final_state: HashMap<u64, Option<Vec<u64>>> = HashMap::new();
-        let mut decrypt_err: Option<EngineError> = None;
-        let wal_cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
-        WalReader::open(wal_cfg).scan(vectorvolt_wal::WalCursor::beginning(), |frame| {
-            if frame.sequence <= replay_after {
-                return true;
-            }
-            let payload = if vectorvolt_crypto::is_encrypted(&frame.payload) {
-                let Some(key) = &wal_key else {
-                    decrypt_err = Some(EngineError::WalDecrypt {
-                        seq: frame.sequence,
-                        reason: "frame is encrypted but no key was provided".into(),
-                    });
-                    return false;
-                };
-                match vectorvolt_crypto::decrypt(key, &frame.payload) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        decrypt_err = Some(EngineError::WalDecrypt {
-                            seq: frame.sequence,
-                            reason: e.to_string(),
-                        });
-                        return false;
-                    }
-                }
-            } else {
-                frame.payload
-            };
-            match Mutation::decode(&payload) {
-                Ok(Mutation::Insert { pk, values })
-                | Ok(Mutation::Upsert { pk, values })
-                | Ok(Mutation::Update { pk, values }) => {
-                    final_state.insert(pk, Some(values));
-                }
-                Ok(Mutation::Delete { pk }) => {
-                    final_state.insert(pk, None);
-                }
-                Ok(Mutation::InsertBatch { rows }) | Ok(Mutation::UpsertBatch { rows }) => {
-                    for (pk, values) in rows {
-                        final_state.insert(pk, Some(values));
-                    }
-                }
-                Ok(Mutation::DeleteBatch { pks }) => {
-                    for pk in pks {
-                        final_state.insert(pk, None);
-                    }
-                }
-                Ok(Mutation::TxnBatch { ops }) => {
-                    for (pk, op) in ops {
-                        final_state.insert(pk, op);
-                    }
-                }
-                Ok(Mutation::Checkpoint { .. })
-                | Ok(Mutation::DdlCreate { .. })
-                | Ok(Mutation::DdlDrop { .. })
-                | Ok(Mutation::DdlAlter { .. })
-                | Err(_) => {}
-            }
-            true
-        })?;
-        if let Some(e) = decrypt_err {
-            return Err(e);
-        }
+        verify_wal_seal(&wal_dir, wal_key.as_ref())?;
+        let final_state = fold_wal(&wal_dir, replay_after, u64::MAX, wal_key.as_ref())?.state;
 
         for (pk, state) in final_state {
             let current = txn.pk_index.read().get(pk);
@@ -663,6 +717,10 @@ impl TableEngine {
             changes_tx,
             lsn_counter: std::sync::atomic::AtomicU64::new(max_lsn),
             cdc_log,
+            cdc_append_failures: std::sync::atomic::AtomicU64::new(0),
+            cdc_gap_first: std::sync::atomic::AtomicU64::new(0),
+            cdc_gap_last: std::sync::atomic::AtomicU64::new(0),
+            fk_rebuild: parking_lot::Mutex::new(()),
             projections: parking_lot::Mutex::new(vectorvolt_projection::ProjectionStore::new()),
             vector_indexes: parking_lot::RwLock::new(std::collections::HashMap::new()),
         };
@@ -691,6 +749,56 @@ impl TableEngine {
     /// CDC log without parsing JSON bodies.
     pub fn cdc_log_stats(&self) -> EngineResult<crate::cdc_log::CdcLogStats> {
         Ok(self.cdc_log.stats()?)
+    }
+
+    /// Persist `ev` to the CDC log.
+    ///
+    /// Runs after the mutation is committed to the WAL, so a failure here
+    /// must not be reported to the caller as a failed write — the write
+    /// happened and is durable. Instead the failure is logged, counted, and
+    /// recorded as an LSN gap: the failed LSN is never reused in this
+    /// process, the log is cut back to its last complete record, and
+    /// consumers see the hole both as a missing LSN in
+    /// [`read_log_from`](Self::read_log_from) and through
+    /// [`cdc_health`](Self::cdc_health). Live subscribers still receive the
+    /// event: it describes a committed change.
+    fn persist_cdc(&self, ev: &ChangeEvent) {
+        use std::sync::atomic::Ordering;
+        if let Err(e) = self.cdc_log.append(ev) {
+            self.cdc_append_failures.fetch_add(1, Ordering::Relaxed);
+            let _ = self.cdc_gap_first.compare_exchange(
+                0,
+                ev.lsn,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            self.cdc_gap_first.fetch_min(ev.lsn, Ordering::Relaxed);
+            self.cdc_gap_last.fetch_max(ev.lsn, Ordering::Relaxed);
+            tracing::error!(
+                lsn = ev.lsn,
+                pk = ev.pk,
+                error = %e,
+                "CDC log append failed after commit; CDC stream now has a gap"
+            );
+        }
+    }
+
+    /// Whether the persisted CDC stream is complete for this process.
+    ///
+    /// `append_failures > 0` means at least one committed change is missing
+    /// from the CDC log; `gap_first_lsn..=gap_last_lsn` bounds the missing
+    /// LSNs. Consumers that need a complete stream must resynchronise from a
+    /// full scan rather than trust the log across that range.
+    pub fn cdc_health(&self) -> crate::cdc_log::CdcHealth {
+        use std::sync::atomic::Ordering;
+        let failures = self.cdc_append_failures.load(Ordering::Relaxed);
+        let first = self.cdc_gap_first.load(Ordering::Relaxed);
+        let last = self.cdc_gap_last.load(Ordering::Relaxed);
+        crate::cdc_log::CdcHealth {
+            append_failures: failures,
+            gap_first_lsn: (first != 0).then_some(first),
+            gap_last_lsn: (last != 0).then_some(last),
+        }
     }
 
     /// Rewrite the CDC log keeping only events with `lsn >= retain_lsn`.
@@ -790,7 +898,7 @@ impl TableEngine {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             let ev = ChangeEvent::insert(lsn, pk, vals.clone());
-            let _ = self.cdc_log.append(&ev);
+            self.persist_cdc(&ev);
             let _ = self.changes_tx.send(ev);
             self.projections
                 .lock()
@@ -821,7 +929,7 @@ impl TableEngine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let ev = ChangeEvent::delete(lsn, pk);
-        let _ = self.cdc_log.append(&ev);
+        self.persist_cdc(&ev);
         let _ = self.changes_tx.send(ev);
         self.projections
             .lock()
@@ -868,7 +976,7 @@ impl TableEngine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let ev = ChangeEvent::insert(lsn, pk, new_values);
-        let _ = self.cdc_log.append(&ev);
+        self.persist_cdc(&ev);
         let _ = self.changes_tx.send(ev);
         Ok(tip)
     }
@@ -888,21 +996,35 @@ impl TableEngine {
     // -- Vector sidecar -----------------------------------------------------------
 
     /// Insert a vector for `pk` into the HNSW sidecar for `col_idx`.
-    pub fn insert_vector(&self, col_idx: usize, pk: u64, vector: Vec<f32>) {
+    ///
+    /// A vector with a NaN or infinite component is rejected (`InvalidVector`):
+    /// it has no meaningful distance to anything.
+    pub fn insert_vector(&self, col_idx: usize, pk: u64, vector: Vec<f32>) -> EngineResult<()> {
         let mut indexes = self.vector_indexes.write();
         let idx = indexes
             .entry(col_idx)
             .or_insert_with(|| vectorvolt_vector::HnswIndex::new(16, 200));
-        idx.insert(pk, vector);
+        idx.try_insert(pk, vector)
+            .map_err(|e| EngineError::InvalidVector(e.to_string()))
     }
 
     /// Return the k nearest neighbours to `query` in the HNSW index for `col_idx`.
-    pub fn search_vector(&self, col_idx: usize, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+    ///
+    /// A non-finite query is rejected (`InvalidVector`) rather than answered
+    /// with an empty result.
+    pub fn search_vector(
+        &self,
+        col_idx: usize,
+        query: &[f32],
+        k: usize,
+    ) -> EngineResult<Vec<(u64, f32)>> {
         let indexes = self.vector_indexes.read();
-        indexes
-            .get(&col_idx)
-            .map(|idx| idx.search(query, k))
-            .unwrap_or_default()
+        match indexes.get(&col_idx) {
+            Some(idx) => idx
+                .try_search(query, k)
+                .map_err(|e| EngineError::InvalidVector(e.to_string())),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Retrieve the stored vector for `pk` from the HNSW index for `col_idx`.
@@ -1181,11 +1303,19 @@ impl TableEngine {
     pub fn compact(&self) -> EngineResult<Option<CompactResult>> {
         self.do_flush()?;
 
-        let mut parts = self.partitions.write();
-        let mut pending = self.pending_partitions.write();
-        if parts.is_empty() && pending.is_empty() {
+        if self.partitions.read().is_empty() && self.pending_partitions.read().is_empty() {
             return Ok(None);
         }
+
+        // Build the merged output first, without the partition locks: reads and
+        // writes keep running against the current files while the merge runs
+        // (B24). Only the swap below needs readers out of the way.
+        let prepared = self
+            .txn
+            .prepare_compaction(self.compaction_strategy, self.write_options)?;
+
+        let mut parts = self.partitions.write();
+        let mut pending = self.pending_partitions.write();
 
         // Release every mapping before the executor tries to delete input files.
         // Pending (peeked-only) partitions hold no mapping, but are cleared too:
@@ -1195,9 +1325,7 @@ impl TableEngine {
         parts.clear();
         pending.clear();
 
-        let outcomes = self
-            .txn
-            .run_compaction(self.compaction_strategy, self.write_options)?;
+        let outcomes = self.txn.install_compaction(prepared)?;
 
         // Re-open whatever the manifest now says is live. Driven by the manifest
         // rather than by a directory scan, so an orphan left by an interrupted run
@@ -1364,7 +1492,12 @@ impl TableEngine {
         for ((file_id, partition_id), reader) in ordered {
             for row in 0..reader.row_count() as usize {
                 let pk = reader.read_value(0, row)?;
-                let _ = idx.insert(pk, RowDescriptor::new(*file_id, *partition_id, row as u32));
+                // A dropped entry here is a row that silently vanishes from
+                // every read, so a failed insert fails the rebuild (B18).
+                idx.insert(pk, RowDescriptor::new(*file_id, *partition_id, row as u32))
+                    .map_err(|e| {
+                        EngineError::Other(format!("pk index rebuild failed at pk {pk}: {e}"))
+                    })?;
                 total += 1;
             }
         }
@@ -1400,11 +1533,73 @@ impl TableEngine {
         Ok(rows)
     }
 
-    /// Probabilistic check: was `value` ever inserted as a PK?
+    /// Exact check: is `value` currently a live PK of this table?
     ///
-    /// False positive rate â‰ˆ 0.78%; false negatives are impossible.
+    /// The cuckoo filter answers "definitely not" cheaply; a positive is
+    /// only a "maybe" (stale keys from deletes, ~3% fingerprint collisions at
+    /// full load), so it is confirmed against the pk index, which holds every
+    /// live row — buffered or flushed. Returning the raw filter answer, as
+    /// this once did, told FK checks that absent rows existed (PP-39).
     pub fn fk_exists(&self, value: u64) -> bool {
-        self.txn.fk_check(value)
+        self.maybe_rebuild_fk_filter();
+        if !self.txn.fk_check(value) {
+            return false;
+        }
+        self.txn.pk_index.read().get(value).is_some()
+    }
+
+    /// Rebuild the fk filter from the pk index when it has outgrown its
+    /// buckets or is mostly stale.
+    ///
+    /// `TxnManager` creates the filter with room for 64 keys and the filter
+    /// cannot grow in place (it stores fingerprints, not keys, so nothing can
+    /// be rehashed). Past capacity every key lands in its exact overflow set
+    /// and the saturated buckets answer "maybe" for ~3% of absent keys. The
+    /// pk index does hold the keys, so the filter is rebuilt from it at
+    /// twice the live count — amortised O(1) per insert. The rebuild also
+    /// drops keys deleted since the last one: deletes do not remove keys
+    /// from the filter, because `TxnManager::delete` cannot tell two racing
+    /// deletes of one pk apart, and removing a key twice could remove a
+    /// colliding key's fingerprint (a false negative).
+    pub(crate) fn maybe_rebuild_fk_filter(&self) {
+        let (len, cap) = {
+            let f = self.txn.fk_filter.read();
+            (f.len(), f.capacity())
+        };
+        if len < cap && len <= 2 * self.txn.pk_index.read().len() + 64 {
+            return;
+        }
+        let Some(_rebuilding) = self.fk_rebuild.try_lock() else {
+            return;
+        };
+        let snapshot: HashSet<u64> = self.txn.pk_index.read().iter().map(|(k, _)| k).collect();
+        let mut fresh = vectorvolt_index::CuckooFilter::with_capacity((snapshot.len() * 2).max(64));
+        for &k in &snapshot {
+            if let Err(e) = fresh.insert(k) {
+                tracing::error!(error = %e, "fk filter rebuild aborted; keeping old filter");
+                return;
+            }
+        }
+        *self.txn.fk_filter.write() = fresh;
+        // An insert adds its key to the filter before it indexes the pk. One
+        // that put its key into the old filter but was not yet indexed when
+        // the snapshot was taken is finished once `quiesced_tip` returns, so
+        // the second pass below catches it.
+        let _ = self.txn.quiesced_tip();
+        let late: Vec<u64> = self
+            .txn
+            .pk_index
+            .read()
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| !snapshot.contains(k))
+            .collect();
+        let mut filter = self.txn.fk_filter.write();
+        for k in late {
+            if let Err(e) = filter.insert(k) {
+                tracing::error!(pk = k, error = %e, "fk filter rebuild: late insert failed");
+            }
+        }
     }
 
     /// Snapshot of current engine state (non-flushing).
@@ -1696,7 +1891,7 @@ impl TableEngine {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         + 1;
                     let ev = ChangeEvent::insert(lsn, pk, values.clone());
-                    let _ = self.cdc_log.append(&ev);
+                    self.persist_cdc(&ev);
                     let _ = self.changes_tx.send(ev);
                     self.projections
                         .lock()
@@ -1715,7 +1910,7 @@ impl TableEngine {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         + 1;
                     let ev = ChangeEvent::delete(lsn, pk);
-                    let _ = self.cdc_log.append(&ev);
+                    self.persist_cdc(&ev);
                     let _ = self.changes_tx.send(ev);
                     self.projections
                         .lock()
@@ -1762,5 +1957,49 @@ impl TableEngine {
             .into_iter()
             .map(|(pk, values)| EngineRow { pk, values })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod cdc_failure_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// B17: a CDC append that fails after commit is observable — counted,
+    /// reported as a gap, and leaves the log readable — while the write
+    /// itself stands.
+    #[test]
+    fn failed_cdc_append_is_observable_and_leaves_a_clean_gap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let eng = TableEngine::open_with(
+            vec!["pk".into(), "v".into()],
+            dir.path(),
+            EngineOptions::new(1000).with_durability(Durability::WriteOnly),
+        )
+        .unwrap();
+        assert_eq!(eng.cdc_health(), crate::cdc_log::CdcHealth::default());
+
+        eng.insert(1, vec![1, 10]).unwrap();
+        eng.cdc_log.fail_next.store(1, Ordering::SeqCst);
+        eng.insert(2, vec![2, 20]).unwrap();
+        eng.delete(1).unwrap();
+
+        // The committed writes are not undone by the CDC failure.
+        assert!(eng.get(1).unwrap().is_none());
+        assert_eq!(eng.get(2).unwrap().unwrap().values, vec![2, 20]);
+
+        let health = eng.cdc_health();
+        assert_eq!(health.append_failures, 1);
+        assert_eq!(health.gap_first_lsn, Some(2));
+        assert_eq!(health.gap_last_lsn, Some(2));
+
+        // The partial record was cut back: the log parses past the gap.
+        let lsns: Vec<u64> = eng
+            .read_log_from(0)
+            .unwrap()
+            .iter()
+            .map(|e| e.lsn)
+            .collect();
+        assert_eq!(lsns, vec![1, 3]);
     }
 }

@@ -24,9 +24,13 @@
 //!
 //! ## Sentinel
 //!
-//! `u64::MAX` is reserved as the empty-slot sentinel. Keys equal to `u64::MAX`
-//! are rejected with `IndexError::MapFull` — in practice PK values never reach
-//! this (they are sequence numbers or hashes with the top bit masked off).
+//! `u64::MAX` is the empty-slot sentinel inside the bucket array, so the key
+//! `u64::MAX` itself can never live in a bucket. It is still a valid key: its
+//! entry is stored out of band in a dedicated `max_key` slot that `get`,
+//! `insert`, `remove`, `iter` and `len` all consult. (It used to be guarded
+//! only by a `debug_assert!`, so in release builds an `insert(u64::MAX, ..)`
+//! was written into a bucket indistinguishable from an empty one, and a
+//! `get(u64::MAX)` "found" whatever empty bucket its home hashed to.)
 
 use crate::{IndexError, IndexResult, RowDescriptor};
 
@@ -156,7 +160,11 @@ pub struct CuckooMap {
     buckets: Vec<Bucket>,
     /// `capacity - 1`: used as a bitmask for fast modulo (capacity is always power-of-2).
     mask: usize,
+    /// Number of entries in `buckets` (excludes `max_key`).
     len: usize,
+    /// Out-of-band entry for the key `u64::MAX`, which collides with the
+    /// bucket sentinel `EMPTY` and so cannot be stored in `buckets`.
+    max_key: Option<RowDescriptor>,
 }
 
 impl CuckooMap {
@@ -167,19 +175,20 @@ impl CuckooMap {
             buckets: vec![Bucket::empty(); cap],
             mask: cap - 1,
             len: 0,
+            max_key: None,
         }
     }
 
     /// Number of entries currently stored.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.len + usize::from(self.max_key.is_some())
     }
 
     /// True if no entries are stored.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     /// Allocated slot count (always a power of two).
@@ -193,7 +202,9 @@ impl CuckooMap {
     /// Exactly 2 memory probes — O(1) worst case.
     #[inline]
     pub fn get(&self, key: u64) -> Option<RowDescriptor> {
-        debug_assert_ne!(key, EMPTY, "u64::MAX is reserved as empty sentinel");
+        if key == EMPTY {
+            return self.max_key;
+        }
         let b = &self.buckets;
         let (i1, i2) = homes(key, self.mask);
         if b[i1].key == key {
@@ -220,7 +231,10 @@ impl CuckooMap {
     /// `MAX_GROW_RETRIES` consecutive attempts all fail, which requires a
     /// pathological hash rather than mere load.
     pub fn insert(&mut self, key: u64, value: RowDescriptor) -> IndexResult<()> {
-        debug_assert_ne!(key, EMPTY, "u64::MAX is reserved as empty sentinel");
+        if key == EMPTY {
+            self.max_key = Some(value);
+            return Ok(());
+        }
 
         // Grow before we hit the load limit.
         if self.len * LOAD_DEN >= self.capacity() * LOAD_NUM {
@@ -251,6 +265,9 @@ impl CuckooMap {
 
     /// Remove `key`. Returns the evicted [`RowDescriptor`] if the key existed.
     pub fn remove(&mut self, key: u64) -> Option<RowDescriptor> {
+        if key == EMPTY {
+            return self.max_key.take();
+        }
         let (i1, i2) = homes(key, self.mask);
         if self.buckets[i1].key == key {
             let v = self.buckets[i1].value;
@@ -279,6 +296,7 @@ impl CuckooMap {
             .iter()
             .filter(|b| !b.is_empty())
             .map(|b| (b.key, b.value))
+            .chain(self.max_key.map(|v| (EMPTY, v)))
     }
 
     // ── internals ─────────────────────────────────────────────────────────────
@@ -304,6 +322,8 @@ impl CuckooMap {
     /// from the primary key index, which surfaced as a map holding 238 entries after
     /// 240 successful-looking inserts.
     fn insert_inner(&mut self, key: u64, value: RowDescriptor) -> Result<(), (u64, RowDescriptor)> {
+        // `EMPTY` is routed to `max_key` by `insert`; it must never reach a bucket.
+        debug_assert_ne!(key, EMPTY, "u64::MAX must be stored out of band");
         let (i1, i2) = homes(key, self.mask);
 
         // Update in place if the key is already present.
@@ -366,6 +386,7 @@ impl CuckooMap {
             buckets: vec![Bucket::empty(); new_cap],
             mask: new_cap - 1,
             len: 0,
+            max_key: self.max_key,
         };
         for b in &self.buckets {
             if !b.is_empty() {
@@ -408,6 +429,42 @@ mod tests {
 
     fn rd(offset: u32) -> RowDescriptor {
         RowDescriptor::new(0, 0, offset)
+    }
+
+    /// B21 / PP-40: `u64::MAX` (the bucket sentinel) must be a real, isolated
+    /// key in release builds too — not a phantom hit on an empty bucket.
+    #[test]
+    fn u64_max_key_is_stored_out_of_band() {
+        let mut m = CuckooMap::with_capacity(16);
+        // Before any insert, u64::MAX must not "hit" an empty bucket.
+        assert_eq!(m.get(u64::MAX), None);
+        assert!(!m.contains(u64::MAX));
+        assert_eq!(m.remove(u64::MAX), None);
+        assert_eq!(m.len(), 0);
+
+        m.insert(u64::MAX, rd(7)).unwrap();
+        m.insert(1, rd(1)).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(u64::MAX), Some(rd(7)));
+        assert_eq!(m.get(1), Some(rd(1)));
+
+        // Update in place, survive growth, show up in iter.
+        m.insert(u64::MAX, rd(8)).unwrap();
+        for k in 2..2_000u64 {
+            m.insert(k, rd(k as u32)).unwrap();
+        }
+        assert_eq!(m.len(), 2_000);
+        assert_eq!(m.get(u64::MAX), Some(rd(8)));
+        assert_eq!(m.iter().filter(|&(k, _)| k == u64::MAX).count(), 1);
+        assert_eq!(m.iter().count(), 2_000);
+        assert_eq!(m.get_batch(&[u64::MAX, 5]), vec![Some(rd(8)), Some(rd(5))]);
+
+        assert_eq!(m.remove(u64::MAX), Some(rd(8)));
+        assert_eq!(m.get(u64::MAX), None);
+        assert_eq!(m.len(), 1_999);
+        // Removing it again must not underflow len.
+        assert_eq!(m.remove(u64::MAX), None);
+        assert_eq!(m.len(), 1_999);
     }
 
     #[test]

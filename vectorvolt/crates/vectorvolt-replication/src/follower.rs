@@ -19,7 +19,7 @@ use crate::frame::{ReplicaMutation, ReplicationFrame};
 /// so far — the follower may lag the leader.
 pub struct Follower {
     engine: Arc<TableEngine>,
-    receiver: Receiver<ReplicationFrame>,
+    pub(crate) receiver: Receiver<ReplicationFrame>,
     /// Highest sequence number applied.
     last_seq: AtomicU64,
     /// Total frames applied since construction.

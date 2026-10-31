@@ -425,3 +425,115 @@ sinks:
     assert_eq!(cfg.domain_events[0].events[0].version, "1.2.0");
     assert!(cfg.sinks.kafka.is_some());
 }
+
+// ── PP-66 / B28: HttpWebhookSink reports real delivery results ──────────────
+
+/// Minimal HTTP/1.1 server answering every request with `status`. Returns the
+/// URL and a counter of requests received.
+fn http_server(status: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // Read headers, then Content-Length bytes of body.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let header_end = loop {
+                let n = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(i + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+            let len: usize = headers
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + len {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            hits2.fetch_add(1, Ordering::SeqCst);
+            let resp =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    (url, hits)
+}
+
+fn webhook_env() -> DomainEventEnvelope {
+    DomainEventEnvelope::new(
+        "OrderPlaced",
+        "1.0.0",
+        "orders",
+        7,
+        serde_json::json!({"id": 7}),
+    )
+}
+
+#[test]
+fn webhook_500_returns_err_after_retries_and_lands_in_dlq() {
+    use std::sync::atomic::Ordering;
+    use vectorvolt_events::HttpWebhookSink;
+
+    let (url, hits) = http_server("500 Internal Server Error");
+    let sink = HttpWebhookSink::new(url, Some("s3cret".into()), 5, 3, 1);
+
+    let err = sink
+        .send(&webhook_env())
+        .expect_err("a 500 must not be reported as Ok");
+    assert!(
+        matches!(err, SinkError::Http(ref m) if m.contains("500")),
+        "{err}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "retry_max attempts");
+
+    // The outbox must now route the failure to the DLQ.
+    let outbox = EventOutbox::new();
+    let dlq = EventDlq::new();
+    outbox.push(webhook_env());
+    outbox.flush(&sink, &dlq);
+    assert_eq!(dlq.len(), 1);
+    assert_eq!(outbox.pending_count(), 0);
+}
+
+#[test]
+fn webhook_2xx_returns_ok() {
+    use std::sync::atomic::Ordering;
+    use vectorvolt_events::HttpWebhookSink;
+
+    let (url, hits) = http_server("200 OK");
+    let sink = HttpWebhookSink::new(url, None, 5, 3, 1);
+    sink.send(&webhook_env()).unwrap();
+    sink.send(&webhook_env()).unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn webhook_send_inside_runtime_reports_failure() {
+    use vectorvolt_events::HttpWebhookSink;
+
+    let (url, _hits) = http_server("500 Internal Server Error");
+    let sink = HttpWebhookSink::new(url, None, 5, 2, 1);
+    // Previously this spawned and returned Ok immediately.
+    assert!(sink.send(&webhook_env()).is_err());
+    // The explicit fire-and-forget path still exists and returns at once.
+    assert!(sink.send_fire_and_forget(&webhook_env()).is_ok());
+}

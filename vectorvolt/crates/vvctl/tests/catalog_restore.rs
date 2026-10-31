@@ -45,6 +45,8 @@ fn serve_args(dir: &TempDir, catalog: bool, restore_catalog: bool) -> ServeArgs 
         max_connections: 4,
         secret: None,
         key_id: "default".into(),
+        key_scope: None,
+        key_file: None,
         cert: None,
         key: None,
         multi: true, // avoids single-table mode requiring --columns

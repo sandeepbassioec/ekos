@@ -157,15 +157,16 @@ fn fk_exists_on_empty_table_returns_false() {
 }
 
 #[test]
-fn fk_exists_true_for_deleted_pk() {
+fn fk_exists_false_for_deleted_pk() {
     let h = Harness::start();
     let mut c = h.client();
 
     c.insert(44, vec![44, 1, 2]).unwrap();
     c.delete(44).unwrap();
 
-    // CuckooFilter is write-only; deleted PKs remain in the filter.
-    assert!(c.fk_exists(44).unwrap());
+    // The filter may still hold the key, but positives are confirmed against
+    // the pk index (PP-39), so a deleted pk is reported absent.
+    assert!(!c.fk_exists(44).unwrap());
 }
 
 #[test]
