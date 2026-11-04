@@ -71,6 +71,7 @@ fn start_with_cluster(dir: &TempDir, seeds: Vec<SocketAddr>) -> (u16, impl FnOnc
         cluster_seeds: seeds,
         cluster_node_id: None,
         cluster_status_port: status_port,
+        listener: Default::default(),
     };
 
     let bound = bind(&args).expect("bind");

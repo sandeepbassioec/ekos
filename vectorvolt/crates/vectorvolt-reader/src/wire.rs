@@ -1,7 +1,9 @@
 //! PostgreSQL wire protocol message encoding/decoding.
 //!
 //! Implements a minimal subset of the PostgreSQL frontend/backend protocol
-//! (protocol version 3.0) sufficient for simple query execution.
+//! (protocol version 3.0): startup, cleartext / MD5 / SASL (SCRAM)
+//! authentication messages, the simple query protocol and the extended
+//! query protocol (Parse / Bind / Describe / Execute / Close / Sync / Flush).
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
@@ -74,6 +76,140 @@ pub enum FrontendMsg {
     Password(String),
     /// Terminate connection.
     Terminate,
+    /// Extended query: Parse ('P').
+    Parse {
+        name: String,
+        query: String,
+        param_types: Vec<u32>,
+    },
+    /// Extended query: Bind ('B'). `params[i] = None` is SQL NULL.
+    Bind {
+        portal: String,
+        statement: String,
+        param_formats: Vec<i16>,
+        params: Vec<Option<Vec<u8>>>,
+        result_formats: Vec<i16>,
+    },
+    /// Extended query: Describe ('D'); `kind` is `b'S'` (statement) or
+    /// `b'P'` (portal).
+    Describe { kind: u8, name: String },
+    /// Extended query: Execute ('E'); `max_rows == 0` = no limit.
+    Execute { portal: String, max_rows: i32 },
+    /// Extended query: Close ('C'); `kind` is `b'S'` or `b'P'`.
+    Close { kind: u8, name: String },
+    /// Extended query: Sync ('S').
+    Sync,
+    /// Extended query: Flush ('H').
+    Flush,
+}
+
+impl FrontendMsg {
+    /// True for the extended-query messages that are skipped after an error
+    /// until the next Sync.
+    pub fn is_extended(&self) -> bool {
+        matches!(
+            self,
+            FrontendMsg::Parse { .. }
+                | FrontendMsg::Bind { .. }
+                | FrontendMsg::Describe { .. }
+                | FrontendMsg::Execute { .. }
+                | FrontendMsg::Close { .. }
+                | FrontendMsg::Flush
+        )
+    }
+}
+
+/// Bounds-checked big-endian reader over a message payload: every read past
+/// the end is [`WireError::Incomplete`], never a panic.
+struct Rd<'a>(&'a [u8]);
+
+impl<'a> Rd<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
+        if self.0.len() < n {
+            return Err(WireError::Incomplete);
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Ok(a)
+    }
+    fn u8(&mut self) -> Result<u8, WireError> {
+        Ok(self.take(1)?[0])
+    }
+    fn i16(&mut self) -> Result<i16, WireError> {
+        let b = self.take(2)?;
+        Ok(i16::from_be_bytes([b[0], b[1]]))
+    }
+    fn i32(&mut self) -> Result<i32, WireError> {
+        let b = self.take(4)?;
+        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    /// A non-negative Int16 count.
+    fn count(&mut self) -> Result<usize, WireError> {
+        let n = self.i16()?;
+        usize::try_from(n).map_err(|_| WireError::InvalidLength(i32::from(n)))
+    }
+    fn cstr(&mut self) -> Result<String, WireError> {
+        read_cstr(&mut self.0)
+    }
+}
+
+fn decode_parse(p: &[u8]) -> Result<FrontendMsg, WireError> {
+    let mut r = Rd(p);
+    let name = r.cstr()?;
+    let query = r.cstr()?;
+    let n = r.count()?;
+    let mut param_types = Vec::with_capacity(n.min(p.len() / 4));
+    for _ in 0..n {
+        param_types.push(r.i32()? as u32);
+    }
+    Ok(FrontendMsg::Parse {
+        name,
+        query,
+        param_types,
+    })
+}
+
+fn decode_bind(p: &[u8]) -> Result<FrontendMsg, WireError> {
+    let mut r = Rd(p);
+    let portal = r.cstr()?;
+    let statement = r.cstr()?;
+    let nf = r.count()?;
+    let mut param_formats = Vec::with_capacity(nf.min(p.len() / 2));
+    for _ in 0..nf {
+        param_formats.push(r.i16()?);
+    }
+    let np = r.count()?;
+    let mut params = Vec::with_capacity(np.min(p.len() / 4));
+    for _ in 0..np {
+        let len = r.i32()?;
+        if len == -1 {
+            params.push(None);
+        } else {
+            let len = usize::try_from(len).map_err(|_| WireError::InvalidLength(len))?;
+            params.push(Some(r.take(len)?.to_vec()));
+        }
+    }
+    let nr = r.count()?;
+    let mut result_formats = Vec::with_capacity(nr.min(p.len() / 2));
+    for _ in 0..nr {
+        result_formats.push(r.i16()?);
+    }
+    Ok(FrontendMsg::Bind {
+        portal,
+        statement,
+        param_formats,
+        params,
+        result_formats,
+    })
+}
+
+fn decode_target(p: &[u8]) -> Result<(u8, String), WireError> {
+    let mut r = Rd(p);
+    let kind = r.u8()?;
+    if kind != b'S' && kind != b'P' {
+        return Err(WireError::UnknownMessageType(kind));
+    }
+    Ok((kind, r.cstr()?))
 }
 
 /// Parse a startup message from a buffer.
@@ -125,6 +261,24 @@ pub fn decode_frontend(buf: &[u8]) -> Result<FrontendMsg, WireError> {
         }
         b'X' => Ok(FrontendMsg::Terminate),
         b'p' => Ok(FrontendMsg::Password(read_cstr_bytes(payload)?)),
+        b'P' => decode_parse(payload),
+        b'B' => decode_bind(payload),
+        b'D' => {
+            let (kind, name) = decode_target(payload)?;
+            Ok(FrontendMsg::Describe { kind, name })
+        }
+        b'C' => {
+            let (kind, name) = decode_target(payload)?;
+            Ok(FrontendMsg::Close { kind, name })
+        }
+        b'E' => {
+            let mut r = Rd(payload);
+            let portal = r.cstr()?;
+            let max_rows = r.i32()?;
+            Ok(FrontendMsg::Execute { portal, max_rows })
+        }
+        b'S' => Ok(FrontendMsg::Sync),
+        b'H' => Ok(FrontendMsg::Flush),
         t => Err(WireError::UnknownMessageType(t)),
     }
 }
@@ -146,6 +300,198 @@ pub fn encode_auth_cleartext_password() -> Bytes {
     buf.put_u8(b'R');
     buf.put_i32(8); // length including self
     buf.put_i32(3); // AuthenticationCleartextPassword
+    buf.freeze()
+}
+
+/// Encode an `AuthenticationXxx` message: 'R' Int32(len) Int32(code) data.
+fn encode_auth(code: i32, data: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(9 + data.len());
+    buf.put_u8(b'R');
+    buf.put_i32((8 + data.len()) as i32);
+    buf.put_i32(code);
+    buf.put(data);
+    buf.freeze()
+}
+
+/// AuthenticationMD5Password (code 5) with its 4-byte salt.
+pub fn encode_auth_md5_password(salt: &[u8; 4]) -> Bytes {
+    encode_auth(5, salt)
+}
+
+/// AuthenticationSASL (code 10): the offered mechanisms, each NUL-terminated,
+/// then an empty terminator.
+pub fn encode_auth_sasl(mechanisms: &[&str]) -> Bytes {
+    let mut data = Vec::new();
+    for m in mechanisms {
+        data.extend_from_slice(m.as_bytes());
+        data.push(0);
+    }
+    data.push(0);
+    encode_auth(10, &data)
+}
+
+/// AuthenticationSASLContinue (code 11) carrying the server-first-message.
+pub fn encode_auth_sasl_continue(data: &[u8]) -> Bytes {
+    encode_auth(11, data)
+}
+
+/// AuthenticationSASLFinal (code 12) carrying the server-final-message.
+pub fn encode_auth_sasl_final(data: &[u8]) -> Bytes {
+    encode_auth(12, data)
+}
+
+/// A SASLInitialResponse ('p' during SASL): the chosen mechanism and the
+/// initial client data (`None` when its length is -1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaslInitialResponse {
+    pub mechanism: String,
+    pub data: Option<Vec<u8>>,
+}
+
+/// Decode a SASLInitialResponse from a full 'p' message (type byte + length).
+pub fn decode_sasl_initial_response(buf: &[u8]) -> Result<SaslInitialResponse, WireError> {
+    let payload = typed_payload(buf, b'p')?;
+    let mut r = Rd(payload);
+    let mechanism = r.cstr()?;
+    let len = r.i32()?;
+    let data = if len == -1 {
+        None
+    } else {
+        let len = usize::try_from(len).map_err(|_| WireError::InvalidLength(len))?;
+        Some(r.take(len)?.to_vec())
+    };
+    Ok(SaslInitialResponse { mechanism, data })
+}
+
+/// The raw data of a SASLResponse ('p' during SASL) message.
+pub fn decode_sasl_response(buf: &[u8]) -> Result<Vec<u8>, WireError> {
+    Ok(typed_payload(buf, b'p')?.to_vec())
+}
+
+/// The payload of a typed message of type `expected`.
+fn typed_payload(buf: &[u8], expected: u8) -> Result<&[u8], WireError> {
+    if buf.len() < 5 {
+        return Err(WireError::Incomplete);
+    }
+    if buf[0] != expected {
+        return Err(WireError::UnknownMessageType(buf[0]));
+    }
+    let len = checked_len(
+        i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]),
+        MAX_MESSAGE_LEN,
+    )?;
+    if buf.len() < 1 + len {
+        return Err(WireError::Incomplete);
+    }
+    Ok(&buf[5..1 + len])
+}
+
+/// A body-less backend message: type byte + Int32(4).
+fn encode_empty(t: u8) -> Bytes {
+    let mut buf = BytesMut::with_capacity(5);
+    buf.put_u8(t);
+    buf.put_i32(4);
+    buf.freeze()
+}
+
+/// ParseComplete ('1').
+pub fn encode_parse_complete() -> Bytes {
+    encode_empty(b'1')
+}
+
+/// BindComplete ('2').
+pub fn encode_bind_complete() -> Bytes {
+    encode_empty(b'2')
+}
+
+/// CloseComplete ('3').
+pub fn encode_close_complete() -> Bytes {
+    encode_empty(b'3')
+}
+
+/// NoData ('n').
+pub fn encode_no_data() -> Bytes {
+    encode_empty(b'n')
+}
+
+/// PortalSuspended ('s'): Execute hit its row limit.
+pub fn encode_portal_suspended() -> Bytes {
+    encode_empty(b's')
+}
+
+/// EmptyQueryResponse ('I').
+pub fn encode_empty_query_response() -> Bytes {
+    encode_empty(b'I')
+}
+
+/// ParameterDescription ('t'): Int16(count) then one Int32 type OID each.
+pub fn encode_parameter_description(oids: &[u32]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(7 + 4 * oids.len());
+    buf.put_u8(b't');
+    buf.put_i32((6 + 4 * oids.len()) as i32);
+    buf.put_i16(oids.len() as i16);
+    for &o in oids {
+        buf.put_u32(o);
+    }
+    buf.freeze()
+}
+
+/// RowDescription with per-column format codes (`formats` follows the Bind
+/// convention: empty = all text, one entry = applies to all, else one each).
+/// Every column is reported as `text` (OID 25), whose binary representation
+/// is the same UTF-8 bytes as its text form.
+pub fn encode_row_description_with_formats(columns: &[String], formats: &[i16]) -> Bytes {
+    let mut payload = BytesMut::new();
+    payload.put_i16(columns.len() as i16);
+    for (i, col) in columns.iter().enumerate() {
+        let fmt = match formats {
+            [] => 0,
+            [f] => *f,
+            fs => fs.get(i).copied().unwrap_or(0),
+        };
+        payload.put(col.as_bytes());
+        payload.put_u8(0);
+        payload.put_i32(0); // table oid
+        payload.put_i16(0); // col attr
+        payload.put_i32(25); // text oid
+        payload.put_i16(-1); // variable length
+        payload.put_i32(-1); // no modifier
+        payload.put_i16(fmt);
+    }
+    let mut buf = BytesMut::with_capacity(1 + 4 + payload.len());
+    buf.put_u8(b'T');
+    buf.put_i32((4 + payload.len()) as i32);
+    buf.put(payload);
+    buf.freeze()
+}
+
+/// ErrorResponse (severity ERROR) with a SQLSTATE code.
+pub fn encode_error_with_code(code: &str, msg: &str) -> Bytes {
+    encode_notice_like(b'E', "ERROR", code, msg)
+}
+
+/// NoticeResponse ('N', severity NOTICE, SQLSTATE 00000).
+pub fn encode_notice_response(msg: &str) -> Bytes {
+    encode_notice_like(b'N', "NOTICE", "00000", msg)
+}
+
+fn encode_notice_like(t: u8, severity: &str, code: &str, msg: &str) -> Bytes {
+    let mut payload = BytesMut::new();
+    for (f, v) in [
+        (b'S', severity),
+        (b'V', severity),
+        (b'C', code),
+        (b'M', msg),
+    ] {
+        payload.put_u8(f);
+        payload.put(v.as_bytes());
+        payload.put_u8(0);
+    }
+    payload.put_u8(0); // terminator
+    let mut buf = BytesMut::with_capacity(1 + 4 + payload.len());
+    buf.put_u8(t);
+    buf.put_i32((4 + payload.len()) as i32);
+    buf.put(payload);
     buf.freeze()
 }
 
@@ -248,21 +594,10 @@ pub fn encode_command_complete(tag: &str) -> Bytes {
 
 /// Encode an ErrorResponse message.
 /// Format: 'E' Int32(len) fields... \0
-/// We only emit the 'S' (severity) and 'M' (message) fields.
+/// Emits severity ('S' / 'V'), SQLSTATE 'C' = XX000 (drivers such as
+/// tokio-postgres require a code) and the message.
 pub fn encode_error_response(msg: &str) -> Bytes {
-    let mut payload = BytesMut::new();
-    payload.put_u8(b'S');
-    payload.put("ERROR".as_bytes());
-    payload.put_u8(0);
-    payload.put_u8(b'M');
-    payload.put(msg.as_bytes());
-    payload.put_u8(0);
-    payload.put_u8(0); // terminator
-    let mut buf = BytesMut::with_capacity(1 + 4 + payload.len());
-    buf.put_u8(b'E');
-    buf.put_i32((4 + payload.len()) as i32);
-    buf.put(payload);
-    buf.freeze()
+    encode_error_with_code("XX000", msg)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -490,7 +825,9 @@ mod tests {
     #[test]
     fn test_decoders_never_panic_on_hostile_input() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        let types = [b'Q', b'X', b'p', b'P', b'Z', 0, 0xFF];
+        let types = [
+            b'Q', b'X', b'p', b'P', b'B', b'D', b'E', b'C', b'S', b'H', b'Z', 0, 0xFF,
+        ];
         let lens = [
             0,
             1,
@@ -520,6 +857,8 @@ mod tests {
             }
             let _ = decode_frontend(&bytes);
             let _ = decode_startup(&bytes);
+            let _ = decode_sasl_initial_response(&bytes);
+            let _ = decode_sasl_response(&bytes);
             let mut buf = BytesMut::from(&bytes[..]);
             while let Ok(Some(f)) = split_frontend_frame(&mut buf, MAX_MESSAGE_LEN) {
                 let _ = decode_frontend(&f);

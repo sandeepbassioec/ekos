@@ -88,6 +88,44 @@ fn sql_error(code: &str, msg: &str) -> QueryResult {
     QueryResult::Error(format!("[{}] {}", code, msg))
 }
 
+/// D5/S295 — prefix of the memory-limit error (mapped to SQLSTATE 53200).
+const MEMORY_LIMIT_MSG: &str = "query memory limit exceeded";
+
+/// D5/S295 — parse a memory size such as `512MB`, `64 KB`, `2GiB` or a plain
+/// byte count. Units are binary (1KB = 1024 bytes).
+fn parse_memory_limit(s: &str) -> Option<u64> {
+    let s = s.trim().to_ascii_uppercase();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num.parse().ok()?;
+    let mult: u64 = match unit.trim() {
+        "" | "B" => 1,
+        "K" | "KB" | "KIB" => 1 << 10,
+        "M" | "MB" | "MIB" => 1 << 20,
+        "G" | "GB" | "GIB" => 1 << 30,
+        "T" | "TB" | "TIB" => 1 << 40,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
+/// D5/S295 — estimated heap bytes of one materialised result row
+/// (`Vec<String>`): vector header plus, per cell, a `String` header and its
+/// bytes. An approximation — allocator slack is not counted.
+fn est_str_row_bytes(row: &[String]) -> u64 {
+    let hdr = std::mem::size_of::<Vec<String>>() as u64;
+    let cell = std::mem::size_of::<String>() as u64;
+    hdr + row.iter().map(|c| cell + c.len() as u64).sum::<u64>()
+}
+
+/// D5/S295 — estimated heap bytes of scanned engine rows (row struct plus
+/// 8 bytes per stored column value).
+fn est_engine_rows_bytes(rows: &[EngineRow]) -> u64 {
+    let per_row = std::mem::size_of::<EngineRow>() as u64
+        + rows.first().map_or(0, |r| r.values.len() as u64 * 8);
+    per_row * rows.len() as u64
+}
+
 fn chrono_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -539,7 +577,7 @@ pub struct SqlExecutor {
     // S115 â€” table statistics
     table_stats: Mutex<HashMap<String, HashMap<String, ColStat>>>,
     // S116 â€” connection limits
-    max_connections: Mutex<u64>,
+    max_connections: Arc<Mutex<u64>>,
     connection_count: std::sync::atomic::AtomicU64,
     // S117 â€” resource groups
     resource_groups: Mutex<HashMap<String, ResourceGroup>>,
@@ -865,6 +903,16 @@ pub struct SqlExecutor {
     s251_histograms_v3: Mutex<HashMap<String, Vec<(String, u64)>>>,
     // S252 â€” table access control v2: (role, table, privilege) -> granted
     s252_role_grants: Arc<Mutex<Vec<(String, String, String)>>>,
+    /// D5 — tables that have ever been the target of a GRANT. Privilege
+    /// checks apply only to these, so databases that never use GRANT keep
+    /// their open behaviour; revoking the last grant keeps the table
+    /// governed (deny by default) instead of silently re-opening it.
+    s252_governed_tables: Arc<Mutex<HashSet<String>>>,
+    /// D5 — role of this session (`SET ROLE` / `set_session_role`).
+    s252_session_role: Mutex<Option<String>>,
+    /// D5 — set by `set_authenticated_role`: the listener fixed the role
+    /// from the authenticated user, so `SET ROLE` may not change it.
+    s252_role_pinned: std::sync::atomic::AtomicBool,
     // S253 â€” query scheduling: id -> (sql, at, cancelled)
     s253_scheduled_queries: Mutex<Vec<(u64, String, String, bool)>>,
     s253_next_id: Mutex<u64>,
@@ -910,7 +958,7 @@ pub struct SqlExecutor {
     // S272 â€” query semaphores: name -> limit
     s272_semaphores: Mutex<HashMap<String, u64>>,
     // S273 â€” table freeze
-    s273_frozen: Mutex<HashSet<String>>,
+    s273_frozen: Arc<Mutex<HashSet<String>>>,
     // S274 â€” column value distribution: table.col -> Vec<(value, count)>
     s274_value_dist: Mutex<HashMap<String, Vec<(String, u64)>>>,
     // S275 â€” query circuit breaker: table -> (threshold, trip_count)
@@ -920,7 +968,7 @@ pub struct SqlExecutor {
     // S277 â€” query batching v2
     s277_batch_size: Mutex<u64>,
     // S278 â€” schema lock
-    s278_schema_locks: Mutex<HashSet<String>>,
+    s278_schema_locks: Arc<Mutex<HashSet<String>>>,
     // S279 â€” table growth prediction: table -> predicted rows
     s279_growth_predictions: Mutex<HashMap<String, u64>>,
     // S280 â€” index defrag scheduling: idx -> at
@@ -930,7 +978,12 @@ pub struct SqlExecutor {
     // S282 â€” table replication lag threshold
     s282_repl_lag_threshold: Mutex<Option<u64>>,
     // S283 â€” connection idle timeout
-    s283_idle_timeout_ms: Mutex<Option<u64>>,
+    s283_idle_timeout_ms: Arc<Mutex<Option<u64>>>,
+    /// D5 — end of this session's last statement, in ns since `created_at`.
+    s283_last_activity_ns: std::sync::atomic::AtomicU64,
+    /// D5 — nesting depth of `execute` (triggers/procedures re-enter it);
+    /// the idle check only runs for the outermost call.
+    exec_depth: std::sync::atomic::AtomicU32,
     // S284 â€” table archival tiering: table -> tier
     s284_archival_tiers: Mutex<HashMap<String, String>>,
     // S285 â€” query plan diffing
@@ -956,7 +1009,9 @@ pub struct SqlExecutor {
     // S294 â€” table snapshot diffing
     s294_snapshot_diffs: Mutex<Vec<(String, String, String, String)>>,
     // S295 â€” query resource limits
-    s295_memory_limit: Mutex<Option<String>>,
+    s295_memory_limit: Arc<Mutex<Option<String>>>,
+    /// D5 — parsed form of `s295_memory_limit` in bytes (0 = no limit).
+    s295_memory_limit_bytes: Arc<std::sync::atomic::AtomicU64>,
     // S296 â€” table partition pruning stats: table -> pruned_count
     s296_pruning_stats: Mutex<HashMap<String, u64>>,
     // S297 â€” schema validation rules: rule -> (schema, expr)
@@ -1247,7 +1302,7 @@ impl SqlExecutor {
             partitions: Mutex::new(HashMap::new()),
             dead_rows: Mutex::new(HashMap::new()),
             table_stats: Mutex::new(HashMap::new()),
-            max_connections: Mutex::new(100),
+            max_connections: Arc::new(Mutex::new(100)),
             connection_count: std::sync::atomic::AtomicU64::new(0),
             resource_groups: Mutex::new(HashMap::new()),
             event_log: Mutex::new(HashMap::new()),
@@ -1424,6 +1479,9 @@ impl SqlExecutor {
             s250_locked_plans: Mutex::new(HashMap::new()),
             s251_histograms_v3: Mutex::new(HashMap::new()),
             s252_role_grants: Arc::new(Mutex::new(Vec::new())),
+            s252_governed_tables: Arc::new(Mutex::new(HashSet::new())),
+            s252_session_role: Mutex::new(None),
+            s252_role_pinned: std::sync::atomic::AtomicBool::new(false),
             s253_scheduled_queries: Mutex::new(Vec::new()),
             s253_next_id: Mutex::new(1),
             s254_auto_coalesce: Mutex::new(false),
@@ -1448,17 +1506,19 @@ impl SqlExecutor {
             s270_table_aliases: Mutex::new(HashMap::new()),
             s271_build_history: Mutex::new(Vec::new()),
             s272_semaphores: Mutex::new(HashMap::new()),
-            s273_frozen: Mutex::new(HashSet::new()),
+            s273_frozen: Arc::new(Mutex::new(HashSet::new())),
             s274_value_dist: Mutex::new(HashMap::new()),
             s275_circuit_breakers: Mutex::new(HashMap::new()),
             s276_checksums: Mutex::new(HashMap::new()),
             s277_batch_size: Mutex::new(1),
-            s278_schema_locks: Mutex::new(HashSet::new()),
+            s278_schema_locks: Arc::new(Mutex::new(HashSet::new())),
             s279_growth_predictions: Mutex::new(HashMap::new()),
             s280_defrag_schedule: Mutex::new(HashMap::new()),
             s281_result_masks: Arc::new(Mutex::new(HashMap::new())),
             s282_repl_lag_threshold: Mutex::new(None),
-            s283_idle_timeout_ms: Mutex::new(None),
+            s283_idle_timeout_ms: Arc::new(Mutex::new(None)),
+            s283_last_activity_ns: std::sync::atomic::AtomicU64::new(0),
+            exec_depth: std::sync::atomic::AtomicU32::new(0),
             s284_archival_tiers: Mutex::new(HashMap::new()),
             s285_plan_diffs: Mutex::new(Vec::new()),
             s286_access_audit: Mutex::new(HashSet::new()),
@@ -1472,7 +1532,8 @@ impl SqlExecutor {
             s292_timeout_escalation: Mutex::new(Vec::new()),
             s293_usage_forecast: Mutex::new(HashMap::new()),
             s294_snapshot_diffs: Mutex::new(Vec::new()),
-            s295_memory_limit: Mutex::new(None),
+            s295_memory_limit: Arc::new(Mutex::new(None)),
+            s295_memory_limit_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             s296_pruning_stats: Mutex::new(HashMap::new()),
             s297_validation_rules: Mutex::new(HashMap::new()),
             s298_explain_history: Mutex::new(Vec::new()),
@@ -1582,8 +1643,15 @@ impl SqlExecutor {
         s.table_tokens = Arc::clone(&self.table_tokens);
         s.rate_limits = Arc::clone(&self.rate_limits);
         s.allowed_ips = Arc::clone(&self.allowed_ips);
+        s.max_connections = Arc::clone(&self.max_connections);
         s.read_only = Arc::clone(&self.read_only);
         s.s252_role_grants = Arc::clone(&self.s252_role_grants);
+        s.s252_governed_tables = Arc::clone(&self.s252_governed_tables);
+        s.s273_frozen = Arc::clone(&self.s273_frozen);
+        s.s278_schema_locks = Arc::clone(&self.s278_schema_locks);
+        s.s283_idle_timeout_ms = Arc::clone(&self.s283_idle_timeout_ms);
+        s.s295_memory_limit = Arc::clone(&self.s295_memory_limit);
+        s.s295_memory_limit_bytes = Arc::clone(&self.s295_memory_limit_bytes);
         s.mask_policies = Arc::clone(&self.mask_policies);
         s.applied_masks = Arc::clone(&self.applied_masks);
         s.s281_result_masks = Arc::clone(&self.s281_result_masks);
@@ -1670,10 +1738,40 @@ impl SqlExecutor {
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, ExecError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        /// Decrements `exec_depth` and stamps the session's last activity
+        /// (outermost call) even if the statement unwinds.
+        struct ExecGuard<'a> {
+            ex: &'a SqlExecutor,
+            outermost: bool,
+        }
+        impl Drop for ExecGuard<'_> {
+            fn drop(&mut self) {
+                self.ex.exec_depth.fetch_sub(1, Relaxed);
+                if self.outermost {
+                    self.ex.touch_activity();
+                }
+            }
+        }
+        let outermost = self.exec_depth.fetch_add(1, Relaxed) == 0;
+        let _guard = ExecGuard {
+            ex: self,
+            outermost,
+        };
+        // D5/S283 — idle-session timeout (outermost statement only).
+        if outermost && let Some(err) = self.check_idle_timeout() {
+            return Ok(err);
+        }
         // B8 — arm the cooperative statement deadline (outermost call only;
         // statements fired by triggers/procedures share the caller's).
         let owns_deadline = self.arm_deadline();
-        let result = self.execute_inner(sql);
+        let result = match self.execute_inner(sql) {
+            // D5/S295 — memory-limit aborts surface as SQLSTATE 53200.
+            Err(ExecError::Engine(msg)) if msg.starts_with(MEMORY_LIMIT_MSG) => {
+                Ok(sql_error("53200", &msg))
+            }
+            other => other,
+        };
         if owns_deadline {
             self.stmt_deadline_ns
                 .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1685,6 +1783,318 @@ impl SqlExecutor {
             }
         }
         result
+    }
+
+    /// D5/S283 — record "now" as this session's last activity.
+    fn touch_activity(&self) {
+        let now = self.created_at.elapsed().as_nanos() as u64;
+        self.s283_last_activity_ns
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// D5/S283 — enforce `SET CONNECTION IDLE TIMEOUT`. A session whose
+    /// previous statement ended (or which was opened) longer ago than the
+    /// timeout gets SQLSTATE 57P05 for this statement and any open
+    /// transaction is rolled back. The executor cannot close the socket, so
+    /// the session is then treated as freshly started (its next statement
+    /// runs normally); listeners that want to drop the connection can
+    /// match on 57P05. A timeout of 0 disables the check.
+    fn check_idle_timeout(&self) -> Option<QueryResult> {
+        let timeout_ms = (*self.s283_idle_timeout_ms.lock_safe())?;
+        if timeout_ms == 0 {
+            return None;
+        }
+        let now = self.created_at.elapsed().as_nanos() as u64;
+        let last = self
+            .s283_last_activity_ns
+            .swap(now, std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) <= timeout_ms.saturating_mul(1_000_000) {
+            return None;
+        }
+        let had_txn = self.txn.lock_safe().is_some();
+        if had_txn {
+            let _ = self.exec_rollback();
+        }
+        Some(sql_error(
+            "57P05",
+            &format!(
+                "terminating session due to idle timeout ({timeout_ms} ms){}",
+                if had_txn {
+                    "; open transaction rolled back"
+                } else {
+                    ""
+                }
+            ),
+        ))
+    }
+
+    /// D5/S252 — set this session's role (as `SET ROLE`). `None` clears it.
+    /// Ignored while the role is pinned by
+    /// [`set_authenticated_role`](Self::set_authenticated_role).
+    pub fn set_session_role(&self, role: Option<&str>) {
+        if self
+            .s252_role_pinned
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        *self.s252_session_role.lock_safe() = role.map(|r| r.trim().to_ascii_lowercase());
+    }
+
+    /// D5/S252 — fix this session's role to the authenticated user (for
+    /// listeners that authenticate connections); `SET ROLE` to a different
+    /// role is then refused.
+    pub fn set_authenticated_role(&self, role: &str) {
+        *self.s252_session_role.lock_safe() = Some(role.trim().to_ascii_lowercase());
+        self.s252_role_pinned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// D5/S252 — the current session role, if any.
+    pub fn session_role(&self) -> Option<String> {
+        self.s252_session_role.lock_safe().clone()
+    }
+
+    /// D5/S252 — table privilege check. Tables that never had a GRANT are
+    /// open (backwards compatible); for governed tables the session role
+    /// must hold `privilege` (or ALL) on the table.
+    fn check_privilege(&self, table: &str, privilege: &str) -> Option<QueryResult> {
+        let table = table.to_ascii_lowercase();
+        if !self.s252_governed_tables.lock_safe().contains(&table) {
+            return None;
+        }
+        let Some(role) = self.s252_session_role.lock_safe().clone() else {
+            return Some(sql_error(
+                "42501",
+                &format!("permission denied for table {table}: no session role set (SET ROLE)"),
+            ));
+        };
+        let granted = self
+            .s252_role_grants
+            .lock_safe()
+            .iter()
+            .any(|(r, t, p)| r == &role && t == &table && (p == privilege || p == "ALL"));
+        if granted {
+            None
+        } else {
+            Some(sql_error(
+                "42501",
+                &format!("permission denied for table {table}: role {role} lacks {privilege}"),
+            ))
+        }
+    }
+
+    /// D5/S273/S278 — DDL guard. DDL is refused when the table's schema
+    /// (the `schema.` prefix, else the current search_path) or the table
+    /// itself is named in `LOCK SCHEMA`. `destructive` DDL (ALTER, DROP,
+    /// RENAME) is also refused on a frozen table.
+    fn check_ddl_allowed(&self, table: &str, destructive: bool) -> Option<QueryResult> {
+        let table = table.to_ascii_lowercase();
+        let schema = match table.split_once('.') {
+            Some((s, _)) => s.to_owned(),
+            None => self
+                .search_path
+                .lock_safe()
+                .split(',')
+                .next()
+                .unwrap_or("public")
+                .trim()
+                .to_ascii_lowercase(),
+        };
+        {
+            let locks = self.s278_schema_locks.lock_safe();
+            if locks.contains(&schema) || locks.contains(&table) {
+                return Some(sql_error(
+                    "55000",
+                    &format!(
+                        "schema {schema} is locked: DDL on table {table} is not allowed (UNLOCK SCHEMA first)"
+                    ),
+                ));
+            }
+        }
+        if destructive && self.s273_frozen.lock_safe().contains(&table) {
+            return Some(sql_error(
+                "55000",
+                &format!("table {table} is frozen: DDL is not allowed (UNFREEZE TABLE first)"),
+            ));
+        }
+        None
+    }
+
+    /// D5 — guards evaluated before a parsed statement runs: S278 schema
+    /// lock and S273 freeze for table DDL.
+    fn pre_dispatch_guard(&self, stmt: &Stmt) -> Option<QueryResult> {
+        match stmt {
+            Stmt::CreateTable(s) => self.check_ddl_allowed(&s.table, false),
+            Stmt::DropTable(s) => self.check_ddl_allowed(&s.table, true),
+            Stmt::AlterTable(s) => self.check_ddl_allowed(&s.table, true),
+            Stmt::RenameTable(s) => self
+                .check_ddl_allowed(&s.old_name, true)
+                .or_else(|| self.check_ddl_allowed(&s.new_name, false)),
+            Stmt::CreateIndex(s) => self.check_ddl_allowed(&s.table, false),
+            Stmt::CreateTrigger(def) => self.check_ddl_allowed(&def.table, false),
+            Stmt::CreatePolicy { table, .. } => self.check_ddl_allowed(table, false),
+            Stmt::CreatePartition { parent, .. } => self.check_ddl_allowed(parent, false),
+            _ => None,
+        }
+    }
+
+    /// D5/S295 — fail with a memory-limit error when `bytes` (an estimate of
+    /// the memory a query has materialised) exceeds the configured limit.
+    fn check_memory(&self, bytes: u64) -> Result<(), ExecError> {
+        let limit = self
+            .s295_memory_limit_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if limit != 0 && bytes > limit {
+            return Err(ExecError::Engine(format!(
+                "{MEMORY_LIMIT_MSG}: query needs ~{bytes} bytes, limit is {limit} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    /// D5/S295 — whether a memory limit is configured.
+    fn memory_limited(&self) -> bool {
+        self.s295_memory_limit_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+    }
+
+    /// D5/S159/S79/S281 — every active column mask as
+    /// (table, column) -> replacement value, keys lower-cased.
+    fn active_masks(&self) -> HashMap<(String, String), String> {
+        let mut out: HashMap<(String, String), String> = HashMap::new();
+        for ((t, c), v) in self.s281_result_masks.lock_safe().iter() {
+            out.insert((t.to_ascii_lowercase(), c.to_ascii_lowercase()), v.clone());
+        }
+        for ((t, c), v) in self.masks.lock_safe().iter() {
+            out.insert((t.to_ascii_lowercase(), c.to_ascii_lowercase()), v.clone());
+        }
+        let policies = self.mask_policies.lock_safe();
+        for (key, policy) in self.applied_masks.lock_safe().iter() {
+            if let (Some((t, c)), Some((_, expr))) = (key.split_once('.'), policies.get(policy)) {
+                out.insert(
+                    (t.to_ascii_lowercase(), c.to_ascii_lowercase()),
+                    expr.clone(),
+                );
+            }
+        }
+        out
+    }
+
+    /// D5 — the mask for a result column header, if it exposes a masked
+    /// column of a table in `scope`: `col`, `table.col`, or a value-returning
+    /// function header such as `min(col)` / `first_value(col)` (COUNT and
+    /// ranking functions do not expose the value).
+    fn mask_for_header<'m>(
+        header: &str,
+        scope: &[String],
+        masks: &'m HashMap<(String, String), String>,
+    ) -> Option<&'m String> {
+        let h = header.trim().to_ascii_lowercase();
+        if let Some(open) = h.find('(')
+            && h.ends_with(')')
+        {
+            let func = h[..open].trim();
+            if matches!(
+                func,
+                "count" | "row_number" | "rank" | "dense_rank" | "ntile" | "percent_rank"
+            ) {
+                return None;
+            }
+            let arg = h[open + 1..h.len() - 1]
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if arg.is_empty() || arg.contains('(') {
+                return None;
+            }
+            return Self::mask_for_header(arg, scope, masks);
+        }
+        if let Some((t, c)) = h.split_once('.')
+            && let Some(m) = masks.get(&(t.to_owned(), c.to_owned()))
+        {
+            return Some(m);
+        }
+        scope
+            .iter()
+            .find_map(|t| masks.get(&(t.to_ascii_lowercase(), h.clone())))
+    }
+
+    /// D5 — SELECT with column masks applied to its result. Masks apply to
+    /// every session (mask definitions carry no per-user exemption). Plain
+    /// and qualified columns, `*`, joins, value aggregates (SUM/MIN/MAX),
+    /// window value functions and computed expressions that reference a
+    /// masked column all return the mask value; views, CTEs and subqueries
+    /// are masked by the inner SELECT. Filtering/sorting still sees real
+    /// values (dynamic masking, as in other databases).
+    fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
+        let masks = self.active_masks();
+        if masks.is_empty() {
+            return self.exec_select_unmasked(stmt);
+        }
+        let scope: Vec<String> = std::iter::once(stmt.table.to_ascii_lowercase())
+            .chain(stmt.joins.iter().map(|j| j.table.to_ascii_lowercase()))
+            .collect();
+        let mut derived: HashMap<String, String> = HashMap::new();
+        for col in &stmt.columns {
+            if let SelectExpr::Computed { alias, expr } = col {
+                let dbg = format!("{expr:?}").to_ascii_lowercase();
+                if let Some(m) = masks.iter().find_map(|((t, c), m)| {
+                    (scope.contains(t)
+                        && (dbg.contains(&format!("col(\"{c}\")"))
+                            || dbg.contains(&format!("col: \"{c}\""))))
+                    .then_some(m)
+                }) {
+                    derived.insert(alias.to_ascii_lowercase(), m.clone());
+                }
+            }
+        }
+        let result = self.exec_select_unmasked(stmt)?;
+        Ok(Self::apply_masks(result, &scope, &masks, &derived))
+    }
+
+    fn apply_masks(
+        result: QueryResult,
+        scope: &[String],
+        masks: &HashMap<(String, String), String>,
+        derived: &HashMap<String, String>,
+    ) -> QueryResult {
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                let per_col: Vec<Option<String>> = columns
+                    .iter()
+                    .map(|h| {
+                        derived
+                            .get(&h.to_ascii_lowercase())
+                            .or_else(|| Self::mask_for_header(h, scope, masks))
+                            .cloned()
+                    })
+                    .collect();
+                if per_col.iter().all(Option::is_none) {
+                    return QueryResult::Rows { columns, rows };
+                }
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .enumerate()
+                            .map(|(i, v)| match per_col.get(i) {
+                                Some(Some(m)) => m.clone(),
+                                _ => v,
+                            })
+                            .collect()
+                    })
+                    .collect();
+                QueryResult::Rows { columns, rows }
+            }
+            QueryResult::WithNotice { result, notice } => QueryResult::WithNotice {
+                result: Box::new(Self::apply_masks(*result, scope, masks, derived)),
+                notice,
+            },
+            other => other,
+        }
     }
 
     /// B8 — start the statement deadline if a timeout is set and none is
@@ -1739,6 +2149,12 @@ impl SqlExecutor {
         let skip_stats = is_reset_stmt || is_stat_reset_select;
         let t0 = std::time::Instant::now();
         let result = self.execute_stmt(stmt)?;
+        // D5/S295 — the materialised result counts against the memory limit.
+        if self.memory_limited()
+            && let QueryResult::Rows { rows, .. } = &result
+        {
+            self.check_memory(rows.iter().map(|r| est_str_row_bytes(r)).sum())?;
+        }
         // S121 â€” change feed auto-capture for INSERT/UPDATE/DELETE
         {
             let up_trim = sql.trim_start().to_ascii_uppercase();
@@ -1872,6 +2288,10 @@ impl SqlExecutor {
     }
 
     fn execute_stmt(&self, stmt: Stmt) -> Result<QueryResult, ExecError> {
+        // D5 — schema lock / freeze guards for DDL
+        if let Some(denied) = self.pre_dispatch_guard(&stmt) {
+            return Ok(denied);
+        }
         match stmt {
             Stmt::Select(s) => self.exec_select(s),
             Stmt::Insert(s) => {
@@ -7987,28 +8407,111 @@ impl SqlExecutor {
         }
 
         // â"€â"€ S252 â€" Table access control v2 â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-        if up.starts_with("GRANT SELECT ON ") && up.contains(" TO ROLE ") {
-            let rest = &s["GRANT SELECT ON ".len()..];
-            let up_rest = rest.to_ascii_uppercase();
-            if let Some(rp) = up_rest.find(" TO ROLE ") {
-                let tbl = rest[..rp].trim().to_ascii_lowercase();
-                let role = rest[rp + " TO ROLE ".len()..].trim().to_ascii_lowercase();
-                self.s252_role_grants
-                    .lock_safe()
-                    .push((role, tbl, "SELECT".to_owned()));
-                return Some(Ok(QueryResult::Ok("GRANTED".to_owned())));
-            }
-        }
-        if up.starts_with("REVOKE SELECT ON ") && up.contains(" FROM ROLE ") {
-            let rest = &s["REVOKE SELECT ON ".len()..];
-            let up_rest = rest.to_ascii_uppercase();
-            if let Some(rp) = up_rest.find(" FROM ROLE ") {
-                let tbl = rest[..rp].trim().to_ascii_lowercase();
-                let role = rest[rp + " FROM ROLE ".len()..].trim().to_ascii_lowercase();
+        // D5 — GRANT/REVOKE <privs> ON [TABLE] t TO|FROM ROLE r, where
+        // privs is a comma list of SELECT, INSERT, UPDATE, DELETE, TRUNCATE
+        // or ALL [PRIVILEGES]. A granted table becomes governed: from then on
+        // every statement on it needs the privilege (see check_privilege).
+        let is_grant = up.starts_with("GRANT ") && up.contains(" TO ROLE ");
+        let is_revoke = up.starts_with("REVOKE ") && up.contains(" FROM ROLE ");
+        if (is_grant || is_revoke) && up.contains(" ON ") {
+            let (verb_len, kw) = if is_grant {
+                ("GRANT ".len(), " TO ROLE ")
+            } else {
+                ("REVOKE ".len(), " FROM ROLE ")
+            };
+            let s = s.trim_end_matches(';');
+            let up = s.to_ascii_uppercase();
+            if let Some(rp) = up.find(kw)
+                && let Some(on) = up[verb_len..rp].find(" ON ")
+            {
+                let on = verb_len + on;
+                let privs_part = up[verb_len..on].trim().to_owned();
+                let mut tbl = s[on + " ON ".len()..rp].trim();
+                if tbl.len() > 6 && tbl[..6].eq_ignore_ascii_case("TABLE ") {
+                    tbl = tbl[6..].trim();
+                }
+                let tbl = tbl.to_ascii_lowercase();
+                let role = s[rp + kw.len()..].trim().to_ascii_lowercase();
+                let mut privs: Vec<String> = Vec::new();
+                for p in privs_part.split(',') {
+                    let p = p.trim();
+                    let p = if p == "ALL PRIVILEGES" { "ALL" } else { p };
+                    if !matches!(
+                        p,
+                        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE" | "ALL"
+                    ) {
+                        return Some(Ok(sql_error(
+                            "42601",
+                            &format!("unsupported privilege '{p}'"),
+                        )));
+                    }
+                    privs.push(p.to_owned());
+                }
+                if tbl.is_empty() || role.is_empty() || privs.is_empty() {
+                    return Some(Ok(sql_error("42601", "invalid GRANT/REVOKE syntax")));
+                }
                 let mut grants = self.s252_role_grants.lock_safe();
-                grants.retain(|(r, t, p)| !(r == &role && t == &tbl && p == "SELECT"));
+                if is_grant {
+                    for p in privs {
+                        if !grants
+                            .iter()
+                            .any(|(r, t, gp)| r == &role && t == &tbl && gp == &p)
+                        {
+                            grants.push((role.clone(), tbl.clone(), p));
+                        }
+                    }
+                    drop(grants);
+                    self.s252_governed_tables.lock_safe().insert(tbl);
+                    return Some(Ok(QueryResult::Ok("GRANTED".to_owned())));
+                }
+                let all = privs.iter().any(|p| p == "ALL");
+                grants.retain(|(r, t, p)| !(r == &role && t == &tbl && (all || privs.contains(p))));
                 return Some(Ok(QueryResult::Ok("REVOKED".to_owned())));
             }
+        }
+        // D5 — session role: SET ROLE r | SET ROLE NONE | RESET ROLE | SHOW ROLE
+        if up.starts_with("SET ROLE ") || up.trim_end_matches(';') == "RESET ROLE" {
+            let target = if up.starts_with("RESET") {
+                None
+            } else {
+                let r = s["SET ROLE ".len()..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .to_ascii_lowercase();
+                if r.is_empty() || r == "none" || r == "default" {
+                    None
+                } else {
+                    Some(r)
+                }
+            };
+            if self
+                .s252_role_pinned
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && target != *self.s252_session_role.lock_safe()
+            {
+                return Some(Ok(sql_error(
+                    "42501",
+                    "session role is fixed by the authenticated user; SET ROLE not permitted",
+                )));
+            }
+            *self.s252_session_role.lock_safe() = target;
+            return Some(Ok(QueryResult::Ok("SET ROLE".to_owned())));
+        }
+        if matches!(
+            up.trim_end_matches(';'),
+            "SHOW ROLE" | "SELECT CURRENT_ROLE"
+        ) {
+            let role = self
+                .s252_session_role
+                .lock_safe()
+                .clone()
+                .unwrap_or_else(|| "none".to_owned());
+            return Some(Ok(QueryResult::Rows {
+                columns: vec!["current_role".to_owned()],
+                rows: vec![vec![role]],
+            }));
         }
         if up == "SHOW ROLE GRANTS" {
             let grants = self.s252_role_grants.lock_safe().clone();
@@ -8991,11 +9494,23 @@ impl SqlExecutor {
 
         // â”€â”€ S283 â€" Connection idle timeout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if up.starts_with("SET CONNECTION IDLE TIMEOUT ") {
-            let val_str = s["SET CONNECTION IDLE TIMEOUT ".len()..]
+            // D5 — `<n>ms` or `<n>[s]` (seconds)
+            let raw = s["SET CONNECTION IDLE TIMEOUT ".len()..]
                 .trim()
-                .trim_end_matches('s');
-            if let Ok(val) = val_str.parse::<u64>() {
-                *self.s283_idle_timeout_ms.lock_safe() = Some(val * 1000);
+                .trim_end_matches(';')
+                .trim()
+                .to_ascii_lowercase();
+            let ms = match raw.strip_suffix("ms") {
+                Some(n) => n.trim().parse::<u64>().ok(),
+                None => raw
+                    .trim_end_matches('s')
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|v| v.checked_mul(1000)),
+            };
+            if let Some(ms) = ms {
+                *self.s283_idle_timeout_ms.lock_safe() = Some(ms);
                 return Some(Ok(QueryResult::Ok(
                     "CONNECTION IDLE TIMEOUT SET".to_owned(),
                 )));
@@ -9349,8 +9864,19 @@ impl SqlExecutor {
         if up.starts_with("SET QUERY MEMORY LIMIT ") {
             let val = s["SET QUERY MEMORY LIMIT ".len()..]
                 .trim()
+                .trim_end_matches(';')
+                .trim()
                 .to_ascii_uppercase();
+            // D5 — the limit is enforced, so it must parse (e.g. 512MB, 64KB).
+            let Some(bytes) = parse_memory_limit(&val).filter(|b| *b > 0) else {
+                return Some(Ok(sql_error(
+                    "22023",
+                    &format!("invalid query memory limit '{val}' (expected e.g. 64KB, 512MB, 2GB)"),
+                )));
+            };
             *self.s295_memory_limit.lock_safe() = Some(val);
+            self.s295_memory_limit_bytes
+                .store(bytes, std::sync::atomic::Ordering::Relaxed);
             return Some(Ok(QueryResult::Ok("QUERY MEMORY LIMIT SET".to_owned())));
         }
         if up == "SHOW QUERY RESOURCE LIMITS" {
@@ -9362,6 +9888,8 @@ impl SqlExecutor {
         }
         if up == "RESET QUERY RESOURCE LIMITS" {
             *self.s295_memory_limit.lock_safe() = None;
+            self.s295_memory_limit_bytes
+                .store(0, std::sync::atomic::Ordering::Relaxed);
             return Some(Ok(QueryResult::Ok(
                 "QUERY RESOURCE LIMITS RESET".to_owned(),
             )));
@@ -12052,7 +12580,25 @@ impl SqlExecutor {
     /// and write path (SELECT, INSERT/UPSERT, INSERT ... SELECT, UPDATE,
     /// DELETE, TRUNCATE, COPY FROM). Returns the error result to send back
     /// when access is denied.
-    fn check_table_access(&self, table: &str) -> Option<QueryResult> {
+    ///
+    /// D5 — also enforces S252 grants (`privilege` is SELECT, INSERT,
+    /// UPDATE, DELETE or TRUNCATE) and S273 freeze (any non-SELECT access to
+    /// a frozen table is refused).
+    fn check_table_access(&self, table: &str, privilege: &str) -> Option<QueryResult> {
+        if let Some(denied) = self.check_privilege(table, privilege) {
+            return Some(denied);
+        }
+        if privilege != "SELECT"
+            && self
+                .s273_frozen
+                .lock_safe()
+                .contains(&table.to_ascii_lowercase())
+        {
+            return Some(sql_error(
+                "55000",
+                &format!("table {table} is frozen: writes are not allowed (UNFREEZE TABLE first)"),
+            ));
+        }
         // S81 — auth check
         if let Some(required) = self.table_tokens.lock_safe().get(table).cloned() {
             let sess = self.session_token.lock_safe().clone();
@@ -12173,12 +12719,12 @@ impl SqlExecutor {
         pred(expr, schema, table)
     }
 
-    fn exec_select(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
+    fn exec_select_unmasked(&self, stmt: SelectStmt) -> Result<QueryResult, ExecError> {
         // S83 — check client IP (empty allowlist = allow all)
         // IP check is structural only; actual enforcement is done via check_access_allowed()
 
         // S81/S82 — token auth + rate limit
-        if let Some(denied) = self.check_table_access(&stmt.table) {
+        if let Some(denied) = self.check_table_access(&stmt.table, "SELECT") {
             return Ok(denied);
         }
 
@@ -12711,6 +13257,10 @@ impl SqlExecutor {
         } else {
             self.execute_scan(&plan, &engine)?
         };
+        // D5/S295 — the scanned working set counts against the memory limit.
+        if self.memory_limited() {
+            self.check_memory(est_engine_rows_bytes(&left_rows))?;
+        }
         let mut filtered_left =
             self.filter_rows(left_rows, stmt.where_clause.as_ref(), schema, &stmt.table)?;
 
@@ -13248,27 +13798,7 @@ impl SqlExecutor {
             })
             .collect();
 
-        // S79 â€” apply column masks
-        let masks_snap: HashMap<(String, String), String> = self.masks.lock_safe().clone();
-        let rows: Vec<Vec<String>> = if masks_snap.is_empty() {
-            rows
-        } else {
-            rows.into_iter()
-                .map(|row| {
-                    row.into_iter()
-                        .enumerate()
-                        .map(|(i, val)| {
-                            let col_name = out_col_names.get(i).cloned().unwrap_or_default();
-                            if let Some(mv) = masks_snap.get(&(stmt.table.clone(), col_name)) {
-                                mv.clone()
-                            } else {
-                                val
-                            }
-                        })
-                        .collect()
-                })
-                .collect()
-        };
+        // S79 / S159 / S281 — column masks are applied by `exec_select`.
 
         // S87 â€” notice for empty table
         let warnings_on = *self.warnings_enabled.lock_safe();
@@ -13493,6 +14023,14 @@ impl SqlExecutor {
         left_schema: &TableSchema,
         left_col_names: &[String],
     ) -> Result<QueryResult, ExecError> {
+        // D5/S252 — joined tables need SELECT too
+        for join in &stmt.joins {
+            if let Some(denied) = self.check_privilege(&join.table, "SELECT") {
+                return Ok(denied);
+            }
+        }
+        // D5/S295 — the join's materialised rows count against the limit.
+        let mem_limited = self.memory_limited();
         // Build combined rows: each element is (left_values, right_values_per_join_table)
         // We work in display-string space for simplicity.
 
@@ -13580,6 +14118,7 @@ impl SqlExecutor {
         {
             let right_width = right_col_names.len();
             let mut next: Vec<Vec<String>> = Vec::new();
+            let mut next_bytes: u64 = 0;
             // S71 â€” CROSS JOIN: pair every left row with every right row
             if join.kind == JoinKind::Cross {
                 let all_right: Vec<Vec<String>> = right_map.values().flatten().cloned().collect();
@@ -13588,6 +14127,10 @@ impl SqlExecutor {
                         self.check_deadline()?;
                         let mut merged = left_row.clone();
                         merged.extend(right_row.clone());
+                        if mem_limited {
+                            next_bytes += est_str_row_bytes(&merged);
+                            self.check_memory(next_bytes)?;
+                        }
                         next.push(merged);
                     }
                 }
@@ -13602,6 +14145,10 @@ impl SqlExecutor {
                     for right_row in right_matches {
                         let mut merged = left_row.clone();
                         merged.extend(right_row.clone());
+                        if mem_limited {
+                            next_bytes += est_str_row_bytes(&merged);
+                            self.check_memory(next_bytes)?;
+                        }
                         next.push(merged);
                     }
                 } else if join.kind == JoinKind::Left {
@@ -13661,7 +14208,7 @@ impl SqlExecutor {
 
     fn exec_insert_select(&self, stmt: InsertSelectStmt) -> Result<QueryResult, ExecError> {
         // S81/S82 — the target table is checked here, the source by exec_select
-        if let Some(denied) = self.check_table_access(&stmt.table) {
+        if let Some(denied) = self.check_table_access(&stmt.table, "INSERT") {
             return Ok(denied);
         }
         let result = self.exec_select(*stmt.select)?;
@@ -13889,7 +14436,7 @@ impl SqlExecutor {
 
     fn exec_truncate(&self, stmt: TruncateStmt) -> Result<QueryResult, ExecError> {
         // S81/S82 — token auth + rate limit
-        if let Some(denied) = self.check_table_access(&stmt.table) {
+        if let Some(denied) = self.check_table_access(&stmt.table, "TRUNCATE") {
             return Ok(denied);
         }
         let engine = self
@@ -13940,7 +14487,7 @@ impl SqlExecutor {
             return Ok(sql_error("25006", "read-only transaction"));
         }
         // S81/S82 — token auth + rate limit apply to writes too
-        if let Some(denied) = self.check_table_access(&stmt.table) {
+        if let Some(denied) = self.check_table_access(&stmt.table, "INSERT") {
             return Ok(denied);
         }
         let engine = self
@@ -14200,7 +14747,7 @@ impl SqlExecutor {
             return Ok(sql_error("25006", "read-only transaction"));
         }
         // S81/S82 — token auth + rate limit apply to writes too
-        if let Some(denied) = self.check_table_access(&stmt.table) {
+        if let Some(denied) = self.check_table_access(&stmt.table, "UPDATE") {
             return Ok(denied);
         }
         let engine = self
@@ -14299,7 +14846,7 @@ impl SqlExecutor {
             return Ok(sql_error("25006", "read-only transaction"));
         }
         // S81/S82 — token auth + rate limit apply to writes too
-        if let Some(denied) = self.check_table_access(&stmt.table) {
+        if let Some(denied) = self.check_table_access(&stmt.table, "DELETE") {
             return Ok(denied);
         }
         let engine = self
@@ -14481,6 +15028,11 @@ impl SqlExecutor {
                     .join("indexes")
                     .join(format!("{}.json", stmt.index_name));
                 if idx_path.exists() {
+                    // D5/S278 — DROP INDEX is DDL on the owning table
+                    let owner = entry.file_name().to_string_lossy().into_owned();
+                    if let Some(denied) = self.check_ddl_allowed(&owner, false) {
+                        return Ok(denied);
+                    }
                     let _ = std::fs::remove_file(idx_path);
                     return Ok(QueryResult::Dropped);
                 }
@@ -16059,7 +16611,7 @@ impl SqlExecutor {
         has_header: bool,
     ) -> Result<QueryResult, ExecError> {
         // S81/S82 — token auth + rate limit (covers COPY FROM STDIN too)
-        if let Some(denied) = self.check_table_access(&table) {
+        if let Some(denied) = self.check_table_access(&table, "INSERT") {
             return Ok(denied);
         }
         // S104 â€” COPY FROM STDIN with inline tab-delimited data
@@ -16379,6 +16931,12 @@ impl SqlExecutor {
     }
 
     // S83 â€” check whether a client IP is allowed
+    /// S116 — the server-wide connection limit (`SET MAX_CONNECTIONS n`),
+    /// shared by every session from [`new_session`](Self::new_session).
+    pub fn max_connections(&self) -> u64 {
+        *self.max_connections.lock_safe()
+    }
+
     pub fn check_ip_allowed(&self, client_ip: &str) -> bool {
         let ips = self.allowed_ips.lock_safe();
         if ips.is_empty() {
@@ -21635,7 +22193,10 @@ mod tests {
         let _r1 = ex.execute("SELECT * FROM t");
         let _r2 = ex.execute("SELECT * FROM t");
         let r3 = ex.execute("SELECT * FROM t").unwrap();
-        assert!(matches!(r3, QueryResult::Error(_)));
+        assert!(
+            matches!(r3, QueryResult::Error(_)),
+            "DBG r1={_r1:?} r2={_r2:?} r3={r3:?}"
+        );
         if let QueryResult::Error(msg) = r3 {
             assert!(msg.contains("rate limit"));
         }

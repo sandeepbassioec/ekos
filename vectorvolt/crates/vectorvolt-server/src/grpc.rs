@@ -190,6 +190,8 @@ pub struct GrpcServer {
     svc: GrpcWriteService,
     /// When set, every RPC must carry `authorization: Bearer <token>`.
     token: Option<Arc<str>>,
+    /// When set, the server speaks TLS (mutual TLS if it has a client CA).
+    tls: Option<tonic::transport::ServerTlsConfig>,
 }
 
 /// Constant-time equality, so a wrong token cannot be found byte by byte by
@@ -228,7 +230,32 @@ impl GrpcServer {
             addr,
             svc: GrpcWriteService::new(engine, txns, txn_seq),
             token: None,
+            tls: None,
         }
+    }
+
+    /// Serve over TLS with this PEM certificate chain and key. With
+    /// `client_ca_pem`, every client must present a certificate issued by
+    /// that CA (mutual TLS).
+    pub fn with_tls_pem(
+        mut self,
+        cert_pem: impl AsRef<[u8]>,
+        key_pem: impl AsRef<[u8]>,
+        client_ca_pem: Option<&[u8]>,
+    ) -> Self {
+        let mut tls = tonic::transport::ServerTlsConfig::new().identity(
+            tonic::transport::Identity::from_pem(cert_pem.as_ref(), key_pem.as_ref()),
+        );
+        if let Some(ca) = client_ca_pem {
+            tls = tls.client_ca_root(tonic::transport::Certificate::from_pem(ca));
+        }
+        self.tls = Some(tls);
+        self
+    }
+
+    /// True if the server speaks TLS.
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
     }
 
     /// Require `authorization: Bearer <token>` on every RPC.
@@ -247,15 +274,32 @@ impl GrpcServer {
     /// Serve until `shutdown_rx` fires.
     #[allow(clippy::result_large_err)] // the interceptor closure must return tonic's `Status`
     pub async fn run(self, shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        self.run_with_listener(listener, shutdown_rx).await
+    }
+
+    /// Like [`run`](Self::run), on an already-bound listener (lets callers
+    /// bind port 0 and learn the real port first).
+    #[allow(clippy::result_large_err)] // the interceptor closure must return tonic's `Status`
+    pub async fn run_with_listener(
+        self,
+        listener: tokio::net::TcpListener,
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> anyhow::Result<()> {
         let token = self.token.clone();
         let svc =
             WriteServiceServer::with_interceptor(self.svc, move |req: Request<()>| match &token {
                 Some(t) => check_token(t, &req).map(|()| req),
                 None => Ok(req),
             });
-        Server::builder()
+        let mut builder = Server::builder();
+        if let Some(tls) = self.tls {
+            builder = builder.tls_config(tls)?;
+        }
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        builder
             .add_service(svc)
-            .serve_with_shutdown(self.addr, async {
+            .serve_with_incoming_shutdown(incoming, async {
                 let _ = shutdown_rx.await;
             })
             .await?;

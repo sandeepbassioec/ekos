@@ -20,8 +20,11 @@ tower      = { workspace = true }
 thiserror  = { workspace = true }
 reqwest    = { workspace = true, features = ["json"] }
 parking_lot = { workspace = true }
+rustls       = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
+rcgen        = { workspace = true }
 reqwest      = { workspace = true, features = ["stream", "json"] }
 tempfile     = { workspace = true }
 tokio        = { workspace = true }

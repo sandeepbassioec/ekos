@@ -30,7 +30,9 @@ struct Txn {
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub addr: SocketAddr,
-    /// Connections served concurrently. Beyond this, accepted sockets wait.
+    /// Connections served concurrently. Beyond this, newly accepted sockets
+    /// are closed immediately (and counted in
+    /// [`ServerStats::connections_refused`]) rather than queued.
     ///
     /// A bound rather than unlimited: one thread per connection means an
     /// unbounded server lets a peer exhaust process threads by connecting
@@ -121,6 +123,8 @@ pub struct ServerStats {
     /// certificate or trust problem, not a malformed frame, and conflating them
     /// hides the difference between a misconfigured client and a hostile one.
     pub tls_handshake_failures: AtomicU64,
+    /// Connections closed on accept because `max_connections` were already live.
+    pub connections_refused: AtomicU64,
 }
 
 /// A running server.
@@ -193,6 +197,9 @@ impl Server {
                 // Refuse by closing rather than queueing. A client that gets a
                 // closed socket can back off; one left hanging cannot tell the
                 // difference between a busy server and a dead one.
+                self.stats
+                    .connections_refused
+                    .fetch_add(1, Ordering::Relaxed);
                 drop(stream);
                 continue;
             }

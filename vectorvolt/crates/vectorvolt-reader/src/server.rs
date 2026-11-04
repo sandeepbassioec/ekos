@@ -1,14 +1,19 @@
 //! PostgreSQL wire protocol server.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::net::TcpListener;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 use vectorvolt_engine::TableRegistry;
 use vectorvolt_query::sql::executor::SqlExecutor;
 
+use crate::auth::{AuthMethod, Credentials};
 use crate::session::{PgSession, open_registry};
+use crate::wire::encode_fatal_error;
 
 /// Configuration for `PgServer`.
 #[derive(Debug, Clone)]
@@ -37,6 +42,142 @@ impl PgConfig {
     }
 }
 
+/// Everything the accept loop needs per connection: shared executor,
+/// credentials, TLS policy and the admission limits (S83 / S116).
+#[derive(Clone)]
+struct ConnPolicy {
+    executor: Arc<SqlExecutor>,
+    credentials: Credentials,
+    tls: Option<TlsAcceptor>,
+    require_tls: bool,
+    /// Operator cap (e.g. `vvctl serve --pgwire-max-connections`).
+    max_connections: Option<usize>,
+    /// Sessions currently running on this listener.
+    live: Arc<AtomicUsize>,
+}
+
+/// Decrements the live-session count when a session ends, however it ends.
+struct LiveGuard(Arc<AtomicUsize>);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Fold an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a dual-stack
+/// `[::]` listener reports for IPv4 peers) back to IPv4, so allowlist entries
+/// written as `10.0.0.5` match either way.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+impl ConnPolicy {
+    /// The executor's S116 `max_connections` (`SET MAX_CONNECTIONS n`,
+    /// default 100). Shared by every session, so a `SET` over any pgwire
+    /// connection applies here.
+    fn executor_limit(&self) -> usize {
+        usize::try_from(self.executor.max_connections()).unwrap_or(usize::MAX)
+    }
+
+    /// The effective connection limit: the tighter of the operator cap and
+    /// the executor's S116 setting.
+    fn connection_limit(&self) -> usize {
+        self.executor_limit()
+            .min(self.max_connections.unwrap_or(usize::MAX))
+    }
+
+    /// Admit `peer` or say why not, as (SQLSTATE, message).
+    fn admit(&self, peer: SocketAddr) -> Result<LiveGuard, (&'static str, String)> {
+        let ip = canonical_ip(peer.ip());
+        // S83 — IP allowlist (empty = everyone allowed).
+        if !self.executor.check_ip_allowed(&ip.to_string()) {
+            return Err((
+                "28000",
+                format!("connection from host \"{ip}\" rejected: not in the IP allowlist"),
+            ));
+        }
+        // S116 — max_connections. Reserve the slot first, then check, so two
+        // concurrent accepts cannot both squeeze into the last slot.
+        let limit = self.connection_limit();
+        let prev = self.live.fetch_add(1, Ordering::AcqRel);
+        let guard = LiveGuard(Arc::clone(&self.live));
+        if prev >= limit {
+            drop(guard);
+            return Err(("53300", "sorry, too many clients already".to_owned()));
+        }
+        Ok(guard)
+    }
+
+    /// Build the session for an admitted connection.
+    fn session(&self, stream: TcpStream) -> PgSession {
+        PgSession::new(
+            stream,
+            self.executor.new_session(),
+            self.credentials.clone(),
+        )
+        .with_tls(self.tls.clone(), self.require_tls)
+    }
+
+    /// Admit and run one connection to completion.
+    async fn handle(&self, mut stream: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
+        let _guard = match self.admit(peer) {
+            Ok(g) => g,
+            Err((code, msg)) => {
+                tracing::info!("pgwire: refusing {peer}: {msg}");
+                // Sent before any negotiation: libpq reports an ErrorResponse
+                // received in place of the SSLRequest / startup answer.
+                let _ = stream.write_all(&encode_fatal_error(code, &msg)).await;
+                let _ = stream.flush().await;
+                let _ = stream.shutdown().await;
+                return Ok(());
+            }
+        };
+        self.session(stream).run().await
+    }
+
+    /// Accept connections until `shutdown` resolves.
+    async fn accept_until(
+        self,
+        listener: TcpListener,
+        addr: SocketAddr,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> std::io::Result<()> {
+        tracing::info!("PgServer listening on {addr}");
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = match accepted {
+                        Ok(a) => a,
+                        // A peer that resets mid-accept must not stop the
+                        // listener for everyone else.
+                        Err(e) => {
+                            tracing::warn!("pgwire accept error: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            continue;
+                        }
+                    };
+                    tracing::debug!("accepted connection from {peer}");
+                    let policy = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = policy.handle(stream, peer).await {
+                            tracing::warn!("session error: {e}");
+                        }
+                    });
+                }
+                _ = &mut shutdown => {
+                    tracing::info!("PgServer on {addr} shutting down (no longer accepting new connections)");
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 /// PostgreSQL wire protocol server.
 ///
 /// Listens for incoming TCP connections and spawns a `PgSession` per client.
@@ -44,11 +185,25 @@ impl PgConfig {
 /// executor, so SQL security state (policies, table tokens, read-only mode,
 /// masks, grants, ...) is server-wide and survives reconnects, while
 /// transactions stay per connection.
+///
+/// At accept time every connection is checked against the executor's IP
+/// allowlist (S83, SQLSTATE 28000) and the connection limit (S116, SQLSTATE
+/// 53300) before a session starts. With [`with_tls`](Self::with_tls) an
+/// SSLRequest is answered 'S' and the connection is upgraded to TLS.
 pub struct PgServer {
     config: PgConfig,
     executor: Arc<SqlExecutor>,
-    /// Cleartext password every client must present; `None` = no auth.
+    /// Password every client must prove it knows; `None` = no auth.
     password: Option<String>,
+    /// How the password is checked (default SCRAM-SHA-256).
+    auth_method: AuthMethod,
+    /// Derived from `password` + `auth_method` (for SCRAM: the verifier,
+    /// computed once with a random per-server salt).
+    credentials: Credentials,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    require_tls: bool,
+    max_connections: Option<usize>,
+    live: Arc<AtomicUsize>,
 }
 
 impl PgServer {
@@ -65,20 +220,76 @@ impl PgServer {
             config,
             executor,
             password: None,
+            auth_method: AuthMethod::default(),
+            credentials: Credentials::None,
+            tls: None,
+            require_tls: false,
+            max_connections: None,
+            live: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Require clients to authenticate with this password
-    /// (AuthenticationCleartextPassword, constant-time compare). `None`
-    /// disables authentication.
+    /// Require clients to authenticate with this password, using the
+    /// configured [`with_auth_method`](Self::with_auth_method) (default
+    /// SCRAM-SHA-256). `None` disables authentication.
     pub fn with_password(mut self, password: Option<String>) -> Self {
         self.password = password;
+        self.credentials = Credentials::new(self.password.as_deref(), self.auth_method);
+        self
+    }
+
+    /// Choose how the password is checked: SCRAM-SHA-256 (default), MD5 or
+    /// cleartext. Has no effect without [`with_password`](Self::with_password).
+    pub fn with_auth_method(mut self, method: AuthMethod) -> Self {
+        self.auth_method = method;
+        self.credentials = Credentials::new(self.password.as_deref(), method);
+        self
+    }
+
+    /// The configured authentication method.
+    pub fn auth_method(&self) -> AuthMethod {
+        self.auth_method
+    }
+
+    /// Offer TLS on SSLRequest with this rustls config (`None` = answer 'N').
+    /// A config with a client-certificate verifier makes it mutual TLS.
+    pub fn with_tls(mut self, tls: Option<Arc<rustls::ServerConfig>>) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// Refuse clients that do not upgrade to TLS (SQLSTATE 28000).
+    pub fn with_require_tls(mut self, require: bool) -> Self {
+        self.require_tls = require;
+        self
+    }
+
+    /// Cap concurrent sessions on this listener. The executor's own S116
+    /// `max_connections` (default 100) also applies; the tighter one wins.
+    pub fn with_max_connections(mut self, max: Option<usize>) -> Self {
+        self.max_connections = max;
         self
     }
 
     /// The shared executor whose security state every session sees.
     pub fn executor(&self) -> &Arc<SqlExecutor> {
         &self.executor
+    }
+
+    /// Sessions currently running on this server.
+    pub fn live_connections(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    fn policy(&self) -> ConnPolicy {
+        ConnPolicy {
+            executor: Arc::clone(&self.executor),
+            credentials: self.credentials.clone(),
+            tls: self.tls.clone().map(TlsAcceptor::from),
+            require_tls: self.require_tls,
+            max_connections: self.max_connections,
+            live: Arc::clone(&self.live),
+        }
     }
 
     /// Bind and return the listener and the actual bound address (useful when
@@ -92,28 +303,13 @@ impl PgServer {
     /// Accept one connection, drive its session to completion, and return.
     /// Useful for tests.
     pub async fn accept_one(&self, listener: &TcpListener) -> std::io::Result<()> {
-        let (stream, _) = listener.accept().await?;
-        let mut session =
-            PgSession::new(stream, self.executor.new_session(), self.password.clone());
-        session.run().await
+        let (stream, peer) = listener.accept().await?;
+        self.policy().handle(stream, peer).await
     }
 
-    /// Serve indefinitely (until the process is killed or an accept error occurs).
+    /// Serve indefinitely (until the process is killed).
     pub async fn serve(self) -> std::io::Result<()> {
-        let (listener, addr) = self.bind().await?;
-        tracing::info!("PgServer listening on {addr}");
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            tracing::debug!("accepted connection from {peer}");
-            let executor = self.executor.new_session();
-            let password = self.password.clone();
-            tokio::spawn(async move {
-                let mut session = PgSession::new(stream, executor, password);
-                if let Err(e) = session.run().await {
-                    tracing::warn!("session error: {e}");
-                }
-            });
-        }
+        self.serve_until(std::future::pending()).await
     }
 
     /// Serve until `shutdown` resolves, then stop accepting NEW connections and
@@ -125,19 +321,25 @@ impl PgServer {
         shutdown: impl std::future::Future<Output = ()>,
     ) -> std::io::Result<()> {
         let (listener, addr) = self.bind().await?;
-        Self::accept_loop_until(
-            Arc::clone(&self.executor),
-            self.password.clone(),
-            listener,
-            addr,
-            shutdown,
-        )
-        .await
+        self.serve_listener_until(listener, addr, shutdown).await
+    }
+
+    /// [`serve_until`](Self::serve_until) on an already-bound listener, with
+    /// this server's full policy (password, TLS, admission limits).
+    pub async fn serve_listener_until(
+        self,
+        listener: TcpListener,
+        addr: SocketAddr,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> std::io::Result<()> {
+        self.policy().accept_until(listener, addr, shutdown).await
     }
 
     /// Same accept-loop as [`serve_until`](Self::serve_until), but takes an
     /// already-bound listener — lets tests learn the real ephemeral port before
     /// the loop starts, the same way [`accept_one`](Self::accept_one) does.
+    /// Plaintext only, with the executor's own admission limits; use
+    /// [`serve_listener_until`](Self::serve_listener_until) for TLS.
     pub async fn accept_loop_until(
         executor: Arc<SqlExecutor>,
         password: Option<String>,
@@ -145,28 +347,16 @@ impl PgServer {
         addr: SocketAddr,
         shutdown: impl std::future::Future<Output = ()>,
     ) -> std::io::Result<()> {
-        tracing::info!("PgServer listening on {addr}");
-        tokio::pin!(shutdown);
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    let (stream, peer) = accepted?;
-                    tracing::debug!("accepted connection from {peer}");
-                    let session_exec = executor.new_session();
-                    let password = password.clone();
-                    tokio::spawn(async move {
-                        let mut session = PgSession::new(stream, session_exec, password);
-                        if let Err(e) = session.run().await {
-                            tracing::warn!("session error: {e}");
-                        }
-                    });
-                }
-                _ = &mut shutdown => {
-                    tracing::info!("PgServer on {addr} shutting down (no longer accepting new connections)");
-                    return Ok(());
-                }
-            }
+        ConnPolicy {
+            executor,
+            credentials: Credentials::new(password.as_deref(), AuthMethod::default()),
+            tls: None,
+            require_tls: false,
+            max_connections: None,
+            live: Arc::new(AtomicUsize::new(0)),
         }
+        .accept_until(listener, addr, shutdown)
+        .await
     }
 }
 
@@ -423,6 +613,7 @@ mod tests {
         let config = PgConfig::new("127.0.0.1:0".parse().unwrap(), dir.to_path_buf());
         let server = PgServer::new(config)
             .unwrap()
+            .with_auth_method(AuthMethod::Password)
             .with_password(Some("s3cret".to_owned()));
         let (listener, addr) = server.bind().await.unwrap();
         let handle = tokio::spawn(async move {
