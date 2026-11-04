@@ -123,9 +123,11 @@ impl MultiTxnRegistry {
             return Ok(count);
         }
 
-        let log =
-            vectorvolt_engine::TxnIntentLog::open(registry.base_dir().join("_txn_intent.log"))
-                .map_err(engine_err)?;
+        let log = vectorvolt_engine::TxnIntentLog::open_with(
+            registry.base_dir().join("_txn_intent.log"),
+            registry.encryption_key().cloned(),
+        )
+        .map_err(engine_err)?;
         let uuid = format!(
             "http-{}-{txn_id}-{}",
             std::process::id(),

@@ -26,7 +26,7 @@ use vectorvolt_cluster::node::NodeId;
 use vectorvolt_cluster::node_runtime::{ClusterNode, ClusterStatusServer};
 use vectorvolt_crypto::{EncryptedReader, EncryptedWriter, KeyStore};
 use vectorvolt_engine::{
-    CliOverrides, ShardCatalog, SystemProfile, TableEngine, TableRegistry, VvConfig,
+    CliOverrides, EngineOptions, ShardCatalog, SystemProfile, TableEngine, TableRegistry, VvConfig,
     load_config_full,
 };
 use vectorvolt_http::{HttpServer, HttpServerConfig};
@@ -216,17 +216,18 @@ pub struct ServeArgs {
     #[arg(long)]
     pub tpm_unseal: bool,
 
-    /// Encrypt table metadata at rest with AES-256-GCM (`vectorvolt-crypto`, VV-SEC-001/002).
+    /// Encrypt data at rest with AES-256-GCM (`vectorvolt-crypto`, VV-SEC-001/002).
     ///
     /// Requires a master key: either unseal one from the TPM with `--tpm-unseal`, or
     /// export `VECTORVOLT_MASTER_KEY` (64 hex chars, see `vvctl install --gen-key`)
     /// before starting the server. Fails immediately if neither is present.
     ///
-    /// Today this covers the table's `schema.txt` metadata file (written/read via
-    /// `vectorvolt_crypto::{EncryptedWriter,EncryptedReader}`). Row data in `.vvsst`
-    /// partitions and WAL segments is NOT yet covered — see VV-SEC-006 follow-up;
-    /// those readers are mmap-based and require a format change to support
-    /// transparent decryption without losing the zero-copy read path.
+    /// Covers every table's WAL payloads (single-table and `--multi`, PP-51), the
+    /// single-table `schema.txt`, and enables SQL column encryption (`INSERT
+    /// ENCRYPTED`) on the pgwire listener under a key derived from the master key.
+    /// `.vvsst` partitions, the `--multi` `schema.txt` files and the catalog WAL are
+    /// NOT yet covered (PP-53/PP-54); the partition readers are mmap-based and need
+    /// a format change to decrypt without losing the zero-copy read path.
     #[arg(long)]
     pub encrypt_at_rest: bool,
 
@@ -334,6 +335,8 @@ pub struct BoundServer {
     pub master_config: Option<VvConfig>,
     /// Whether `--encrypt-at-rest` is active (schema metadata encrypted, VV-SEC-006).
     pub encrypt_at_rest: bool,
+    /// The master key when `--encrypt-at-rest` is active (`None` otherwise).
+    pub master_key: Option<Arc<KeyStore>>,
 }
 
 /// Resolve the AES-256-GCM master key for `--encrypt-at-rest` from
@@ -346,6 +349,41 @@ fn resolve_master_key() -> Result<KeyStore> {
              Set VECTORVOLT_MASTER_KEY (see `vvctl install --gen-key`) or pass --tpm-unseal."
         )
     })
+}
+
+/// Domain-separation label for the SQL column-encryption key (A2).
+const COLUMN_KEY_LABEL: &[u8] = b"vectorvolt-column-encryption-v1";
+
+/// Derive the SQL column-encryption key (`INSERT ENCRYPTED` / `SELECT DECRYPT`)
+/// from the at-rest master key: `SHA3-256(label || master_key)`. Domain
+/// separation keeps column ciphertexts and WAL ciphertexts under different keys.
+pub fn derive_column_key(master: &KeyStore) -> Result<KeyStore> {
+    use sha3::{Digest, Sha3_256};
+    let mut hasher = Sha3_256::new();
+    hasher.update(COLUMN_KEY_LABEL);
+    hasher.update(master.as_bytes());
+    // `from_bytes` moves the derived key into protected (locked) memory.
+    let digest: [u8; 32] = hasher.finalize().into();
+    KeyStore::from_bytes(digest)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| "derive column-encryption key")
+}
+
+/// Build the pgwire server `vvctl serve --pgwire-port` runs: shares `registry`,
+/// is gated by `password`, and has SQL column encryption enabled when
+/// `column_key` is set (A2: otherwise `INSERT ENCRYPTED` fails with "column
+/// encryption key not configured").
+pub fn build_pg_server(
+    config: PgConfig,
+    registry: Arc<TableRegistry>,
+    password: Option<String>,
+    column_key: Option<KeyStore>,
+) -> PgServer {
+    let server = PgServer::with_registry(config, registry).with_password(password);
+    if let Some(key) = column_key {
+        server.executor().set_column_encryption_key(key);
+    }
+    server
 }
 
 /// Read `schema.txt`, transparently decrypting it first when `encrypt` is set.
@@ -488,12 +526,12 @@ fn build_auth(args: &ServeArgs) -> Result<AuthConfig> {
 }
 
 pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
-    if args.encrypt_at_rest && args.multi {
-        bail!(
-            "--encrypt-at-rest is not yet supported with --multi (catalog schemas aren't \
-             routed through schema.txt) — see VV-SEC-006 follow-up"
-        );
-    }
+    // ── Master key (--encrypt-at-rest) — resolved first so it fails fast ─────
+    let master_key: Option<Arc<KeyStore>> = if args.encrypt_at_rest {
+        Some(Arc::new(resolve_master_key()?))
+    } else {
+        None
+    };
     // ── Master config (VV-CFG-011, L123) — lowest precedence layer ───────────
     let master_config: Option<VvConfig> = if let Some(ref p) = args.master_config {
         let cfg = VvConfig::from_file(p)
@@ -538,10 +576,12 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         std::fs::create_dir_all(&args.dir)
             .with_context(|| format!("create catalog root {}", args.dir.display()))?;
         let opts = cfg_opts;
-        let reg = Arc::new(
-            TableRegistry::open(&args.dir, opts)
-                .with_context(|| format!("open catalog at {}", args.dir.display()))?,
-        );
+        // PP-51: every table in the catalog gets WAL encryption at rest.
+        let reg = match &master_key {
+            Some(key) => TableRegistry::open_with_encryption(&args.dir, opts, Arc::clone(key)),
+            None => TableRegistry::open(&args.dir, opts),
+        };
+        let reg = Arc::new(reg.with_context(|| format!("open catalog at {}", args.dir.display()))?);
         let table_count = reg.list_tables().len();
         eprintln!(
             "catalog at {}  ({} table(s) restored)",
@@ -582,10 +622,16 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
             );
             args.columns.clone()
         };
-        let eng = Arc::new(
-            TableEngine::open(schema.clone(), &args.dir, cfg_opts.flush_threshold)
-                .with_context(|| "open engine")?,
-        );
+        let eng = match &master_key {
+            Some(key) => TableEngine::open_with_encryption(
+                schema.clone(),
+                &args.dir,
+                EngineOptions::new(cfg_opts.flush_threshold),
+                Arc::clone(key),
+            ),
+            None => TableEngine::open(schema.clone(), &args.dir, cfg_opts.flush_threshold),
+        };
+        let eng = Arc::new(eng.with_context(|| "open engine")?);
         let eng2 = Arc::clone(&eng);
         let addr = args.addr;
         (
@@ -656,6 +702,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         engine_opts_flush_threshold: resolved_flush_threshold,
         master_config,
         encrypt_at_rest: args.encrypt_at_rest,
+        master_key,
     })
 }
 
@@ -728,6 +775,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         engine_opts_flush_threshold,
         master_config,
         encrypt_at_rest,
+        master_key,
     } = bind(&args)?;
 
     let local = server.local_addr()?;
@@ -794,7 +842,11 @@ pub fn run(args: ServeArgs) -> Result<()> {
     eprintln!(
         "  encrypt   : {}",
         if encrypt_at_rest {
-            "schema.txt (AES-256-GCM)"
+            if args.multi {
+                "table WALs + SQL column key (AES-256-GCM)"
+            } else {
+                "WAL + schema.txt + SQL column key (AES-256-GCM)"
+            }
         } else {
             "disabled (use --encrypt-at-rest)"
         }
@@ -958,6 +1010,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
         let pg_dir = args.dir.clone();
         // A3: `--secret` also gates pgwire (clients send it as their password).
         let pg_password = args.secret.as_ref().map(|s| s.trim().to_owned());
+        // A2: SQL column encryption uses a key derived from the master key.
+        let pg_column_key = master_key.as_deref().map(derive_column_key).transpose()?;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         pgwire_shutdown = Some(tx);
         std::thread::Builder::new()
@@ -967,7 +1021,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async move {
                     let config = PgConfig::new(pgwire_addr, pg_dir);
-                    let server = PgServer::with_registry(config, pg_reg).with_password(pg_password);
+                    let server = build_pg_server(config, pg_reg, pg_password, pg_column_key);
                     eprintln!("  pgwire    : postgres://{pgwire_addr}");
                     let shutdown = async move {
                         let _ = rx.await;

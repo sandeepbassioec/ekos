@@ -18,6 +18,7 @@ pub mod bitpack;
 pub mod column;
 pub mod compaction;
 pub mod direct_io;
+pub mod encryption;
 pub mod format;
 pub mod lifecycle;
 pub mod manifest;
@@ -32,6 +33,7 @@ pub use column::ColumnValues;
 pub use compaction::{
     CompactionOptions, CompactionOutcome, KeepAll, Liveness, RowLocation, execute_job,
 };
+pub use encryption::{is_encrypted_partition, register_partition_key};
 pub use lifecycle::{
     CompactionJob, CompactionReason, CompactionStrategy, PartitionMeta, RetentionAction,
     RetentionPlan, RetentionPolicy, RetentionRule, RetentionVeto, VerifyFinding, VerifyReport,
@@ -43,7 +45,9 @@ pub use prefetch::{AccessPattern, PrefetchAdvisor};
 pub use reader::{PartitionReader, ZonePeek};
 pub use tier::{StorageTier, TierConfig, TierStats, TieredStorageConfig};
 pub use tiered_writer::TieredWriter;
-pub use writer::{Compression, WriteOptions, write_partition, write_partition_with};
+pub use writer::{
+    Compression, WriteOptions, write_partition, write_partition_keyed, write_partition_with,
+};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -106,6 +110,37 @@ pub enum StorageError {
 
     #[error("invalid data in file: {0}")]
     InvalidData(String),
+
+    /// An encrypted partition file was opened without a key (PP-53).
+    #[error("partition file {path} is encrypted with key id {key_id} but no key was supplied")]
+    PartitionKeyMissing {
+        path: std::path::PathBuf,
+        key_id: String,
+    },
+
+    /// An encrypted partition file was opened with a different key (PP-53).
+    #[error(
+        "partition file {path} is encrypted with key id {file_key_id},          but the supplied key has id {supplied_key_id}"
+    )]
+    PartitionKeyMismatch {
+        path: std::path::PathBuf,
+        file_key_id: String,
+        supplied_key_id: String,
+    },
+
+    /// The AES-GCM tag of an encrypted partition did not verify: the bytes were
+    /// altered, or the file was moved from another partition's path (PP-53).
+    #[error(
+        "partition file {path} failed authenticated decryption ({reason}): altered bytes,          or a file copied from another partition"
+    )]
+    PartitionDecrypt {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+
+    /// Sealing a partition or manifest record failed.
+    #[error("encryption error: {0}")]
+    Encryption(String),
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;

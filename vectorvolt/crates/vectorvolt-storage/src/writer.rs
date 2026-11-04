@@ -123,6 +123,32 @@ pub fn write_partition<W: Write>(writer: &mut W, partition: &MicroPartition) -> 
     write_partition_with(writer, partition, WriteOptions::default())
 }
 
+/// Serialize `partition`, sealing it under `key` when one is given (PP-53).
+///
+/// With `None` this is exactly [`write_partition_with`] (a v3 file). With a
+/// key the v3 image is built in memory, sealed whole as an encrypted v4 file
+/// (see [`crate::encryption`]) and the plaintext image is wiped. The
+/// partition's `file_id`/`partition_id` are bound into the tag, so the file
+/// must be published under the matching `{file_id:05}_{partition_id:05}.vvsst`
+/// name — which every writer in the workspace already does.
+pub fn write_partition_keyed<W: Write>(
+    writer: &mut W,
+    partition: &MicroPartition,
+    opts: WriteOptions,
+    key: Option<&vectorvolt_crypto::KeyStore>,
+) -> StorageResult<()> {
+    let Some(key) = key else {
+        return write_partition_with(writer, partition, opts);
+    };
+    let mut plain: Vec<u8> = Vec::new();
+    write_partition_with(&mut plain, partition, opts)?;
+    let sealed =
+        crate::encryption::seal_partition(&plain, partition.file_id, partition.partition_id, key);
+    zeroize::Zeroize::zeroize(&mut plain);
+    writer.write_all(&sealed?)?;
+    Ok(())
+}
+
 /// Serialize `partition` into `writer` with explicit options.
 pub fn write_partition_with<W: Write>(
     writer: &mut W,

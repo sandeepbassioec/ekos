@@ -3814,8 +3814,11 @@ dependencies = [
  "aes-gcm",
  "libc",
  "rand 0.8.8",
+ "sha3",
  "tempfile",
  "thiserror 2.0.20",
+ "tracing",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 
@@ -3829,6 +3832,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha3",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -4147,7 +4151,9 @@ dependencies = [
  "memmap2",
  "tempfile",
  "thiserror 2.0.20",
+ "vectorvolt-crypto",
  "vectorvolt-hal",
+ "zeroize",
  "zstd",
 ]
 
@@ -4288,6 +4294,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha3",
  "tempfile",
  "tokio",
  "toml",

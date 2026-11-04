@@ -52,13 +52,39 @@ struct ColMeta {
     pub zone_max: u64,
 }
 
+// ── Backing bytes ─────────────────────────────────────────────────────────────
+
+/// The bytes a reader serves from.
+///
+/// A plaintext file is served straight out of its mapping, exactly as before
+/// PP-53. An encrypted file is decrypted once at open into private heap memory
+/// (wiped on drop) and served from there; the file itself is closed, so it
+/// holds no mapping that would block deletion on Windows.
+enum Backing {
+    Mapped {
+        // Keep the file open so the mapping stays valid on all platforms.
+        _file: std::fs::File,
+        mmap: memmap2::Mmap,
+    },
+    Decrypted(crate::encryption::Plaintext),
+}
+
+impl std::ops::Deref for Backing {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Backing::Mapped { mmap, .. } => mmap,
+            Backing::Decrypted(p) => p,
+        }
+    }
+}
+
 // ── PartitionReader ───────────────────────────────────────────────────────────
 
 /// Memory-mapped reader for a single `.vvsst` partition file.
 pub struct PartitionReader {
-    // Keep the file open so the mapping stays valid on all platforms.
-    _file: std::fs::File,
-    mmap: memmap2::Mmap,
+    mmap: Backing,
     // Cached header fields (avoids re-parsing on every call).
     file_id: u16,
     partition_id: u16,
@@ -97,12 +123,32 @@ pub struct ZonePeek {
 
 impl PartitionReader {
     /// Read just enough of `path` to answer zone-map queries — see [`ZonePeek`].
+    ///
+    /// An encrypted (v4) file keeps its zone maps inside the ciphertext — they
+    /// are row values — so peeking one decrypts the whole file with the key
+    /// registered for its key id (see [`crate::encryption`]).
     pub fn peek_zone_maps(path: &Path) -> StorageResult<ZonePeek> {
         use std::io::BufReader;
 
         let file = std::fs::File::open(path)?;
         let mut r = BufReader::new(file);
 
+        let mut header = [0u8; HEADER_FIXED_SIZE];
+        r.read_exact(&mut header)?;
+        if crate::encryption::is_encrypted_partition(&header) {
+            drop(r);
+            let bytes = std::fs::read(path)?;
+            let plain = crate::encryption::open_envelope(
+                &bytes,
+                path,
+                crate::encryption::KeySource::Registry,
+            )?;
+            return Self::peek_from(Cursor::new(&plain[..]));
+        }
+        Self::peek_from(Cursor::new(&header[..]).chain(r))
+    }
+
+    fn peek_from<R: Read>(mut r: R) -> StorageResult<ZonePeek> {
         let mut header = [0u8; HEADER_FIXED_SIZE];
         r.read_exact(&mut header)?;
         if header[0..8] != MAGIC[..] {
@@ -165,12 +211,44 @@ impl PartitionReader {
     ///
     /// Returns `Err` immediately on magic mismatch, version mismatch,
     /// or any CRC failure.
+    ///
+    /// An encrypted (v4) file is decrypted with the key registered for the
+    /// key id in its header ([`crate::register_partition_key`]); with no live
+    /// key registered the open fails with
+    /// [`StorageError::PartitionKeyMissing`]. Callers that hold the key should
+    /// use [`open_with_key`](Self::open_with_key).
     pub fn open(path: &Path) -> StorageResult<Self> {
+        Self::open_inner(path, crate::encryption::KeySource::Registry)
+    }
+
+    /// Open with an explicit key (PP-53), never consulting the registry.
+    ///
+    /// A plaintext (v3) file opens normally whatever `key` is — that is how a
+    /// table that gained encryption keeps reading its older files. An
+    /// encrypted file needs `key` to be the key named in its header:
+    /// [`StorageError::PartitionKeyMissing`] without one,
+    /// [`StorageError::PartitionKeyMismatch`] with another, and
+    /// [`StorageError::PartitionDecrypt`] if the bytes were altered or the
+    /// file was copied from another partition's path.
+    pub fn open_with_key(
+        path: &Path,
+        key: Option<&vectorvolt_crypto::KeyStore>,
+    ) -> StorageResult<Self> {
+        Self::open_inner(path, crate::encryption::KeySource::Explicit(key))
+    }
+
+    fn open_inner(path: &Path, key: crate::encryption::KeySource<'_>) -> StorageResult<Self> {
         let file = std::fs::File::open(path)?;
         // SAFETY: file content must not be modified while the Mmap is live.
         // VectorVolt SSTables are immutable once written — this invariant holds.
         let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
-        Self::parse(file, mmap)
+        if crate::encryption::is_encrypted_partition(&mmap) {
+            let plain = crate::encryption::open_envelope(&mmap, path, key)?;
+            drop(mmap);
+            drop(file);
+            return Self::parse(Backing::Decrypted(plain));
+        }
+        Self::parse(Backing::Mapped { _file: file, mmap })
     }
 
     /// A file section, or an error if it does not lie inside the mapping.
@@ -194,7 +272,7 @@ impl PartitionReader {
         })
     }
 
-    fn parse(file: std::fs::File, mmap: memmap2::Mmap) -> StorageResult<Self> {
+    fn parse(mmap: Backing) -> StorageResult<Self> {
         let data: &[u8] = &mmap;
 
         // ── Magic + minimum size check ────────────────────────────────────
@@ -302,7 +380,6 @@ impl PartitionReader {
         }
 
         Ok(PartitionReader {
-            _file: file,
             mmap,
             file_id,
             partition_id,
@@ -438,6 +515,12 @@ impl PartitionReader {
         self.col_meta
             .iter()
             .all(|m| m.compression == COMPRESSION_NONE)
+    }
+
+    /// True if the file was encrypted at rest (v4) and is being served from a
+    /// decrypted private copy (PP-53).
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.mmap, Backing::Decrypted(_))
     }
 
     /// True if `col_idx` is stored compressed.

@@ -79,9 +79,32 @@ impl WriterInner {
             self.next_seq,
             self.config.segment_max_bytes,
             false,
+            self.config.encryption_key_id,
         )?;
         self.sync_file = open_sync_handle(&self.segment.path)?;
         Ok(())
+    }
+
+    /// Start a new segment if the current one's header does not record the
+    /// configured encryption key id, so a segment never mixes frames written
+    /// under different keys (or plaintext and ciphertext) - PP-52.
+    fn ensure_segment_key(&mut self) -> WalResult<()> {
+        if self.segment.key_id != self.config.encryption_key_id {
+            self.rotate()?;
+        }
+        Ok(())
+    }
+
+    /// Append a frame whose payload is built from the sequence number it will
+    /// carry. `make` runs under the append lock, after the sequence is fixed,
+    /// so it can bind the payload to that sequence (AAD for encryption).
+    fn append_frame_with<E, F>(&mut self, payload_type: PayloadType, make: F) -> Result<WalTip, E>
+    where
+        E: From<WalError>,
+        F: FnOnce(u64) -> Result<Vec<u8>, E>,
+    {
+        let payload = make(self.next_seq)?;
+        Ok(self.append_frame(payload, payload_type)?)
     }
 
     fn append_frame(&mut self, payload: Vec<u8>, payload_type: PayloadType) -> WalResult<WalTip> {
@@ -141,7 +164,14 @@ impl WalWriter {
 
         let (segment, next_seq, chain_hash) = if ids.is_empty() {
             // Fresh WAL.
-            let seg = SegmentWriter::create(&config.dir, 0, 1, config.segment_max_bytes, false)?;
+            let seg = SegmentWriter::create(
+                &config.dir,
+                0,
+                1,
+                config.segment_max_bytes,
+                false,
+                config.encryption_key_id,
+            )?;
             info!(dir = %config.dir.display(), "created new WAL");
             (seg, 1u64, GENESIS_HASH)
         } else {
@@ -193,21 +223,26 @@ impl WalWriter {
                 frames.len() as u64,
                 config.segment_max_bytes,
                 false,
+                reader.header.key_id,
             );
             (seg, next_seq, chain_hash)
         };
 
         let sync_file = open_sync_handle(&segment.path)?;
+        let mut inner = WriterInner {
+            config,
+            segment,
+            sync_file,
+            next_seq,
+            chain_hash,
+            #[cfg(test)]
+            before_sync: None,
+        };
+        // Reopening with encryption turned on (or off, or under a new key)
+        // must not append into a segment whose header says otherwise.
+        inner.ensure_segment_key()?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(WriterInner {
-                config,
-                segment,
-                sync_file,
-                next_seq,
-                chain_hash,
-                #[cfg(test)]
-                before_sync: None,
-            })),
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 
@@ -215,6 +250,33 @@ impl WalWriter {
     /// Does NOT fsync — call `flush()` or use the GroupCommitBatcher.
     pub fn append(&self, payload: Vec<u8>) -> WalResult<WalTip> {
         self.inner.lock().append_frame(payload, PayloadType::Data)
+    }
+
+    /// Append a data frame whose payload `make` builds from the frame's
+    /// sequence number. The sequence is assigned and `make` runs under the
+    /// writer's lock, so concurrent appends can never disagree with it: this
+    /// is how an encrypted payload is bound to its position (PP-52 AAD).
+    /// Nothing is written if `make` fails.
+    pub fn append_with<E, F>(&self, make: F) -> Result<WalTip, E>
+    where
+        E: From<WalError>,
+        F: FnOnce(u64) -> Result<Vec<u8>, E>,
+    {
+        self.inner.lock().append_frame_with(PayloadType::Data, make)
+    }
+
+    /// Set the encryption key id recorded in new segment headers. If the
+    /// current segment's header records a different one, the writer rotates
+    /// to a fresh segment first.
+    pub fn set_encryption_key_id(&self, key_id: Option<crate::segment::KeyId>) -> WalResult<()> {
+        let mut g = self.inner.lock();
+        g.config.encryption_key_id = key_id;
+        g.ensure_segment_key()
+    }
+
+    /// The encryption key id new segments are written with.
+    pub fn encryption_key_id(&self) -> Option<crate::segment::KeyId> {
+        self.inner.lock().config.encryption_key_id
     }
 
     /// Flush OS write buffers + optional fsync for everything written so far.
@@ -488,6 +550,7 @@ mod tests {
             next,
             512,
             false,
+            None,
         )
         .unwrap();
         seg.flush().unwrap();
@@ -519,5 +582,45 @@ mod tests {
 
         let ids = list_segment_ids(dir.path()).unwrap();
         assert!(ids.len() > 1, "expected multiple segments after rotation");
+    }
+
+    #[test]
+    fn enabling_encryption_rotates_into_a_keyed_segment() {
+        let dir = TempDir::new().unwrap();
+        let cfg = WalConfig::default().with_dir(dir.path()).with_fsync(false);
+        let writer = WalWriter::open(cfg.clone()).unwrap();
+        writer.append(b"plain".to_vec()).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let id: crate::segment::KeyId = [9u8; 8];
+        let writer = WalWriter::open(cfg.clone().with_encryption_key_id(Some(id))).unwrap();
+        let tip = writer
+            .append_with(|seq| Ok::<_, WalError>(seq.to_le_bytes().to_vec()))
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let ids = list_segment_ids(dir.path()).unwrap();
+        assert_eq!(ids.len(), 2);
+        let first = SegmentReader::open(&segment_path(dir.path(), ids[0])).unwrap();
+        let second = SegmentReader::open(&segment_path(dir.path(), ids[1])).unwrap();
+        assert_eq!(first.header.key_id, None);
+        assert_eq!(second.header.key_id, Some(id));
+        let frames = crate::WalReader::open(cfg.clone()).read_all().unwrap();
+        assert_eq!(frames[1].payload, tip.sequence.to_le_bytes());
+        assert_eq!(crate::WalReader::open(cfg).verify().unwrap(), 2);
+    }
+
+    #[test]
+    fn failed_payload_builder_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let cfg = WalConfig::default().with_dir(dir.path()).with_fsync(false);
+        let writer = WalWriter::open(cfg).unwrap();
+        let r = writer
+            .append_with(|_| Err::<Vec<u8>, _>(WalError::PayloadTooLarge { size: 1, max: 0 }));
+        assert!(r.is_err());
+        assert_eq!(writer.tip().sequence, 0);
+        assert_eq!(writer.append(b"x".to_vec()).unwrap().sequence, 1);
     }
 }
