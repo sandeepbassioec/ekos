@@ -53,6 +53,12 @@ pub const MAGIC: &[u8; 8] = b"VVSST001";
 /// | 1 | Raw + dictionary encodings |
 /// | 2 | Added RLE, frame-of-reference, blocked-frame; bit_width in column metadata byte 1 |
 /// | 3 | Optional LZ4 per column; section offsets became payload-relative |
+/// | 4 | Encrypted envelope around a complete v3 file (PP-53) — see [`crate::encryption`] |
+///
+/// `VERSION` stays 3: it is the layout the reader parses. A v4 file is
+/// recognised by [`crate::encryption::is_encrypted_partition`], decrypted, and
+/// the v3 image inside it is parsed as usual; plaintext files are written and
+/// read as v3 exactly as before.
 ///
 /// **v3 is a breaking change and `MIN_READABLE_VERSION` says so.** v1 and v2
 /// stored `dict_offset` as an absolute file offset; v3 replaced that slot with

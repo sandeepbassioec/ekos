@@ -33,6 +33,7 @@ use crate::cdc_log::CdcLog;
 use crate::index_catalog;
 use crate::mvcc::MvccStore;
 use crate::schema::TableSchema;
+use crate::side_crypto::{KeyedWal, SideKey, TableId};
 use crate::{CompactResult, EngineError, EngineResult, EngineRow, EngineStats, TxnId};
 
 /// Per-table engine: owns the write path (TxnManager) and read path (PartitionReader map).
@@ -118,6 +119,10 @@ pub struct TableEngine {
     #[allow(dead_code)]
     pub(crate) vector_indexes:
         parking_lot::RwLock<std::collections::HashMap<usize, vectorvolt_vector::HnswIndex>>,
+    /// Table key + identity for encrypting side files (`cdc.log`,
+    /// `snapshot.vvss`, `secondary_index.catalog`); `None` when unencrypted
+    /// (PP-54 / PP-56). Vector/HNSW indexes are in memory only.
+    pub(crate) side_key: Option<SideKey>,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -284,16 +289,33 @@ pub(crate) struct WalFold {
     pub(crate) last_seq: u64,
 }
 
-/// Verify the keyed WAL tail seal when the table is encrypted (PP-38).
-pub(crate) fn verify_wal_seal(
+/// Refuse to replay a WAL whose segment headers record an encryption key id
+/// that `wal_key` does not match, or that is encrypted while no key was given
+/// (PP-52). Runs before any frame is read, so the error names the segment and
+/// both key ids instead of surfacing as an opaque decrypt failure.
+pub(crate) fn check_wal_keys(
     wal_dir: &std::path::Path,
     wal_key: Option<&Arc<vectorvolt_crypto::KeyStore>>,
 ) -> EngineResult<()> {
-    if let Some(key) = wal_key {
-        let seal_key = vectorvolt_wal::seal::derive_seal_key(key.as_bytes());
-        vectorvolt_wal::seal::verify_seal(wal_dir, &seal_key)?;
+    vectorvolt_txn::manager::check_wal_segment_keys(wal_dir, wal_key.map(|k| k.as_ref())).map_err(
+        |e| EngineError::WalDecrypt {
+            seq: e.seq,
+            reason: e.reason,
+        },
+    )
+}
+
+/// Verify the keyed WAL tail seal when the table is encrypted (PP-38), the
+/// WAL table marker, and that a table that was sealed still has its seal
+/// (see [`crate::side_crypto::check_keyed_wal`]).
+pub(crate) fn verify_wal_seal(
+    wal_dir: &std::path::Path,
+    wal_key: Option<&Arc<vectorvolt_crypto::KeyStore>>,
+) -> EngineResult<KeyedWal> {
+    match wal_key {
+        Some(key) => crate::side_crypto::check_keyed_wal(wal_dir, key),
+        None => Ok(KeyedWal::default()),
     }
-    Ok(())
 }
 
 /// Fold every WAL frame with `after < sequence <= upto` into the final state
@@ -311,6 +333,9 @@ pub(crate) fn verify_wal_seal(
 /// an encrypted table without its key fails with `WalDecrypt` instead of
 /// silently dropping the rows (A8 / PP-52). Plaintext frames (markers, and
 /// frames written before encryption was turned on) are read as they are.
+/// Segment key ids are checked first ([`check_wal_keys`]); `VVE2` frames are
+/// decrypted with their sequence as AAD, so a frame copied to another
+/// position fails (see `vectorvolt_txn::manager::open_wal_payload`).
 pub(crate) fn fold_wal(
     wal_dir: &std::path::Path,
     after: u64,
@@ -322,71 +347,70 @@ pub(crate) fn fold_wal(
         first_seq: None,
         last_seq: 0,
     };
+    check_wal_keys(wal_dir, wal_key)?;
     let mut decrypt_err: Option<EngineError> = None;
     let wal_cfg = WalConfig::default().with_dir(wal_dir).with_fsync(false);
-    WalReader::open(wal_cfg).scan(vectorvolt_wal::WalCursor::beginning(), |frame| {
-        if frame.sequence > upto {
-            return false;
-        }
-        fold.first_seq.get_or_insert(frame.sequence);
-        fold.last_seq = frame.sequence;
-        if frame.sequence <= after {
-            return true;
-        }
-        let payload = if vectorvolt_crypto::is_encrypted(&frame.payload) {
-            let Some(key) = wal_key else {
-                decrypt_err = Some(EngineError::WalDecrypt {
-                    seq: frame.sequence,
-                    reason: "frame is encrypted but no key was provided".into(),
-                });
+    let key = wal_key.map(|k| k.as_ref());
+    WalReader::open(wal_cfg).scan_with_header(
+        vectorvolt_wal::WalCursor::beginning(),
+        |frame, header| {
+            if frame.sequence > upto {
                 return false;
-            };
-            match vectorvolt_crypto::decrypt(key, &frame.payload) {
+            }
+            fold.first_seq.get_or_insert(frame.sequence);
+            fold.last_seq = frame.sequence;
+            if frame.sequence <= after {
+                return true;
+            }
+            let payload = match vectorvolt_txn::manager::open_wal_payload(
+                key,
+                header,
+                frame.sequence,
+                frame.payload,
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     decrypt_err = Some(EngineError::WalDecrypt {
-                        seq: frame.sequence,
-                        reason: e.to_string(),
+                        seq: e.seq,
+                        reason: e.reason,
                     });
                     return false;
                 }
-            }
-        } else {
-            frame.payload
-        };
-        let final_state = &mut fold.state;
-        match Mutation::decode(&payload) {
-            Ok(Mutation::Insert { pk, values })
-            | Ok(Mutation::Upsert { pk, values })
-            | Ok(Mutation::Update { pk, values }) => {
-                final_state.insert(pk, Some(values));
-            }
-            Ok(Mutation::Delete { pk }) => {
-                final_state.insert(pk, None);
-            }
-            Ok(Mutation::InsertBatch { rows }) | Ok(Mutation::UpsertBatch { rows }) => {
-                for (pk, values) in rows {
+            };
+            let final_state = &mut fold.state;
+            match Mutation::decode(&payload) {
+                Ok(Mutation::Insert { pk, values })
+                | Ok(Mutation::Upsert { pk, values })
+                | Ok(Mutation::Update { pk, values }) => {
                     final_state.insert(pk, Some(values));
                 }
-            }
-            Ok(Mutation::DeleteBatch { pks }) => {
-                for pk in pks {
+                Ok(Mutation::Delete { pk }) => {
                     final_state.insert(pk, None);
                 }
-            }
-            Ok(Mutation::TxnBatch { ops }) => {
-                for (pk, op) in ops {
-                    final_state.insert(pk, op);
+                Ok(Mutation::InsertBatch { rows }) | Ok(Mutation::UpsertBatch { rows }) => {
+                    for (pk, values) in rows {
+                        final_state.insert(pk, Some(values));
+                    }
                 }
+                Ok(Mutation::DeleteBatch { pks }) => {
+                    for pk in pks {
+                        final_state.insert(pk, None);
+                    }
+                }
+                Ok(Mutation::TxnBatch { ops }) => {
+                    for (pk, op) in ops {
+                        final_state.insert(pk, op);
+                    }
+                }
+                Ok(Mutation::Checkpoint { .. })
+                | Ok(Mutation::DdlCreate { .. })
+                | Ok(Mutation::DdlDrop { .. })
+                | Ok(Mutation::DdlAlter { .. })
+                | Err(_) => {}
             }
-            Ok(Mutation::Checkpoint { .. })
-            | Ok(Mutation::DdlCreate { .. })
-            | Ok(Mutation::DdlDrop { .. })
-            | Ok(Mutation::DdlAlter { .. })
-            | Err(_) => {}
-        }
-        true
-    })?;
+            true
+        },
+    )?;
     if let Some(e) = decrypt_err {
         return Err(e);
     }
@@ -497,20 +521,32 @@ impl TableEngine {
         // version truncated the whole directory on every open while a marker
         // existed, which silently discarded every write made after the
         // snapshot that had not been flushed yet (PP-01).
+        //
+        // The marker is read below, once the WAL check has established the
+        // table identity an encrypted marker is bound to (PP-56).
         let snapshot_path = partition_dir.join("snapshot.vvss");
-        let replay_after = crate::snapshot::read_marker(&snapshot_path)?
-            .map(|m| m.wal_seq)
-            .unwrap_or(0);
 
+        // A wrong or missing key must fail here, before `WalWriter::open`
+        // could rotate a fresh segment under the wrong key id (PP-52).
+        check_wal_keys(&wal_dir, wal_key.as_ref())?;
         let cfg = WalConfig::default()
             .with_dir(&wal_dir)
-            .with_fsync(durability.wal_fsync());
+            .with_fsync(durability.wal_fsync())
+            .with_encryption_key_id(wal_key.as_ref().map(|k| k.key_id()));
         let wal = WalWriter::open(cfg)?;
 
         // Recover previously-flushed partitions. A file that fails to open is
         // moved aside rather than failing the whole table: its rows are rebuilt
         // from the WAL below wherever the WAL still holds them, and the move is
         // reported through `quarantined_partitions` (PP-13).
+        //
+        // Encrypted partitions (PP-53) are opened through the key registry, so
+        // the key must be registered before this scan, not only when the
+        // `TxnManager` below is built — otherwise every encrypted file would
+        // fail to open and be quarantined.
+        if let Some(key) = &wal_key {
+            vectorvolt_storage::register_partition_key(key);
+        }
         let mut partitions = HashMap::new();
         let mut quarantined = Vec::new();
         let mut max_partition_id: u16 = 0;
@@ -518,7 +554,7 @@ impl TableEngine {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("vvsst") {
-                match PartitionReader::open(&path) {
+                match PartitionReader::open_with_key(&path, wal_key.as_deref()) {
                     Ok(reader) => {
                         if reader.partition_id() >= max_partition_id {
                             max_partition_id = reader.partition_id().wrapping_add(1);
@@ -655,7 +691,44 @@ impl TableEngine {
         // Corrupt and undecryptable frames are errors; see `fold_wal`.
         // With a key, the log must still match its keyed tail seal: this is
         // what catches a truncated or rewritten WAL that still chains (PP-38).
-        verify_wal_seal(&wal_dir, wal_key.as_ref())?;
+        let keyed_wal = verify_wal_seal(&wal_dir, wal_key.as_ref())?;
+        let side_key = match &wal_key {
+            Some(key) => Some(SideKey::new(
+                Arc::clone(key),
+                match keyed_wal.table_id {
+                    Some(id) => id,
+                    None => crate::side_crypto::new_table_id()?,
+                },
+            )),
+            None => None,
+        };
+        let replay_after =
+            match crate::snapshot::read_marker_keyed(&snapshot_path, side_key.as_ref())? {
+                crate::snapshot::MarkerRead::Missing => 0,
+                crate::snapshot::MarkerRead::Authenticated(m) => m.wal_seq,
+                crate::snapshot::MarkerRead::Plain(m) if side_key.is_none() => {
+                    m.map(|m| m.wal_seq).unwrap_or(0)
+                }
+                // A keyed table that already has its identity only ever
+                // writes encrypted markers: a plaintext one was planted, and
+                // trusting its `wal_seq` would skip frames.
+                crate::snapshot::MarkerRead::Plain(_) if keyed_wal.table_id.is_some() => {
+                    return Err(crate::side_crypto::unauthenticated(
+                        &snapshot_path,
+                        "snapshot marker",
+                    )
+                    .into());
+                }
+                // Written before this table was opened with a key: not
+                // trusted, so replay the whole WAL, which is always safe.
+                crate::snapshot::MarkerRead::Plain(_) => {
+                    tracing::warn!(
+                        file = %snapshot_path.display(),
+                        "ignoring unauthenticated legacy snapshot marker on an encrypted table"
+                    );
+                    0
+                }
+            };
         let final_state = fold_wal(&wal_dir, replay_after, u64::MAX, wal_key.as_ref())?.state;
 
         for (pk, state) in final_state {
@@ -692,9 +765,22 @@ impl TableEngine {
         // Seed the flushed-rows counter so stats() is accurate after a restart.
         txn.set_total_rows_flushed(rows_on_disk);
 
+        // Record the table identity and "this table is sealed" in the WAL
+        // (A12 follow-up). `append_marker` syncs the frame and writes
+        // `tail.seal` before returning, so from here on a missing seal is a
+        // deleted one. Re-appended after a crash between those two steps.
+        if let (Some(key), Some(side)) = (&wal_key, &side_key)
+            && (keyed_wal.table_id.is_none() || keyed_wal.needs_reseal)
+        {
+            txn.append_marker(crate::side_crypto::encode_table_marker(
+                key,
+                &side.table_id(),
+            ))?;
+        }
+
         let catalog_path = index_catalog::catalog_path(&data_dir);
         let cdc_log_path = data_dir.join("cdc.log");
-        let cdc_log = CdcLog::open(cdc_log_path)?;
+        let cdc_log = CdcLog::open_keyed(cdc_log_path, side_key.clone())?;
         let max_lsn = cdc_log.max_lsn()?;
         let (changes_tx, _) = tokio::sync::broadcast::channel(1024);
         let engine = TableEngine {
@@ -723,12 +809,13 @@ impl TableEngine {
             fk_rebuild: parking_lot::Mutex::new(()),
             projections: parking_lot::Mutex::new(vectorvolt_projection::ProjectionStore::new()),
             vector_indexes: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            side_key,
         };
 
         // Rebuild any secondary indexes that were persisted before shutdown.
         // Done after full construction so build_secondary_index can call
         // flush_if_needed, get, and scan normally.
-        for col in index_catalog::load(&engine.catalog_path) {
+        for col in index_catalog::load(&engine.catalog_path, engine.side_key.as_ref())? {
             if col < engine.schema.col_count() {
                 engine.build_secondary_index(col)?;
             }
@@ -831,15 +918,32 @@ impl TableEngine {
             wal_seq,
         };
         let marker = self.partition_dir.join("snapshot.vvss");
-        crate::snapshot::write_marker(&marker, &meta)?;
+        crate::snapshot::write_marker_keyed(&marker, &meta, self.side_key.as_ref())?;
         Ok(meta)
     }
 
     /// Return snapshot metadata if a marker exists, or `None` if no snapshot
     /// has been taken for this table.
+    ///
+    /// On an encrypted table the marker must authenticate; a plaintext one is
+    /// an error rather than trusted.
     pub fn snapshot_info(&self) -> EngineResult<Option<crate::snapshot::SnapshotMeta>> {
+        use crate::snapshot::MarkerRead;
         let marker = self.partition_dir.join("snapshot.vvss");
-        Ok(crate::snapshot::read_marker(&marker)?)
+        match crate::snapshot::read_marker_keyed(&marker, self.side_key.as_ref())? {
+            MarkerRead::Missing => Ok(None),
+            MarkerRead::Authenticated(m) => Ok(Some(m)),
+            MarkerRead::Plain(m) if self.side_key.is_none() => Ok(m),
+            MarkerRead::Plain(_) => {
+                Err(crate::side_crypto::unauthenticated(&marker, "snapshot marker").into())
+            }
+        }
+    }
+
+    /// The random identity this encrypted table's side files are bound to
+    /// (recorded in its WAL table marker); `None` when unencrypted.
+    pub fn table_id(&self) -> Option<TableId> {
+        self.side_key.as_ref().map(|s| s.table_id())
     }
 
     /// Subscribe to change events for this table.
@@ -1331,7 +1435,8 @@ impl TableEngine {
         // rather than by a directory scan, so an orphan left by an interrupted run
         // is not silently adopted as a live partition.
         for meta in self.txn.partitions() {
-            let reader = PartitionReader::open(&meta.path)?;
+            let reader =
+                PartitionReader::open_with_key(&meta.path, self.txn.wal_key().map(|k| k.as_ref()))?;
             parts.insert((reader.file_id(), reader.partition_id()), reader);
         }
 
@@ -1450,7 +1555,8 @@ impl TableEngine {
         // rather than by subtracting, because the deleted partitions' key lists
         // are no longer readable once their files are unlinked.
         for meta in self.txn.partitions() {
-            let reader = PartitionReader::open(&meta.path)?;
+            let reader =
+                PartitionReader::open_with_key(&meta.path, self.txn.wal_key().map(|k| k.as_ref()))?;
             parts.insert((reader.file_id(), reader.partition_id()), reader);
         }
         self.rebuild_index_from(&parts)?;
@@ -1720,7 +1826,26 @@ impl TableEngine {
             // full-file CRC, no mmap page prefault. This is the fix for
             // VV-ENG-014 â€” a partition a zone-map filter will exclude is
             // registered here for near-zero cost and never promoted.
-            let peek = PartitionReader::peek_zone_maps(&path)?;
+            //
+            // An encrypted table peeks with its own key: an encrypted peek
+            // decrypts the whole file anyway, and the process-wide key
+            // registry `peek_zone_maps` uses can lose a live key when another
+            // `Arc` of the same key id is registered and dropped.
+            let peek = match self.txn.wal_key() {
+                Some(k) => {
+                    let r = PartitionReader::open_with_key(&path, Some(k.as_ref()))?;
+                    let zones = (0..r.col_count() as usize)
+                        .map(|c| r.zone_min_max(c))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    ZonePeek {
+                        file_id: r.file_id(),
+                        partition_id: r.partition_id(),
+                        row_count: r.row_count(),
+                        zones,
+                    }
+                }
+                None => PartitionReader::peek_zone_maps(&path)?,
+            };
             let key = (peek.file_id, peek.partition_id);
             if parts.contains_key(&key) || pending.contains_key(&key) {
                 continue;
@@ -1756,7 +1881,7 @@ impl TableEngine {
             self.pending_partitions.write().remove(&key);
             return Ok(());
         }
-        let reader = PartitionReader::open(&path)?;
+        let reader = PartitionReader::open_with_key(&path, self.txn.wal_key().map(|k| k.as_ref()))?;
         self.partition_opens
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         parts.insert(key, reader);

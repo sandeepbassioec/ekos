@@ -30,6 +30,22 @@
 //! └──────────────────────────────────────┘
 //! ```
 //!
+//! ## Encrypted manifests (PP-53)
+//!
+//! A manifest records each partition's `min_key`/`max_key` — primary-key
+//! values, i.e. row data — so authenticating it is not enough; with a key
+//! ([`Manifest::open_with_key`]) it is encrypted. The file starts with
+//! `magic[8] "VVMANIF2" key_id[8] salt[16]` and every record body is a `VVE2`
+//! AES-256-GCM blob of the edit, with AAD =
+//! `"vectorvolt-manifest-v2" || key_id || salt || record_index`. The index
+//! binds record order (a record cannot be moved, duplicated or dropped from
+//! the middle) and the per-file salt stops records being spliced in from
+//! another manifest under the same key. The CRC still frames each record, so a
+//! torn tail is truncated exactly as in a plaintext log; a record whose CRC
+//! holds but whose tag does not is tampering or a wrong key and fails the open.
+//! A plaintext `VVMANIF1` log opened with a key is read and immediately
+//! rewritten encrypted.
+//!
 //! ## The torn-write ambiguity, stated rather than hidden
 //!
 //! A partial write at the end of the log is normal — the process died mid-append.
@@ -60,6 +76,82 @@ type PartitionState = BTreeMap<(u16, u16), PartitionMeta>;
 
 /// Magic bytes at the head of a manifest file.
 pub const MANIFEST_MAGIC: &[u8; 8] = b"VVMANIF1";
+
+/// Magic bytes at the head of an encrypted manifest file (PP-53).
+pub const MANIFEST_MAGIC_ENCRYPTED: &[u8; 8] = b"VVMANIF2";
+
+/// `magic[8] key_id[8] salt[16]`.
+const ENC_HEADER_LEN: usize = 32;
+const MANIFEST_AAD_DOMAIN: &[u8] = b"vectorvolt-manifest-v2";
+
+/// Encryption state of an open manifest file.
+struct ManifestCipher {
+    key: std::sync::Arc<vectorvolt_crypto::KeyStore>,
+    /// Unique per file write; bound into every record's AAD. Not secret.
+    salt: [u8; 16],
+    /// Index of the next record appended to the current file.
+    next_index: u64,
+}
+
+impl ManifestCipher {
+    fn new(key: std::sync::Arc<vectorvolt_crypto::KeyStore>) -> Self {
+        ManifestCipher {
+            key,
+            salt: fresh_salt(),
+            next_index: 0,
+        }
+    }
+
+    fn header(&self) -> [u8; ENC_HEADER_LEN] {
+        let mut h = [0u8; ENC_HEADER_LEN];
+        h[0..8].copy_from_slice(MANIFEST_MAGIC_ENCRYPTED);
+        h[8..16].copy_from_slice(&self.key.key_id());
+        h[16..32].copy_from_slice(&self.salt);
+        h
+    }
+
+    fn aad(&self, index: u64) -> Vec<u8> {
+        let mut a = Vec::with_capacity(MANIFEST_AAD_DOMAIN.len() + 32);
+        a.extend_from_slice(MANIFEST_AAD_DOMAIN);
+        a.extend_from_slice(&self.key.key_id());
+        a.extend_from_slice(&self.salt);
+        a.extend_from_slice(&index.to_le_bytes());
+        a
+    }
+
+    /// Seal the next record's body.
+    fn seal(&mut self, body: &[u8]) -> StorageResult<Vec<u8>> {
+        let sealed = vectorvolt_crypto::encryptor::encrypt_with_aad(
+            &self.key,
+            body,
+            &self.aad(self.next_index),
+        )
+        .map_err(|e| StorageError::Encryption(format!("manifest record: {e}")))?;
+        self.next_index += 1;
+        Ok(sealed)
+    }
+}
+
+/// A value unique to this file write: nanosecond clock, process id and a
+/// process-wide counter. It only has to differ between manifest files.
+fn fresh_salt() -> [u8; 16] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut s = [0u8; 16];
+    s[0..8].copy_from_slice(&nanos.to_le_bytes());
+    s[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+    s[12..16].copy_from_slice(&(n as u32).to_le_bytes());
+    s
+}
+
+fn key_hex(id: &[u8]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// Largest edit payload accepted during replay.
 ///
@@ -365,6 +457,8 @@ pub struct Manifest {
     file: std::fs::File,
     /// Edits appended since the last rewrite, for the compaction heuristic.
     edits_since_rewrite: usize,
+    /// Set when the manifest is encrypted at rest (PP-53).
+    cipher: Option<ManifestCipher>,
 }
 
 impl Manifest {
@@ -376,12 +470,38 @@ impl Manifest {
     pub const REWRITE_AFTER_EDITS: usize = 1000;
 
     /// Open an existing manifest or create an empty one.
+    ///
+    /// Plaintext only: an encrypted manifest fails to open. See
+    /// [`open_with_key`](Self::open_with_key).
     pub fn open(path: impl AsRef<Path>) -> StorageResult<(Self, ManifestRecovery)> {
+        Self::open_with_key(path, None)
+    }
+
+    /// Open or create a manifest, encrypted under `key` when one is given
+    /// (PP-53; format in the module docs).
+    ///
+    /// - no file: created encrypted with a key, plaintext without;
+    /// - an encrypted file: needs `key`, and it must be the key named in the
+    ///   header — a missing or different key is an error naming both ids;
+    /// - a plaintext file with a key: replayed, then rewritten encrypted.
+    pub fn open_with_key(
+        path: impl AsRef<Path>,
+        key: Option<std::sync::Arc<vectorvolt_crypto::KeyStore>>,
+    ) -> StorageResult<(Self, ManifestRecovery)> {
         let path = path.as_ref().to_path_buf();
-        let (partitions, recovery, valid_len) = if path.exists() {
-            Self::replay(&path)?
+        let (partitions, recovery, valid_len, cipher, migrate) = if path.exists() {
+            let (state, rec, valid, cipher) = Self::replay(&path, key.as_ref())?;
+            // A plaintext log replayed with a key in hand is migrated below.
+            let migrate = cipher.is_none() && key.is_some();
+            (state, rec, valid, cipher, migrate)
         } else {
-            (BTreeMap::new(), ManifestRecovery::default(), 0)
+            (
+                BTreeMap::new(),
+                ManifestRecovery::default(),
+                0,
+                key.clone().map(ManifestCipher::new),
+                false,
+            )
         };
 
         // Truncate the torn tail before appending. Otherwise the next append lands
@@ -406,35 +526,92 @@ impl Manifest {
                 .read(true)
                 .write(true)
                 .open(&path)?;
-            f.write_all(MANIFEST_MAGIC)?;
+            match &cipher {
+                Some(c) => f.write_all(&c.header())?,
+                None => f.write_all(MANIFEST_MAGIC)?,
+            }
             f.sync_all()?;
             f
         };
 
-        Ok((
-            Manifest {
-                path,
-                partitions,
-                file,
-                edits_since_rewrite: recovery.edits_applied,
-            },
-            recovery,
-        ))
+        let mut m = Manifest {
+            path,
+            partitions,
+            file,
+            edits_since_rewrite: recovery.edits_applied,
+            cipher,
+        };
+        if migrate {
+            m.cipher = key.map(ManifestCipher::new);
+            m.rewrite()?;
+        }
+        Ok((m, recovery))
+    }
+
+    /// True if this manifest is encrypted at rest.
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
     }
 
     /// Replay a manifest file. Returns the state, what recovery did, and the byte
     /// offset of the end of the last valid record.
-    fn replay(path: &Path) -> StorageResult<(PartitionState, ManifestRecovery, u64)> {
+    #[allow(clippy::type_complexity)]
+    fn replay(
+        path: &Path,
+        key: Option<&std::sync::Arc<vectorvolt_crypto::KeyStore>>,
+    ) -> StorageResult<(
+        PartitionState,
+        ManifestRecovery,
+        u64,
+        Option<ManifestCipher>,
+    )> {
         let data = std::fs::read(path)?;
-        if data.len() < MANIFEST_MAGIC.len() || &data[..8] != MANIFEST_MAGIC.as_slice() {
+        let encrypted = data.len() >= 8 && &data[..8] == MANIFEST_MAGIC_ENCRYPTED.as_slice();
+        if !encrypted
+            && (data.len() < MANIFEST_MAGIC.len() || &data[..8] != MANIFEST_MAGIC.as_slice())
+        {
             return Err(StorageError::InvalidData(
                 "manifest magic missing or wrong".into(),
             ));
         }
 
+        let mut cipher = None;
+        let mut at = MANIFEST_MAGIC.len();
+        if encrypted {
+            let header = data.get(..ENC_HEADER_LEN).ok_or_else(|| {
+                StorageError::InvalidData(format!(
+                    "encrypted manifest {} is shorter than its header",
+                    path.display()
+                ))
+            })?;
+            let file_key_id = &header[8..16];
+            let Some(key) = key else {
+                return Err(StorageError::Encryption(format!(
+                    "manifest {} is encrypted with key id {} but no key was supplied",
+                    path.display(),
+                    key_hex(file_key_id)
+                )));
+            };
+            if key.key_id()[..] != file_key_id[..] {
+                return Err(StorageError::Encryption(format!(
+                    "manifest {} is encrypted with key id {}, but the supplied key has id {}",
+                    path.display(),
+                    key_hex(file_key_id),
+                    key_hex(&key.key_id())
+                )));
+            }
+            let mut salt = [0u8; 16];
+            salt.copy_from_slice(&header[16..32]);
+            cipher = Some(ManifestCipher {
+                key: std::sync::Arc::clone(key),
+                salt,
+                next_index: 0,
+            });
+            at = ENC_HEADER_LEN;
+        }
+
         let mut state: PartitionState = BTreeMap::new();
         let mut recovery = ManifestRecovery::default();
-        let mut at = MANIFEST_MAGIC.len();
 
         // Header is 8 bytes: length + CRC. Anything shorter is a torn tail.
         while let Some(header) = data.get(at..at + 8) {
@@ -451,6 +628,29 @@ impl Manifest {
             if crc32fast::hash(body) != crc {
                 break; // torn write, or corruption — see module docs
             }
+            let opened;
+            let body = match cipher.as_mut() {
+                None => body,
+                Some(c) => {
+                    // The CRC held, so this is a whole record: a failed tag is
+                    // a wrong key or tampering, never a torn tail.
+                    opened = vectorvolt_crypto::encryptor::decrypt_with_aad(
+                        &c.key,
+                        body,
+                        &c.aad(c.next_index),
+                    )
+                    .map_err(|e| {
+                        StorageError::Encryption(format!(
+                            "manifest {} record {} failed authenticated decryption ({e}): \
+                             altered, reordered or spliced from another manifest",
+                            path.display(),
+                            c.next_index
+                        ))
+                    })?;
+                    c.next_index += 1;
+                    &opened[..]
+                }
+            };
             let Ok(edit) = ManifestEdit::decode(body) else {
                 break;
             };
@@ -461,7 +661,7 @@ impl Manifest {
         }
 
         recovery.discarded_bytes = (data.len() - at) as u64;
-        Ok((state, recovery, at as u64))
+        Ok((state, recovery, at as u64, cipher))
     }
 
     fn apply_to(state: &mut PartitionState, edit: ManifestEdit) {
@@ -529,7 +729,10 @@ impl Manifest {
     /// happen per flush and per compaction, not per row, so the fsync is
     /// affordable here in a way it is not on the write path.
     pub fn apply(&mut self, edit: ManifestEdit) -> StorageResult<()> {
-        let body = edit.encode()?;
+        let mut body = edit.encode()?;
+        if let Some(c) = self.cipher.as_mut() {
+            body = c.seal(&body)?;
+        }
         let len = u32::try_from(body.len())
             .map_err(|_| StorageError::InvalidData("manifest edit too large".into()))?;
 
@@ -558,11 +761,26 @@ impl Manifest {
     /// reason the log is append-only in the first place.
     pub fn rewrite(&mut self) -> StorageResult<()> {
         let tmp = self.path.with_extension("manifest.tmp");
+        let mut next_cipher;
         {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(MANIFEST_MAGIC)?;
+            // A fresh salt per file: records of the old file can never be
+            // replayed as records of the new one.
+            // Installed only after the rename, so a failed rewrite leaves the
+            // cipher describing the file that is still in place.
+            next_cipher = self
+                .cipher
+                .as_ref()
+                .map(|c| ManifestCipher::new(std::sync::Arc::clone(&c.key)));
+            match &next_cipher {
+                Some(c) => f.write_all(&c.header())?,
+                None => f.write_all(MANIFEST_MAGIC)?,
+            }
             for p in self.partitions.values() {
-                let body = ManifestEdit::Add(Box::new(p.clone())).encode()?;
+                let mut body = ManifestEdit::Add(Box::new(p.clone())).encode()?;
+                if let Some(c) = next_cipher.as_mut() {
+                    body = c.seal(&body)?;
+                }
                 let len = u32::try_from(body.len())
                     .map_err(|_| StorageError::InvalidData("manifest edit too large".into()))?;
                 f.write_all(&len.to_le_bytes())?;
@@ -585,6 +803,9 @@ impl Manifest {
         f.seek(std::io::SeekFrom::End(0))?;
         self.file = f;
         self.edits_since_rewrite = 0;
+        if next_cipher.is_some() {
+            self.cipher = next_cipher;
+        }
         Ok(())
     }
 

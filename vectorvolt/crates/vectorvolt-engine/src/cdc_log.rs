@@ -27,6 +27,16 @@
 //!
 //! The LSN is redundant (it is also embedded in the [`ChangeEvent`] JSON) but
 //! placing it first lets a reader skip entries cheaply without parsing JSON.
+//!
+//! ## Encryption at rest (PP-54)
+//!
+//! On an encrypted table the body is a sealed blob (`crate::side_crypto`)
+//! instead of JSON, bound to the table identity and to the record's LSN, so a
+//! record cannot be moved to another LSN or another table's log. The framing
+//! is unchanged, so the B17 cut-back-on-failed-append repair and the
+//! header-only `stats` / `max_lsn` / `compact` scans work the same. Plaintext
+//! records written before the table had a key still read, but only as a
+//! prefix: a plaintext record after a sealed one is rejected.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -36,6 +46,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::cdc::ChangeEvent;
+use crate::side_crypto::{SideKey, purpose};
 
 // ── stats ─────────────────────────────────────────────────────────────────────
 
@@ -70,6 +81,8 @@ pub struct CdcHealth {
 pub struct CdcLog {
     path: PathBuf,
     writer: Mutex<LogWriter>,
+    /// Table key + identity: records are sealed when set (PP-54).
+    side: Option<SideKey>,
     /// Test-only fault injection: the next N appends fail before writing.
     #[cfg(test)]
     pub(crate) fail_next: std::sync::atomic::AtomicU32,
@@ -85,10 +98,18 @@ struct LogWriter {
 impl CdcLog {
     /// Open or create the log at `path`.
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
+        Self::open_keyed(path, None)
+    }
+
+    /// Open or create the log at `path`; with `side`, every new record body
+    /// is sealed under the table key, bound to the table identity and the
+    /// record's LSN.
+    pub fn open_keyed(path: PathBuf, side: Option<SideKey>) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let len = file.metadata()?.len();
         Ok(Self {
             path,
+            side,
             writer: Mutex::new(LogWriter {
                 w: std::io::BufWriter::new(file),
                 len,
@@ -106,7 +127,10 @@ impl CdcLog {
     /// LSN gap rather than a torn record that would desynchronise every reader
     /// after it — or a stale record that a later flush writes out of order.
     pub fn append(&self, event: &ChangeEvent) -> std::io::Result<()> {
-        let json = serde_json::to_vec(event).map_err(std::io::Error::other)?;
+        let mut json = serde_json::to_vec(event).map_err(std::io::Error::other)?;
+        if let Some(side) = &self.side {
+            json = side.seal(purpose::CDC, &event.lsn.to_le_bytes(), &json)?;
+        }
         let mut record = Vec::with_capacity(12 + json.len());
         record.extend_from_slice(&event.lsn.to_le_bytes());
         record.extend_from_slice(&(json.len() as u32).to_le_bytes());
@@ -178,6 +202,7 @@ impl CdcLog {
             Err(e) => return Err(e),
         };
         let mut out = Vec::new();
+        let mut seen_sealed = false;
         let mut lsn_buf = [0u8; 8];
         let mut len_buf = [0u8; 4];
         loop {
@@ -195,8 +220,31 @@ impl CdcLog {
             if file.read_exact(&mut json).is_err() {
                 break;
             }
+            let body = if crate::side_crypto::is_sealed(&json) {
+                seen_sealed = true;
+                if lsn < from_lsn {
+                    continue;
+                }
+                match &self.side {
+                    Some(side) => side.open(purpose::CDC, &lsn.to_le_bytes(), &json, &self.path)?,
+                    None => {
+                        crate::side_crypto::open(None, purpose::CDC, b"", b"", &json, &self.path)?
+                    }
+                }
+            } else {
+                // Plaintext records are legacy history written before the
+                // table had a key; they can only precede the sealed ones.
+                // One after a sealed record was injected.
+                if seen_sealed && self.side.is_some() {
+                    return Err(crate::side_crypto::unauthenticated(
+                        &self.path,
+                        &format!("CDC record (lsn {lsn}) after encrypted records"),
+                    ));
+                }
+                json
+            };
             if lsn >= from_lsn
-                && let Ok(ev) = serde_json::from_slice::<ChangeEvent>(&json)
+                && let Ok(ev) = serde_json::from_slice::<ChangeEvent>(&body)
             {
                 out.push(ev);
             }

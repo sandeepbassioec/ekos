@@ -7,8 +7,13 @@
 /// partition files. On open, replay skips frames at or below it and applies every
 /// later one. A v1 marker carries no position, so it is read as `wal_seq = 0`:
 /// replay everything that is still in the WAL, which is always safe.
-use std::io::{Read, Write};
+///
+/// On an encrypted table the marker is a sealed side file (PP-56, see
+/// `crate::side_crypto`) bound to the table identity: a forged `wal_seq` could
+/// otherwise make recovery skip frames.
 use std::path::Path;
+
+use crate::side_crypto::{FileContents, SideKey, purpose};
 
 const MAGIC: &[u8; 4] = b"VVSS";
 const VERSION: u16 = 2;
@@ -26,34 +31,19 @@ pub struct SnapshotMeta {
     pub wal_seq: u64,
 }
 
-pub fn write_marker(path: &Path, meta: &SnapshotMeta) -> std::io::Result<()> {
+fn encode(meta: &SnapshotMeta) -> Vec<u8> {
     let mut buf = Vec::with_capacity(V2_LEN);
-    buf.write_all(MAGIC)?;
-    buf.write_all(&VERSION.to_le_bytes())?;
-    buf.write_all(&meta.row_count.to_le_bytes())?;
-    buf.write_all(&meta.byte_size.to_le_bytes())?;
-    buf.write_all(&meta.wal_seq.to_le_bytes())?;
-    // atomic write: write to .tmp, sync, then rename
-    let tmp = path.with_extension("vvss.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&buf)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    buf.extend_from_slice(MAGIC);
+    buf.extend_from_slice(&VERSION.to_le_bytes());
+    buf.extend_from_slice(&meta.row_count.to_le_bytes());
+    buf.extend_from_slice(&meta.byte_size.to_le_bytes());
+    buf.extend_from_slice(&meta.wal_seq.to_le_bytes());
+    buf
 }
 
-pub fn read_marker(path: &Path) -> std::io::Result<Option<SnapshotMeta>> {
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut buf = Vec::with_capacity(V2_LEN);
-    f.read_to_end(&mut buf)?;
+fn decode(buf: &[u8]) -> Option<SnapshotMeta> {
     if buf.len() < V1_LEN || &buf[..4] != MAGIC {
-        return Ok(None);
+        return None;
     }
     let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
     let row_count = u64::from_le_bytes(buf[6..14].try_into().unwrap());
@@ -63,11 +53,66 @@ pub fn read_marker(path: &Path) -> std::io::Result<Option<SnapshotMeta>> {
     } else {
         0
     };
-    Ok(Some(SnapshotMeta {
+    Some(SnapshotMeta {
         row_count,
         byte_size,
         wal_seq,
-    }))
+    })
+}
+
+/// Write the marker in plaintext (unencrypted tables).
+pub fn write_marker(path: &Path, meta: &SnapshotMeta) -> std::io::Result<()> {
+    write_marker_keyed(path, meta, None)
+}
+
+/// Write the marker atomically (temp file, sync, rename), encrypted and
+/// authenticated under `side` when set.
+pub(crate) fn write_marker_keyed(
+    path: &Path,
+    meta: &SnapshotMeta,
+    side: Option<&SideKey>,
+) -> std::io::Result<()> {
+    crate::side_crypto::write_file(path, side, purpose::SNAPSHOT, &encode(meta))
+}
+
+/// Read a plaintext marker. An encrypted one is an error naming the file.
+pub fn read_marker(path: &Path) -> std::io::Result<Option<SnapshotMeta>> {
+    Ok(match read_marker_keyed(path, None)? {
+        MarkerRead::Missing => None,
+        MarkerRead::Authenticated(m) => Some(m),
+        MarkerRead::Plain(m) => m,
+    })
+}
+
+/// What [`read_marker_keyed`] found.
+pub(crate) enum MarkerRead {
+    Missing,
+    /// Encrypted under the table key and authenticated.
+    Authenticated(SnapshotMeta),
+    /// Legacy plaintext marker (`None` if unparseable). Not authenticated.
+    Plain(Option<SnapshotMeta>),
+}
+
+/// Read the marker, decrypting it under `side` when it is sealed.
+pub(crate) fn read_marker_keyed(
+    path: &Path,
+    side: Option<&SideKey>,
+) -> std::io::Result<MarkerRead> {
+    Ok(
+        match crate::side_crypto::read_file(path, side, purpose::SNAPSHOT)? {
+            FileContents::Missing => MarkerRead::Missing,
+            FileContents::Plain(b) => MarkerRead::Plain(decode(&b)),
+            FileContents::Decrypted(b) => match decode(&b) {
+                Some(m) => MarkerRead::Authenticated(m),
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{}: malformed snapshot marker", path.display()),
+                    ));
+                }
+            },
+        },
+    )
 }
 
 /// Returns the combined byte size of all `.vvsst` files in `partition_dir`.

@@ -1175,12 +1175,14 @@ impl SqlExecutor {
 
     pub fn new(registry: Arc<TableRegistry>) -> Self {
         let intent_log_path = registry.base_dir().join("_txn_intent.log");
-        let txn_intent_log = TxnIntentLog::open(&intent_log_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to open MVCC Phase 3 transaction intent log at {:?}: {e}",
-                intent_log_path
-            )
-        });
+        let txn_intent_log =
+            TxnIntentLog::open_with(&intent_log_path, registry.encryption_key().cloned())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to open MVCC Phase 3 transaction intent log at {:?}: {e}",
+                        intent_log_path
+                    )
+                });
 
         let graph_dir = registry.base_dir().join("_graph");
         let graph_store = GraphStore::open(&graph_dir)

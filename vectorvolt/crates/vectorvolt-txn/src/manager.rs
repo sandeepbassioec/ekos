@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use vectorvolt_index::{CuckooFilter, CuckooMap, RowDescriptor, SecondaryIndex, ZoneMap};
-use vectorvolt_storage::{ColumnValues, MicroPartition, PartitionReader, write_partition};
+use vectorvolt_storage::{ColumnValues, MicroPartition, PartitionReader, write_partition_keyed};
 use vectorvolt_storage::{
     CompactionOptions, CompactionOutcome, CompactionStrategy, Liveness, Manifest, ManifestEdit,
     ManifestRecovery, PartitionMeta, RowLocation, WriteOptions,
@@ -161,6 +161,11 @@ pub struct TxnManager {
     /// `wal_key()` below, which callers use to mirror this same key).
     /// `None` preserves the existing on-disk format exactly (opt-in only).
     wal_key: Option<Arc<vectorvolt_crypto::KeyStore>>,
+    /// Whether the WAL writer has been told `wal_key`'s key id, so every
+    /// segment that receives encrypted frames records it (PP-52). Set lazily
+    /// on the first commit if [`with_wal_encryption`](Self::with_wal_encryption)
+    /// could not rotate the segment at configuration time.
+    wal_key_bound: AtomicBool,
     /// MAC key for the WAL tail seal (PP-38), derived from `wal_key`. With it,
     /// every synced commit records the sealed tip, and the highest sequence
     /// sealed so far is kept here so concurrent commits never move it back.
@@ -244,6 +249,7 @@ impl TxnManager {
             clock: CommitClock::new(),
             version_index: VersionIndex::new(),
             wal_key: None,
+            wal_key_bound: AtomicBool::new(false),
             seal: None,
             durable_flush: true,
             apply_gate: RwLock::new(()),
@@ -308,9 +314,27 @@ impl TxnManager {
     /// responsible for decrypting `frame.payload` with the same key during
     /// WAL replay before calling `Mutation::decode` — this manager only
     /// handles the write side.
+    ///
+    /// Each payload is sealed as `VVE2` with AAD = [`frame_aad`] of the key id
+    /// and the frame's sequence number, and the WAL writer records the key id
+    /// in every segment header it writes from now on (PP-52).
+    ///
+    /// [`frame_aad`]: vectorvolt_wal::segment::frame_aad
     pub fn with_wal_encryption(mut self, key: Arc<vectorvolt_crypto::KeyStore>) -> Self {
         let seal_key = vectorvolt_wal::seal::derive_seal_key(key.as_bytes());
         self.seal = Some((seal_key, Mutex::new(0)));
+        // Usually a no-op: `TableEngine` already opened the writer with this
+        // key id. If the rotation fails here it is retried by `commit`.
+        let bound = self
+            .wal
+            .wal()
+            .set_encryption_key_id(Some(key.key_id()))
+            .is_ok();
+        self.wal_key_bound = AtomicBool::new(bound);
+        // Partition files and the manifest are encrypted under the same key
+        // (PP-53). Registering it lets code that opens a partition by path
+        // alone (zone peeks, `verify_partitions`) resolve it by key id.
+        vectorvolt_storage::register_partition_key(&key);
         self.wal_key = Some(key);
         self
     }
@@ -364,20 +388,32 @@ impl TxnManager {
     ///
     /// A *single* writer still pays one sync per commit; there is nobody to batch
     /// with. Group commit removes the scaling penalty, not the device latency.
+    ///
+    /// With a key, the payload is encrypted inside the WAL writer's append
+    /// lock, once its sequence number is fixed, so the AAD always names the
+    /// position the frame actually lands at — even under concurrent appends.
     #[inline]
     fn commit(&self, payload: Vec<u8>) -> TxnResult<WalTip> {
-        let payload = match &self.wal_key {
-            Some(key) => vectorvolt_crypto::encrypt(key, &payload)
-                .map_err(|e| TxnError::Encryption(format!("payload encrypt failed: {e}")))?,
-            None => payload,
+        let tip = match &self.wal_key {
+            Some(key) => {
+                let key_id = key.key_id();
+                if !self.wal_key_bound.load(Ordering::Acquire) {
+                    self.wal.wal().set_encryption_key_id(Some(key_id))?;
+                    self.wal_key_bound.store(true, Ordering::Release);
+                }
+                self.wal.wal().append_with(|seq| {
+                    let aad = vectorvolt_wal::segment::frame_aad(&key_id, seq);
+                    vectorvolt_crypto::encryptor::encrypt_with_aad(key, &payload, &aad)
+                        .map_err(|e| TxnError::Encryption(format!("payload encrypt failed: {e}")))
+                })?
+            }
+            None => self.wal.append(payload)?,
         };
         if self.sync_on_commit {
-            let tip = self.wal.append_and_sync(payload)?;
+            self.wal.sync_upto(tip.sequence)?;
             self.seal_tip(&tip)?;
-            Ok(tip)
-        } else {
-            Ok(self.wal.append(payload)?)
         }
+        Ok(tip)
     }
 
     /// Append a non-mutation record (e.g. a PITR snapshot marker) through this
@@ -561,7 +597,12 @@ impl TxnManager {
         // reader then serves this one read (consistent with the descriptor it
         // was opened for) but is not cached.
         let epoch = self.reader_epoch.load(Ordering::Acquire);
-        let reader = Arc::new(PartitionReader::open(&path)?);
+        // Encrypted files are decrypted once here into private memory; the
+        // cache below makes that a per-file, not per-read, cost (PP-53).
+        let reader = Arc::new(PartitionReader::open_with_key(
+            &path,
+            self.wal_key.as_deref(),
+        )?);
         let mut cache = self.readers.write();
         if self.reader_epoch.load(Ordering::Acquire) != epoch {
             return Ok(reader);
@@ -968,7 +1009,8 @@ impl TxnManager {
     /// rather than logged so a caller can decide which it is.
     pub fn enable_manifest(&self) -> TxnResult<ManifestRecovery> {
         std::fs::create_dir_all(&self.flush_dir)?;
-        let (m, recovery) = Manifest::open(self.flush_dir.join("MANIFEST"))?;
+        let (m, recovery) =
+            Manifest::open_with_key(self.flush_dir.join("MANIFEST"), self.wal_key.clone())?;
         *self.manifest.lock() = Some(m);
         Ok(recovery)
     }
@@ -1141,6 +1183,7 @@ impl TxnManager {
                 output_partition_id: partition_id,
                 write_options,
                 now_millis: now_millis(),
+                encryption_key: self.wal_key.clone(),
             };
 
             let liveness = IndexLiveness { txn: self };
@@ -1346,7 +1389,12 @@ impl TxnManager {
             let tmp_path = self.flush_dir.join(&tmp_filename);
             {
                 let mut file = std::fs::File::create(&tmp_path)?;
-                write_partition(&mut file, &mp)?;
+                write_partition_keyed(
+                    &mut file,
+                    &mp,
+                    WriteOptions::default(),
+                    self.wal_key.as_deref(),
+                )?;
                 if self.durable_flush {
                     file.sync_all()?;
                 }
@@ -1605,25 +1653,19 @@ impl TxnManager {
         let mut latest_deleted: HashMap<u64, bool> = HashMap::new();
         let mut max_seq = 0u64;
         let mut ok = true;
-        let scanned = vectorvolt_wal::WalReader::open(cfg).scan(
+        let scanned = vectorvolt_wal::WalReader::open(cfg).scan_with_header(
             vectorvolt_wal::WalCursor::beginning(),
-            |frame| {
+            |frame, header| {
                 max_seq = max_seq.max(frame.sequence);
-                let payload = if vectorvolt_crypto::is_encrypted(&frame.payload) {
-                    let Some(key) = &self.wal_key else {
-                        ok = false;
-                        return false;
-                    };
-                    match vectorvolt_crypto::decrypt(key, &frame.payload) {
+                let seq = frame.sequence;
+                let payload =
+                    match open_wal_payload(self.wal_key.as_deref(), header, seq, frame.payload) {
                         Ok(p) => p,
                         Err(_) => {
                             ok = false;
                             return false;
                         }
-                    }
-                } else {
-                    frame.payload
-                };
+                    };
                 let ts = frame.sequence;
                 let mut put = |pk: u64, op: Option<Vec<u64>>| {
                     latest_deleted.insert(pk, op.is_none());
@@ -1733,6 +1775,132 @@ impl TxnManager {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// A WAL key problem found before or during replay (PP-52): the sequence it
+/// concerns (a segment's base sequence for header checks) and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalKeyError {
+    pub seq: u64,
+    pub reason: String,
+}
+
+impl std::fmt::Display for WalKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WAL frame {}: {}", self.seq, self.reason)
+    }
+}
+
+/// Check every segment header in the WAL at `wal_dir` against `key` before
+/// replay reads a frame (PP-52). An encrypted segment needs a key, and the
+/// key's id must equal the one the header records. Plaintext segments are
+/// accepted either way, so a table that gains encryption keeps its history.
+pub fn check_wal_segment_keys(
+    wal_dir: &std::path::Path,
+    key: Option<&vectorvolt_crypto::KeyStore>,
+) -> Result<(), WalKeyError> {
+    use vectorvolt_wal::segment::key_id_hex;
+    let cfg = vectorvolt_wal::WalConfig::default()
+        .with_dir(wal_dir)
+        .with_fsync(false);
+    let headers = vectorvolt_wal::WalReader::open(cfg)
+        .segment_headers()
+        .map_err(|e| WalKeyError {
+            seq: 0,
+            reason: format!("cannot read WAL segment headers: {e}"),
+        })?;
+    let given = key.map(|k| k.key_id());
+    for h in headers {
+        let Some(want) = h.key_id else { continue };
+        match given {
+            None => {
+                return Err(WalKeyError {
+                    seq: h.base_seq,
+                    reason: format!(
+                        "WAL segment {} is encrypted under key id {} but no key was provided",
+                        h.segment_id,
+                        key_id_hex(&want)
+                    ),
+                });
+            }
+            Some(got) if got != want => {
+                return Err(WalKeyError {
+                    seq: h.base_seq,
+                    reason: format!(
+                        "WAL segment {} is encrypted under key id {} but the key provided has id {}",
+                        h.segment_id,
+                        key_id_hex(&want),
+                        key_id_hex(&got)
+                    ),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Recover the plaintext of one WAL frame payload read from the segment with
+/// `header` (PP-52).
+///
+/// - `VVE2` payloads are decrypted with AAD = (key id, `seq`): a ciphertext
+///   moved to another position, a wrong key or altered bytes all fail.
+/// - `VVE1` payloads (written before AAD binding) decrypt as before, but only
+///   in segments whose header does not record a key id — inside a keyed
+///   segment an unbound frame can only be a downgrade.
+/// - Plaintext payloads (snapshot markers, pre-encryption history) are
+///   returned as they are, except that a row mutation in plaintext inside an
+///   encrypted segment is refused: the writer never produces one.
+pub fn open_wal_payload(
+    key: Option<&vectorvolt_crypto::KeyStore>,
+    header: &vectorvolt_wal::segment::SegmentHeader,
+    seq: u64,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, WalKeyError> {
+    let fail = |reason: String| WalKeyError { seq, reason };
+    if vectorvolt_crypto::encryptor::is_aad_encrypted(&payload) {
+        let key = key.ok_or_else(|| fail("frame is encrypted but no key was provided".into()))?;
+        let aad = vectorvolt_wal::segment::frame_aad(&key.key_id(), seq);
+        return vectorvolt_crypto::encryptor::decrypt_with_aad(key, &payload, &aad).map_err(|e| {
+            fail(format!(
+                "{e}; the frame is bound to sequence {seq} under key id {}, so it was \
+                 moved, altered, or the key is wrong",
+                vectorvolt_wal::segment::key_id_hex(&key.key_id())
+            ))
+        });
+    }
+    if vectorvolt_crypto::is_encrypted(&payload) {
+        if header.is_encrypted() {
+            return Err(fail(format!(
+                "unbound (VVE1) frame inside AAD-bound WAL segment {}",
+                header.segment_id
+            )));
+        }
+        let key = key.ok_or_else(|| fail("frame is encrypted but no key was provided".into()))?;
+        return vectorvolt_crypto::decrypt(key, &payload).map_err(|e| fail(e.to_string()));
+    }
+    if header.is_encrypted() && is_row_mutation(&payload) {
+        return Err(fail(format!(
+            "plaintext row mutation inside encrypted WAL segment {}",
+            header.segment_id
+        )));
+    }
+    Ok(payload)
+}
+
+/// Whether `payload` decodes as a mutation that changes row data.
+fn is_row_mutation(payload: &[u8]) -> bool {
+    matches!(
+        Mutation::decode(payload),
+        Ok(Mutation::Insert { .. }
+            | Mutation::Upsert { .. }
+            | Mutation::Update { .. }
+            | Mutation::Delete { .. }
+            | Mutation::InsertBatch { .. }
+            | Mutation::UpsertBatch { .. }
+            | Mutation::DeleteBatch { .. }
+            | Mutation::TxnBatch { .. })
+    )
+}
 
 /// The write stripe a pk belongs to (PP-23). Fibonacci hashing, so sequential
 /// pks spread over every stripe instead of clustering.

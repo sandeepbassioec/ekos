@@ -35,6 +35,12 @@ pub struct WalConfig {
 
     /// Adaptive batch window: maximum flush interval in nanoseconds.
     pub adaptive_window_max_ns: u64,
+
+    /// Fingerprint (`vectorvolt_crypto::KeyStore::key_id`) of the key mutation payloads
+    /// are encrypted with, or `None` for a plaintext WAL. Written into every
+    /// new segment header so replay can refuse a wrong or missing key before
+    /// it reads a frame (PP-52). Readers ignore it.
+    pub encryption_key_id: Option<crate::segment::KeyId>,
 }
 
 impl Default for WalConfig {
@@ -49,6 +55,7 @@ impl Default for WalConfig {
             fsync: true,
             adaptive_window_min_ns: 0,
             adaptive_window_max_ns: 0,
+            encryption_key_id: None,
         }
     }
 }
@@ -83,6 +90,12 @@ impl WalConfig {
     pub fn with_adaptive_window(mut self, min_ns: u64, max_ns: u64) -> Self {
         self.adaptive_window_min_ns = min_ns;
         self.adaptive_window_max_ns = max_ns;
+        self
+    }
+
+    /// Mark new segments as encrypted under the key with this fingerprint.
+    pub fn with_encryption_key_id(mut self, key_id: Option<crate::segment::KeyId>) -> Self {
+        self.encryption_key_id = key_id;
         self
     }
 }

@@ -64,14 +64,31 @@
 //!
 //! Records written before write sets existed are still handled the old way
 //! (roll forward by txn id, treating `TxnNotFound` as already applied).
+//!
+//! ## Encryption at rest (PP-54)
+//!
+//! A log opened with [`TxnIntentLog::open_with_encryption`] writes each record
+//! as its own line, `vvsf1:<hex of a sealed blob>` (`crate::side_crypto`),
+//! bound to the record's ordinal in the log, so records cannot be reordered,
+//! dropped from the middle or moved between logs undetected. Write sets hold
+//! row values, so they are never on disk in plaintext. A torn final line
+//! (crash mid-append) is cut off on open and skipped on read, as before.
+//! Plaintext records from before encryption was enabled still read, but only
+//! as a prefix: a plaintext record after an encrypted one is rejected, since
+//! recovery would otherwise apply a planted write set.
 
-use crate::error::EngineResult;
+use crate::error::{EngineError, EngineResult};
 use crate::mvcc::TxnId;
+use crate::side_crypto::{INTENT_IDENTITY, purpose};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use vectorvolt_crypto::KeyStore;
+
+/// Line prefix of an encrypted record.
+const SEALED_PREFIX: &str = "vvsf1:";
 
 /// One table + its per-table transaction id, as recorded in an intent record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,34 +148,93 @@ pub struct RecoveryAction {
 /// internal mutex so callers don't need external synchronization.
 pub struct TxnIntentLog {
     path: PathBuf,
-    file: Mutex<File>,
+    /// Append handle and, with a key, the ordinal of the next record.
+    file: Mutex<(File, u64)>,
+    key: Option<Arc<KeyStore>>,
 }
 
 impl TxnIntentLog {
     /// Open (creating if necessary) the intent log at `path`, appending to
     /// any existing content.
     pub fn open(path: impl Into<PathBuf>) -> EngineResult<Self> {
-        let path = path.into();
+        Self::open_keyed(path.into(), None)
+    }
+
+    /// Open the intent log with every new record encrypted under `key`; see
+    /// the module docs.
+    /// Open the log encrypted when `key` is set, plaintext otherwise.
+    pub fn open_with(path: impl Into<PathBuf>, key: Option<Arc<KeyStore>>) -> EngineResult<Self> {
+        Self::open_keyed(path.into(), key)
+    }
+
+    pub fn open_with_encryption(
+        path: impl Into<PathBuf>,
+        key: Arc<KeyStore>,
+    ) -> EngineResult<Self> {
+        Self::open_keyed(path.into(), Some(key))
+    }
+
+    fn open_keyed(path: PathBuf, key: Option<Arc<KeyStore>>) -> EngineResult<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)?;
         }
+        let mut next = 0u64;
+        if key.is_some() {
+            // Cut a torn final line so the next record starts on its own line
+            // and record ordinals stay in step with complete lines.
+            if let Ok(bytes) = std::fs::read(&path) {
+                let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                if complete < bytes.len() {
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&path)?
+                        .set_len(complete as u64)?;
+                }
+                next = complete_lines(&bytes[..complete]).count() as u64;
+            }
+        }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(TxnIntentLog {
             path,
-            file: Mutex::new(file),
+            file: Mutex::new((file, next)),
+            key,
         })
     }
 
     fn append(&self, record: &IntentRecord) -> EngineResult<()> {
-        let mut line = serde_json::to_string(record)
-            .map_err(|e| crate::error::EngineError::Other(format!("intent log encode: {e}")))?;
+        let json = serde_json::to_string(record)
+            .map_err(|e| EngineError::Other(format!("intent log encode: {e}")))?;
+        let mut guard = self.file.lock().unwrap();
+        let (file, next) = &mut *guard;
+        let mut line = match &self.key {
+            Some(key) => {
+                let blob = crate::side_crypto::seal(
+                    key,
+                    purpose::INTENT,
+                    INTENT_IDENTITY,
+                    &next.to_le_bytes(),
+                    json.as_bytes(),
+                )?;
+                format!("{SEALED_PREFIX}{}", crate::side_crypto::to_hex(&blob))
+            }
+            None => json,
+        };
         line.push('\n');
-        let mut file = self.file.lock().unwrap();
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
+        *next += 1;
         Ok(())
+    }
+
+    /// Resolve every dangling record in this log; see
+    /// [`recover_pending_transactions`].
+    pub fn recover<F>(&self, resolve: F) -> EngineResult<Vec<RecoveryAction>>
+    where
+        F: Fn(&str) -> Option<std::sync::Arc<crate::engine::TableEngine>>,
+    {
+        recover_with_log(self, resolve)
     }
 
     /// Phase A — durably record the intent to commit `tables` as one atomic
@@ -225,7 +301,7 @@ impl TxnIntentLog {
     }
 
     pub fn read_all(&self) -> EngineResult<Vec<IntentRecord>> {
-        read_all_records(&self.path)
+        read_all_records(&self.path, self.key.as_deref())
     }
 
     pub fn path(&self) -> &Path {
@@ -233,18 +309,64 @@ impl TxnIntentLog {
     }
 }
 
-fn read_all_records(path: &Path) -> EngineResult<Vec<IntentRecord>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+/// Non-blank lines of `bytes`, split on `\n`.
+fn complete_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.iter().all(|b| b.is_ascii_whitespace()))
+}
+
+fn read_all_records(path: &Path, key: Option<&KeyStore>) -> EngineResult<Vec<IntentRecord>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    // Bytes after the last newline are a torn final record: still parsed if
+    // they happen to be whole (legacy files), never an error.
+    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     let mut out = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
+    let mut seen_sealed = false;
+    let lines = complete_lines(&bytes[..complete])
+        .map(|l| (l, true))
+        .chain(complete_lines(&bytes[complete..]).map(|l| (l, false)));
+    for (ordinal, (raw, terminated)) in lines.enumerate() {
+        let text = String::from_utf8_lossy(raw);
+        let line = text.trim_end_matches('\r');
+        let line = if let Some(hex) = line.strip_prefix(SEALED_PREFIX) {
+            seen_sealed = true;
+            let opened = crate::side_crypto::from_hex(hex.trim())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{}: record {ordinal} is not valid hex", path.display()),
+                    )
+                })
+                .and_then(|blob| {
+                    crate::side_crypto::open(
+                        key,
+                        purpose::INTENT,
+                        INTENT_IDENTITY,
+                        &(ordinal as u64).to_le_bytes(),
+                        &blob,
+                        path,
+                    )
+                });
+            match opened {
+                Ok(pt) => String::from_utf8_lossy(&pt).into_owned(),
+                Err(_) if !terminated => continue,
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            if seen_sealed && key.is_some() {
+                return Err(crate::side_crypto::unauthenticated(
+                    path,
+                    &format!("intent record {ordinal} after encrypted records"),
+                )
+                .into());
+            }
+            line.to_owned()
+        };
         match serde_json::from_str::<IntentRecord>(&line) {
             Ok(rec) => out.push(rec),
             Err(_) => {
@@ -292,6 +414,13 @@ where
     F: Fn(&str) -> Option<std::sync::Arc<crate::engine::TableEngine>>,
 {
     let log = TxnIntentLog::open(log_path.as_ref())?;
+    recover_with_log(&log, resolve)
+}
+
+fn recover_with_log<F>(log: &TxnIntentLog, resolve: F) -> EngineResult<Vec<RecoveryAction>>
+where
+    F: Fn(&str) -> Option<std::sync::Arc<crate::engine::TableEngine>>,
+{
     let records = log.read_all()?;
     let dangling = find_dangling(&records);
 

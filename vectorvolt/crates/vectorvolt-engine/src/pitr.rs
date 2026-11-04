@@ -22,18 +22,110 @@
 //! is never truncated, so it holds the full history; a log whose first frame
 //! is not sequence 1 is refused rather than silently restored without its
 //! beginning.
+//!
+//! ## Authenticated markers (PP-54)
+//!
+//! Markers stay plaintext so `WalReader::scan_snapshot_markers` can find
+//! them, but on an encrypted table each carries a `"mac"` field: a keyed
+//! SHA3-256 over the marker's JSON under a key derived from the table key
+//! (domain `vectorvolt-pitr-marker-mac-v1`). Readers that ignore it still
+//! decode the marker. With a key, [`list_snapshots`](TableEngine::list_snapshots)
+//! skips markers without a MAC (legacy, written before the table had a key)
+//! and fails on a MAC that does not verify;
+//! [`restore_to_marker_with`](TableEngine::restore_to_marker_with) refuses
+//! either.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use vectorvolt_crypto::KeyStore;
+use vectorvolt_wal::snapshot::OP_SNAPSHOT_MARKER;
 use vectorvolt_wal::{SnapshotMarker, WalConfig, WalReader};
 
 use crate::engine::{EngineOptions, TableEngine, fold_wal, verify_wal_seal};
+use crate::side_crypto::{ct_eq, derive_mac_key, from_hex, mac, to_hex};
 use crate::{EngineError, EngineResult};
 
 /// Rows written per `apply_batch` call while materialising a restore.
 const RESTORE_CHUNK: usize = 4096;
+
+const PITR_MAC_DOMAIN: &[u8] = b"vectorvolt-pitr-marker-mac-v1";
+const MAC_FIELD: &str = "mac";
+
+fn marker_mac(key: &KeyStore, marker: &SnapshotMarker) -> [u8; 32] {
+    let body = serde_json::to_vec(marker).expect("SnapshotMarker serialization is infallible");
+    mac(&derive_mac_key(key, PITR_MAC_DOMAIN), &body)
+}
+
+/// WAL payload for `marker`: `SnapshotMarker::encode`, plus a `"mac"` field
+/// when `key` is set.
+fn encode_marker(marker: &SnapshotMarker, key: Option<&KeyStore>) -> Vec<u8> {
+    let Some(key) = key else {
+        return marker.encode();
+    };
+    let mut value = serde_json::to_value(marker).expect("SnapshotMarker serialization");
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            MAC_FIELD.into(),
+            serde_json::Value::String(to_hex(&marker_mac(key, marker))),
+        );
+    }
+    let mut out = vec![OP_SNAPSHOT_MARKER];
+    out.extend_from_slice(&serde_json::to_vec(&value).expect("JSON value serialization"));
+    out
+}
+
+/// How a marker frame authenticated under the table key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerAuth {
+    Valid,
+    /// No MAC: written before the table had a key, or planted.
+    Missing,
+    /// A MAC that does not verify: forged or altered.
+    Invalid,
+}
+
+/// Every snapshot marker in the WAL at `wal_dir`, with its authentication
+/// status under `key` (`Valid` for every marker when there is no key).
+fn scan_markers(
+    wal_dir: &Path,
+    key: Option<&KeyStore>,
+) -> EngineResult<Vec<(SnapshotMarker, MarkerAuth, u64)>> {
+    let cfg = WalConfig::default().with_dir(wal_dir).with_fsync(false);
+    let mut out = Vec::new();
+    WalReader::open(cfg).scan(vectorvolt_wal::WalCursor::beginning(), |frame| {
+        let Ok(marker) = SnapshotMarker::decode(&frame.payload) else {
+            return true;
+        };
+        let auth = match key {
+            None => MarkerAuth::Valid,
+            Some(key) => {
+                let stored = serde_json::from_slice::<serde_json::Value>(&frame.payload[1..])
+                    .ok()
+                    .and_then(|v| v.get(MAC_FIELD)?.as_str().and_then(from_hex));
+                match stored {
+                    None => MarkerAuth::Missing,
+                    Some(tag) if ct_eq(&tag, &marker_mac(key, &marker)) => MarkerAuth::Valid,
+                    Some(_) => MarkerAuth::Invalid,
+                }
+            }
+        };
+        out.push((marker, auth, frame.sequence));
+        true
+    })?;
+    Ok(out)
+}
+
+fn forged(seq: u64, wal_dir: &Path) -> EngineError {
+    EngineError::WalDecrypt {
+        seq,
+        reason: format!(
+            "PITR snapshot marker in {} fails its MAC under this key: forged or altered",
+            wal_dir.display()
+        ),
+    }
+}
 
 impl TableEngine {
     /// Flush the write buffer, then write a [`SnapshotMarker`] to the WAL.
@@ -78,20 +170,36 @@ impl TableEngine {
             tier_files,
         };
 
-        self.txn.append_marker(marker.encode())?;
+        let key = self.txn.wal_key().map(|k| k.as_ref());
+        self.txn.append_marker(encode_marker(&marker, key))?;
         Ok(marker)
     }
 
     /// Return all snapshot markers recorded in this table's WAL.
+    ///
+    /// On an encrypted table only authenticated markers are returned; one
+    /// whose MAC fails is an error, one without a MAC (written before the
+    /// table had a key) is skipped.
     pub fn list_snapshots(&self) -> EngineResult<Vec<SnapshotMarker>> {
         let wal_dir = self
             .partition_dir
             .parent()
             .unwrap_or(&self.partition_dir)
             .join("wal");
-        let cfg = WalConfig::default().with_dir(&wal_dir).with_fsync(false);
-        let reader = WalReader::open(cfg);
-        Ok(reader.scan_snapshot_markers()?)
+        let key = self.txn.wal_key().map(|k| k.as_ref());
+        let mut out = Vec::new();
+        for (marker, auth, seq) in scan_markers(&wal_dir, key)? {
+            match auth {
+                MarkerAuth::Valid => out.push(marker),
+                MarkerAuth::Missing => tracing::warn!(
+                    seq,
+                    snapshot_id = marker.snapshot_id,
+                    "skipping unauthenticated PITR marker on an encrypted table"
+                ),
+                MarkerAuth::Invalid => return Err(forged(seq, &wal_dir)),
+            }
+        }
+        Ok(out)
     }
 
     /// Open a new [`TableEngine`] from `base_dir`, logically restoring from
@@ -226,6 +334,40 @@ impl TableEngine {
                 EngineError::Other(format!("snapshot {snapshot_id} not found in WAL"))
             })?;
         Self::restore_to_lsn(schema, src_dir, dst_dir, marker.lsn)
+    }
+
+    /// [`restore_to_marker`](Self::restore_to_marker) for an encrypted table.
+    /// The marker must carry a MAC that verifies under `key`: an
+    /// unauthenticated or forged marker could point the restore anywhere.
+    pub fn restore_to_marker_with(
+        schema: Vec<String>,
+        src_dir: &Path,
+        dst_dir: &Path,
+        snapshot_id: u64,
+        key: Arc<KeyStore>,
+    ) -> EngineResult<Self> {
+        let wal_dir = src_dir.join("wal");
+        let (marker, auth, seq) = scan_markers(&wal_dir, Some(&key))?
+            .into_iter()
+            .find(|(m, _, _)| m.snapshot_id == snapshot_id)
+            .ok_or_else(|| {
+                EngineError::Other(format!("snapshot {snapshot_id} not found in WAL"))
+            })?;
+        match auth {
+            MarkerAuth::Valid => {}
+            MarkerAuth::Missing => {
+                return Err(EngineError::WalDecrypt {
+                    seq,
+                    reason: format!(
+                        "PITR snapshot marker {snapshot_id} in {} has no MAC; refusing to \
+                         restore an encrypted table to an unauthenticated position",
+                        wal_dir.display()
+                    ),
+                });
+            }
+            MarkerAuth::Invalid => return Err(forged(seq, &wal_dir)),
+        }
+        Self::restore_to_lsn_with(schema, src_dir, dst_dir, marker.lsn, Some(key))
     }
 
     /// Restore to the last WAL frame written at or before `timestamp_ns`

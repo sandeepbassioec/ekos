@@ -6,7 +6,9 @@
 use crate::config::WalConfig;
 use crate::error::{WalError, WalResult};
 use crate::frame::{Frame, GENESIS_HASH};
-use crate::segment::{SEG_HEADER_SIZE, SegmentReader, list_segment_ids, segment_path};
+use crate::segment::{
+    SEG_HEADER_SIZE, SegmentHeader, SegmentReader, list_segment_ids, segment_path,
+};
 use tracing::debug;
 
 // ── WalCursor ─────────────────────────────────────────────────────────────────
@@ -48,6 +50,24 @@ impl WalReader {
     where
         F: FnMut(Frame) -> bool,
     {
+        self.scan_with_header(cursor, |frame, _| f(frame))
+    }
+
+    /// The header of every segment, in segment order.
+    pub fn segment_headers(&self) -> WalResult<Vec<SegmentHeader>> {
+        self.segment_ids()?
+            .into_iter()
+            .map(|id| Ok(SegmentReader::open(&segment_path(&self.config.dir, id))?.header))
+            .collect()
+    }
+
+    /// Like [`scan`](Self::scan), also passing the header of the segment each
+    /// frame was read from (so a caller can tell whether that segment is
+    /// encrypted, and under which key id).
+    pub fn scan_with_header<F>(&self, cursor: WalCursor, mut f: F) -> WalResult<WalCursor>
+    where
+        F: FnMut(Frame, &SegmentHeader) -> bool,
+    {
         let ids = self.segment_ids()?;
         let start_idx = ids.partition_point(|&id| id < cursor.segment_id);
 
@@ -72,7 +92,7 @@ impl WalReader {
                             segment_id: seg_id,
                             offset: pos,
                         };
-                        let keep_going = f(frame);
+                        let keep_going = f(frame, &reader.header);
                         if !keep_going {
                             return Ok(cur);
                         }

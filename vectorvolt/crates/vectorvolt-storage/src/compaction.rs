@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use crate::lifecycle::{CompactionJob, PartitionMeta};
 use crate::{
     ColumnValues, MicroPartition, PartitionReader, StorageError, StorageResult, WriteOptions,
-    write_partition_with,
+    write_partition_keyed,
 };
 
 /// Where a row physically lives, for a liveness decision.
@@ -147,6 +147,11 @@ pub struct CompactionOptions {
     /// Milliseconds since the epoch, stamped on the output. Passed in rather than
     /// read from the clock so a merge is deterministic and testable.
     pub now_millis: u64,
+    /// Encryption at rest (PP-53). With a key, encrypted inputs are decrypted
+    /// with it and the output is written encrypted; plaintext inputs are read
+    /// as they are, which is how an existing table migrates. Without one, an
+    /// encrypted input is an error rather than being rewritten as plaintext.
+    pub encryption_key: Option<std::sync::Arc<vectorvolt_crypto::KeyStore>>,
 }
 
 /// Merge a job's inputs into one partition.
@@ -207,7 +212,8 @@ pub fn execute_job<L: Liveness>(
     let mut scratch: Vec<u64> = Vec::new();
 
     for part in &inputs {
-        let reader = PartitionReader::open(Path::new(&part.path))?;
+        let reader =
+            PartitionReader::open_with_key(Path::new(&part.path), opts.encryption_key.as_deref())?;
         let n = reader.row_count() as usize;
         bytes_in += part.size_bytes;
         rows_in += n as u64;
@@ -286,7 +292,12 @@ pub fn execute_job<L: Liveness>(
     let tmp_path = opts.output_dir.join(format!("{filename}.tmp"));
     {
         let mut f = std::fs::File::create(&tmp_path)?;
-        write_partition_with(&mut f, &mp, opts.write_options)?;
+        write_partition_keyed(
+            &mut f,
+            &mp,
+            opts.write_options,
+            opts.encryption_key.as_deref(),
+        )?;
         use std::io::Write;
         f.flush()?;
         f.sync_all()?;
@@ -391,6 +402,7 @@ mod tests {
             output_partition_id: 900,
             write_options: WriteOptions::default(),
             now_millis: 5_000,
+            encryption_key: None,
         }
     }
 

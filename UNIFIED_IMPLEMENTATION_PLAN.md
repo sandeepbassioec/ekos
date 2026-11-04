@@ -665,7 +665,7 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 | # | Gap | Where | Ref | Size | Status |
 |---|---|---|---|---|---|
 | A1 | Row-level security policies stored, never applied | `sql/executor.rs:1695` | S78 | M | ✅ SELECT, JOIN right side, UPDATE, DELETE all filtered; unsupported policy expressions rejected `[0A000]`. No user/role model yet, so policies apply to every session. |
-| A2 | "Column encryption" reverses the string | `executor.rs:3505-3535` | S142 | M | 🟡 Real AES-256-GCM, ciphertext bound to table.col.pk; fails without a key. The servers don't set a key yet → wire with C1. |
+| A2 | "Column encryption" reverses the string | `executor.rs:3505-3535` | S142 | M | ✅ Real AES-256-GCM bound to table.col.pk; servers now set a key derived from the master key (C1). |
 | A3 | pgwire has no authentication (always AuthenticationOk) | `reader/session.rs:54` | PP-35 | M | ✅ Cleartext password = `--secret`, constant-time check, FATAL 28P01; malformed startup → 08P01; SSLRequest answered `N`. Cleartext is loopback-only until D1 TLS. |
 | A4 | SQL security state is per connection; reconnect clears restrictions | `tcp_server.rs:94,125`, `reader/session.rs:40` | — | L | ✅ One shared executor state per server (`new_session()`); txn/cursors/prepared stay per connection. Any client can still change shared settings via SQL until a privilege model exists. |
 | A5 | Table tokens / rate limits only checked on SELECT | `executor.rs:12053,12062` | S81/S82 | S | ✅ `check_table_access()` on SELECT, INSERT, INSERT…SELECT, UPDATE, DELETE, TRUNCATE, COPY FROM. |
@@ -675,7 +675,7 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 | A9 | ledger/orders/workflow rewrite JSON without fsync/atomic rename | `ledger.rs:55`, `workflow/engine.rs:40` | PP-15 | M | ✅ tmp + fsync + rename + dir fsync in ledger/orders/workflow (and ledger accounts). Open: `Ledger::post` writes two files non-atomically. |
 | A10 | `vectorvolt-store` put never flushes its WAL buffer | `store.rs` | PP-14 | S | ✅ put/delete flush (fsync per config); sealed WAL segments truncated after SST flush (open segment kept). |
 | A11 | Store compaction empties the manifest on mid-way failure | `store.rs:148-164` | — | S | ✅ SST written as `.tmp` → rename + dir fsync; manifest swapped only after success; leftover `.tmp` cleaned on open. |
-| A12 | WAL hash chain unkeyed (tail edits / truncation undetected) | wal | PP-38 | M | ✅ Keyed tail seal (`wal/seal.rs`) written after each synced commit when encryption is on; truncation/rewrite/forged seal fail the open. |
+| A12 | WAL hash chain unkeyed (tail edits / truncation undetected) | wal | PP-38 | M | ✅ Keyed tail seal (`wal/seal.rs`) written after each synced commit when encryption is on; truncation/rewrite/forged seal fail the open. Batch C: a deleted `tail.seal` is now rejected once a table has been sealed. Residual: forging the table-marker frame or rolling back to exactly the marker still needs a keyed frame chain. |
 | A13 | HTTP/control tokens compared with `==`; tenant tokens plaintext | `http/server.rs:125`, `control/server.rs:60` | PP-34 | S | ✅ Constant-time bearer compare (HTTP, control); tenant tokens stored as SHA-256, never serialized. |
 | A14 | RBAC store never enforced by any listener | control + listeners | PP-37 | L | 🟡 Control plane enforces RBAC per route (users + roles in config; 401/403). HTTP/gRPC/pgwire still single-credential → per-user roles land with B30. |
 
@@ -719,12 +719,12 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 
 | # | Gap | Ref | Size | Status |
 |---|---|---|---|---|
-| C1 | `--encrypt-at-rest` with `--multi` / `TableRegistry` | PP-51 | M | ⬜ |
-| C2 | Key ID + flag in segment header; fail loudly on mismatch; AAD = (segment, seq) | PP-52 | M | ⬜ |
-| C3 | `.vvsst` encryption (format bump) | PP-53 | L | ⬜ |
-| C4 | Encrypt CDC log, manifest, intent log, PITR markers, sidecars | PP-54 | M | ⬜ |
-| C5 | KeyStore: no heap copy, mlock, rotation, nonce accounting | PP-55 | M | ⬜ |
-| C6 | Encrypted + compressed snapshots | PP-56 | M | ⬜ |
+| C1 | `--encrypt-at-rest` with `--multi` / `TableRegistry` | PP-51 | M | ✅ `TableRegistry::open_with_encryption`; `--multi --encrypt-at-rest` works; SQL column key derived from the master key and set on the pgwire executor (closes A2's remainder). |
+| C2 | Key ID + flag in segment header; fail loudly on mismatch; AAD = (segment, seq) | PP-52 | M | ✅ Segment header flag + key id (v2 header); AAD = key id + seq (VVE2); wrong/missing key fails naming both ids; VVE1 legacy still opens. |
+| C3 | `.vvsst` encryption (format bump) | PP-53 | L | ✅ Encrypted `.vvsst` v4 (whole-file VVE2, AAD = identity + key id), decrypted once at open into zeroed memory; `VVMANIF2` encrypted manifest; mixed plaintext/encrypted compaction; warm reads unchanged (214 vs 282 ns). |
+| C4 | Encrypt CDC log, manifest, intent log, PITR markers, sidecars | PP-54 | M | ✅ Per-record sealed cdc.log and intent log, sealed `--multi` schema.txt and index catalog, encrypted catalog WAL, MAC'd PITR markers; files bound to a WAL-recorded table id. Residual: plaintext legacy prefixes are accepted unauthenticated (migration). |
+| C5 | KeyStore: no heap copy, mlock, rotation, nonce accounting | PP-55 | M | ✅ Single protected key copy (memfd_secret / mlock / VirtualLock), zeroized; key_id(); nonce use counter + needs_rotation(); KeyRing rotation (re-encrypt on compaction still open). |
+| C6 | Encrypted + compressed snapshots | PP-56 | M | ✅ `snapshot.vvss` sealed; unauthenticated markers rejected on keyed tables. Partitions already column-compressed (no second layer). |
 
 ### D — Network and security hardening
 
@@ -898,3 +898,5 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 - 2026-10-31: register created. PR #647 (PP-01…13, 20–22, 25, 31, 32 + CI green-up) precedes batch A.
 - 2026-10-31: **Batch A** (branch `feat/gaps-batch-a`): A1, A3–A13 ✅; A2 and A14 🟡 (remainders folded into C1 and B30). New tests in query, reader, net, engine, wal, store, ledger/orders/workflow, control.
 - 2026-10-31: **Batch B** (branch `feat/gaps-batch-b`): 26 of 31 ✅; B6, B7, B14, B17, B31 🟡 with the remainder written in each row.
+- 2026-10-31: **Batch C paused** (branch `feat/gaps-batch-c`, WIP commit, not gate-checked): C2, C5 done; C1 partial. **Resume:** finish C1 (+A2 key wiring), then wave 2 = C3 + C4 + C6, then run the full gate (fmt, clippy 1.99 win + linux-target, workspace tests), mark rows, open the batch C PR stacked on #649. Also note A12: a deleted `tail.seal` is still accepted.
+- 2026-11-04: **Batch C complete** (branch `feat/gaps-batch-c`, rebased on main): C1–C6 ✅ (A2 remainder closed via C1). Storage key registry keeps every live owner; intent log encrypted through `TableRegistry::encryption_key()`.

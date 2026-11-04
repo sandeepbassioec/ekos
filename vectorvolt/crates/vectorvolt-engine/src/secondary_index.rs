@@ -136,7 +136,7 @@ impl TableEngine {
     pub(crate) fn save_index_catalog(&self) {
         let mut cols: Vec<usize> = self.secondary_indexes.read().keys().copied().collect();
         cols.sort_unstable();
-        let _ = index_catalog::save(&self.catalog_path, &cols);
+        let _ = index_catalog::save(&self.catalog_path, &cols, self.side_key.as_ref());
     }
 
     /// Whether a secondary index currently exists for `col_idx`.
