@@ -16,6 +16,9 @@ parking_lot    = { workspace = true }
 serde_json     = { workspace = true }
 async-trait    = "0.1"
 tokio          = { workspace = true }
+tokio-postgres = { workspace = true }
+rskafka        = { workspace = true }
+chrono         = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

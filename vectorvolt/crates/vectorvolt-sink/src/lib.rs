@@ -9,7 +9,7 @@ pub mod sink;
 
 pub use bridge::WalSinkBridge;
 pub use error::{SinkError, SinkResult};
-pub use kafka::{KafkaSink, KafkaSinkReceiver};
-pub use postgres::PostgresSink;
+pub use kafka::{ChannelKafkaSink, KafkaSink, KafkaSinkConfig, KafkaSinkReceiver};
+pub use postgres::{PostgresSink, PostgresSinkConfig};
 pub use registry::SinkRegistry;
 pub use sink::{Sink, SinkEvent, SinkEventKind};

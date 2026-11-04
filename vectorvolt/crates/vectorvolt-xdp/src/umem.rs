@@ -110,6 +110,25 @@ impl Umem {
         Ok(())
     }
 
+    /// UMEM byte offset of the packet data in frame `idx` (frame base + headroom);
+    /// this is the address to place in a TX descriptor.
+    pub fn data_addr(&self, idx: u32) -> u64 {
+        self.cfg.frame_addr(idx) + self.cfg.headroom as u64
+    }
+
+    /// Bounds-checked view of `len` bytes at UMEM offset `addr` (as found in an
+    /// RX descriptor).  `None` if the range escapes the UMEM.
+    pub fn bytes_at(&self, addr: u64, len: u32) -> Option<&[u8]> {
+        let end = addr.checked_add(len as u64)?;
+        if end > self.len as u64 {
+            return None;
+        }
+        // SAFETY: range checked against the mapping length above.
+        Some(unsafe {
+            std::slice::from_raw_parts(self.ptr.as_ptr().add(addr as usize), len as usize)
+        })
+    }
+
     /// Read a frame slice (headroom-adjusted, length `len`).
     pub fn read_frame(&self, idx: u32, len: usize) -> &[u8] {
         let offset = self.cfg.frame_addr(idx) as usize + self.cfg.headroom as usize;

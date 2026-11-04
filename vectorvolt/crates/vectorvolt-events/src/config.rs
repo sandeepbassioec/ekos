@@ -143,6 +143,12 @@ fn default_retries() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisSinkConfig {
     pub url: String,
+    #[serde(default = "default_redis_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+}
+
+fn default_redis_connect_timeout_ms() -> u64 {
+    3000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,4 +169,16 @@ fn default_retry_max() -> u32 {
 }
 fn default_backoff() -> u64 {
     500
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redis_config_defaults_timeout() {
+        let c: RedisSinkConfig = serde_yaml::from_str("url: redis://h:6379/").unwrap();
+        assert_eq!(c.url, "redis://h:6379/");
+        assert_eq!(c.connect_timeout_ms, 3000);
+    }
 }

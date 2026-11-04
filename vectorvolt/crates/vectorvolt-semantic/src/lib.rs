@@ -9,7 +9,7 @@ pub mod read_model;
 pub mod reducer;
 
 pub use cache::ReadModelSnapshot;
-pub use cache::{InProcessReadCache, ReadCache};
+pub use cache::{InProcessReadCache, ReadCache, RedisCacheError, RedisReadCache};
 pub use config::{
     CacheConfig, InProcessCacheConfig, PartitionConfig, ReadModelConfig, RedisCacheConfig,
     ReducerKind,
