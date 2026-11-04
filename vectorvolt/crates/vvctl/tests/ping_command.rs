@@ -1,66 +1,49 @@
-//! Tests for Layer 191: vvctl ping command (VV-CTL-191).
+//! Tests for vvctl ping (VV-CTL-191): real wire-protocol round trips.
 
-use vvctl::commands::ping::{PingArgs, run};
+mod common;
 
-fn make(host: &str, port: u16, count: u32) -> PingArgs {
+use common::{TestServer, dead_port};
+use vvctl::commands::ping::{PingArgs, ping_rtts, run};
+use vvctl::commands::wire::WireOpts;
+
+fn make(port: u16, count: u32) -> PingArgs {
     PingArgs {
-        host: host.to_string(),
+        host: "127.0.0.1".into(),
         port,
         count,
+        conn: WireOpts::default(),
     }
 }
 
 #[test]
-fn ping_run_ok() {
-    assert!(run(make("127.0.0.1", 7700, 1)).is_ok());
+fn ping_measures_one_rtt_per_request() {
+    let s = TestServer::start(0);
+    let rtts = ping_rtts(&make(s.port, 5)).unwrap();
+    assert_eq!(rtts.len(), 5);
+    assert!(rtts.iter().all(|d| !d.is_zero()));
 }
+
 #[test]
-fn ping_host_stored() {
-    assert_eq!(make("localhost", 9000, 1).host, "localhost");
+fn ping_run_succeeds_against_live_server() {
+    let s = TestServer::start(0);
+    run(make(s.port, 3)).unwrap();
 }
+
 #[test]
-fn ping_port_stored() {
-    assert_eq!(make("127.0.0.1", 9000, 1).port, 9000);
+fn ping_fails_when_nothing_listens() {
+    let err = run(make(dead_port(), 1)).unwrap_err();
+    assert!(err.to_string().contains("connect"), "{err:#}");
 }
+
 #[test]
-fn ping_count_stored() {
-    assert_eq!(make("127.0.0.1", 7700, 5).count, 5);
+fn ping_zero_count_is_rejected() {
+    let s = TestServer::start(0);
+    assert!(run(make(s.port, 0)).is_err());
 }
+
 #[test]
-fn ping_count_zero_ok() {
-    assert!(run(make("127.0.0.1", 7700, 0)).is_ok());
-}
-#[test]
-fn ping_count_one_ok() {
-    assert!(run(make("127.0.0.1", 7700, 1)).is_ok());
-}
-#[test]
-fn ping_count_ten_ok() {
-    assert!(run(make("127.0.0.1", 7700, 10)).is_ok());
-}
-#[test]
-fn ping_port_zero_ok() {
-    assert!(run(make("127.0.0.1", 0, 1)).is_ok());
-}
-#[test]
-fn ping_port_max_ok() {
-    assert!(run(make("127.0.0.1", 65535, 1)).is_ok());
-}
-#[test]
-fn ping_different_host() {
-    assert!(run(make("0.0.0.0", 7700, 1)).is_ok());
-}
-#[test]
-fn ping_multiple_times() {
-    for _ in 0..5 {
-        assert!(run(make("127.0.0.1", 7700, 1)).is_ok());
-    }
-}
-#[test]
-fn ping_count_three() {
-    assert_eq!(make("x", 1, 3).count, 3);
-}
-#[test]
-fn ping_host_empty_ok() {
-    assert!(run(make("", 7700, 1)).is_ok());
+fn ping_empty_host_is_rejected() {
+    let mut a = make(1, 1);
+    a.host = String::new();
+    assert!(run(a).is_err());
 }

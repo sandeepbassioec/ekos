@@ -7,9 +7,9 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use store::OutputFormat;
 use vvctl::commands::{
     bench, bench_net, catalog, cdc_cmd, chaos, cluster_cmd, completion, config, config_audit,
-    connect, disconnect, events_cmd, graph, hal, http, install, keygen, ledger_cmd, linux, ping,
-    profile, projection_cmd, query_cmd, serve, server_cmd, status_cmd, store, support_bundle,
-    table, topology, tune, wal, xdp_cmd,
+    connect, control, disconnect, events_cmd, graph, hal, http, install, keygen, ledger_cmd, linux,
+    ping, profile, projection_cmd, query_cmd, reader, serve, server_cmd, sql, status_cmd, store,
+    support_bundle, table, topology, tune, vector, wal, xdp_cmd,
 };
 use vvctl::ui;
 
@@ -180,6 +180,19 @@ enum Commands {
 
     /// Execute ad-hoc SQL against a local table directory (SELECT/INSERT/DELETE/EXPLAIN) — S24-B.
     Query(query_cmd::QueryArgs),
+
+    /// Control-plane HTTP admin API: start a server or query a running one (VV-CTL-006).
+    #[command(subcommand)]
+    Control(control::ControlCommand),
+
+    /// Interactive SQL REPL / one-shot exec against a local table directory (VV-QRY-020).
+    Sql(sql::SqlArgs),
+
+    /// Insert, search, and get vectors in a local table directory (VV-IDX-012).
+    Vector(vector::VectorArgs),
+
+    /// Standalone PostgreSQL wire-protocol reader (dev fallback; prefer `serve --pgwire-port`).
+    Reader(reader::ReaderArgs),
 
     /// Print version and build info.
     Version,
@@ -373,6 +386,14 @@ fn main() -> Result<()> {
         Commands::Events(args) => events_cmd::run(args)?,
 
         Commands::Query(args) => query_cmd::run(args)?,
+
+        Commands::Control(cmd) => control::run(cmd)?,
+
+        Commands::Sql(args) => sql::run(args)?,
+
+        Commands::Vector(args) => vector::run(args)?,
+
+        Commands::Reader(args) => reader::run(args)?,
 
         Commands::Version => print_version(),
     }

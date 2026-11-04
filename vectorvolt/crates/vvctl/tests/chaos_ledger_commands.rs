@@ -1,4 +1,4 @@
-//! Tests for S10-L9: chaos + ledger CLI commands.
+//! Tests for the chaos (DST) and ledger CLI commands.
 use tempfile::TempDir;
 use vvctl::commands::chaos::{ChaosCommand, run as chaos_run};
 use vvctl::commands::ledger_cmd::{LedgerCommand, run as ledger_run};

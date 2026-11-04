@@ -1,69 +1,42 @@
-//! Tests for Layer 198: vvctl bench-net command (VV-CTL-198).
+//! Tests for vvctl bench-net (VV-CTL-198): real round trips.
 
-use vvctl::commands::bench_net::{BenchNetArgs, run};
+mod common;
 
-fn args(host: &str, port: u16, requests: u32) -> BenchNetArgs {
+use common::{TestServer, dead_port};
+use vvctl::commands::bench_net::{BenchNetArgs, bench, run};
+use vvctl::commands::wire::WireOpts;
+
+fn args(port: u16, requests: u32) -> BenchNetArgs {
     BenchNetArgs {
-        host: host.into(),
+        host: "127.0.0.1".into(),
         port,
         requests,
+        conn: WireOpts::default(),
     }
 }
 
 #[test]
-fn bench_net_ok() {
-    assert!(run(args("127.0.0.1", 7700, 10)).is_ok());
+fn bench_net_performs_requested_round_trips() {
+    let s = TestServer::start(0);
+    let r = bench(&args(s.port, 50)).unwrap();
+    assert_eq!(r.latencies.len(), 50);
+    assert!(r.total >= r.percentile(100.0));
+    assert!(r.percentile(50.0) <= r.percentile(99.0));
 }
+
 #[test]
-fn bench_net_zero_requests_ok() {
-    assert!(run(args("127.0.0.1", 7700, 0)).is_ok());
+fn bench_net_run_ok() {
+    let s = TestServer::start(0);
+    run(args(s.port, 10)).unwrap();
 }
+
 #[test]
-fn bench_net_many_requests_ok() {
-    assert!(run(args("127.0.0.1", 7700, 1000)).is_ok());
+fn bench_net_fails_when_peer_is_down() {
+    assert!(bench(&args(dead_port(), 5)).is_err());
 }
+
 #[test]
-fn bench_net_localhost_ok() {
-    assert!(run(args("localhost", 7700, 1)).is_ok());
-}
-#[test]
-fn bench_net_custom_port_ok() {
-    assert!(run(args("127.0.0.1", 9000, 5)).is_ok());
-}
-#[test]
-fn bench_net_host_stored() {
-    let a = args("10.0.0.1", 8080, 1);
-    assert_eq!(a.host, "10.0.0.1");
-}
-#[test]
-fn bench_net_port_stored() {
-    let a = args("127.0.0.1", 1234, 1);
-    assert_eq!(a.port, 1234);
-}
-#[test]
-fn bench_net_requests_stored() {
-    let a = args("127.0.0.1", 7700, 42);
-    assert_eq!(a.requests, 42);
-}
-#[test]
-fn bench_net_returns_ok() {
-    let r = run(args("127.0.0.1", 7700, 5));
-    assert!(r.is_ok());
-}
-#[test]
-fn bench_net_high_port_ok() {
-    assert!(run(args("127.0.0.1", 65000, 1)).is_ok());
-}
-#[test]
-fn bench_net_ipv4_ok() {
-    assert!(run(args("192.168.1.1", 7700, 1)).is_ok());
-}
-#[test]
-fn bench_net_does_not_panic() {
-    let r = std::panic::catch_unwind(|| run(args("127.0.0.1", 7700, 3)));
-    assert!(r.is_ok());
-}
-#[test]
-fn bench_net_large_count_ok() {
-    assert!(run(args("127.0.0.1", 7700, 10000)).is_ok());
+fn bench_net_zero_requests_rejected() {
+    let s = TestServer::start(0);
+    assert!(run(args(s.port, 0)).is_err());
 }

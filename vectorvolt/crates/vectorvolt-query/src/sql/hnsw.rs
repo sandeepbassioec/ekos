@@ -140,6 +140,10 @@ impl HnswIndex {
                         let dists = nbrs
                             .iter()
                             .map(|&n| {
+                                // The new node is not in the graph yet: use its vector directly.
+                                if n == pk {
+                                    return metric.distance(&node.vec, &nvec);
+                                }
                                 self.g
                                     .nodes
                                     .get(&n.to_string())
@@ -412,6 +416,45 @@ mod tests {
         let results = idx.search(&[1.0, 0.0], 1);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1);
+    }
+
+    #[test]
+    fn test_hnsw_recall_at_10_vs_brute_force() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let dim = 16;
+        let data: Vec<Vec<f32>> = (0..3000)
+            .map(|_| (0..dim).map(|_| next()).collect())
+            .collect();
+        let dir = TempDir::new().unwrap();
+        let mut idx = HnswIndex::load(dir.path(), "t", "v", DistanceMetric::L2).unwrap();
+        for (i, v) in data.iter().enumerate() {
+            idx.insert(i as u64, v.clone());
+        }
+        let mut hits = 0;
+        let queries = 50;
+        for _ in 0..queries {
+            let q: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let mut exact: Vec<(u64, f32)> = data
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as u64, DistanceMetric::L2.distance(v, &q)))
+                .collect();
+            exact.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let truth: HashSet<u64> = exact.iter().take(10).map(|e| e.0).collect();
+            hits += idx
+                .search(&q, 10)
+                .iter()
+                .filter(|r| truth.contains(&r.0))
+                .count();
+        }
+        let recall = hits as f64 / (queries * 10) as f64;
+        assert!(recall >= 0.9, "recall@10 = {recall}");
     }
 
     #[test]

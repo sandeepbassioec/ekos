@@ -167,7 +167,7 @@ fn test_topology_format_tree() {
 }
 
 #[tokio::test]
-async fn test_cluster_nodes_returns_json_array() {
+async fn test_cluster_nodes_without_source_is_501() {
     let port = free_port();
     start_server(port, "tok").await;
     let client = reqwest::Client::new();
@@ -177,8 +177,9 @@ async fn test_cluster_nodes_returns_json_array() {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 501);
     let json: serde_json::Value = resp.json().await.unwrap();
-    assert!(json.is_array());
+    assert_eq!(json["error"], "not available");
 }
 
 #[test]

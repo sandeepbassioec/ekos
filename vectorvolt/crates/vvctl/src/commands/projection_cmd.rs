@@ -31,25 +31,16 @@ pub enum ProjectionCommand {
     },
 }
 
+/// No server API exposes read models (no wire opcode or HTTP route), so every
+/// subcommand fails rather than printing placeholder output.
 pub fn run(args: ProjectionArgs) -> Result<()> {
-    match args.command {
-        ProjectionCommand::List => {
-            println!("{:<30} {:<12} {:<10}", "NAME", "STATUS", "CACHE");
-            println!("{}", "-".repeat(55));
-            println!("(no live server — start with `vvctl serve` and connect)");
-        }
-        ProjectionCommand::Status { name } => {
-            println!("Read model: {name}");
-            println!("Status:     (requires live server)");
-        }
-        ProjectionCommand::Replay { name } => {
-            println!("Triggering WAL replay for read model '{name}' …");
-            println!("(requires live server)");
-        }
-        ProjectionCommand::InvalidateCache { name } => {
-            println!("Invalidating cache for read model '{name}' …");
-            println!("(requires live server)");
-        }
-    }
-    Ok(())
+    let what = match args.command {
+        ProjectionCommand::List => "list".to_string(),
+        ProjectionCommand::Status { name } => format!("status {name}"),
+        ProjectionCommand::Replay { name } => format!("replay {name}"),
+        ProjectionCommand::InvalidateCache { name } => format!("invalidate-cache {name}"),
+    };
+    anyhow::bail!(
+        "projection {what}: not implemented - the server exposes no read-model          management API to query or control"
+    )
 }

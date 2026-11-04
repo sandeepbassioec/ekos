@@ -8,7 +8,7 @@
 //!      5     1  opcode      — see [`WireOpcode`]
 //!      6     2  flags       — reserved, must be zero
 //!      8     4  payload_len — byte count of the payload that follows
-//!     12     4  crc32c      — CRC-32C of the payload bytes
+//!     12     4  crc32c      — CRC-32 (IEEE, crc32fast) of the payload bytes
 //!     16     8  request_id  — client correlation id echoed in every response
 //!     24    40  _pad        — zero-filled, reserved for future use
 //! ```
@@ -87,7 +87,7 @@ pub struct WireFrameHeader {
     pub flags: u16,
     /// Byte count of the payload that follows the header.
     pub payload_len: u32,
-    /// CRC-32C over the payload bytes.  Validated by [`verify_payload`].
+    /// CRC-32 (IEEE, crc32fast) over the payload bytes.  Validated by [`verify_payload`].
     pub crc32c: u32,
     /// Client-supplied correlation id.  Echoed verbatim in every response.
     pub request_id: u64,
@@ -202,7 +202,7 @@ impl WireFrameHeader {
 
     /// Decode header + payload from a single contiguous buffer.
     ///
-    /// Validates magic, version, opcode, payload length, and CRC-32C.
+    /// Validates magic, version, opcode, payload length, and CRC-32.
     /// Returns `(header, payload_slice)`.
     pub fn decode_full(buf: &[u8]) -> NetResult<(Self, &[u8])> {
         let header = Self::decode(buf)?;
@@ -218,7 +218,7 @@ impl WireFrameHeader {
         Ok((header, payload))
     }
 
-    /// Verify that `payload` matches the CRC-32C stored in this header.
+    /// Verify that `payload` matches the CRC-32 stored in this header.
     pub fn verify_payload(&self, payload: &[u8]) -> NetResult<()> {
         let actual = crc32fast::hash(payload);
         if actual != self.crc32c {

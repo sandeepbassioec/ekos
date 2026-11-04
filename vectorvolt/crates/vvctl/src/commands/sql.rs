@@ -31,7 +31,9 @@ pub fn run(args: SqlArgs) -> Result<()> {
     let csv_mode = args.output.to_lowercase() == "csv";
 
     if let Some(sql) = args.exec {
-        exec_and_print(&executor, sql.trim(), csv_mode);
+        if !exec_and_print(&executor, sql.trim(), csv_mode) {
+            anyhow::bail!("statement failed");
+        }
         return Ok(());
     }
 
@@ -53,7 +55,7 @@ pub fn run(args: SqlArgs) -> Result<()> {
         }
         buf.push_str(trimmed);
         if trimmed.ends_with(';') {
-            exec_and_print(&executor, buf.trim_end_matches(';').trim(), csv_mode);
+            let _ = exec_and_print(&executor, buf.trim_end_matches(';').trim(), csv_mode);
             buf.clear();
             print!("> ");
         } else {
@@ -65,7 +67,9 @@ pub fn run(args: SqlArgs) -> Result<()> {
     Ok(())
 }
 
-fn exec_and_print(executor: &SqlExecutor, sql: &str, csv: bool) {
+/// Execute and print one statement; `false` when it failed.
+fn exec_and_print(executor: &SqlExecutor, sql: &str, csv: bool) -> bool {
+    let mut ok = true;
     match executor.execute(sql) {
         Ok(QueryResult::Rows { columns, rows }) => {
             if csv {
@@ -88,7 +92,10 @@ fn exec_and_print(executor: &SqlExecutor, sql: &str, csv: bool) {
                 println!("{line}");
             }
         }
-        Ok(QueryResult::Error(msg)) => eprintln!("ERROR  {msg}"),
+        Ok(QueryResult::Error(msg)) => {
+            ok = false;
+            eprintln!("ERROR  {msg}");
+        }
         Ok(QueryResult::Notice(msg)) => println!("NOTICE {msg}"),
         Ok(QueryResult::Ok(msg)) => println!("{msg}"),
         Ok(QueryResult::WithNotice { result, notice }) => {
@@ -108,8 +115,12 @@ fn exec_and_print(executor: &SqlExecutor, sql: &str, csv: bool) {
                 other => println!("{other:?}"),
             }
         }
-        Err(e) => eprintln!("ERROR  {e}"),
+        Err(e) => {
+            ok = false;
+            eprintln!("ERROR  {e}");
+        }
     }
+    ok
 }
 
 fn print_table(columns: &[String], rows: &[Vec<String>]) {
