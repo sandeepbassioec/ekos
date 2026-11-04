@@ -117,7 +117,7 @@ impl XdpStream {
     pub fn bind(iface: &str, queue_id: u32, ring_size: u32) -> NetResult<Self> {
         use vectorvolt_xdp::umem::{Umem, UmemConfig};
         let umem = Umem::new(UmemConfig::default()).map_err(|e| NetError::Engine(e.to_string()))?;
-        let driver = vectorvolt_xdp::XdpDriver::bind(iface, ring_size, umem)
+        let driver = vectorvolt_xdp::XdpDriver::bind(iface, queue_id, ring_size, umem)
             .map_err(|e| NetError::Engine(e.to_string()))?;
         Ok(Self {
             driver,
@@ -139,9 +139,9 @@ impl Read for XdpStream {
             self.read_pos += n;
             return Ok(n);
         }
-        // Block until a frame arrives (spin — real impl would use poll).
+        // Block in poll(2) until a frame arrives (no busy-spin).
         loop {
-            match self.driver.recv() {
+            match self.driver.recv_wait(100) {
                 Ok((_slot, data)) => {
                     let n = buf.len().min(data.len());
                     buf[..n].copy_from_slice(&data[..n]);
@@ -154,9 +154,8 @@ impl Read for XdpStream {
                     }
                     return Ok(n);
                 }
-                Err(vectorvolt_xdp::XdpError::RingEmpty) => {
-                    std::hint::spin_loop();
-                }
+                // Timeout / spurious wakeup: keep waiting (blocking read).
+                Err(vectorvolt_xdp::XdpError::Timeout | vectorvolt_xdp::XdpError::RingEmpty) => {}
                 Err(e) => {
                     return Err(io::Error::other(e.to_string()));
                 }
@@ -168,11 +167,12 @@ impl Read for XdpStream {
 #[cfg(target_os = "linux")]
 impl Write for XdpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        const FRAME_IDX: u32 = 0;
-        self.driver
-            .send(FRAME_IDX, buf)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(buf.len())
+        // The driver allocates a free UMEM TX frame per send.
+        match self.driver.send(buf) {
+            Ok(()) => Ok(buf.len()),
+            Err(vectorvolt_xdp::XdpError::RingFull) => Err(io::ErrorKind::WouldBlock.into()),
+            Err(e) => Err(io::Error::other(e.to_string())),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {

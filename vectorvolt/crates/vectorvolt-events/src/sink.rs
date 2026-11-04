@@ -19,6 +19,8 @@ pub enum SinkError {
     Http(String),
     #[error("channel closed")]
     ChannelClosed,
+    #[error("redis: {0}")]
+    Redis(String),
 }
 
 pub type SinkResult = Result<(), SinkError>;
@@ -226,13 +228,28 @@ async fn webhook_post_with_retry(
 
 /// XADD to a Redis Stream per event (VV-EVT-005).
 ///
-/// Actual Redis connectivity is behind a trait so tests can use a no-op impl.
-/// Production wiring happens in `vvctl serve` using the `redis` crate directly.
+/// [`RedisStreamSink::connect`] builds a real sink on the `redis` crate (sync
+/// API; `send` blocks until Redis acknowledges the XADD). [`noop`] and [`new`]
+/// (custom writer closure) exist for tests.
+///
+/// [`noop`]: RedisStreamSink::noop
+/// [`new`]: RedisStreamSink::new
 pub struct RedisStreamSink {
     stream_name: String,
     maxlen: Option<u64>,
-    /// Pluggable write fn for testability; production sets a real redis sender.
+    /// Write fn `(stream, maxlen (0 = unbounded), json body)`.
     writer: WriterFn,
+}
+
+/// Build the `XADD stream [MAXLEN ~ n] * data <body>` command.
+pub fn xadd_cmd(stream: &str, maxlen: u64, body: &str) -> redis::Cmd {
+    let mut cmd = redis::cmd("XADD");
+    cmd.arg(stream);
+    if maxlen > 0 {
+        cmd.arg("MAXLEN").arg("~").arg(maxlen);
+    }
+    cmd.arg("*").arg("data").arg(body);
+    cmd
 }
 
 impl RedisStreamSink {
@@ -248,11 +265,114 @@ impl RedisStreamSink {
     pub fn noop(stream_name: impl Into<String>) -> Self {
         Self::new(stream_name, None, Arc::new(|_, _, _| Ok(())))
     }
+
+    /// Connect to Redis (`redis://host:port/db`). Fails if unreachable.
+    /// A broken connection is dropped and re-established on the next send.
+    pub fn connect(
+        url: &str,
+        stream_name: impl Into<String>,
+        maxlen: Option<u64>,
+        connect_timeout: Duration,
+    ) -> Result<Self, SinkError> {
+        let client = redis::Client::open(url).map_err(|e| SinkError::Redis(e.to_string()))?;
+        let first = client
+            .get_connection_with_timeout(connect_timeout)
+            .map_err(|e| SinkError::Redis(format!("connect: {e}")))?;
+        let conn = std::sync::Mutex::new(Some(first));
+        let writer: WriterFn = Arc::new(move |stream, maxlen, body| {
+            let mut guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+            if guard.is_none() {
+                *guard = Some(
+                    client
+                        .get_connection_with_timeout(connect_timeout)
+                        .map_err(|e| SinkError::Redis(format!("reconnect: {e}")))?,
+                );
+            }
+            let c = guard.as_mut().expect("connection present");
+            match xadd_cmd(stream, maxlen, body).query::<String>(c) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    *guard = None;
+                    Err(SinkError::Redis(format!("XADD: {e}")))
+                }
+            }
+        });
+        Ok(Self::new(stream_name, maxlen, writer))
+    }
+
+    /// Connect using a parsed [`RedisSinkConfig`](crate::config::RedisSinkConfig).
+    pub fn from_config(
+        cfg: &crate::config::RedisSinkConfig,
+        stream_name: impl Into<String>,
+        maxlen: Option<u64>,
+    ) -> Result<Self, SinkError> {
+        Self::connect(
+            &cfg.url,
+            stream_name,
+            maxlen,
+            Duration::from_millis(cfg.connect_timeout_ms),
+        )
+    }
 }
 
 impl EventSink for RedisStreamSink {
     fn send(&self, envelope: &DomainEventEnvelope) -> SinkResult {
         let body = serde_json::to_string(envelope)?;
         (self.writer)(&self.stream_name, self.maxlen.unwrap_or(0), &body)
+    }
+}
+
+#[cfg(test)]
+mod redis_tests {
+    use super::*;
+
+    #[test]
+    fn xadd_cmd_encoding() {
+        let packed = xadd_cmd("s", 0, "{}").get_packed_command();
+        let text = String::from_utf8_lossy(&packed).to_string();
+        assert!(text.contains("XADD") && text.contains("data"), "{text:?}");
+        assert!(!text.contains("MAXLEN"));
+        let packed = xadd_cmd("s", 1000, "{}").get_packed_command();
+        let text = String::from_utf8_lossy(&packed).to_string();
+        assert!(text.contains("MAXLEN") && text.contains("1000"), "{text:?}");
+    }
+
+    #[test]
+    fn connect_unreachable_errors() {
+        let r = RedisStreamSink::connect(
+            "redis://127.0.0.1:1/",
+            "s",
+            None,
+            Duration::from_millis(500),
+        );
+        assert!(matches!(r, Err(SinkError::Redis(_))));
+    }
+
+    #[test]
+    fn connect_bad_url_errors() {
+        let r = RedisStreamSink::connect("not a url", "s", None, Duration::from_millis(100));
+        assert!(r.is_err());
+    }
+
+    /// Needs a live Redis: `VV_TEST_REDIS=redis://host:6379/`.
+    #[test]
+    #[ignore = "requires VV_TEST_REDIS"]
+    fn live_xadd() {
+        let url = std::env::var("VV_TEST_REDIS").expect("VV_TEST_REDIS");
+        let sink =
+            RedisStreamSink::connect(&url, "vv:test:events", Some(100), Duration::from_secs(3))
+                .unwrap();
+        (sink.writer)("vv:test:events", 100, "{\"k\":1}").unwrap();
+        let client = redis::Client::open(url.as_str()).unwrap();
+        let mut c = client.get_connection().unwrap();
+        let n: u64 = redis::cmd("XLEN")
+            .arg("vv:test:events")
+            .query(&mut c)
+            .unwrap();
+        assert!(n >= 1);
+        let _: () = redis::cmd("DEL")
+            .arg("vv:test:events")
+            .query(&mut c)
+            .unwrap();
     }
 }

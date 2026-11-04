@@ -740,18 +740,18 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 
 | # | Gap | Ref | Size | Status |
 |---|---|---|---|---|
-| E1 | ~300 of 353 executor settings are state-only; implement or return unsupported | PP-70 | L | ⬜ |
-| E2 | Split the 34,955-line `executor.rs` | PP-70 | L | ⬜ |
+| E1 | ~300 of 353 executor settings are state-only; implement or return unsupported | PP-70 | L | ✅ 19 SET forms with real effect kept; 14 PG client-compat settings accepted as no-ops; ~78 state-only settings removed and now return 0A000 naming the setting (tests `e1_settings.rs`). Residual: SHOW/RESET of removed settings still return defaults. |
+| E2 | Split the 34,955-line `executor.rs` | PP-70 | L | ✅ `executor.rs` split into `sql/executor/` (13 files, largest ~3k lines; tests in 4 parts); pure move, public paths unchanged. |
 | E3 | Control API returns hardcoded data | PP-60 | M | ✅ `ControlBackend` over a real `TableRegistry` (`vvctl control start --dir`); health/tables/stats/snapshot are real, cluster endpoints return 501 "not available". Residual: CLI default token `vvctl-token` still hardcoded. |
 | E4 | vvctl ping/status/disconnect/bench-net/server/projection only print | PP-61 | M | ✅ ping/status/server status/bench-net do real wire round trips with latency; disconnect, server stop and projection fail with "not implemented" (no opcode). `vvctl sql -e` now exits non-zero on error. |
 | E5 | Orphan vvctl modules | PP-62 | S | ✅ control/sql/vector/reader wired into `vvctl`; print-only `connect_simple.rs` deleted. |
 | E6 | `table_*_stub.rs` tests test nothing they're named for | PP-65 | S | ✅ 44 meaningless `table_*_stub.rs` deleted; chaos/ledger kept as `chaos_ledger_commands.rs`; real `vector_command`/`sql_command` tests. |
 | E7 | "HNSW" is brute force | PP-66 | L | ✅ `vectorvolt-vector` HNSW is a real multi-layer graph (recall@10 ≥ 0.9, visits < N/3); SQL HNSW pruning bug fixed (recall 0.014 → passing). Residual: SQL HNSW ef fixed at max(k,100). |
-| E8 | Kafka sink is mpsc; Postgres sink collects strings; flush no-op | PP-66 | L | ⬜ |
-| E9 | Redis Streams sink / Redis cache have no client | PP-66, VV-PRJ-016 | M | ⬜ |
+| E8 | Kafka sink is mpsc; Postgres sink collects strings; flush no-op | PP-66 | L | ✅ `KafkaSink` (rskafka, flush awaits acks) and `PostgresSink` (tokio-postgres, parameterized upserts, one txn per batch, flush awaits COMMIT); old mpsc kept as `ChannelKafkaSink` test double. Residual: PG NoTls only; Kafka single partition, no retries; `vvctl serve` does not build sinks from config yet. |
+| E9 | Redis Streams sink / Redis cache have no client | PP-66, VV-PRJ-016 | M | ✅ `RedisStreamSink` (XADD MAXLEN ~, reconnect) and `RedisReadCache` (GET/SET EX/DEL) on the `redis` crate; live tests `#[ignore]` behind VV_TEST_REDIS. |
 | E10 | Outbox and DLQ in memory, not in WAL | VV-EVT-008/012 | M | ✅ `EventOutbox::open` / `EventDlq::open`: fsynced journal replayed and compacted on open, torn tail skipped; restart tests. Residual: callers still use in-memory `new()`. |
-| E11 | XDP: no eBPF program, TX frame 0, busy-spin | PP-67, 4.6 | L | ⬜ |
-| E12 | Python/Go/TS SDKs speak a protocol no server implements | PP-63 | L | ⬜ |
+| E11 | XDP: no eBPF program, TX frame 0, busy-spin | PP-67, 4.6 | L | ✅ real mmap'd rings, TX frame allocator with completion reclaim, poll(2) + NEED_WAKEUP instead of busy-spin, hand-built XSKMAP redirect program loaded via bpf(2) (clear error + TCP fallback on failure). Residual: lint-checked only for Linux, never run on a kernel; needs 5.7+, single queue. |
+| E12 | Python/Go/TS SDKs speak a protocol no server implements | PP-63 | L | ✅ Python/Go/TS SDKs rewritten to the real 24-byte `protocol.rs` framing (persistent connection, auth, table/row ops, txns); golden-byte tests. No SQL opcode exists, so query/execute raise not-supported. Breaking API change (rows are u64 lists). |
 | E13 | Rust SDK connection per call breaks transactions | PP-64 | M | ✅ SDK keeps one persistent connection; transactions span calls; dropped only on transport errors. |
 | E14 | CRC-32C comments over IEEE CRC-32 | PP-68 | S | ✅ net and WAL frame comments now say IEEE CRC-32 (no on-disk change); HAL's real CRC-32C left as is. |
 
@@ -902,3 +902,4 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 - 2026-11-04: **Batch C complete** (branch `feat/gaps-batch-c`, rebased on main): C1–C6 ✅ (A2 remainder closed via C1). Storage key registry keeps every live owner; intent log encrypted through `TableRegistry::encryption_key()`.
 - 2026-11-04: **Batch D complete** (branch `feat/gaps-batch-d`): D1–D5 ✅ — TLS/mTLS on all listeners, pgwire SCRAM/MD5 + extended protocol, `--pgwire-host`, IP allowlist and connection limits enforced, D5 SQL rules enforced.
 - 2026-11-04: **Batch E part 1** (branch `feat/gaps-batch-e`): E3–E7, E10, E13, E14 ✅. E1, E2, E8, E9, E11, E12 remain for part 2.
+- 2026-11-04: **Batch E part 2** (branch `feat/gaps-batch-e2`): E1, E2, E8, E9, E11, E12 ✅. **Batch E complete.**

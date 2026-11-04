@@ -201,7 +201,7 @@ mod linux {
         use vectorvolt_xdp::XdpDriver;
         use vectorvolt_xdp::umem::UmemConfig;
         let umem = Umem::new(UmemConfig::default()).unwrap();
-        let _driver = XdpDriver::bind("lo", 64, umem).unwrap();
+        let _driver = XdpDriver::bind("lo", 0, 64, umem).unwrap();
     }
 }
 

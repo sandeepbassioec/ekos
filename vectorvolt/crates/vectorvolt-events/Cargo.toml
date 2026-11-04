@@ -18,6 +18,7 @@ rhai           = { workspace = true }
 reqwest        = { workspace = true }
 tokio          = { workspace = true }
 thiserror      = { workspace = true }
+redis          = { workspace = true }
 tracing        = { workspace = true }
 chrono         = { workspace = true }
 hmac           = { workspace = true }
