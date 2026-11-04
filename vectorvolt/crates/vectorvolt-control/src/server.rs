@@ -9,7 +9,6 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
@@ -30,8 +29,33 @@ pub struct ApiUser {
     pub roles: Vec<String>,
 }
 
+/// Failure from a [`ControlBackend`] operation.
+#[derive(Debug, Clone)]
+pub enum BackendError {
+    NotFound(String),
+    Failed(String),
+}
+
+/// The live engine state the control API reports on.
+///
+/// Anything a backend cannot answer returns `None` (or the default), and the
+/// API then answers 501 rather than inventing data.
+pub trait ControlBackend: Send + Sync {
+    fn list_tables(&self) -> Vec<String>;
+    fn table_stats(&self, name: &str) -> Result<Value, BackendError>;
+    fn snapshot_table(&self, name: &str) -> Result<Value, BackendError>;
+    fn cluster_nodes(&self) -> Option<Vec<Value>> {
+        None
+    }
+    fn cluster_shards(&self) -> Option<Vec<Value>> {
+        None
+    }
+}
+
 pub struct AppState {
     pub config: ControlConfig,
+    /// Engine the endpoints report on; `None` = standalone, no engine data.
+    pub backend: Option<Arc<dyn ControlBackend>>,
     pub tenants: Arc<TenantRegistry>,
     pub metrics: Arc<Metrics>,
     /// Role and permission store every handler checks (PP-37).
@@ -51,6 +75,15 @@ pub struct ControlServer {
 
 impl ControlServer {
     pub fn new(config: ControlConfig) -> Self {
+        Self::build(config, None)
+    }
+
+    /// Control server reporting on a live engine.
+    pub fn with_backend(config: ControlConfig, backend: Arc<dyn ControlBackend>) -> Self {
+        Self::build(config, Some(backend))
+    }
+
+    fn build(config: ControlConfig, backend: Option<Arc<dyn ControlBackend>>) -> Self {
         let rbac = RbacStore::new();
         rbac.load_predefined();
         let mut credentials = Vec::new();
@@ -70,6 +103,7 @@ impl ControlServer {
         Self {
             state: Arc::new(AppState {
                 config,
+                backend,
                 tenants: Arc::new(TenantRegistry::new()),
                 metrics: Arc::new(Metrics::new()),
                 rbac: Arc::new(rbac),
@@ -124,8 +158,37 @@ fn authorize(
     }
 }
 
-async fn health_handler() -> impl IntoResponse {
-    Json(json!({"status": "ok", "version": "0.1.0"}))
+fn not_available(what: &str) -> axum::response::Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"error": "not available", "detail": what})),
+    )
+        .into_response()
+}
+
+fn backend_error(e: BackendError) -> axum::response::Response {
+    match e {
+        BackendError::NotFound(n) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "table not found", "table": n})),
+        )
+            .into_response(),
+        BackendError::Failed(m) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": m}))).into_response()
+        }
+    }
+}
+
+async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut body = json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "engine_attached": state.backend.is_some(),
+    });
+    if let Some(b) = &state.backend {
+        body["table_count"] = json!(b.list_tables().len());
+    }
+    Json(body)
 }
 
 async fn cluster_nodes_handler(
@@ -135,12 +198,10 @@ async fn cluster_nodes_handler(
     if let Err(e) = authorize(&headers, &state, Permission::ClusterRead) {
         return e.into_response();
     }
-    let nodes: Vec<Value> = vec![
-        json!({"id": "node-1", "addr": "127.0.0.1:7001", "role": "leader", "healthy": true}),
-        json!({"id": "node-2", "addr": "127.0.0.1:7002", "role": "follower", "healthy": true}),
-        json!({"id": "node-3", "addr": "127.0.0.1:7003", "role": "follower", "healthy": true}),
-    ];
-    Json(nodes).into_response()
+    match state.backend.as_ref().and_then(|b| b.cluster_nodes()) {
+        Some(nodes) => Json(nodes).into_response(),
+        None => not_available("no cluster membership source is attached"),
+    }
 }
 
 async fn cluster_shards_handler(
@@ -150,11 +211,10 @@ async fn cluster_shards_handler(
     if let Err(e) = authorize(&headers, &state, Permission::ClusterRead) {
         return e.into_response();
     }
-    let shards: Vec<Value> = vec![
-        json!({"id": "shard-0", "range_start": 0, "range_end": 16383, "leader": "node-1"}),
-        json!({"id": "shard-1", "range_start": 16384, "range_end": 32767, "leader": "node-2"}),
-    ];
-    Json(shards).into_response()
+    match state.backend.as_ref().and_then(|b| b.cluster_shards()) {
+        Some(shards) => Json(shards).into_response(),
+        None => not_available("no shard map source is attached"),
+    }
 }
 
 async fn remove_node_handler(
@@ -165,7 +225,8 @@ async fn remove_node_handler(
     if let Err(e) = authorize(&headers, &state, Permission::ClusterAdmin) {
         return e.into_response();
     }
-    Json(json!({"removed": true, "node_id": id})).into_response()
+    let _ = id;
+    not_available("node removal is not supported by the attached backend")
 }
 
 async fn tables_handler(
@@ -175,12 +236,15 @@ async fn tables_handler(
     if let Err(e) = authorize(&headers, &state, Permission::TableRead) {
         return e.into_response();
     }
-    let tables: Vec<String> = state
-        .tenants
-        .list()
-        .iter()
-        .flat_map(|t| t.tables.clone())
-        .collect();
+    let tables: Vec<String> = match &state.backend {
+        Some(b) => b.list_tables(),
+        None => state
+            .tenants
+            .list()
+            .iter()
+            .flat_map(|t| t.tables.clone())
+            .collect(),
+    };
     Json(tables).into_response()
 }
 
@@ -192,14 +256,13 @@ async fn table_stats_handler(
     if let Err(e) = authorize(&headers, &state, Permission::TableRead) {
         return e.into_response();
     }
-    Json(json!({
-        "table": name,
-        "row_count": 0u64,
-        "bytes": 0u64,
-        "shard_count": 1u32,
-        "index_count": 0u32
-    }))
-    .into_response()
+    let Some(backend) = state.backend.clone() else {
+        return not_available("no engine is attached; table stats unavailable");
+    };
+    match backend.table_stats(&name) {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => backend_error(e),
+    }
 }
 
 async fn table_snapshot_handler(
@@ -210,11 +273,16 @@ async fn table_snapshot_handler(
     if let Err(e) = authorize(&headers, &state, Permission::TableAdmin) {
         return e.into_response();
     }
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    Json(json!({"snapshot_id": format!("snap-{name}-{ts}")})).into_response()
+    let Some(backend) = state.backend.clone() else {
+        return not_available("no engine is attached; snapshots unavailable");
+    };
+    let n = name.clone();
+    // Snapshots flush and compact: keep them off the async workers.
+    match tokio::task::spawn_blocking(move || backend.snapshot_table(&n)).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => backend_error(e),
+        Err(e) => backend_error(BackendError::Failed(e.to_string())),
+    }
 }
 
 async fn metrics_handler(
@@ -315,9 +383,10 @@ mod tests {
     #[tokio::test]
     async fn admin_token_keeps_full_access() {
         let s = rbac_server();
+        // Authorised, but no engine attached: honest 501, not a fake snapshot.
         assert_eq!(
             status(s.router(), "POST", "/tables/t/snapshot", "test-token").await,
-            StatusCode::OK
+            StatusCode::NOT_IMPLEMENTED
         );
     }
 
@@ -363,22 +432,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cluster_nodes_200() {
-        let app = make_server().router();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/cluster/nodes")
-                    .header("Authorization", auth_header())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
     async fn test_tables_200() {
         let app = make_server().router();
         let resp = app
@@ -392,44 +445,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_table_stats_200() {
-        let app = make_server().router();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/tables/my_table/stats")
-                    .header("Authorization", auth_header())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["table"], "my_table");
-    }
-
-    #[tokio::test]
-    async fn test_table_snapshot_200() {
-        let app = make_server().router();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/tables/my_table/snapshot")
-                    .header("Authorization", auth_header())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        let snap_id = body["snapshot_id"].as_str().unwrap();
-        assert!(snap_id.starts_with("snap-my_table-"));
     }
 
     #[tokio::test]
@@ -494,61 +509,114 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn test_cluster_shards_200() {
-        let app = make_server().router();
+    struct MockBackend;
+    impl ControlBackend for MockBackend {
+        fn list_tables(&self) -> Vec<String> {
+            vec!["orders".into(), "users".into()]
+        }
+        fn table_stats(&self, name: &str) -> Result<Value, BackendError> {
+            if name == "orders" {
+                Ok(json!({"table": "orders", "rows_flushed": 7}))
+            } else {
+                Err(BackendError::NotFound(name.into()))
+            }
+        }
+        fn snapshot_table(&self, name: &str) -> Result<Value, BackendError> {
+            self.table_stats(name).map(|_| json!({"row_count": 7}))
+        }
+    }
+
+    fn backed() -> Router {
+        ControlServer::with_backend(
+            ControlConfig {
+                bind_addr: "127.0.0.1:0".into(),
+                token: "test-token".into(),
+                users: vec![],
+            },
+            Arc::new(MockBackend),
+        )
+        .router()
+    }
+
+    async fn call(app: Router, method: &str, uri: &str) -> (StatusCode, Value) {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/cluster/shards")
+                    .method(method)
+                    .uri(uri)
                     .header("Authorization", auth_header())
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let st = resp.status();
+        (st, body_json(resp).await)
     }
 
     #[tokio::test]
-    async fn test_remove_node_200() {
-        let app = make_server().router();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/cluster/nodes/node-1/remove")
-                    .header("Authorization", auth_header())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["removed"], true);
-        assert_eq!(body["node_id"], "node-1");
+    async fn no_backend_means_501_not_fake_data() {
+        for (m, u) in [
+            ("GET", "/tables/t/stats"),
+            ("POST", "/tables/t/snapshot"),
+            ("GET", "/cluster/nodes"),
+            ("GET", "/cluster/shards"),
+            ("POST", "/cluster/nodes/n1/remove"),
+        ] {
+            let (st, body) = call(make_server().router(), m, u).await;
+            assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{m} {u}");
+            assert_eq!(body["error"], "not available");
+        }
     }
 
     #[tokio::test]
-    async fn test_cluster_nodes_content_type_json() {
-        let app = make_server().router();
-        let resp = app
+    async fn backend_tables_stats_snapshot_are_real() {
+        let (st, body) = call(backed(), "GET", "/tables").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body, json!(["orders", "users"]));
+        let (st, body) = call(backed(), "GET", "/tables/orders/stats").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["rows_flushed"], 7);
+        let (st, _) = call(backed(), "GET", "/tables/ghost/stats").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, body) = call(backed(), "POST", "/tables/orders/snapshot").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["row_count"], 7);
+        let (st, _) = call(backed(), "POST", "/tables/ghost/snapshot").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // Backend has no cluster source: still 501.
+        let (st, _) = call(backed(), "GET", "/cluster/nodes").await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn health_reports_real_version_and_engine_state() {
+        let (_, standalone) = {
+            let resp = make_server()
+                .router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (0, body_json(resp).await)
+        };
+        assert_eq!(standalone["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(standalone["engine_attached"], false);
+        let resp = backed()
             .oneshot(
                 Request::builder()
-                    .uri("/cluster/nodes")
-                    .header("Authorization", auth_header())
+                    .uri("/health")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(ct.contains("application/json"));
+        let b = body_json(resp).await;
+        assert_eq!(b["engine_attached"], true);
+        assert_eq!(b["table_count"], 2);
     }
 }

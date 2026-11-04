@@ -13,7 +13,7 @@
 //! │  payload_len 4 bytes                                             │
 //! │  payload     N bytes                                             │
 //! │  frame_hash 32 bytes  SHA3-256(all bytes above)                  │
-//! │  crc32c      4 bytes  CRC32C(all bytes above) — fast I/O guard   │
+//! │  crc32       4 bytes  CRC-32 (IEEE, crc32fast) of all bytes above — fast guard │
 //! └──────────────────────────────────────────────────────────────────┘
 //!
 //! Overhead per frame: 4+4+8+8+32+1+4+32+4 = 97 bytes
@@ -82,7 +82,7 @@ impl Frame {
         h.finalize().into()
     }
 
-    /// Serialize to bytes, computing hash and crc32c.
+    /// Serialize to bytes, computing hash and crc32.
     pub fn encode(&mut self) -> Vec<u8> {
         let frame_len = (FRAME_OVERHEAD + self.payload.len()) as u32;
         let mut buf = Vec::with_capacity(frame_len as usize);

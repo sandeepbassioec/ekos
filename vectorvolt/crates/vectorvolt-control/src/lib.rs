@@ -4,4 +4,4 @@ pub mod rbac;
 pub mod server;
 pub mod tenant;
 
-pub use server::{ControlConfig, ControlServer};
+pub use server::{BackendError, ControlBackend, ControlConfig, ControlServer};
