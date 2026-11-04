@@ -54,12 +54,32 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+fn read_certs(pem: &[u8], what: &str) -> NetResult<Vec<CertificateDer<'static>>> {
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &pem[..])
+        .collect::<Result<_, _>>()
+        .map_err(|e| NetError::Tls(format!("reading {what} PEM: {e}")))?;
+    if certs.is_empty() {
+        return Err(NetError::Tls(format!(
+            "{what} PEM contained no certificates"
+        )));
+    }
+    Ok(certs)
+}
+
+fn read_key(pem: &[u8]) -> NetResult<PrivateKeyDer<'static>> {
+    rustls_pemfile::private_key(&mut &pem[..])
+        .map_err(|e| NetError::Tls(format!("reading private key PEM: {e}")))?
+        .ok_or_else(|| NetError::Tls("private key PEM contained no key".into()))
+}
+
 // ── Server ────────────────────────────────────────────────────────────────────
 
 /// Server-side TLS: the certificate chain this server presents, and its key.
 #[derive(Clone)]
 pub struct ServerTlsConfig {
     inner: Arc<ServerConfig>,
+    /// Whether client certificates are required (mutual TLS).
+    client_auth: bool,
 }
 
 impl std::fmt::Debug for ServerTlsConfig {
@@ -76,32 +96,59 @@ impl ServerTlsConfig {
     /// order TLS requires. A chain in the wrong order fails at the client with a
     /// confusing "unknown issuer", so it is worth getting right at build time.
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> NetResult<Self> {
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_pem[..])
-            .collect::<Result<_, _>>()
-            .map_err(|e| NetError::Tls(format!("reading certificate PEM: {e}")))?;
-        if certs.is_empty() {
-            return Err(NetError::Tls(
-                "certificate PEM contained no certificates".into(),
-            ));
-        }
+        Self::build(cert_pem, key_pem, None)
+    }
 
-        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &key_pem[..])
-            .map_err(|e| NetError::Tls(format!("reading private key PEM: {e}")))?
-            .ok_or_else(|| NetError::Tls("private key PEM contained no key".into()))?;
+    /// Build from PEM bytes and **require** every client to present a
+    /// certificate issued by one of the CAs in `client_ca_pem` (mutual TLS).
+    ///
+    /// A client without a certificate, or with one from another issuer, fails
+    /// the handshake before any application byte is exchanged.
+    pub fn from_pem_with_client_ca(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        client_ca_pem: &[u8],
+    ) -> NetResult<Self> {
+        Self::build(cert_pem, key_pem, Some(client_ca_pem))
+    }
 
-        let inner = ServerConfig::builder_with_provider(provider())
+    fn build(cert_pem: &[u8], key_pem: &[u8], client_ca_pem: Option<&[u8]>) -> NetResult<Self> {
+        let certs = read_certs(cert_pem, "certificate")?;
+        let key = read_key(key_pem)?;
+
+        let builder = ServerConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
-            .map_err(|e| NetError::Tls(format!("protocol versions: {e}")))?
-            // No client certificates. Client identity comes from the
-            // challenge–response handshake, which already exists and already
-            // carries a scope. Two identity systems that can disagree is worse
-            // than one — see the module docs on why the handshake stays.
-            .with_no_client_auth()
+            .map_err(|e| NetError::Tls(format!("protocol versions: {e}")))?;
+        let builder = match client_ca_pem {
+            // Without a client CA there are no client certificates: client
+            // identity comes from the challenge–response handshake, which
+            // already exists and already carries a scope.
+            None => builder.with_no_client_auth(),
+            // With one, the certificate is an *additional* gate in front of
+            // the handshake (mTLS), not a replacement for it.
+            Some(ca_pem) => {
+                let mut roots = RootCertStore::empty();
+                for c in read_certs(ca_pem, "client CA")? {
+                    roots
+                        .add(c)
+                        .map_err(|e| NetError::Tls(format!("adding client CA: {e}")))?;
+                }
+                let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    provider(),
+                )
+                .build()
+                .map_err(|e| NetError::Tls(format!("client certificate verifier: {e}")))?;
+                builder.with_client_cert_verifier(verifier)
+            }
+        };
+        let inner = builder
             .with_single_cert(certs, key)
             .map_err(|e| NetError::Tls(format!("certificate and key do not match: {e}")))?;
 
         Ok(ServerTlsConfig {
             inner: Arc::new(inner),
+            client_auth: client_ca_pem.is_some(),
         })
     }
 
@@ -113,6 +160,31 @@ impl ServerTlsConfig {
         let cert = std::fs::read(cert_path)?;
         let key = std::fs::read(key_path)?;
         Self::from_pem(&cert, &key)
+    }
+
+    /// Load from files, optionally requiring client certificates issued by the
+    /// CA(s) in `client_ca_path` (mutual TLS).
+    pub fn from_files_with_client_ca(
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+        client_ca_path: Option<&std::path::Path>,
+    ) -> NetResult<Self> {
+        let cert = std::fs::read(cert_path)?;
+        let key = std::fs::read(key_path)?;
+        let ca = client_ca_path.map(std::fs::read).transpose()?;
+        Self::build(&cert, &key, ca.as_deref())
+    }
+
+    /// True if clients must present a certificate (mutual TLS).
+    pub fn requires_client_cert(&self) -> bool {
+        self.client_auth
+    }
+
+    /// The underlying rustls config, for async listeners (pgwire, HTTP) that
+    /// drive the handshake with `tokio-rustls` instead of the blocking
+    /// [`ServerConn`]. Shares the same certificate, key and client policy.
+    pub fn rustls_config(&self) -> Arc<ServerConfig> {
+        Arc::clone(&self.inner)
     }
 
     fn new_connection(&self) -> NetResult<ServerConnection> {
@@ -169,17 +241,49 @@ impl ClientTlsConfig {
         roots: RootCertStore,
         server_name: impl Into<String>,
     ) -> NetResult<Self> {
-        let server_name = server_name.into();
+        Self::build(roots, server_name.into(), None)
+    }
+
+    /// Like [`pin_certificate`](Self::pin_certificate), and also present a
+    /// client certificate — needed when the server requires mutual TLS
+    /// (`vvctl serve --tls-client-ca`).
+    pub fn pin_certificate_with_client_cert(
+        cert_pem: &[u8],
+        server_name: impl Into<String>,
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+    ) -> NetResult<Self> {
+        let mut roots = RootCertStore::empty();
+        for c in read_certs(cert_pem, "pinned certificate")? {
+            roots
+                .add(c)
+                .map_err(|e| NetError::Tls(format!("pinning certificate: {e}")))?;
+        }
+        let chain = read_certs(client_cert_pem, "client certificate")?;
+        let key = read_key(client_key_pem)?;
+        Self::build(roots, server_name.into(), Some((chain, key)))
+    }
+
+    fn build(
+        roots: RootCertStore,
+        server_name: String,
+        client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    ) -> NetResult<Self> {
         // Validated here rather than at connect time, so a bad name is a
         // configuration error rather than a runtime surprise on first use.
         ServerName::try_from(server_name.clone())
             .map_err(|e| NetError::Tls(format!("invalid server name {server_name:?}: {e}")))?;
 
-        let inner = ClientConfig::builder_with_provider(provider())
+        let builder = ClientConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
             .map_err(|e| NetError::Tls(format!("protocol versions: {e}")))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+            .with_root_certificates(roots);
+        let inner = match client_auth {
+            None => builder.with_no_client_auth(),
+            Some((chain, key)) => builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| NetError::Tls(format!("client certificate and key: {e}")))?,
+        };
 
         Ok(ClientTlsConfig {
             inner: Arc::new(inner),

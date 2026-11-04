@@ -730,11 +730,11 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 
 | # | Gap | Ref | Size | Status |
 |---|---|---|---|---|
-| D1 | TLS for HTTP, gRPC, pgwire; optional mTLS | PP-36 | L | ⬜ |
-| D2 | pgwire SCRAM/MD5, SSLRequest, extended protocol | PP-35 | L | ⬜ |
-| D3 | `--pgwire-host` flag (hardcoded 127.0.0.1) | VA-07 | S | ⬜ |
-| D4 | IP allowlist (S83) never called; `max_connections` (S116) not enforced | — | S | ⬜ |
-| D5 | Masking, grants, freeze, schema lock, idle timeout, memory limit never enforced | S159/252/273/278/283/295 | L | ⬜ |
+| D1 | TLS for HTTP, gRPC, pgwire; optional mTLS | PP-36 | L | ✅ `--tls-cert`/`--tls-key` apply to the wire, HTTP, gRPC and pgwire listeners; `--tls-client-ca` requires client certs (mTLS); pgwire SSLRequest answers `S`/`N`, `--pgwire-require-tls` refuses plaintext; non-loopback plaintext binds warn. |
+| D2 | pgwire SCRAM/MD5, SSLRequest, extended protocol | PP-35 | L | ✅ SCRAM-SHA-256 default (`--pgwire-auth scram\|md5\|password`), verifier-only storage, constant-time proofs; extended protocol (Parse/Bind/Describe/Execute/Close/Sync/Flush, row limits, error-until-Sync). Residual: no SCRAM-PLUS; text params containing `'` refused (lexer has no quote escape); Describe probes by executing; all columns typed text. |
+| D3 | `--pgwire-host` flag (hardcoded 127.0.0.1) | VA-07 | S | ✅ `--pgwire-host` (default 127.0.0.1). |
+| D4 | IP allowlist (S83) never called; `max_connections` (S116) not enforced | — | S | ✅ pgwire admission rejects disallowed IPs (28000) and connections over the shared `max_connections` / `--pgwire-max-connections` (53300); native listener enforces its own limit. |
+| D5 | Masking, grants, freeze, schema lock, idle timeout, memory limit never enforced | S159/252/273/278/283/295 | L | ✅ Result masks applied, grants enforced on tables that ever had a GRANT (pgwire sets the authenticated role), frozen tables reject writes, schema-locked tables reject DDL, idle sessions expire, memory limit aborts with 53200 (estimated row bytes). |
 
 ### E — Stand-ins presented as real
 
@@ -900,3 +900,4 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 - 2026-10-31: **Batch B** (branch `feat/gaps-batch-b`): 26 of 31 ✅; B6, B7, B14, B17, B31 🟡 with the remainder written in each row.
 - 2026-10-31: **Batch C paused** (branch `feat/gaps-batch-c`, WIP commit, not gate-checked): C2, C5 done; C1 partial. **Resume:** finish C1 (+A2 key wiring), then wave 2 = C3 + C4 + C6, then run the full gate (fmt, clippy 1.99 win + linux-target, workspace tests), mark rows, open the batch C PR stacked on #649. Also note A12: a deleted `tail.seal` is still accepted.
 - 2026-11-04: **Batch C complete** (branch `feat/gaps-batch-c`, rebased on main): C1–C6 ✅ (A2 remainder closed via C1). Storage key registry keeps every live owner; intent log encrypted through `TableRegistry::encryption_key()`.
+- 2026-11-04: **Batch D complete** (branch `feat/gaps-batch-d`): D1–D5 ✅ — TLS/mTLS on all listeners, pgwire SCRAM/MD5 + extended protocol, `--pgwire-host`, IP allowlist and connection limits enforced, D5 SQL rules enforced.

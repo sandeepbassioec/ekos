@@ -64,6 +64,7 @@ fn start_plain(dir: &TempDir) -> (SocketAddr, impl FnOnce()) {
         cluster_seeds: vec![],
         cluster_node_id: None,
         cluster_status_port: 7900,
+        listener: Default::default(),
         catalog: false,
         restore_catalog: false,
     };
@@ -121,6 +122,7 @@ fn start_authed(dir: &TempDir, secret_hex: &str) -> (SocketAddr, impl FnOnce()) 
         cluster_seeds: vec![],
         cluster_node_id: None,
         cluster_status_port: 7900,
+        listener: Default::default(),
         catalog: false,
         restore_catalog: false,
     };
@@ -205,6 +207,7 @@ fn bind_creates_schema_file_for_new_table() {
         cluster_seeds: vec![],
         cluster_node_id: None,
         cluster_status_port: 7900,
+        listener: Default::default(),
         catalog: false,
         restore_catalog: false,
     };
@@ -257,6 +260,7 @@ fn bind_reads_existing_schema_from_disk() {
         cluster_seeds: vec![],
         cluster_node_id: None,
         cluster_status_port: 7900,
+        listener: Default::default(),
         catalog: false,
         restore_catalog: false,
     };
@@ -306,6 +310,7 @@ fn bind_fails_when_no_table_and_no_columns() {
         cluster_seeds: vec![],
         cluster_node_id: None,
         cluster_status_port: 7900,
+        listener: Default::default(),
         catalog: false,
         restore_catalog: false,
     };
@@ -354,6 +359,7 @@ fn bind_fails_with_cert_but_no_key() {
         cluster_seeds: vec![],
         cluster_node_id: None,
         cluster_status_port: 7900,
+        listener: Default::default(),
         catalog: false,
         restore_catalog: false,
     };

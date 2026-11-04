@@ -8,7 +8,9 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 use vectorvolt_engine::{TableRegistry, ViewRegistry};
 use vectorvolt_query::SqlExecutor;
 
@@ -38,6 +40,9 @@ pub struct HttpServerConfig {
     /// Optional Bearer token. When set, every request to data/DDL routes
     /// must supply `Authorization: Bearer <token>`.
     pub api_token: Option<String>,
+    /// Serve HTTPS with this rustls config (`None` = plaintext HTTP). A config
+    /// with a client-certificate verifier makes it mutual TLS.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl HttpServerConfig {
@@ -45,6 +50,7 @@ impl HttpServerConfig {
         Self {
             addr,
             api_token: None,
+            tls: None,
         }
     }
 
@@ -52,11 +58,100 @@ impl HttpServerConfig {
         self.api_token = Some(token.into());
         self
     }
+
+    /// Serve HTTPS (optionally mTLS) instead of plaintext HTTP.
+    pub fn with_tls(mut self, tls: Arc<rustls::ServerConfig>) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+}
+
+/// How long a client gets to finish the TLS handshake.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// An axum [`Listener`](axum::serve::Listener) that yields TLS-wrapped
+/// connections.
+///
+/// Handshakes run in their own tasks, not in `accept()`: an inline handshake
+/// would let one slow or silent client stall every other accept. A client
+/// that fails the handshake (bad or missing certificate under mTLS, garbage,
+/// timeout) is dropped without ever reaching the router.
+pub struct TlsListener {
+    local_addr: SocketAddr,
+    rx: tokio::sync::mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
+    acceptor_task: tokio::task::JoinHandle<()>,
+}
+
+impl TlsListener {
+    /// Wrap `listener`, handshaking every connection with `config`.
+    pub fn new(listener: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<Self> {
+        let local_addr = listener.local_addr()?;
+        let acceptor = TlsAcceptor::from(config);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let acceptor_task = tokio::spawn(async move {
+            loop {
+                let (stream, peer) = match listener.accept().await {
+                    Ok(a) => a,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
+                };
+                if tx.is_closed() {
+                    return;
+                }
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(Ok(tls)) =
+                        tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+                    {
+                        let _ = tx.send((tls, peer)).await;
+                    }
+                });
+            }
+        });
+        Ok(Self {
+            local_addr,
+            rx,
+            acceptor_task,
+        })
+    }
+}
+
+impl Drop for TlsListener {
+    fn drop(&mut self) {
+        // Release the port as soon as the server stops, not on the next accept.
+        self.acceptor_task.abort();
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        match self.rx.recv().await {
+            Some(conn) => conn,
+            // The acceptor task only ends when aborted by our own Drop.
+            None => std::future::pending().await,
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(self.local_addr)
+    }
+}
+
+/// Plain TCP or TLS, chosen at bind time.
+enum GatewayListener {
+    Plain(TcpListener),
+    Tls(TlsListener),
 }
 
 /// Axum-backed HTTP/REST gateway.
 pub struct HttpServer {
-    listener: TcpListener,
+    listener: GatewayListener,
     app: Router,
 }
 
@@ -80,18 +175,30 @@ impl HttpServer {
             metrics,
             config.api_token,
         );
-        let listener = TcpListener::bind(config.addr).await?;
+        let tcp = TcpListener::bind(config.addr).await?;
+        let listener = match config.tls {
+            Some(tls) => GatewayListener::Tls(TlsListener::new(tcp, tls)?),
+            None => GatewayListener::Plain(tcp),
+        };
         Ok(Self { listener, app })
     }
 
     /// The actual local address (useful when port 0 was requested).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.listener.local_addr()
+        match &self.listener {
+            GatewayListener::Plain(l) => l.local_addr(),
+            GatewayListener::Tls(l) => Ok(l.local_addr),
+        }
+    }
+
+    /// True if the gateway serves HTTPS.
+    pub fn is_tls(&self) -> bool {
+        matches!(self.listener, GatewayListener::Tls(_))
     }
 
     /// Run until the process is killed. This future never returns `Ok`.
     pub async fn serve(self) -> std::io::Result<()> {
-        axum::serve(self.listener, self.app).await
+        self.serve_with_shutdown(std::future::pending()).await
     }
 
     /// Run until `shutdown` resolves, then stop accepting new connections and
@@ -102,9 +209,18 @@ impl HttpServer {
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
-        axum::serve(self.listener, self.app)
-            .with_graceful_shutdown(shutdown)
-            .await
+        match self.listener {
+            GatewayListener::Plain(l) => {
+                axum::serve(l, self.app)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            }
+            GatewayListener::Tls(l) => {
+                axum::serve(l, self.app)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            }
+        }
     }
 }
 

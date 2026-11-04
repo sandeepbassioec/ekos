@@ -12,11 +12,14 @@
 //! # with a static secret key (hex)
 //! vvctl serve ./data --secret aabbccdd...
 //!
-//! # with TLS
-//! vvctl serve ./data --cert server.pem --key server.key
+//! # with TLS on every listener (wire, HTTP, gRPC, pgwire)
+//! vvctl serve ./data --tls-cert server.pem --tls-key server.key
+//!
+//! # mutual TLS: clients must present a certificate issued by ca.pem
+//! vvctl serve ./data --tls-cert server.pem --tls-key server.key --tls-client-ca ca.pem
 //! ```
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,6 +35,7 @@ use vectorvolt_engine::{
 use vectorvolt_http::{HttpServer, HttpServerConfig};
 use vectorvolt_net::tls::ServerTlsConfig;
 use vectorvolt_net::{AuthConfig, Scope, Secret, Server, ServerConfig};
+use vectorvolt_reader::auth::AuthMethod;
 use vectorvolt_reader::server::{PgConfig, PgServer};
 
 const SCHEMA_FILE: &str = "schema.txt";
@@ -74,12 +78,15 @@ pub struct ServeArgs {
     #[arg(long)]
     pub key_file: Option<PathBuf>,
 
-    /// PEM certificate file for TLS.
-    #[arg(long)]
+    /// PEM certificate (chain) for TLS. Applies to every listener this
+    /// process starts: the wire protocol, `--http-addr`, gRPC and
+    /// `--pgwire-port` (pgwire upgrades on SSLRequest). `--cert` is accepted
+    /// as an alias.
+    #[arg(long = "tls-cert", alias = "cert", requires = "key")]
     pub cert: Option<PathBuf>,
 
-    /// PEM private-key file for TLS.
-    #[arg(long)]
+    /// PEM private key for `--tls-cert`. `--key` is accepted as an alias.
+    #[arg(long = "tls-key", alias = "key", requires = "cert")]
     pub key: Option<PathBuf>,
 
     /// Multi-table mode: `dir` is a catalog root, not a single table directory.
@@ -270,6 +277,151 @@ pub struct ServeArgs {
     /// `--cluster-bind` is set. Defaults to 7900.
     #[arg(long, default_value_t = 7900)]
     pub cluster_status_port: u16,
+
+    /// Listener TLS / pgwire options (D1, D3, D4).
+    #[command(flatten)]
+    pub listener: ListenerArgs,
+}
+
+/// Shared listener options: mutual TLS for every listener, and pgwire bind /
+/// TLS / connection-limit settings.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ListenerArgs {
+    /// PEM CA bundle for mutual TLS. When set, every TLS listener (wire,
+    /// HTTP, gRPC, pgwire) requires clients to present a certificate issued
+    /// by one of these CAs. Requires `--tls-cert` / `--tls-key`.
+    #[arg(long, requires = "cert")]
+    pub tls_client_ca: Option<PathBuf>,
+
+    /// Interface the pgwire listener binds (default loopback only).
+    #[arg(long, default_value = "127.0.0.1")]
+    pub pgwire_host: IpAddr,
+
+    /// Refuse pgwire clients that do not negotiate TLS (SSLRequest) with
+    /// SQLSTATE 28000. Requires `--tls-cert` / `--tls-key`.
+    #[arg(long, requires = "cert")]
+    pub pgwire_require_tls: bool,
+
+    /// Cap concurrent pgwire sessions; beyond it clients get SQLSTATE 53300.
+    /// The SQL-level `SET MAX_CONNECTIONS` (default 100) also applies — the
+    /// tighter limit wins.
+    #[arg(long)]
+    pub pgwire_max_connections: Option<usize>,
+
+    /// How pgwire clients prove they know `--secret`: `scram`
+    /// (SCRAM-SHA-256, default), `md5`, or `password` (cleartext — only
+    /// sensible with TLS).
+    #[arg(long, default_value = "scram", value_parser = parse_auth_method)]
+    pub pgwire_auth: AuthMethod,
+}
+
+fn parse_auth_method(s: &str) -> std::result::Result<AuthMethod, String> {
+    s.parse()
+}
+
+impl Default for ListenerArgs {
+    fn default() -> Self {
+        Self {
+            tls_client_ca: None,
+            pgwire_host: IpAddr::from([127, 0, 0, 1]),
+            pgwire_require_tls: false,
+            pgwire_max_connections: None,
+            pgwire_auth: AuthMethod::default(),
+        }
+    }
+}
+
+/// TLS material loaded once from `--tls-cert` / `--tls-key` /
+/// `--tls-client-ca` and shared by every listener.
+#[derive(Clone)]
+pub struct ServeTls {
+    /// The wire listener's config; its rustls config also drives HTTP and pgwire.
+    pub net: ServerTlsConfig,
+    /// Raw PEM, for gRPC (tonic builds its own rustls config from PEM).
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    pub client_ca_pem: Option<Vec<u8>>,
+}
+
+impl ServeTls {
+    /// True if clients must present a certificate.
+    pub fn is_mutual(&self) -> bool {
+        self.client_ca_pem.is_some()
+    }
+
+    fn describe(&self) -> &'static str {
+        if self.is_mutual() {
+            "mutual TLS (client certificate required)"
+        } else {
+            "TLS"
+        }
+    }
+}
+
+/// Load the TLS material named by `args` (`None` when TLS is not configured).
+pub fn load_tls(args: &ServeArgs) -> Result<Option<ServeTls>> {
+    match (&args.cert, &args.key) {
+        (Some(cert), Some(key)) => {
+            let cert_pem = std::fs::read(cert)
+                .with_context(|| format!("read TLS certificate {}", cert.display()))?;
+            let key_pem =
+                std::fs::read(key).with_context(|| format!("read TLS key {}", key.display()))?;
+            let client_ca_pem = args
+                .listener
+                .tls_client_ca
+                .as_ref()
+                .map(|p| {
+                    std::fs::read(p).with_context(|| format!("read TLS client CA {}", p.display()))
+                })
+                .transpose()?;
+            let net = match &client_ca_pem {
+                Some(ca) => ServerTlsConfig::from_pem_with_client_ca(&cert_pem, &key_pem, ca),
+                None => ServerTlsConfig::from_pem(&cert_pem, &key_pem),
+            }
+            .with_context(|| "load TLS certificate / key")?;
+            Ok(Some(ServeTls {
+                net,
+                cert_pem,
+                key_pem,
+                client_ca_pem,
+            }))
+        }
+        (None, None) => {
+            if args.listener.tls_client_ca.is_some() {
+                bail!("--tls-client-ca requires --tls-cert and --tls-key");
+            }
+            if args.listener.pgwire_require_tls {
+                bail!("--pgwire-require-tls requires --tls-cert and --tls-key");
+            }
+            Ok(None)
+        }
+        _ => bail!("--tls-cert and --tls-key must both be provided, or neither"),
+    }
+}
+
+/// The pgwire bind address from `--pgwire-host` and `--pgwire-port`.
+pub fn pgwire_addr(args: &ServeArgs, port: u16) -> SocketAddr {
+    SocketAddr::new(args.listener.pgwire_host, port)
+}
+
+/// Warn when a listener is reachable beyond loopback without TLS: its traffic
+/// (credentials included) crosses the network in plaintext. A warning, not
+/// an error, so existing deployments keep starting.
+pub fn plaintext_exposure_warning(listener: &str, addr: SocketAddr, tls: bool) -> Option<String> {
+    if tls || addr.ip().is_loopback() {
+        return None;
+    }
+    Some(format!(
+        "WARNING: the {listener} listener is bound to a non-loopback address ({addr}) without \
+         TLS — traffic, including credentials, is sent in plaintext. Pass --tls-cert and \
+         --tls-key to encrypt it."
+    ))
+}
+
+fn warn_plaintext(listener: &str, addr: SocketAddr, tls: bool) {
+    if let Some(w) = plaintext_exposure_warning(listener, addr, tls) {
+        eprintln!("{w}");
+    }
 }
 
 impl Default for ServeArgs {
@@ -312,6 +464,7 @@ impl Default for ServeArgs {
             cluster_seeds: vec![],
             cluster_node_id: None,
             cluster_status_port: 7900,
+            listener: ListenerArgs::default(),
         }
     }
 }
@@ -323,6 +476,8 @@ pub struct BoundServer {
     /// Single-table mode: the schema of the default table.
     pub schema: Vec<String>,
     pub tls_enabled: bool,
+    /// The TLS material every listener uses (`None` = plaintext).
+    pub tls: Option<ServeTls>,
     /// Single-table mode: the opened engine (None in --multi mode).
     pub engine: Option<Arc<TableEngine>>,
     /// Multi-table mode: the opened registry (None in single-table mode).
@@ -370,16 +525,20 @@ pub fn derive_column_key(master: &KeyStore) -> Result<KeyStore> {
 }
 
 /// Build the pgwire server `vvctl serve --pgwire-port` runs: shares `registry`,
-/// is gated by `password`, and has SQL column encryption enabled when
+/// is gated by `password` (checked with `auth`: SCRAM-SHA-256, MD5 or
+/// cleartext), and has SQL column encryption enabled when
 /// `column_key` is set (A2: otherwise `INSERT ENCRYPTED` fails with "column
 /// encryption key not configured").
 pub fn build_pg_server(
     config: PgConfig,
     registry: Arc<TableRegistry>,
     password: Option<String>,
+    auth: AuthMethod,
     column_key: Option<KeyStore>,
 ) -> PgServer {
-    let server = PgServer::with_registry(config, registry).with_password(password);
+    let server = PgServer::with_registry(config, registry)
+        .with_auth_method(auth)
+        .with_password(password);
     if let Some(key) = column_key {
         server.executor().set_column_encryption_key(key);
     }
@@ -646,17 +805,9 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
     // ── Auth ──────────────────────────────────────────────────────────────────
     let auth = build_auth(args)?;
 
-    // ── TLS ───────────────────────────────────────────────────────────────────
-    let tls_enabled = args.cert.is_some();
-    let tls = match (&args.cert, &args.key) {
-        (Some(cert), Some(key)) => {
-            let tls = ServerTlsConfig::from_files(cert, key)
-                .with_context(|| "load TLS certificate / key")?;
-            Some(tls)
-        }
-        (None, None) => None,
-        _ => bail!("--cert and --key must both be provided, or neither"),
-    };
+    // ── TLS (shared by every listener, D1) ────────────────────────────────────
+    let serve_tls = load_tls(args)?;
+    let tls_enabled = serve_tls.is_some();
 
     // ── Transport ─────────────────────────────────────────────────────────────
     let transport_kind = build_transport_kind(args)?;
@@ -666,8 +817,8 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         .with_auth(auth.clone())
         .with_transport(transport_kind);
     config.max_connections = args.max_connections;
-    if let Some(t) = tls {
-        config = config.with_tls(t);
+    if let Some(t) = &serve_tls {
+        config = config.with_tls(t.net.clone());
     }
 
     let server = server_builder(config)?;
@@ -696,6 +847,7 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         auth,
         schema,
         tls_enabled,
+        tls: serve_tls,
         engine,
         registry,
         catalog,
@@ -769,6 +921,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         auth,
         schema,
         tls_enabled,
+        tls,
         engine,
         registry,
         catalog,
@@ -793,6 +946,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
              write data. Pass --secret <hex> to require authentication."
         );
     }
+    warn_plaintext("wire-protocol", local, tls_enabled);
 
     // ── MVCC Phase 3 crash recovery ──────────────────────────────────────────
     let recovery_registry: Arc<vectorvolt_engine::TableRegistry> = if let Some(ref reg) = registry {
@@ -837,7 +991,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     );
     eprintln!(
         "  tls       : {}",
-        if tls_enabled { "enabled" } else { "plaintext" }
+        tls.as_ref().map_or("plaintext", ServeTls::describe)
     );
     eprintln!(
         "  encrypt   : {}",
@@ -901,6 +1055,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
             };
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         http_shutdown = Some(tx);
+        let http_tls = tls.as_ref().map(|t| t.net.rustls_config());
+        warn_plaintext("HTTP", http_addr, http_tls.is_some());
         std::thread::Builder::new()
             .name("http-gateway".into())
             .stack_size(8 * 1024 * 1024)
@@ -911,11 +1067,15 @@ pub fn run(args: ServeArgs) -> Result<()> {
                     if let Some(tok) = http_token {
                         cfg = cfg.with_token(tok);
                     }
+                    if let Some(t) = http_tls {
+                        cfg = cfg.with_tls(t);
+                    }
                     let cfg = cfg;
                     match HttpServer::bind(http_reg, cfg).await {
                         Ok(srv) => {
                             eprintln!(
-                                "  http      : http://{}",
+                                "  http      : {}://{}",
+                                if srv.is_tls() { "https" } else { "http" },
                                 srv.local_addr().unwrap_or(http_addr)
                             );
                             let shutdown = async move {
@@ -965,6 +1125,11 @@ pub fn run(args: ServeArgs) -> Result<()> {
         if let Some(token) = grpc_token {
             grpc_srv = grpc_srv.with_token(token);
         }
+        if let Some(t) = &tls {
+            grpc_srv = grpc_srv.with_tls_pem(&t.cert_pem, &t.key_pem, t.client_ca_pem.as_deref());
+        }
+        warn_plaintext("gRPC", grpc_addr, grpc_srv.is_tls());
+        let grpc_scheme = if grpc_srv.is_tls() { "grpcs" } else { "grpc" };
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         std::thread::Builder::new()
             .name("grpc-server".into())
@@ -972,7 +1137,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .spawn(move || {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async move {
-                    eprintln!("  grpc      : grpc://{grpc_addr}");
+                    eprintln!("  grpc      : {grpc_scheme}://{grpc_addr}");
                     if let Err(e) = grpc_srv.run(rx).await {
                         eprintln!("gRPC server error: {e}");
                     }
@@ -1006,7 +1171,14 @@ pub fn run(args: ServeArgs) -> Result<()> {
         } else {
             unreachable!("either registry or engine must be present")
         };
-        let pgwire_addr: SocketAddr = format!("127.0.0.1:{pgwire_port}").parse().unwrap();
+        // D3: `--pgwire-host` (default loopback) instead of a hardcoded 127.0.0.1.
+        let pgwire_addr = pgwire_addr(&args, pgwire_port);
+        // D1: pgwire answers SSLRequest with 'S' and upgrades when TLS is set.
+        let pg_tls = tls.as_ref().map(|t| t.net.rustls_config());
+        let pg_require_tls = args.listener.pgwire_require_tls;
+        let pg_max_connections = args.listener.pgwire_max_connections;
+        let pg_auth = args.listener.pgwire_auth;
+        warn_plaintext("pgwire", pgwire_addr, pg_tls.is_some());
         let pg_dir = args.dir.clone();
         // A3: `--secret` also gates pgwire (clients send it as their password).
         let pg_password = args.secret.as_ref().map(|s| s.trim().to_owned());
@@ -1021,8 +1193,20 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async move {
                     let config = PgConfig::new(pgwire_addr, pg_dir);
-                    let server = build_pg_server(config, pg_reg, pg_password, pg_column_key);
-                    eprintln!("  pgwire    : postgres://{pgwire_addr}");
+                    let pg_tls_on = pg_tls.is_some();
+                    let server =
+                        build_pg_server(config, pg_reg, pg_password, pg_auth, pg_column_key)
+                            .with_tls(pg_tls)
+                            .with_require_tls(pg_require_tls)
+                            .with_max_connections(pg_max_connections);
+                    eprintln!(
+                        "  pgwire    : postgres://{pgwire_addr}{}",
+                        match (pg_tls_on, pg_require_tls) {
+                            (true, true) => " (TLS required)",
+                            (true, false) => " (TLS offered)",
+                            _ => "",
+                        }
+                    );
                     let shutdown = async move {
                         let _ = rx.await;
                     };

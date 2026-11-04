@@ -56,6 +56,7 @@ fn base_args(dir: &TempDir, encrypt_at_rest: bool) -> ServeArgs {
         cluster_seeds: vec![],
         cluster_node_id: None,
         cluster_status_port: 7900,
+        listener: Default::default(),
     }
 }
 
@@ -368,6 +369,7 @@ fn pgwire_replies(args: &ServeArgs, queries: &[&str]) -> Vec<String> {
             PgConfig::new(addr, PathBuf::new()),
             registry,
             None,
+            Default::default(),
             column_key,
         );
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
