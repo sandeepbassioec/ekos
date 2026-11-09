@@ -111,6 +111,7 @@ mod sys {
 
     const BPF_MAP_CREATE: libc::c_long = 0;
     const BPF_MAP_UPDATE_ELEM: libc::c_long = 2;
+    const BPF_MAP_DELETE_ELEM: libc::c_long = 3;
     const BPF_PROG_LOAD: libc::c_long = 5;
     const BPF_LINK_CREATE: libc::c_long = 28;
     const BPF_MAP_TYPE_XSKMAP: u32 = 17;
@@ -202,6 +203,22 @@ mod sys {
         _link: OwnedFd,
         _prog: OwnedFd,
         map: OwnedFd,
+        queue_id: u32,
+    }
+
+    impl Drop for XdpProgram {
+        fn drop(&mut self) {
+            // The XSKMAP holds a reference to the socket and is freed only
+            // after an RCU grace period, which leaves the queue busy (EBUSY
+            // on the next bind). Removing the entry releases it right away.
+            let key = self.queue_id;
+            let attr = MapElemAttr {
+                map_fd: self.map.as_raw_fd() as u32,
+                key: &key as *const u32 as u64,
+                ..Default::default()
+            };
+            let _ = bpf(BPF_MAP_DELETE_ELEM, &attr, "remove socket from XSKMAP");
+        }
     }
 
     impl XdpProgram {
@@ -243,6 +260,7 @@ mod sys {
                 _link: link,
                 _prog: prog,
                 map,
+                queue_id,
             })
         }
 

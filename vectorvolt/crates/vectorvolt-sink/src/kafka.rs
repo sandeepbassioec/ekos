@@ -49,31 +49,58 @@ pub fn encode_record(event: &SinkEvent) -> Record {
     }
 }
 
-/// Record compression codec. Only codecs rskafka implements in pure Rust are
-/// offered (`gzip`, behind the default `compression-gzip` feature); `lz4` and
-/// `zstd` need C toolchains and are intentionally not exposed.
+/// Record compression codec. Each codec is behind a default-on feature
+/// (`compression-gzip`, `compression-snappy`, `compression-lz4`,
+/// `compression-zstd`) mapped to the matching rskafka feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KafkaCompression {
     #[default]
     None,
     #[cfg(feature = "compression-gzip")]
     Gzip,
+    #[cfg(feature = "compression-snappy")]
+    Snappy,
+    #[cfg(feature = "compression-lz4")]
+    Lz4,
+    #[cfg(feature = "compression-zstd")]
+    Zstd,
 }
 
 impl KafkaCompression {
-    /// Parse `none` / `gzip` (case-insensitive).
+    /// Parse `none` / `gzip` / `snappy` / `lz4` / `zstd` (case-insensitive).
     pub fn parse(s: &str) -> SinkResult<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "none" => Ok(Self::None),
             #[cfg(feature = "compression-gzip")]
             "gzip" => Ok(Self::Gzip),
+            #[cfg(feature = "compression-snappy")]
+            "snappy" => Ok(Self::Snappy),
+            #[cfg(feature = "compression-lz4")]
+            "lz4" => Ok(Self::Lz4),
+            #[cfg(feature = "compression-zstd")]
+            "zstd" => Ok(Self::Zstd),
             other => Err(SinkError::Other(format!(
-                "kafka: unsupported compression {other:?} (supported: none{})",
+                "kafka: unsupported compression {other:?} (supported: none{}{}{}{})",
                 if cfg!(feature = "compression-gzip") {
                     ", gzip"
                 } else {
                     ""
-                }
+                },
+                if cfg!(feature = "compression-snappy") {
+                    ", snappy"
+                } else {
+                    ""
+                },
+                if cfg!(feature = "compression-lz4") {
+                    ", lz4"
+                } else {
+                    ""
+                },
+                if cfg!(feature = "compression-zstd") {
+                    ", zstd"
+                } else {
+                    ""
+                },
             ))),
         }
     }
@@ -83,10 +110,15 @@ impl KafkaCompression {
             Self::None => Compression::NoCompression,
             #[cfg(feature = "compression-gzip")]
             Self::Gzip => Compression::Gzip,
+            #[cfg(feature = "compression-snappy")]
+            Self::Snappy => Compression::Snappy,
+            #[cfg(feature = "compression-lz4")]
+            Self::Lz4 => Compression::Lz4,
+            #[cfg(feature = "compression-zstd")]
+            Self::Zstd => Compression::Zstd,
         }
     }
 }
-
 /// Bounded exponential-backoff retry policy for retriable produce errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -684,8 +716,24 @@ mod tests {
             KafkaCompression::parse("none").unwrap(),
             KafkaCompression::None
         );
-        assert!(KafkaCompression::parse("lz4").is_err());
-        assert!(KafkaCompression::parse("zstd").is_err());
+        assert_eq!(KafkaCompression::parse("").unwrap(), KafkaCompression::None);
+        assert!(KafkaCompression::parse("brotli").is_err());
+        assert!(KafkaCompression::parse("bogus").is_err());
+        #[cfg(feature = "compression-snappy")]
+        assert_eq!(
+            KafkaCompression::parse("Snappy").unwrap(),
+            KafkaCompression::Snappy
+        );
+        #[cfg(feature = "compression-lz4")]
+        assert_eq!(
+            KafkaCompression::parse("lz4").unwrap(),
+            KafkaCompression::Lz4
+        );
+        #[cfg(feature = "compression-zstd")]
+        assert_eq!(
+            KafkaCompression::parse(" zstd ").unwrap(),
+            KafkaCompression::Zstd
+        );
         #[cfg(feature = "compression-gzip")]
         assert_eq!(
             KafkaCompression::parse("GZIP").unwrap(),

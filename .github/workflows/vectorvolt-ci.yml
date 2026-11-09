@@ -12,6 +12,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # .cargo/config.toml points CC at MSVC cl.exe (force = false); C deps
+  # such as zstd-sys need the system compiler on Linux.
+  CC: gcc
+  CXX: g++
   # The ubuntu-latest runner has 2 vCPUs and ~7 GB RAM.  vectorvolt-net
   # generates 109 integration-test binaries; linking them all in parallel
   # exhausts the linker's address space (SIGBUS / Bus error).
@@ -59,6 +63,31 @@ jobs:
       - name: Run tests
         run: cargo test --manifest-path vectorvolt/Cargo.toml --all
 
+
+  xdp:
+    name: XDP on a real kernel (root, veth)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Create veth pair
+        run: |
+          sudo ip link add vvx0 type veth peer name vvx1
+          sudo ip link set vvx0 up
+          sudo ip link set vvx1 up
+
+      - name: Build XDP tests
+        run: cargo test --manifest-path vectorvolt/Cargo.toml -p vectorvolt-xdp --no-run
+
+      # Loads the XSKMAP redirect program and moves frames over the veth pair;
+      # needs CAP_BPF + CAP_NET_ADMIN, hence sudo.
+      - name: Run XDP tests as root
+        run: sudo env "PATH=$PATH" VV_XDP_VETH=vvx0,vvx1 cargo test --manifest-path vectorvolt/Cargo.toml -p vectorvolt-xdp -- --include-ignored --test-threads=1
 
   publish:
     name: Publish to crates.io

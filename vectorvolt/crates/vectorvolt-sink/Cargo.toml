@@ -11,6 +11,7 @@ homepage.workspace   = true
 [dependencies]
 vectorvolt-wal = { workspace = true }
 vectorvolt-txn = { workspace = true }
+vectorvolt-crypto = { workspace = true }
 thiserror      = { workspace = true }
 parking_lot    = { workspace = true }
 serde_json     = { workspace = true }
@@ -25,9 +26,11 @@ rustls-pemfile = { workspace = true }
 webpki-roots   = { workspace = true }
 
 [features]
-default = ["compression-gzip"]
-# Pure-Rust gzip record compression (lz4/zstd need C and are not offered).
-compression-gzip = ["rskafka/compression-gzip"]
+default = ["compression-gzip", "compression-snappy", "compression-lz4", "compression-zstd"]
+compression-gzip   = ["rskafka/compression-gzip"]
+compression-snappy = ["rskafka/compression-snappy"]
+compression-lz4    = ["rskafka/compression-lz4"]
+compression-zstd   = ["rskafka/compression-zstd"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

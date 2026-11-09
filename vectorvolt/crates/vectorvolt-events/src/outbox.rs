@@ -89,12 +89,23 @@ impl Journal {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum OutboxRec {
-    Push { seq: u64, env: DomainEventEnvelope },
-    Ack { seq: u64 },
+    Push {
+        seq: u64,
+        env: DomainEventEnvelope,
+    },
+    Ack {
+        seq: u64,
+    },
+    /// Failed delivery attempts so far for `seq` (absolute count).
+    Attempts {
+        seq: u64,
+        n: u32,
+    },
 }
 
 struct OutboxInner {
     pending: VecDeque<(u64, DomainEventEnvelope)>,
+    attempts: std::collections::HashMap<u64, u32>,
     next_seq: u64,
     journal: Option<Journal>,
 }
@@ -114,6 +125,7 @@ impl EventOutbox {
         Self {
             inner: Mutex::new(OutboxInner {
                 pending: VecDeque::new(),
+                attempts: std::collections::HashMap::new(),
                 next_seq: 0,
                 journal: None,
             }),
@@ -125,8 +137,12 @@ impl EventOutbox {
         let path = path.as_ref();
         let mut pending: VecDeque<(u64, DomainEventEnvelope)> = VecDeque::new();
         let mut next_seq = 0u64;
+        let mut attempts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         for rec in Journal::read_all::<OutboxRec>(path)? {
             match rec {
+                OutboxRec::Attempts { seq, n } => {
+                    attempts.insert(seq, n);
+                }
                 OutboxRec::Push { seq, env } => {
                     next_seq = next_seq.max(seq + 1);
                     pending.push_back((seq, env));
@@ -134,20 +150,28 @@ impl EventOutbox {
                 OutboxRec::Ack { seq } => {
                     next_seq = next_seq.max(seq + 1);
                     pending.retain(|(s, _)| *s != seq);
+                    attempts.remove(&seq);
                 }
             }
         }
-        let live: Vec<OutboxRec> = pending
+        attempts.retain(|seq, _| pending.iter().any(|(s, _)| s == seq));
+        let mut live: Vec<OutboxRec> = pending
             .iter()
             .map(|(seq, env)| OutboxRec::Push {
                 seq: *seq,
                 env: env.clone(),
             })
             .collect();
+        live.extend(
+            attempts
+                .iter()
+                .map(|(seq, n)| OutboxRec::Attempts { seq: *seq, n: *n }),
+        );
         let journal = Journal::rewrite(path, &live)?;
         Ok(Self {
             inner: Mutex::new(OutboxInner {
                 pending,
+                attempts,
                 next_seq,
                 journal: Some(journal),
             }),
@@ -205,6 +229,54 @@ impl EventOutbox {
                 warn!("outbox journal ack failed (entry may be redelivered): {e}");
             }
         }
+    }
+
+    /// Up to `max` oldest pending envelopes with their sequence numbers,
+    /// WITHOUT removing them. Pair with [`EventOutbox::ack`] once delivered.
+    pub fn peek(&self, max: usize) -> Vec<(u64, DomainEventEnvelope)> {
+        let g = self.inner.lock().unwrap();
+        g.pending.iter().take(max).cloned().collect()
+    }
+
+    /// Mark the given entries delivered (or dead-lettered): journal the ack and
+    /// drop them. Unknown sequence numbers are ignored.
+    pub fn ack(&self, seqs: &[u64]) {
+        let mut g = self.inner.lock().unwrap();
+        for &seq in seqs {
+            if let Some(j) = g.journal.as_mut()
+                && let Err(e) = j.append(&OutboxRec::Ack { seq })
+            {
+                warn!("outbox journal ack failed (entry may be redelivered): {e}");
+            }
+        }
+        g.pending.retain(|(s, _)| !seqs.contains(s));
+        for s in seqs {
+            g.attempts.remove(s);
+        }
+    }
+
+    /// Failed delivery attempts recorded so far for `seq` (survives restart).
+    pub fn attempts(&self, seq: u64) -> u32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .attempts
+            .get(&seq)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Durably record one more failed attempt for `seq`; returns the new count.
+    pub fn record_attempt(&self, seq: u64) -> u32 {
+        let mut g = self.inner.lock().unwrap();
+        let n = g.attempts.get(&seq).copied().unwrap_or(0) + 1;
+        if let Some(j) = g.journal.as_mut()
+            && let Err(e) = j.append(&OutboxRec::Attempts { seq, n })
+        {
+            warn!("outbox journal attempt record failed: {e}");
+        }
+        g.attempts.insert(seq, n);
+        n
     }
 
     pub fn pending_count(&self) -> usize {
