@@ -28,6 +28,11 @@ pub struct WalSinkBridge {
     /// up to it was dispatched successfully (at-least-once on sink errors).
     cursor: Mutex<WalCursor>,
     table_name: String,
+    /// At-rest key of an encrypted WAL (`--encrypt-at-rest`); frames are opened
+    /// with the engine's own replay helper, so both sides decode identically.
+    key: Option<Arc<vectorvolt_crypto::KeyStore>>,
+    /// Durable cursor file (`<dir>/events/cursor/<table>`), if persisted.
+    cursor_file: Option<std::path::PathBuf>,
 }
 
 impl WalSinkBridge {
@@ -38,7 +43,26 @@ impl WalSinkBridge {
             last_lsn: AtomicU64::new(0),
             cursor: Mutex::new(WalCursor::beginning()),
             table_name: table_name.to_string(),
+            key: None,
+            cursor_file: None,
         }
+    }
+
+    /// Persist the cursor at `path` (write-temp + fsync + rename) after each
+    /// poll whose events were all dispatched, and resume from it if present.
+    pub fn with_cursor_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        if let Some(c) = load_cursor(&path) {
+            *self.cursor.lock() = c;
+        }
+        self.cursor_file = Some(path);
+        self
+    }
+
+    /// Decrypt frames of an encrypted WAL with `key` (same key the engine uses).
+    pub fn with_key(mut self, key: Option<Arc<vectorvolt_crypto::KeyStore>>) -> Self {
+        self.key = key;
+        self
     }
 
     /// Read every complete frame at or after `from`, returning them and the
@@ -63,7 +87,14 @@ impl WalSinkBridge {
             } else {
                 reader.rewind().map_err(io)?;
             }
-            while let Some(frame) = reader.next_frame().map_err(io)? {
+            while let Some(mut frame) = reader.next_frame().map_err(io)? {
+                frame.payload = vectorvolt_txn::manager::open_wal_payload(
+                    self.key.as_deref(),
+                    &reader.header,
+                    frame.sequence,
+                    std::mem::take(&mut frame.payload),
+                )
+                .map_err(|e| crate::error::SinkError::Io(format!("wal frame decrypt: {e}")))?;
                 frames.push(frame);
             }
             cur = WalCursor {
@@ -103,6 +134,12 @@ impl WalSinkBridge {
         }
 
         self.last_lsn.store(max_seq, Ordering::Release);
+        if let Some(p) = &self.cursor_file
+            && next_cursor != from
+        {
+            save_cursor(p, next_cursor)
+                .map_err(|e| crate::error::SinkError::Io(format!("save cursor: {e}")))?;
+        }
         *self.cursor.lock() = next_cursor;
         Ok(dispatched)
     }
@@ -115,6 +152,29 @@ impl WalSinkBridge {
     pub fn last_lsn(&self) -> u64 {
         self.last_lsn.load(Ordering::Acquire)
     }
+}
+
+fn load_cursor(path: &std::path::Path) -> Option<WalCursor> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut it = text.split_whitespace();
+    Some(WalCursor {
+        segment_id: it.next()?.parse().ok()?,
+        offset: it.next()?.parse().ok()?,
+    })
+}
+
+fn save_cursor(path: &std::path::Path, c: WalCursor) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        write!(f, "{} {}", c.segment_id, c.offset)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 fn mutation_to_events(table: &str, mutation: &Mutation) -> Vec<SinkEvent> {
@@ -450,6 +510,47 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
+    #[tokio::test]
+    async fn persisted_cursor_prevents_duplicates_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let (wal, cfg) = setup(&dir);
+        let cur = dir.path().join("cursor").join("t");
+        let append = |from: u64, n: u64| {
+            for i in from..from + n {
+                wal.append(
+                    Mutation::Insert {
+                        pk: i,
+                        values: vec![i],
+                    }
+                    .encode(),
+                )
+                .unwrap();
+            }
+            wal.flush().unwrap();
+        };
+        append(0, 3);
+        let mk = |cfg: WalConfig| {
+            let reg = Arc::new(SinkRegistry::new());
+            let (sink, count) = CountSink::new("s");
+            reg.register(sink);
+            (
+                WalSinkBridge::new(cfg, reg, "t").with_cursor_file(cur.clone()),
+                count,
+            )
+        };
+        let (b1, c1) = mk(cfg.clone());
+        assert_eq!(b1.poll_once().await.unwrap(), 3);
+        assert_eq!(c1.load(Ordering::Relaxed), 3);
+        drop(b1);
+
+        // "Restart": fresh bridge resumes from the persisted cursor.
+        let (b2, c2) = mk(cfg.clone());
+        assert_eq!(b2.poll_once().await.unwrap(), 0, "no duplicates");
+        append(3, 2);
+        assert_eq!(b2.poll_once().await.unwrap(), 2);
+        assert_eq!(c2.load(Ordering::Relaxed), 2);
+    }
+
     /// B29: a second poll must neither re-emit old events nor re-read old
     /// frames. The already-consumed frames are overwritten with garbage after
     /// the first poll: a full re-read would fail to decode them, a resumed
@@ -567,5 +668,95 @@ mod tests {
         let bridge = WalSinkBridge::new(cfg, reg, "t");
         assert_eq!(bridge.poll_once().await.unwrap(), 3);
         assert_eq!(count.load(Ordering::Relaxed), 3);
+    }
+
+    /// Records every event it receives (in-process test double).
+    struct RecSink(parking_lot::Mutex<Vec<(u64, SinkEventKind, Vec<u64>)>>);
+
+    #[async_trait]
+    impl Sink for RecSink {
+        fn name(&self) -> &str {
+            "rec"
+        }
+        async fn send(&self, e: SinkEvent) -> SinkResult<()> {
+            self.0.lock().push((e.pk, e.kind, e.values));
+            Ok(())
+        }
+        async fn flush(&self) -> SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Write the same mutations to a plaintext WAL and to an encrypted one
+    /// (sealed exactly as `TxnManager::commit` does) and tail both.
+    #[tokio::test]
+    async fn encrypted_wal_yields_same_events_as_plain() {
+        use vectorvolt_crypto::KeyStore;
+
+        let key = Arc::new(KeyStore::from_bytes([9u8; 32]).unwrap());
+        let muts = [
+            Mutation::Insert {
+                pk: 1,
+                values: vec![10, 20],
+            },
+            Mutation::Delete { pk: 1 },
+            Mutation::InsertBatch {
+                rows: vec![(2, vec![3]), (3, vec![4])],
+            },
+        ];
+
+        let plain_dir = TempDir::new().unwrap();
+        let (pw, pcfg) = setup(&plain_dir);
+        for m in &muts {
+            pw.append(m.encode()).unwrap();
+        }
+        pw.flush().unwrap();
+
+        let enc_dir = TempDir::new().unwrap();
+        let ecfg = WalConfig::default()
+            .with_dir(enc_dir.path())
+            .with_fsync(false)
+            .with_encryption_key_id(Some(key.key_id()));
+        let ew = WalWriter::open(ecfg.clone()).unwrap();
+        for m in &muts {
+            let payload = m.encode();
+            ew.append_with(|seq| {
+                let aad = vectorvolt_wal::segment::frame_aad(&key.key_id(), seq);
+                vectorvolt_crypto::encryptor::encrypt_with_aad(&key, &payload, &aad)
+                    .map_err(|e| vectorvolt_wal::WalError::Io(std::io::Error::other(e.to_string())))
+            })
+            .unwrap();
+        }
+        ew.flush().unwrap();
+
+        let tail = |cfg: WalConfig, k: Option<Arc<vectorvolt_crypto::KeyStore>>| async move {
+            let reg = Arc::new(SinkRegistry::new());
+            let rec = Arc::new(RecSink(parking_lot::Mutex::new(Vec::new())));
+            reg.register(rec.clone());
+            let bridge = WalSinkBridge::new(cfg, reg, "t").with_key(k);
+            bridge.poll_once().await.unwrap();
+            rec.0.lock().clone()
+        };
+        let plain = tail(pcfg, None).await;
+        let enc = tail(ecfg.clone(), Some(key.clone())).await;
+        assert_eq!(plain.len(), 4);
+        assert_eq!(plain, enc);
+
+        // No key / wrong key must error, not silently skip.
+        let reg = Arc::new(SinkRegistry::new());
+        assert!(
+            WalSinkBridge::new(ecfg.clone(), reg.clone(), "t")
+                .poll_once()
+                .await
+                .is_err()
+        );
+        let wrong = Arc::new(KeyStore::from_bytes([1u8; 32]).unwrap());
+        assert!(
+            WalSinkBridge::new(ecfg, reg, "t")
+                .with_key(Some(wrong))
+                .poll_once()
+                .await
+                .is_err()
+        );
     }
 }

@@ -12,8 +12,8 @@ use crate::{PF_XDP, SOL_XDP, XdpError, XdpResult};
 
 // Linux uapi constants.
 const XDP_UMEM_REG: libc::c_int = 4;
-const XDP_RX_RING: libc::c_int = 1;
-const XDP_TX_RING: libc::c_int = 2;
+const XDP_RX_RING: libc::c_int = 2;
+const XDP_TX_RING: libc::c_int = 3;
 const XDP_UMEM_FILL_RING: libc::c_int = 5;
 const XDP_UMEM_COMPLETION_RING: libc::c_int = 6;
 const XDP_MMAP_OFFSETS: libc::c_int = 1;
@@ -128,15 +128,26 @@ impl XdpSocket {
             sxdp_queue_id: queue_id,
             sxdp_shared_umem_fd: 0,
         };
-        let rc = unsafe {
-            libc::bind(
-                self.raw_fd(),
-                &sa as *const SockaddrXdp as *const sockaddr,
-                std::mem::size_of::<SockaddrXdp>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(XdpError::Os(unsafe { *libc::__errno_location() }));
+        // A socket closed on the same queue releases it from a kernel work
+        // queue, so a quick rebind can briefly see EBUSY: retry for up to 1s.
+        let mut attempts = 0;
+        loop {
+            let rc = unsafe {
+                libc::bind(
+                    self.raw_fd(),
+                    &sa as *const SockaddrXdp as *const sockaddr,
+                    std::mem::size_of::<SockaddrXdp>() as u32,
+                )
+            };
+            if rc == 0 {
+                break;
+            }
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != libc::EBUSY || attempts >= 100 {
+                return Err(XdpError::Os(errno));
+            }
+            attempts += 1;
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok(())
     }
@@ -246,7 +257,7 @@ pub struct XdpStatistics {
     pub tx_ring_empty_descs: u64,
 }
 
-const XDP_STATISTICS: libc::c_int = 8;
+const XDP_STATISTICS: libc::c_int = 7;
 
 impl XdpSocket {
     pub fn statistics(&self) -> XdpResult<XdpStatistics> {

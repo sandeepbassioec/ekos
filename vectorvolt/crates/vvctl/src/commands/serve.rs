@@ -122,8 +122,9 @@ pub struct ServeArgs {
     /// Declare downstream sinks (kafka / postgres / redis_stream) in a YAML or
     /// TOML file. Every sink must connect at startup or the server refuses to
     /// start; committed mutations are then tailed from each table's WAL and
-    /// delivered to all sinks (at-least-once). Not supported together with
-    /// `--encrypt-at-rest` (the WAL tailer cannot decode encrypted frames).
+    /// delivered to all sinks (at-least-once) via a durable outbox under
+    /// `<dir>/events`. Works with `--encrypt-at-rest` (frames are decrypted
+    /// with the same key the engine uses).
     #[arg(long)]
     pub sinks_config: Option<PathBuf>,
 
@@ -947,11 +948,6 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // Connected before any listener starts serving so a bad sink endpoint
     // fails startup loudly instead of silently dropping events.
     let sink_registry = if let Some(ref path) = args.sinks_config {
-        if encrypt_at_rest {
-            bail!(
-                "--sinks-config cannot be combined with --encrypt-at-rest:                  the WAL tailer cannot decode encrypted frames"
-            );
-        }
         let file = sinks::load_sinks(path)?;
         let tables: Box<dyn Fn() -> Vec<sinks::TableWal> + Send> = if let Some(ref reg) = registry {
             let reg = Arc::clone(reg);
@@ -969,7 +965,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
             let wal = args.dir.join("wal");
             Box::new(move || vec![("default".to_string(), wal.clone())])
         };
-        Some(sinks::start(&file, tables)?)
+        Some(sinks::start(&file, tables, &args.dir, master_key.clone())?)
     } else {
         None
     };

@@ -46,6 +46,20 @@ impl SinkRegistry {
         Ok(())
     }
 
+    /// Flush every registered sink; returns the first error (all are attempted).
+    pub async fn flush_all(&self) -> SinkResult<()> {
+        let sinks: Vec<Arc<dyn Sink>> = self.sinks.read().values().cloned().collect();
+        let mut first = Ok(());
+        for sink in sinks {
+            if let Err(e) = sink.flush().await
+                && first.is_ok()
+            {
+                first = Err(e);
+            }
+        }
+        first
+    }
+
     pub fn sink_count(&self) -> usize {
         self.sinks.read().len()
     }
