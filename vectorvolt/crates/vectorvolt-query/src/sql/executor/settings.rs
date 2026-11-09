@@ -57,6 +57,8 @@ const HNSW_EF_SEARCH_MAX: usize = 100_000;
 /// E1 — setting-style `SHOW` / `RESET` forms whose `SET` is rejected with
 /// 0A000. They used to answer with made-up defaults; now they fail the same
 /// way. Upper-case, whitespace-normalised, matched exactly.
+// `QUERY RESOURCE LIMITS` is not listed: SHOW/RESET report and clear the
+// real `SET QUERY MEMORY LIMIT` (D5).
 const UNSUPPORTED_SHOW_RESET: &[&str] = &[
     "QUERY TIMEOUT",
     "TIMEOUT ESCALATION POLICY",
@@ -74,7 +76,6 @@ const UNSUPPORTED_SHOW_RESET: &[&str] = &[
     "QUERY COST BUDGET",
     "QUERY RESULT SAMPLE RATE",
     "QUERY RETRY POLICY",
-    "QUERY RESOURCE LIMITS",
     "QUERY AFFINITY",
     "CURRENT QUERY TAG",
     "RESULT COMPRESSION",
