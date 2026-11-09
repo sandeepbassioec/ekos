@@ -30,6 +30,8 @@ tokio-rustls       = { workspace = true }
 [dependencies]
 vectorvolt-semantic = { workspace = true }
 vectorvolt-events = { workspace = true }
+vectorvolt-sink   = { workspace = true }
+async-trait       = "0.1"
 vectorvolt-wal     = { path = "../vectorvolt-wal" }
 vectorvolt-store   = { path = "../vectorvolt-store" }
 vectorvolt-storage = { workspace = true }

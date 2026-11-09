@@ -19,6 +19,15 @@ tokio          = { workspace = true }
 tokio-postgres = { workspace = true }
 rskafka        = { workspace = true }
 chrono         = { workspace = true }
+rustls         = { workspace = true }
+tokio-rustls   = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots   = { workspace = true }
+
+[features]
+default = ["compression-gzip"]
+# Pure-Rust gzip record compression (lz4/zstd need C and are not offered).
+compression-gzip = ["rskafka/compression-gzip"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -792,9 +792,10 @@ impl SqlExecutor {
                 // When LIMIT is set, try the HNSW index for approximate ANN.
                 // Fall back to brute-force VectorStore when the index is empty or absent.
                 let k = stmt.limit.unwrap_or(u64::MAX) as usize;
+                let ef_search = *self.hnsw_ef_search.lock_safe();
                 let hnsw_results = HnswIndex::load(base, &stmt.table, col, DistanceMetric::L2)
                     .ok()
-                    .map(|idx| idx.search(query, k.max(1)))
+                    .map(|idx| idx.search_with_ef(query, k.max(1), ef_search))
                     .filter(|r| !r.is_empty());
 
                 let dist_map: std::collections::HashMap<u64, f32> =

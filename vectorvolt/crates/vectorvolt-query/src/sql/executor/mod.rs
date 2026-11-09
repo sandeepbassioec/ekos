@@ -709,6 +709,8 @@ pub struct SqlExecutor {
     /// E1 — standard PostgreSQL client-compat settings (`client_encoding`,
     /// `DateStyle`, ...) accepted as documented no-ops and echoed by `SHOW`.
     compat_settings: Mutex<HashMap<String, String>>,
+    /// E7 — `hnsw_ef_search`: layer-0 beam width of SQL vector search.
+    hnsw_ef_search: Mutex<usize>,
     // S166 â€” table inheritance: child â†’ parent
     pub(crate) inherited_tables: Mutex<HashMap<String, String>>,
     // S167 â€” pluggable output formats
@@ -1368,6 +1370,7 @@ impl SqlExecutor {
             optimizer_model: Mutex::new("hash".to_owned()),
             optimizer_hints: Mutex::new(Vec::new()),
             session_vars: Mutex::new(HashMap::new()),
+            hnsw_ef_search: Mutex::new(crate::sql::hnsw::DEFAULT_EF_SEARCH),
             compat_settings: Mutex::new(
                 COMPAT_SETTINGS
                     .iter()

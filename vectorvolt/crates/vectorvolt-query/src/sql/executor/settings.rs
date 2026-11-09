@@ -50,6 +50,48 @@ const REAL_SET_PREFIXES: &[&str] = &[
     "SET CONFIG KEY '",
 ];
 
+/// E7 — real session setting: layer-0 beam width of SQL vector search.
+const HNSW_EF_SEARCH: &str = "hnsw_ef_search";
+const HNSW_EF_SEARCH_MAX: usize = 100_000;
+
+/// E1 — setting-style `SHOW` / `RESET` forms whose `SET` is rejected with
+/// 0A000. They used to answer with made-up defaults; now they fail the same
+/// way. Upper-case, whitespace-normalised, matched exactly.
+const UNSUPPORTED_SHOW_RESET: &[&str] = &[
+    "QUERY TIMEOUT",
+    "TIMEOUT ESCALATION POLICY",
+    "OUTPUT FORMAT",
+    "STREAMING",
+    "QUERY PRIORITY",
+    "WAL LEVEL",
+    "CURRENT TENANT",
+    "POOL SIZE",
+    "PARALLEL DEGREE",
+    "OPTIMIZER",
+    "OPTIMIZER MODEL",
+    "GLOBAL QUERY ROW LIMIT",
+    "QUERY BATCH SIZE",
+    "QUERY COST BUDGET",
+    "QUERY RESULT SAMPLE RATE",
+    "QUERY RETRY POLICY",
+    "QUERY RESOURCE LIMITS",
+    "QUERY AFFINITY",
+    "CURRENT QUERY TAG",
+    "RESULT COMPRESSION",
+    "RESULT ENCODING",
+    "RESULT TTL",
+    "RESULT SET SIZE LIMIT",
+    "BATCH RETRY POLICY",
+    "INDEX BUILD PARALLELISM",
+    "INDEX BUILD THROTTLE",
+    "INDEX BUILD RESOURCE LIMITS",
+    "INDEX MAINTENANCE WINDOW",
+    "REPLICATION LAG THRESHOLD",
+    "CLIENT ID",
+    "MULTIPLEXING",
+    "MULTIPLEXING STATUS",
+];
+
 /// True when `up` starts with `prefix` ending on a word boundary.
 fn starts_with_word(up: &str, prefix: &str) -> bool {
     match up.strip_prefix(prefix) {
@@ -71,6 +113,25 @@ fn unquote_setting(v: &str) -> String {
 }
 
 impl SqlExecutor {
+    /// E1 — `SHOW` / `RESET` of a setting that `SET` rejects fails with 0A000.
+    fn reject_unsupported_show_reset(
+        verb: &str,
+        norm: &str,
+    ) -> Option<Result<QueryResult, ExecError>> {
+        if UNSUPPORTED_SHOW_RESET
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(norm))
+        {
+            return Some(Ok(sql_error(
+                "0A000",
+                &format!(
+                    "unsupported setting \"{norm}\": {verb} {norm} is not implemented and would report a made-up default"
+                ),
+            )));
+        }
+        None
+    }
+
     /// E1 — front door for `SET` / `SHOW` of session settings. Returns
     /// `None` to let the normal pipeline handle the statement (real
     /// settings, every non-settings statement).
@@ -85,12 +146,28 @@ impl SqlExecutor {
         };
         let is_set = kw(4, "SET ");
         let is_show = kw(5, "SHOW ");
-        if !is_set && !is_show {
+        let is_reset = kw(6, "RESET ");
+        if !is_set && !is_show && !is_reset {
             return None;
         }
         let s = sql.trim().trim_end_matches(';').trim();
+        if is_reset {
+            let words: Vec<&str> = s[6..].split_whitespace().collect();
+            let norm = words.join(" ");
+            if norm.eq_ignore_ascii_case(HNSW_EF_SEARCH) {
+                *self.hnsw_ef_search.lock_safe() = crate::sql::hnsw::DEFAULT_EF_SEARCH;
+                return Some(Ok(QueryResult::Ok("RESET".to_owned())));
+            }
+            return Self::reject_unsupported_show_reset("RESET", &norm);
+        }
         if is_show {
             let name = s[5..].trim().to_ascii_lowercase();
+            if let Some(err) = Self::reject_unsupported_show_reset(
+                "SHOW",
+                &s[5..].split_whitespace().collect::<Vec<_>>().join(" "),
+            ) {
+                return Some(err);
+            }
             let name = if name == "time zone" {
                 "timezone".to_owned()
             } else {
@@ -101,6 +178,8 @@ impl SqlExecutor {
                 v
             } else if name == "search_path" {
                 self.search_path.lock_safe().clone()
+            } else if name == HNSW_EF_SEARCH {
+                self.hnsw_ef_search.lock_safe().to_string()
             } else if name == "statement_timeout" {
                 self.statement_timeout_ms
                     .lock_safe()
@@ -154,6 +233,26 @@ impl SqlExecutor {
             };
             (name, rest.to_owned())
         };
+        if name == HNSW_EF_SEARCH {
+            let raw = unquote_setting(&value);
+            let raw = raw.trim();
+            if raw.eq_ignore_ascii_case("default") {
+                *self.hnsw_ef_search.lock_safe() = crate::sql::hnsw::DEFAULT_EF_SEARCH;
+                return Some(Ok(QueryResult::Ok("SET".to_owned())));
+            }
+            return Some(Ok(match raw.parse::<usize>() {
+                Ok(n) if (1..=HNSW_EF_SEARCH_MAX).contains(&n) => {
+                    *self.hnsw_ef_search.lock_safe() = n;
+                    QueryResult::Ok("SET".to_owned())
+                }
+                _ => sql_error(
+                    "22023",
+                    &format!(
+                        "invalid value for hnsw_ef_search: \"{raw}\" (expected an integer in 1..={HNSW_EF_SEARCH_MAX})"
+                    ),
+                ),
+            }));
+        }
         if COMPAT_SETTINGS.iter().any(|(k, _)| *k == name) && !value.trim().is_empty() {
             let v = unquote_setting(&value);
             self.compat_settings.lock_safe().insert(name, v);

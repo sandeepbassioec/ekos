@@ -54,6 +54,7 @@ fn start_multi_with_pgwire(
         config: None,
         http_addr: None,
         master_config: None,
+        sinks_config: None,
         http_token: None,
         transport: "tcp".to_string(),
         xdp_iface: "lo".to_string(),

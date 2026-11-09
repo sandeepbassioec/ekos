@@ -48,6 +48,7 @@ fn start_with_cluster(dir: &TempDir, seeds: Vec<SocketAddr>) -> (u16, impl FnOnc
         config: None,
         http_addr: None,
         master_config: None,
+        sinks_config: None,
         http_token: None,
         transport: "tcp".to_string(),
         xdp_iface: "lo".to_string(),

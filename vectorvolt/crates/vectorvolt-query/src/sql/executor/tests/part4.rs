@@ -142,20 +142,6 @@ fn test_s263_clear_empties_diffs() {
 }
 
 #[test]
-fn test_s264_show_multiplexing_status_returns_rows() {
-    let (ex, _dir) = setup();
-    ex.execute("SET CONNECTION POOL MULTIPLEXING ON").unwrap();
-    let r = ex.execute("SHOW MULTIPLEXING STATUS").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s264_reset_multiplexing_returns_ok() {
-    let (ex, _dir) = setup();
-    ex.execute("SET CONNECTION POOL MULTIPLEXING ON").unwrap();
-    let r = ex.execute("RESET MULTIPLEXING").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
-#[test]
 fn test_s264_reset_sets_false() {
     let (ex, _dir) = setup();
     ex.execute("SET CONNECTION POOL MULTIPLEXING ON").unwrap();
@@ -298,20 +284,6 @@ fn test_s268_drop_removes_entry() {
     assert!(ex.s268_watermarks.lock_safe().is_empty());
 }
 
-#[test]
-fn test_s269_show_cost_budget_returns_rows() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY COST BUDGET 1000").unwrap();
-    let r = ex.execute("SHOW QUERY COST BUDGET").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s269_reset_cost_budget_returns_ok() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY COST BUDGET 1000").unwrap();
-    let r = ex.execute("RESET QUERY COST BUDGET").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
 #[test]
 fn test_s269_reset_clears_budget() {
     let (ex, _dir) = setup();
@@ -570,20 +542,6 @@ fn test_s276_verify_without_compute_invalid() {
 }
 
 #[test]
-fn test_s277_show_batch_size_returns_rows() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY BATCH SIZE 100").unwrap();
-    let r = ex.execute("SHOW QUERY BATCH SIZE").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s277_reset_batch_size_returns_ok() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY BATCH SIZE 100").unwrap();
-    let r = ex.execute("RESET QUERY BATCH SIZE").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
-#[test]
 fn test_s277_reset_restores_default() {
     let (ex, _dir) = setup();
     ex.execute("SET QUERY BATCH SIZE 250").unwrap();
@@ -760,13 +718,6 @@ fn test_s282_show_replication_lag_for_returns_rows() {
     let (ex, _dir) = setup();
     let r = ex.execute("SHOW REPLICATION LAG FOR orders").unwrap();
     assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s282_reset_lag_threshold_returns_ok() {
-    let (ex, _dir) = setup();
-    ex.execute("SET REPLICATION LAG THRESHOLD 5s").unwrap();
-    let r = ex.execute("RESET REPLICATION LAG THRESHOLD").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
 }
 #[test]
 fn test_s282_reset_clears_threshold() {
@@ -1076,20 +1027,6 @@ fn test_s291_refresh_updates_estimate() {
     assert!(ex.s291_row_estimates.lock_safe().contains_key("t"));
 }
 #[test]
-fn test_s292_show_policy_returns_rows() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY TIMEOUT ESCALATION '10s,30s,60s'")
-        .unwrap();
-    let r = ex.execute("SHOW TIMEOUT ESCALATION POLICY").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s292_reset_returns_ok() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("RESET TIMEOUT ESCALATION POLICY").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
-#[test]
 fn test_s292_reset_clears_policy() {
     let (ex, _dir) = setup();
     ex.execute("SET QUERY TIMEOUT ESCALATION '10s,30s,60s'")
@@ -1173,30 +1110,10 @@ fn test_s295_set_returns_ok() {
     assert!(matches!(r, QueryResult::Ok(_)));
 }
 #[test]
-fn test_s295_show_limits_returns_rows() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY MEMORY LIMIT 512MB").unwrap();
-    let r = ex.execute("SHOW QUERY RESOURCE LIMITS").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s295_reset_returns_ok() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("RESET QUERY RESOURCE LIMITS").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
-#[test]
 fn test_s295_limit_stored() {
     let (ex, _dir) = setup();
     ex.execute("SET QUERY MEMORY LIMIT 512MB").unwrap();
     assert_eq!(ex.s295_memory_limit.lock_safe().clone().unwrap(), "512MB");
-}
-#[test]
-fn test_s295_reset_clears_limit() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY MEMORY LIMIT 512MB").unwrap();
-    ex.execute("RESET QUERY RESOURCE LIMITS").unwrap();
-    assert!(ex.s295_memory_limit.lock_safe().is_none());
 }
 // ── S296 — Table partition pruning stats ────────────────────────────────────────────────
 #[test]
@@ -2748,33 +2665,6 @@ fn test_s343_cancel_returns_ok() {
     assert!(matches!(r, QueryResult::Ok(_)));
 }
 
-#[test]
-fn test_s344_default_encoding() {
-    let (ex, _dir) = setup();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT ENCODING").unwrap() {
-        assert_eq!(rows[0][0], "UTF8");
-    } else {
-        panic!();
-    }
-}
-#[test]
-fn test_s344_reset_encoding() {
-    let (ex, _dir) = setup();
-    ex.execute("SET RESULT ENCODING LATIN1").unwrap();
-    ex.execute("RESET RESULT ENCODING").unwrap();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT ENCODING").unwrap() {
-        assert_eq!(rows[0][0], "UTF8");
-    } else {
-        panic!();
-    }
-}
-#[test]
-fn test_s344_reset_returns_ok() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("RESET RESULT ENCODING").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
-
 // ── S345 — table storage class migration ─────────────────────────────────
 #[test]
 fn test_s345_migrate_table() {
@@ -3226,27 +3116,6 @@ fn test_s355_empty_initially() {
     }
 }
 
-#[test]
-fn test_s356_clear_client_id() {
-    let (ex, _dir) = setup();
-    ex.execute("SET CLIENT ID 'app-name'").unwrap();
-    ex.execute("CLEAR CLIENT ID").unwrap();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CLIENT ID").unwrap() {
-        assert_eq!(rows[0][0], "");
-    } else {
-        panic!();
-    }
-}
-#[test]
-fn test_s356_default_empty() {
-    let (ex, _dir) = setup();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW CLIENT ID").unwrap() {
-        assert_eq!(rows[0][0], "");
-    } else {
-        panic!();
-    }
-}
-
 // ── S357 — table skew rebalancing ────────────────────────────────────────
 #[test]
 fn test_s357_rebalance_skew() {
@@ -3574,34 +3443,6 @@ fn test_s363_multiple_backups() {
     } else {
         panic!();
     }
-}
-
-#[test]
-fn test_s364_reset_window() {
-    let (ex, _dir) = setup();
-    ex.execute("SET INDEX MAINTENANCE WINDOW '02:00-04:00'")
-        .unwrap();
-    ex.execute("RESET INDEX MAINTENANCE WINDOW").unwrap();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX MAINTENANCE WINDOW").unwrap() {
-        assert_eq!(rows[0][0], "");
-    } else {
-        panic!();
-    }
-}
-#[test]
-fn test_s364_default_empty() {
-    let (ex, _dir) = setup();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX MAINTENANCE WINDOW").unwrap() {
-        assert_eq!(rows[0][0], "");
-    } else {
-        panic!();
-    }
-}
-#[test]
-fn test_s364_reset_returns_ok() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("RESET INDEX MAINTENANCE WINDOW").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
 }
 
 // ── S365 — query result pagination tokens ────────────────────────────────
@@ -4116,33 +3957,6 @@ fn test_s375_empty_initially() {
     } else {
         panic!();
     }
-}
-
-#[test]
-fn test_s376_default_throttle() {
-    let (ex, _dir) = setup();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX BUILD THROTTLE").unwrap() {
-        assert_eq!(rows[0][0], "100");
-    } else {
-        panic!();
-    }
-}
-#[test]
-fn test_s376_reset_throttle() {
-    let (ex, _dir) = setup();
-    ex.execute("SET INDEX BUILD THROTTLE 50 PERCENT").unwrap();
-    ex.execute("RESET INDEX BUILD THROTTLE").unwrap();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW INDEX BUILD THROTTLE").unwrap() {
-        assert_eq!(rows[0][0], "100");
-    } else {
-        panic!();
-    }
-}
-#[test]
-fn test_s376_reset_returns_ok() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("RESET INDEX BUILD THROTTLE").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
 }
 
 // ── S377 — query result set versioning ───────────────────────────────────
