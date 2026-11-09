@@ -33,6 +33,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ld dies with SIGBUS when its mmap'd output file can't be backed
+      # (full disk) or memory runs out.  ~500 test binaries on top of the
+      # cached target/ dir fill the ~14 GB free on the runner, so reclaim
+      # space from preinstalled toolchains we never use and add swap.
+      - name: Free disk space and add swap
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a || true
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          df -h /
+          free -h
+
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -60,8 +76,15 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --manifest-path vectorvolt/Cargo.toml --all-targets -- -D warnings
 
+      - name: Build tests (link one binary at a time)
+        run: cargo test --manifest-path vectorvolt/Cargo.toml --all --no-run -j 1
+
       - name: Run tests
         run: cargo test --manifest-path vectorvolt/Cargo.toml --all
+
+      - name: Disk usage
+        if: always()
+        run: df -h / && du -sh vectorvolt/target
 
 
   xdp:
