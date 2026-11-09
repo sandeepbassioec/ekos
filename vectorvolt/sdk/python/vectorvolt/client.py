@@ -10,26 +10,67 @@ from __future__ import annotations
 
 import hashlib
 import socket
+import ssl
 from typing import Any, Optional, Sequence
 
 from . import wire
+from .ops import OpsMixin
 from .wire import NotSupportedError, ProtocolError, Reader
 
 
-class VectorVoltClient:
+class VectorVoltClient(OpsMixin):
     """Blocking client holding ONE persistent connection.
 
     Server-side transactions are bound to the connection, so begin_txn ...
     commit_txn/rollback_txn span calls on the same client.
+
+    Plain TCP is the default. Pass ``tls=True`` to speak TLS to a server whose net
+    listener has TLS enabled (vectorvolt-net/src/tls.rs): ``ca_file`` is a PEM CA /
+    pinned server certificate (default: the system trust store), ``server_name`` the
+    name to verify and send as SNI (default: ``host``), ``insecure_skip_verify``
+    turns certificate verification off (testing only), and ``client_cert`` +
+    ``client_key`` (PEM files) present a client certificate for mTLS.
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 5050,
-                 timeout: Optional[float] = None) -> None:
+                 timeout: Optional[float] = None, *, tls: bool = False,
+                 ca_file: Optional[str] = None, server_name: Optional[str] = None,
+                 insecure_skip_verify: bool = False, client_cert: Optional[str] = None,
+                 client_key: Optional[str] = None) -> None:
+        if not tls and (ca_file or server_name or insecure_skip_verify or client_cert
+                        or client_key):
+            raise ValueError("TLS options given but tls=True was not set")
+        if bool(client_cert) != bool(client_key):
+            raise ValueError("client_cert and client_key must be given together")
         self._host = host
         self._port = port
         self._timeout = timeout
+        self._ssl: Optional[ssl.SSLContext] = None
+        self._server_name = server_name or host
+        if tls:
+            self._ssl = self._make_ssl_context(ca_file, insecure_skip_verify,
+                                               client_cert, client_key)
         self._sock: Optional[socket.socket] = None
         self._next_id = 1
+
+    @staticmethod
+    def _make_ssl_context(ca_file: Optional[str], insecure: bool, cert: Optional[str],
+                          key: Optional[str]) -> ssl.SSLContext:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        if insecure:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        else:
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.check_hostname = True
+            if ca_file:
+                ctx.load_verify_locations(cafile=ca_file)
+            else:
+                ctx.load_default_certs()
+        if cert and key:
+            ctx.load_cert_chain(cert, key)
+        return ctx
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -37,6 +78,12 @@ class VectorVoltClient:
         """Open the connection; authenticate when credentials are given."""
         s = socket.create_connection((self._host, self._port), self._timeout)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if self._ssl is not None:
+            try:
+                s = self._ssl.wrap_socket(s, server_hostname=self._server_name)
+            except BaseException:
+                s.close()
+                raise
         self._sock = s
         self._next_id = 1
         if key_id is not None:

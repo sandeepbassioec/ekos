@@ -8,41 +8,119 @@
 package vectorvolt
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
+
+// TLSOptions configures TLS for the connection (the server's net listener speaks
+// TLS directly on the TCP port, vectorvolt-net/src/tls.rs). Plain TCP is the
+// default; set Client.TLS (or use NewTLS) to enable it.
+type TLSOptions struct {
+	// CAFile is a PEM file with the CA / pinned server certificate to trust. Empty
+	// means the system trust store.
+	CAFile string
+	// ServerName is verified against the server certificate and sent as SNI.
+	// Empty means the host given to New.
+	ServerName string
+	// InsecureSkipVerify disables certificate verification (testing only).
+	InsecureSkipVerify bool
+	// CertFile / KeyFile (PEM) present a client certificate for mTLS; both or neither.
+	CertFile, KeyFile string
+}
+
+func (o *TLSOptions) config(host string) (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
+	if o.ServerName != "" {
+		cfg.ServerName = o.ServerName
+	}
+	cfg.InsecureSkipVerify = o.InsecureSkipVerify //nolint:gosec // explicit opt-in
+	if o.CAFile != "" {
+		pem, err := os.ReadFile(o.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("vectorvolt: read CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("vectorvolt: no certificates found in CA file %s", o.CAFile)
+		}
+		cfg.RootCAs = pool
+	}
+	if (o.CertFile == "") != (o.KeyFile == "") {
+		return nil, fmt.Errorf("vectorvolt: CertFile and KeyFile must be set together")
+	}
+	if o.CertFile != "" {
+		cert, err := tls.LoadX509KeyPair(o.CertFile, o.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("vectorvolt: load client certificate: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	return cfg, nil
+}
 
 // Client holds ONE persistent connection; calls are serialised on it. A
 // server-side transaction is bound to the connection, so BeginTxn ...
 // CommitTxn/RollbackTxn span calls on the same Client.
 type Client struct {
+	host string
 	addr string
 	mu   sync.Mutex
 	conn net.Conn
 	next uint64
 	// Timeout bounds each call (0 = none).
 	Timeout time.Duration
+	// TLS, when non-nil, makes Connect speak TLS (set before Connect).
+	TLS *TLSOptions
 }
 
-// New creates a Client targeting host:port.
+// New creates a Client targeting host:port over plain TCP.
 func New(host string, port int) *Client {
-	return &Client{addr: fmt.Sprintf("%s:%d", host, port), next: 1}
+	return &Client{host: host, addr: net.JoinHostPort(host, strconv.Itoa(port)), next: 1}
 }
 
-// Connect opens the TCP connection.
+// NewTLS creates a Client targeting host:port over TLS.
+func NewTLS(host string, port int, opts TLSOptions) *Client {
+	c := New(host, port)
+	c.TLS = &opts
+	return c
+}
+
+// Connect opens the TCP (or TLS) connection.
 func (c *Client) Connect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	conn, err := net.Dial("tcp", c.addr)
+	d := &net.Dialer{Timeout: c.Timeout}
+	conn, err := d.Dial("tcp", c.addr)
 	if err != nil {
 		return err
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
+	}
+	if c.TLS != nil {
+		cfg, err := c.TLS.config(c.host)
+		if err != nil {
+			_ = conn.Close()
+			return err
+		}
+		tc := tls.Client(conn, cfg)
+		if c.Timeout > 0 {
+			_ = tc.SetDeadline(time.Now().Add(c.Timeout))
+		}
+		if err := tc.Handshake(); err != nil {
+			_ = conn.Close()
+			return err
+		}
+		_ = tc.SetDeadline(time.Time{})
+		conn = tc
 	}
 	c.conn = conn
 	c.next = 1

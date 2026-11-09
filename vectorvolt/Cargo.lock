@@ -2958,6 +2958,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32c",
+ "flate2",
  "futures",
  "integer-encoding",
  "parking_lot",
@@ -4521,13 +4522,17 @@ dependencies = [
  "chrono",
  "parking_lot",
  "rskafka",
+ "rustls",
+ "rustls-pemfile",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "vectorvolt-txn",
  "vectorvolt-wal",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4678,6 +4683,7 @@ name = "vvctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.8.9",
  "bytes",
  "chrono",
@@ -4722,6 +4728,7 @@ dependencies = [
  "vectorvolt-reader",
  "vectorvolt-semantic",
  "vectorvolt-server",
+ "vectorvolt-sink",
  "vectorvolt-storage",
  "vectorvolt-store",
  "vectorvolt-tpm",

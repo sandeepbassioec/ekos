@@ -426,17 +426,6 @@ fn test_s158_set_current_tenant_not_exists() {
     assert!(matches!(r, QueryResult::Error(_)));
 }
 
-#[test]
-fn test_s158_show_current_tenant_none() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("SHOW CURRENT TENANT").unwrap();
-    if let QueryResult::Ok(val) = r {
-        assert_eq!(val, "none");
-    } else {
-        panic!();
-    }
-}
-
 // â”€â”€ S159 â€” Data masking policies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #[test]
 fn test_s159_create_mask_policy() {
@@ -487,29 +476,6 @@ fn test_s159_remove_mask_policy_from() {
     assert!(matches!(r, QueryResult::Ok(_)));
 }
 
-#[test]
-fn test_s160_reset_query_timeout() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY TIMEOUT 5000").unwrap();
-    let r = ex.execute("RESET QUERY TIMEOUT").unwrap();
-    if let QueryResult::Ok(msg) = r {
-        assert_eq!(msg, "RESET");
-    } else {
-        panic!();
-    }
-}
-
-#[test]
-fn test_s160_show_query_timeout_none() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("SHOW QUERY TIMEOUT").unwrap();
-    if let QueryResult::Ok(val) = r {
-        assert_eq!(val, "none");
-    } else {
-        panic!();
-    }
-}
-
 // â”€â”€ S161 â€” Parallel DDL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #[test]
 fn test_s161_alter_table_parallel() {
@@ -548,14 +514,6 @@ fn test_s161_show_parallel_ddl_status() {
     } else {
         panic!();
     }
-}
-
-#[test]
-fn test_s161_reset_parallel_degree() {
-    let (ex, _dir) = setup();
-    ex.execute("SET DEFAULT PARALLEL DEGREE 8").unwrap();
-    let r = ex.execute("RESET PARALLEL DEGREE").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
 }
 
 // â”€â”€ S162 â€” Table statistics export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -696,36 +654,6 @@ fn test_s164_show_optimizer_hints() {
     }
 }
 
-#[test]
-fn test_s164_reset_optimizer() {
-    let (ex, _dir) = setup();
-    ex.execute("SET OPTIMIZER COST MODEL merge").unwrap();
-    ex.execute("ADD OPTIMIZER HINT 'hint1'").unwrap();
-    let r = ex.execute("RESET OPTIMIZER").unwrap();
-    if let QueryResult::Ok(msg) = r {
-        assert_eq!(msg, "OPTIMIZER RESET");
-    } else {
-        panic!();
-    }
-    let r2 = ex.execute("SHOW OPTIMIZER MODEL").unwrap();
-    if let QueryResult::Ok(model) = r2 {
-        assert_eq!(model, "hash");
-    } else {
-        panic!();
-    }
-}
-
-#[test]
-fn test_s164_show_optimizer_model_default() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("SHOW OPTIMIZER MODEL").unwrap();
-    if let QueryResult::Ok(model) = r {
-        assert_eq!(model, "hash");
-    } else {
-        panic!();
-    }
-}
-
 // â”€â”€ S165 â€” Session variables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #[test]
 fn test_s165_set_session_var() {
@@ -836,29 +764,6 @@ fn test_s166_count_inheritance_levels() {
     let r = ex.execute("COUNT INHERITANCE LEVELS FOR emp").unwrap();
     if let QueryResult::Ok(val) = r {
         assert_eq!(val, "1");
-    } else {
-        panic!();
-    }
-}
-
-#[test]
-fn test_s167_show_output_format_default() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("SHOW OUTPUT FORMAT").unwrap();
-    if let QueryResult::Ok(fmt) = r {
-        assert_eq!(fmt, "TABLE");
-    } else {
-        panic!();
-    }
-}
-
-#[test]
-fn test_s167_reset_output_format() {
-    let (ex, _dir) = setup();
-    ex.execute("SET OUTPUT FORMAT CSV").unwrap();
-    let r = ex.execute("RESET OUTPUT FORMAT").unwrap();
-    if let QueryResult::Ok(msg) = r {
-        assert_eq!(msg, "RESET");
     } else {
         panic!();
     }
@@ -1473,26 +1378,6 @@ fn test_s182_clear_query_tag() {
     let r = ex.execute("CLEAR QUERY TAG").unwrap();
     assert!(matches!(r, QueryResult::Ok(_)));
 }
-#[test]
-fn test_s182_show_current_query_tag() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY TAG 'mytag'").unwrap();
-    let r = ex.execute("SHOW CURRENT QUERY TAG").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s182_current_tag_cleared() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY TAG 'mytag'").unwrap();
-    ex.execute("CLEAR QUERY TAG").unwrap();
-    let r = ex.execute("SHOW CURRENT QUERY TAG").unwrap();
-    if let QueryResult::Rows { rows, .. } = r {
-        assert!(rows[0][0].is_empty());
-    } else {
-        panic!();
-    }
-}
-
 // â”€â”€ S183 â€” Partial indexes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #[test]
 fn test_s183_create_partial_index() {
@@ -1590,13 +1475,6 @@ fn test_s184_restore_removes_from_archived() {
     } else {
         panic!();
     }
-}
-
-#[test]
-fn test_s185_show_query_priority() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("SHOW QUERY PRIORITY").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
 }
 
 // â”€â”€ S186 â€” Schema versioning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1889,31 +1767,6 @@ fn test_s191_change_stream_appears_in_show() {
     }
 }
 
-#[test]
-fn test_s192_show_result_ttl_returns_rows() {
-    let (ex, _dir) = setup();
-    ex.execute("SET RESULT TTL 120").unwrap();
-    let r = ex.execute("SHOW RESULT TTL").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s192_reset_result_ttl_returns_ok() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("RESET RESULT TTL").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
-#[test]
-fn test_s192_reset_result_ttl_shows_unset() {
-    let (ex, _dir) = setup();
-    ex.execute("SET RESULT TTL 60").unwrap();
-    ex.execute("RESET RESULT TTL").unwrap();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW RESULT TTL").unwrap() {
-        assert_eq!(rows[0][0], "unset");
-    } else {
-        panic!();
-    }
-}
-
 // â”€â”€ S193 â€” Batch operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #[test]
 fn test_s193_begin_batch_returns_ok() {
@@ -2110,31 +1963,6 @@ fn test_s198_migrate_table_to_tier_cold_returns_ok() {
     let (ex, _dir) = setup();
     let r = ex.execute("MIGRATE TABLE old_data TO TIER COLD").unwrap();
     assert!(matches!(r, QueryResult::Ok(_)));
-}
-
-#[test]
-fn test_s199_show_retry_policy_returns_rows() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("SHOW QUERY RETRY POLICY").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s199_reset_retry_policy_returns_ok() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("RESET QUERY RETRY POLICY").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
-#[test]
-fn test_s199_reset_restores_defaults() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY RETRY POLICY retries=9 delay=999ms")
-        .unwrap();
-    ex.execute("RESET QUERY RETRY POLICY").unwrap();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY RETRY POLICY").unwrap() {
-        assert_eq!(rows[0][0], "3");
-    } else {
-        panic!();
-    }
 }
 
 // â”€â”€ S200 â€” Milestone sprint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2369,12 +2197,6 @@ fn test_s204_snapshot_recorded() {
     }
 }
 
-#[test]
-fn test_s205_show_wal_level_returns_rows() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("SHOW WAL LEVEL").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
 #[test]
 fn test_s205_checkpoint_force_returns_ok() {
     let (ex, _dir) = setup();
@@ -3052,19 +2874,6 @@ fn test_s224_health_log_records_checks() {
     }
 }
 
-#[test]
-fn test_s225_show_result_compression_returns_rows() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("SHOW RESULT COMPRESSION").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s225_reset_result_compression_returns_ok() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("RESET RESULT COMPRESSION").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
-
 // â”€â”€ S226 â€” Live reload config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #[test]
 fn test_s226_reload_config_returns_ok() {
@@ -3640,30 +3449,6 @@ fn test_s238_drop_removes_hook() {
     ex.execute("DROP OBSERVE HOOK oh2").unwrap();
     if let QueryResult::Rows { rows, .. } = ex.execute("SHOW OBSERVE HOOKS").unwrap() {
         assert!(rows.iter().all(|r| r[0] != "oh2"));
-    } else {
-        panic!();
-    }
-}
-
-#[test]
-fn test_s239_show_query_affinity_returns_rows() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("SHOW QUERY AFFINITY").unwrap();
-    assert!(matches!(r, QueryResult::Rows { .. }));
-}
-#[test]
-fn test_s239_reset_query_affinity_returns_ok() {
-    let (ex, _dir) = setup();
-    let r = ex.execute("RESET QUERY AFFINITY").unwrap();
-    assert!(matches!(r, QueryResult::Ok(_)));
-}
-#[test]
-fn test_s239_reset_clears_affinity() {
-    let (ex, _dir) = setup();
-    ex.execute("SET QUERY AFFINITY NODE node42").unwrap();
-    ex.execute("RESET QUERY AFFINITY").unwrap();
-    if let QueryResult::Rows { rows, .. } = ex.execute("SHOW QUERY AFFINITY").unwrap() {
-        assert_eq!(rows[0][0], "");
     } else {
         panic!();
     }

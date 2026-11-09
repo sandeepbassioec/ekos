@@ -26,6 +26,9 @@ use crate::sql::vec_store::DistanceMetric;
 const M: usize = 16;
 /// Beam width used when connecting new nodes during index build.
 const EF_CONSTRUCTION: usize = 100;
+
+/// E7 — default layer-0 search width (`hnsw_ef_search`).
+pub const DEFAULT_EF_SEARCH: usize = 100;
 /// Maximum number of layers.
 const MAX_LAYERS: usize = 16;
 
@@ -188,6 +191,12 @@ impl HnswIndex {
     /// Approximate top-`k` nearest neighbours to `query`.
     /// Returns `(pk, distance)` pairs sorted by distance ascending.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.search_with_ef(query, k, DEFAULT_EF_SEARCH)
+    }
+
+    /// E7 — like [`Self::search`] with an explicit search width: the layer-0
+    /// beam width is `max(k, ef_search)`.
+    pub fn search_with_ef(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(u64, f32)> {
         if self.g.entry_pk.is_none() || self.g.nodes.is_empty() {
             return Vec::new();
         }
@@ -201,7 +210,7 @@ impl HnswIndex {
         }
 
         // Beam search at layer 0.
-        let ef = k.max(EF_CONSTRUCTION);
+        let ef = k.max(ef_search);
         let mut candidates = self.beam_search_layer(cur_pk, query, 0, ef);
         candidates.truncate(k);
         candidates
@@ -463,5 +472,22 @@ mod tests {
         let idx = HnswIndex::load(dir.path(), "t", "v", DistanceMetric::L2).unwrap();
         let results = idx.search(&[1.0, 2.0], 5);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_with_ef_widens_beam_and_default_matches_search() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut idx = HnswIndex::load(dir.path(), "t", "v", DistanceMetric::L2).unwrap();
+        for i in 0..300u64 {
+            idx.insert(i, vec![(i % 17) as f32, (i / 17) as f32]);
+        }
+        let q = [3.0, 4.0];
+        assert_eq!(
+            idx.search(&q, 5),
+            idx.search_with_ef(&q, 5, DEFAULT_EF_SEARCH)
+        );
+        // A tiny ef is clamped up to k, so k results still come back.
+        assert_eq!(idx.search_with_ef(&q, 5, 1).len(), 5);
+        assert_eq!(idx.search_with_ef(&q, 5, 500).len(), 5);
     }
 }

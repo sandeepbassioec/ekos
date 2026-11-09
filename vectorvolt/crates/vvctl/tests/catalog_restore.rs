@@ -58,6 +58,7 @@ fn serve_args(dir: &TempDir, catalog: bool, restore_catalog: bool) -> ServeArgs 
         restore_catalog,
         http_addr: None,
         master_config: None,
+        sinks_config: None,
         http_token: None,
         transport: "tcp".to_string(),
         xdp_iface: "lo".to_string(),

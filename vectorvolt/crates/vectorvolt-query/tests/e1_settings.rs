@@ -145,3 +145,71 @@ fn rejected_setting_has_no_side_effect() {
         QueryResult::Ok(ref v) if v == "5000"
     ));
 }
+
+#[test]
+fn show_and_reset_of_rejected_settings_fail_with_0a000() {
+    let (ex, _d) = setup();
+    for name in [
+        "QUERY TIMEOUT",
+        "OUTPUT FORMAT",
+        "STREAMING",
+        "QUERY PRIORITY",
+        "WAL LEVEL",
+        "CURRENT TENANT",
+        "PARALLEL DEGREE",
+        "RESULT TTL",
+        "query  batch size",
+    ] {
+        assert_0a000(
+            &q(&ex, &format!("SHOW {name}")),
+            name.split("  ").next().unwrap(),
+        );
+        assert_0a000(
+            &q(&ex, &format!("RESET {name};")),
+            name.split("  ").next().unwrap(),
+        );
+    }
+}
+
+#[test]
+fn show_and_reset_still_work_for_real_and_compat_settings() {
+    let (ex, _d) = setup();
+    q(&ex, "SET application_name = 'x'");
+    assert_eq!(show_value(&ex, "application_name"), "x");
+    assert_eq!(show_value(&ex, "statement_timeout"), "0");
+    assert!(!matches!(
+        q(&ex, "RESET CONNECTION IDLE TIMEOUT"),
+        QueryResult::Error(_)
+    ));
+}
+
+#[test]
+fn hnsw_ef_search_is_a_real_setting() {
+    let (ex, _d) = setup();
+    assert_eq!(show_value(&ex, "hnsw_ef_search"), "100");
+    assert!(matches!(
+        q(&ex, "SET hnsw_ef_search = 250"),
+        QueryResult::Ok(_)
+    ));
+    assert_eq!(show_value(&ex, "hnsw_ef_search"), "250");
+    // Per session.
+    assert_eq!(show_value(&ex.new_session(), "hnsw_ef_search"), "100");
+    assert!(matches!(
+        q(&ex, "SET hnsw_ef_search TO 32;"),
+        QueryResult::Ok(_)
+    ));
+    assert_eq!(show_value(&ex, "HNSW_EF_SEARCH"), "32");
+    for bad in [
+        "SET hnsw_ef_search = 0",
+        "SET hnsw_ef_search = abc",
+        "SET hnsw_ef_search = 99999999",
+    ] {
+        assert!(
+            matches!(q(&ex, bad), QueryResult::Error(ref e) if e.starts_with("[22023]")),
+            "{bad}"
+        );
+    }
+    assert_eq!(show_value(&ex, "hnsw_ef_search"), "32");
+    q(&ex, "RESET hnsw_ef_search");
+    assert_eq!(show_value(&ex, "hnsw_ef_search"), "100");
+}

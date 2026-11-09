@@ -19,6 +19,9 @@
 //! vvctl serve ./data --tls-cert server.pem --tls-key server.key --tls-client-ca ca.pem
 //! ```
 
+#[path = "serve_sinks.rs"]
+pub mod sinks;
+
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -115,6 +118,14 @@ pub struct ServeArgs {
     /// - `storage.l0_flush_threshold` → default flush threshold
     #[arg(long)]
     pub master_config: Option<PathBuf>,
+
+    /// Declare downstream sinks (kafka / postgres / redis_stream) in a YAML or
+    /// TOML file. Every sink must connect at startup or the server refuses to
+    /// start; committed mutations are then tailed from each table's WAL and
+    /// delivered to all sinks (at-least-once). Not supported together with
+    /// `--encrypt-at-rest` (the WAL tailer cannot decode encrypted frames).
+    #[arg(long)]
+    pub sinks_config: Option<PathBuf>,
 
     /// Override flush threshold (rows buffered before WAL flush). Wins over config + env.
     #[arg(long)]
@@ -440,6 +451,7 @@ impl Default for ServeArgs {
             multi: false,
             config: None,
             master_config: None,
+            sinks_config: None,
             flush_threshold: None,
             durability: None,
             max_partitions: None,
@@ -931,6 +943,37 @@ pub fn run(args: ServeArgs) -> Result<()> {
         master_key,
     } = bind(&args)?;
 
+    // ── Sinks (CDC fan-out) ───────────────────────────────────────────────────
+    // Connected before any listener starts serving so a bad sink endpoint
+    // fails startup loudly instead of silently dropping events.
+    let sink_registry = if let Some(ref path) = args.sinks_config {
+        if encrypt_at_rest {
+            bail!(
+                "--sinks-config cannot be combined with --encrypt-at-rest:                  the WAL tailer cannot decode encrypted frames"
+            );
+        }
+        let file = sinks::load_sinks(path)?;
+        let tables: Box<dyn Fn() -> Vec<sinks::TableWal> + Send> = if let Some(ref reg) = registry {
+            let reg = Arc::clone(reg);
+            let base = args.dir.clone();
+            Box::new(move || {
+                reg.list_tables()
+                    .into_iter()
+                    .map(|t| {
+                        let wal = base.join(&t).join("wal");
+                        (t, wal)
+                    })
+                    .collect()
+            })
+        } else {
+            let wal = args.dir.join("wal");
+            Box::new(move || vec![("default".to_string(), wal.clone())])
+        };
+        Some(sinks::start(&file, tables)?)
+    } else {
+        None
+    };
+
     let local = server.local_addr()?;
     let stats = server.stats();
 
@@ -1005,6 +1048,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
             "disabled (use --encrypt-at-rest)"
         }
     );
+    if let Some(ref r) = sink_registry {
+        eprintln!("  sinks     : {}", r.sink_names().join(", "));
+    }
     eprintln!("  max conns : {}", args.max_connections);
     eprintln!("  flush thr : {} rows", engine_opts_flush_threshold);
     eprintln!("  transport : {}", args.transport);

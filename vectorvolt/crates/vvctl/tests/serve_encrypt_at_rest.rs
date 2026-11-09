@@ -32,6 +32,7 @@ fn base_args(dir: &TempDir, encrypt_at_rest: bool) -> ServeArgs {
         multi: false,
         config: None,
         master_config: None,
+        sinks_config: None,
         flush_threshold: None,
         durability: None,
         max_partitions: None,

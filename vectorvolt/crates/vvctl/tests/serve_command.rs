@@ -20,6 +20,7 @@ fn make_args(addr: &str) -> ServeArgs {
         multi: false,
         config: None,
         master_config: None,
+        sinks_config: None,
         flush_threshold: None,
         durability: None,
         max_partitions: None,

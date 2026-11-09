@@ -11,16 +11,37 @@
  */
 
 import net from "node:net";
+import tls from "node:tls";
+import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import {
   HEADER_SIZE, Op, ProtocolError, NotSupportedError, ServerError, Reader, Writer,
   decodeHeader, encodeFrame, parseError, verifyPayload,
 } from "./wire.js";
 import type { Frame } from "./wire.js";
+import { OpsBase } from "./ops.js";
+import type { Row } from "./ops.js";
 
-export type Row = bigint[];
+export type { Row };
 
-export class VectorVoltClient {
+/**
+ * TLS settings (the server's net listener speaks TLS directly on its TCP port,
+ * vectorvolt-net/src/tls.rs). Plain TCP is the default; pass this as the third
+ * constructor argument to enable TLS.
+ */
+export interface TlsOptions {
+  /** PEM file with the CA / pinned server certificate to trust (default: Node's built-in CAs). */
+  caFile?: string;
+  /** Name verified against the server certificate and sent as SNI (default: the host). */
+  serverName?: string;
+  /** Disable certificate verification (testing only). Off by default. */
+  insecureSkipVerify?: boolean;
+  /** PEM client certificate + key for mTLS; both or neither. */
+  certFile?: string;
+  keyFile?: string;
+}
+
+export class VectorVoltClient extends OpsBase {
   private socket: net.Socket | null = null;
   private nextId = 1n;
   private buf: Buffer = Buffer.alloc(0);
@@ -29,20 +50,52 @@ export class VectorVoltClient {
   private queue: Promise<unknown> = Promise.resolve();
   private host: string;
   private port: number;
+  private tlsOpts: TlsOptions | undefined;
 
-  constructor(host: string, port: number) {
+  constructor(host: string, port: number, tlsOptions?: TlsOptions) {
+    super();
+    if (tlsOptions && !tlsOptions.certFile !== !tlsOptions.keyFile) {
+      throw new Error("certFile and keyFile must be given together");
+    }
     this.host = host;
     this.port = port;
+    this.tlsOpts = tlsOptions;
+  }
+
+  private openSocket(onConnect: () => void, onError: (e: Error) => void): net.Socket {
+    const o = this.tlsOpts;
+    if (!o) {
+      const sock = new net.Socket();
+      sock.setNoDelay(true);
+      sock.once("error", onError);
+      sock.connect(this.port, this.host, onConnect);
+      return sock;
+    }
+    const opts: tls.ConnectionOptions = {
+      host: this.host,
+      port: this.port,
+      minVersion: "TLSv1.2",
+      rejectUnauthorized: !o.insecureSkipVerify,
+    };
+    // Node warns when an IP address is used as SNI; an IP host is verified against IP SANs.
+    const name = o.serverName ?? (net.isIP(this.host) ? undefined : this.host);
+    if (name) opts.servername = name;
+    if (o.caFile) opts.ca = readFileSync(o.caFile);
+    if (o.certFile && o.keyFile) {
+      opts.cert = readFileSync(o.certFile);
+      opts.key = readFileSync(o.keyFile);
+    }
+    const sock = tls.connect(opts, onConnect);
+    sock.setNoDelay(true);
+    sock.once("error", onError);
+    return sock;
   }
 
   // -- lifecycle -------------------------------------------------------------
 
   connect(auth?: { keyId: string; secret: Uint8Array }): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const sock = new net.Socket();
-      sock.setNoDelay(true);
-      sock.once("error", reject);
-      sock.connect(this.port, this.host, () => {
+      const sock: net.Socket = this.openSocket(() => {
         sock.removeListener("error", reject);
         this.socket = sock;
         this.nextId = 1n;
@@ -56,7 +109,7 @@ export class VectorVoltClient {
         sock.on("error", fail);
         sock.on("close", () => fail(new Error("Connection closed by server")));
         resolve();
-      });
+      }, reject);
     }).then(async () => {
       if (auth) {
         try {
@@ -95,7 +148,7 @@ export class VectorVoltClient {
   }
 
   /** Queue one request/response exchange; resolves with the checked frame. */
-  private call(opcode: number, payload: Uint8Array, ...expect: number[]): Promise<Frame> {
+  protected call(opcode: number, payload: Uint8Array, ...expect: number[]): Promise<Frame> {
     const run = async (): Promise<Frame> => {
       if (!this.socket) throw new Error("Not connected -- call connect() first");
       const id = this.nextId;

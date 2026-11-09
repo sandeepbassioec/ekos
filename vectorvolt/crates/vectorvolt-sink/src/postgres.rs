@@ -8,16 +8,17 @@
 //! col1 BIGINT, ...`. `u64` values above `i64::MAX` are rejected with an
 //! error rather than silently wrapped.
 //!
-//! Connections use `NoTls` (pure Rust, no native TLS dependency); run behind a
-//! trusted network or a TLS-terminating proxy.
+//! Connections are plaintext by default; set [`PostgresSinkConfig::tls`] to
+//! `require` or `verify-full` for pure-Rust rustls TLS (see [`crate::pg_tls`]).
 
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio_postgres::{Client, NoTls, types::ToSql};
+use tokio_postgres::{Client, NoTls, config::SslMode, types::ToSql};
 
 use crate::{
     error::{SinkError, SinkResult},
+    pg_tls::{PgTlsMode, PostgresTlsConfig},
     sink::{Sink, SinkEvent, SinkEventKind},
 };
 
@@ -31,6 +32,8 @@ pub struct PostgresSinkConfig {
     /// Auto-flush once this many events are buffered (min 1).
     pub batch_size: usize,
     pub connect_timeout: Duration,
+    /// TLS options (default: disabled / plaintext).
+    pub tls: PostgresTlsConfig,
 }
 
 impl PostgresSinkConfig {
@@ -40,6 +43,7 @@ impl PostgresSinkConfig {
             table: table.into(),
             batch_size: 100,
             connect_timeout: Duration::from_secs(5),
+            tls: PostgresTlsConfig::default(),
         }
     }
 }
@@ -118,18 +122,44 @@ impl PostgresSink {
     /// Connect to Postgres. Fails if the server is unreachable.
     pub async fn connect(name: &str, cfg: PostgresSinkConfig) -> SinkResult<Self> {
         validate_table(&cfg.table)?;
-        let (client, connection) = tokio::time::timeout(
-            cfg.connect_timeout,
-            tokio_postgres::connect(&cfg.conn_str, NoTls),
-        )
-        .await
-        .map_err(|_| SinkError::Io("postgres connect: timed out".into()))?
-        .map_err(|e| SinkError::Io(format!("postgres connect: {e}")))?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("postgres sink connection error: {e}");
+        let mut pg_cfg: tokio_postgres::Config = cfg
+            .conn_str
+            .parse()
+            .map_err(|e| SinkError::Io(format!("postgres connect: bad connection string: {e}")))?;
+        let connector = cfg.tls.connector()?;
+        if connector.is_some() {
+            pg_cfg.ssl_mode(SslMode::Require);
+        } else if cfg.tls.mode == PgTlsMode::Disable {
+            pg_cfg.ssl_mode(SslMode::Disable);
+        }
+        let timeout = cfg.connect_timeout;
+        let to_err = |e: tokio_postgres::Error| SinkError::Io(format!("postgres connect: {e}"));
+        let client = match connector {
+            Some(tls) => {
+                let (client, connection) = tokio::time::timeout(timeout, pg_cfg.connect(tls))
+                    .await
+                    .map_err(|_| SinkError::Io("postgres connect: timed out".into()))?
+                    .map_err(to_err)?;
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        eprintln!("postgres sink connection error: {e}");
+                    }
+                });
+                client
             }
-        });
+            None => {
+                let (client, connection) = tokio::time::timeout(timeout, pg_cfg.connect(NoTls))
+                    .await
+                    .map_err(|_| SinkError::Io("postgres connect: timed out".into()))?
+                    .map_err(to_err)?;
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        eprintln!("postgres sink connection error: {e}");
+                    }
+                });
+                client
+            }
+        };
         Ok(Self {
             name: name.to_string(),
             table: cfg.table,
