@@ -901,7 +901,7 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 | L6 | CDC reverse ingestion; backfill; migration demo | 7.5.4/7.5.5 | L | ⬜ |
 | L7 | Reference Java app testbed | 7.6 | L | ⬜ |
 | L8 | Full suite green on Linux CI | — | M | 🟡 |
-| L9 | Privileged Linux CI job for root/network tests | — | S | ⬜ |
+| L9 | Privileged Linux CI job for root/network tests | — | S | 🟡 The XDP root job exists (veth pair, `sudo`; PRs #657/#658). Other root/network tests are not in it yet. |
 | L10 | Benchmarks with methodology + comparisons | 7.8 | M | ⬜ |
 
 ### M — Build, CI, release
@@ -950,6 +950,28 @@ Source: *VectorVolt VXL Language Specification v1.0* and *VXL Requirements & Arc
 
 Order: O1 → O2 → O3/O4 → O5 + O6 → O7 → O10 → O9 → O8. Deferred, per the spec: LLVM backend, JIT, hot-swap, SIMD specialization, full IDE tooling.
 
+### P — Open findings from batches A–F and the user guide (logged 2026-11-10)
+
+These came up while finishing batches D–F and writing `C:\VectorVolt\VectorVolt_Guide.md`, and no other row tracked them. Hardware items found the same way are H17–H25. Pick any time; S items first.
+
+| # | Finding | Found in | Size | Status |
+|---|---|---|---|---|
+| P1 | pgwire leftovers from D2: no SCRAM-SHA-256-PLUS (channel binding); text parameters containing `'` are refused instead of bound safely; `Describe` finds columns by running the query; every result column is reported as `text`, so strict drivers (JDBC, npgsql) see wrong types. | D2 | M | ⬜ |
+| P2 | The native binary protocol (`vectorvolt-net/src/protocol.rs`) has no SQL opcode, so the Python/Go/TS/Rust SDKs can't run SQL (`query`/`execute` raise not-supported). Rows are lists of `u64` only. Add a SQL request/response opcode with typed values, and update the SDKs and their golden tests. | E12, E18 | L | ⬜ |
+| P3 | Python SDK default port is 5050, but the server listens on 5995. Fix the default and check the Go/TS defaults. | Guide 8.3 | S | ⬜ |
+| P4 | `vvctl server stop`, `vvctl disconnect` and `vvctl projection` still fail with "not implemented": there is no opcode or endpoint for them. Implement them, or remove the commands. | E4 | M | ⬜ |
+| P5 | Control API cluster endpoints (`/nodes`, `/shards`, `/snapshot` cluster parts) still return 501 from E3, although batch F now has real membership, shards and Raft. Back them with the F4/F7 node APIs. | E3, F4, F7 | M | ⬜ |
+| P6 | XDP was verified on a veth pair only (generic/copy mode). Verify on a physical NIC in native driver mode with zero-copy (e.g. ixgbe/i40e/mlx5; on EC2, ENA's XDP support), and record throughput and latency vs TCP. Depends on H17 (server must use XDP first). | E15 | M | ⬜ |
+| P7 | Versionstamps for WAL frames older than the in-memory stamp ring (after a primary restart) are replicated without the primary's stamp, and the follower stamps them locally. Persist the stamp with the WAL record (or a stamp sidecar index) so it survives restart. | F8 | M | ⬜ |
+| P8 | Failover, replication and shard moves are tested in-process and as processes on one host only. Add a multi-machine test (e.g. 3 VMs, real network delay and loss), including a network partition. | F6, F7 | M | ⬜ |
+| P9 | Some code writes `_txn_intent.log` into the current working directory (seen under `crates/vvctl` after tests; now gitignored). Find the default path in the txn intent log and make it relative to the data dir. | F (tests) | S | ⬜ |
+| P10 | Isolation levels: READ COMMITTED vs REPEATABLE READ (vs SERIALIZABLE, if accepted) aren't confirmed to behave differently in SQL. Specify them, and add anomaly tests (dirty read, non-repeatable read, phantom, write skew). | Guide 8.4 | M | ⬜ |
+| P11 | Master config keys `network.bind_addr` and `network.max_connections` are documented in `serve.rs` as applied but aren't used by `bind()`. Apply them or fix the doc. Also fix the stale `--encrypt-at-rest` help comment. | Guide 8.3 | S | ⬜ |
+| P12 | Encryption-at-rest residuals:<br>• key rotation re-encrypts only when a table is compacted or opened;<br>• plaintext legacy prefixes are still accepted unauthenticated, for migration;<br>• forging the table-marker frame, or rolling back to exactly the marker, needs a keyed frame chain (A12 residual).<br><br>Add background re-encryption, a cutoff that rejects plaintext after migration, and the keyed chain. | A12, C | M | ⬜ |
+| P13 | Sinks:<br>• the Redis stream sink and cache use the synchronous `redis` client (`tokio-comp` off), so they block an async worker;<br>• single-table mode names events' table `default`;<br>• the Postgres sink can't map non-`u64` columns.<br><br>Switch to async Redis, use the real table name, and add typed columns (with P2). | E8, E9, E17 | M | ⬜ |
+| P14 | Confirm and enable CPU crypto instructions: check that AES-GCM, SHA3 and CRC dependencies use AES-NI/PCLMUL/SHA extensions (target features and the crates' feature flags) on x86-64 and ARMv8, and benchmark them. | Guide 8.4 | S | ⬜ |
+| P15 | CI health: `Test & Lint` fails because the linker runs out of memory on the 2-vCPU runner (fix in PR #659, not yet confirmed green). `cargo fmt --all` (write mode) fails on Windows with os error 206 (command line too long); add a script that formats per crate with the right edition. | CI, tooling | S | 🟡 |
+
 ### Gap register log
 
 - 2026-10-31: register created. PR #647 (PP-01…13, 20–22, 25, 31, 32 + CI green-up) precedes batch A.
@@ -964,4 +986,5 @@ Order: O1 → O2 → O3/O4 → O5 + O6 → O7 → O10 → O9 → O8. Deferred, p
 - 2026-11-09: **Batch E final** (branch `feat/gaps-batch-e4`): E15 ✅ verified on real Linux; E17 leftovers closed. **Batch E has no open items.**
 - 2026-11-10: Added batch **O — VXL extension language**, scheduled after batch N. Hard rule: VXL never runs in the write hot path.
 - 2026-11-10: Added H17–H25: hardware features that exist in code but are not used by the running engine (XDP transport, io_uring WAL, O_DIRECT, `hal.*` config, `harden()`, CRC-32C, graph SIMD, TPM, HAL timer/arena/wait).
+- 2026-11-10: Added batch **P** (P1–P15): open findings from batches A–F and the user guide that no row tracked. L9 is now 🟡.
 - 2026-11-10: **Batch F complete** (branch `feat/gaps-batch-f`): F1–F8 ✅. Raft, SWIM, replication, failover (0.34 s), shards, versionstamps and sagas are wired into `vvctl serve`.
