@@ -1,6 +1,7 @@
 pub mod config;
 pub mod epoch;
 pub mod gossip;
+pub mod gossip_net;
 pub mod membership;
 pub mod node;
 pub mod node_runtime;
@@ -9,3 +10,4 @@ pub mod raft;
 pub mod ring;
 pub mod shard;
 pub mod swim;
+pub mod transport;

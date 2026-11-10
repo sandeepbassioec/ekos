@@ -13,7 +13,18 @@
 //!   handled in this layer.
 //! - Reads from a follower reflect only what has been applied so far.
 //!
-//! ## Example
+//! ## Networked WAL shipping
+//!
+//! [`ReplicationServer`] (leader) streams committed WAL frames over TCP to
+//! [`ReplicationClient`]s (followers), CRC-framed, starting from each
+//! follower's last applied LSN; a follower that is new, ahead, or older than
+//! the leader's retained WAL receives a snapshot first. Followers ack applied
+//! and durable LSNs; [`ReplicationMode`] decides whether a writer waits
+//! (`wait_for_replication`), and a missing ack is an [`ReplicationError::AckTimeout`].
+//! [`RoleCell`] holds the switchable [`ReplicationRole`] a later election step
+//! can flip to promote a follower.
+//!
+//! ## Example (in-process)
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -40,9 +51,23 @@
 //! assert_eq!(row.values[1], 42);
 //! ```
 
+mod client;
+mod config;
+mod error;
 mod follower;
 mod frame;
 mod leader;
+mod metrics;
+mod proto;
+mod server;
+mod wal_tail;
+
+pub use client::{load_position, save_position, ReplicationClient, POSITION_FILE};
+pub use config::{ReplicationConfig, ReplicationMode, ReplicationRole, RoleCell};
+pub use error::{ReplResult, ReplicationError};
+pub use metrics::{MetricsSnapshot, ReplicationMetrics};
+pub use proto::{Message, WireFrame};
+pub use server::{FollowerInfo, ReplicationServer};
 
 pub use follower::Follower;
 pub use frame::{ReplicaMutation, ReplicationFrame};

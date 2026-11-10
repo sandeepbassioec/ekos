@@ -40,6 +40,10 @@ use vectorvolt_net::tls::ServerTlsConfig;
 use vectorvolt_net::{AuthConfig, Scope, Secret, Server, ServerConfig};
 use vectorvolt_reader::auth::AuthMethod;
 use vectorvolt_reader::server::{PgConfig, PgServer};
+use vectorvolt_replication::{
+    ReplicationClient, ReplicationConfig, ReplicationMode, ReplicationRole, ReplicationServer,
+    RoleCell,
+};
 
 const SCHEMA_FILE: &str = "schema.txt";
 
@@ -262,26 +266,21 @@ pub struct ServeArgs {
     #[arg(long)]
     pub pgwire_port: Option<u16>,
 
-    /// Start a `vectorvolt-cluster` node bound to this address (gossip/Raft
-    /// membership listener) and expose its live status over
-    /// `--cluster-status-port` (Gap #3).
-    ///
-    /// NOTE: `vectorvolt-cluster` does not yet implement wire-level gossip
-    /// transport (see `vectorvolt_cluster::node_runtime` docs), so this
-    /// starts a real, observable node with real membership/gossip state, but
-    /// `--cluster-seeds` peers are recorded as configured-only and are not
-    /// yet reachable over the network. Disabled if omitted.
-    #[arg(long)]
+    /// Start a `vectorvolt-cluster` node bound to this address (UDP SWIM
+    /// gossip) and expose its live membership and control endpoint on
+    /// `--cluster-status-port`. Peers are discovered by joining through
+    /// `--cluster-seeds`. Disabled if omitted.
     pub cluster_bind: Option<SocketAddr>,
 
-    /// Comma-separated seed peer addresses to record for this cluster node
-    /// (see `--cluster-bind`). Purely informational until gossip transport
-    /// exists.
+    /// Comma-separated seed peer addresses (`host:port` of other nodes'
+    /// `--cluster-bind`). The node joins the cluster through the first seed
+    /// that answers, retrying with backoff in the background.
     #[arg(long, value_delimiter = ',')]
     pub cluster_seeds: Vec<SocketAddr>,
 
-    /// Explicit node id (UUID) for this cluster node. Auto-generated if
-    /// omitted.
+    /// Explicit node id (UUID) for this cluster node. Defaults to the node id
+    /// in `<dir>/cluster_identity.json` (written by `vvctl cluster init`),
+    /// else auto-generated.
     #[arg(long)]
     pub cluster_node_id: Option<String>,
 
@@ -293,6 +292,50 @@ pub struct ServeArgs {
     /// Listener TLS / pgwire options (D1, D3, D4).
     #[command(flatten)]
     pub listener: ListenerArgs,
+
+    /// WAL-shipping replication options (F5).
+    #[command(flatten)]
+    pub replication: ReplicationArgs,
+}
+
+/// WAL-shipping replication flags (`vectorvolt-replication`).
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationArgs {
+    /// Replication role: `leader` streams committed WAL frames to followers
+    /// (needs `--replication-listen`); `follower` pulls them from
+    /// `--replicate-from` and is read-only. Single-table mode only.
+    #[arg(long)]
+    pub replication_role: Option<ReplicationRole>,
+
+    /// Leader address to replicate from (`host:port`). Follower only.
+    #[arg(long)]
+    pub replicate_from: Option<String>,
+
+    /// Address the leader accepts follower connections on. Leader only.
+    #[arg(long)]
+    pub replication_listen: Option<SocketAddr>,
+
+    /// When a write counts as replicated: `async` (never wait), `semi-sync`
+    /// (one follower applied) or `sync` (replication-factor - 1 followers
+    /// durably applied, else the write errors after the ack timeout).
+    #[arg(long, default_value = "async")]
+    pub replication_mode: ReplicationMode,
+
+    /// Total copies of the data including the leader.
+    #[arg(long, default_value_t = 2)]
+    pub replication_factor: usize,
+}
+
+impl Default for ReplicationArgs {
+    fn default() -> Self {
+        Self {
+            replication_role: None,
+            replicate_from: None,
+            replication_listen: None,
+            replication_mode: ReplicationMode::Async,
+            replication_factor: 2,
+        }
+    }
 }
 
 /// Shared listener options: mutual TLS for every listener, and pgwire bind /
@@ -478,6 +521,7 @@ impl Default for ServeArgs {
             cluster_node_id: None,
             cluster_status_port: 7900,
             listener: ListenerArgs::default(),
+            replication: ReplicationArgs::default(),
         }
     }
 }
@@ -1262,15 +1306,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eprintln!("  pgwire    : disabled (use --pgwire-port to enable)");
     }
 
-    // ── Cluster node (optional, Gap #3) ──────────────────────────────────────
-    // Starts a real vectorvolt-cluster node (NodeId + MembershipList +
-    // GossipEngine) alongside this single-node server so its state is
-    // observable via GET /cluster/status. See
-    // vectorvolt_cluster::node_runtime for what is and is not real here:
-    // membership/gossip data structures are the genuine ones exercised by
-    // vectorvolt-cluster's own tests, but there is no wire-level gossip
-    // transport yet, so --cluster-seeds peers are recorded as
-    // configured-only, not claimed as discovered/reachable.
+    // ── Cluster node (optional) ──────────────────────────────────────────────
+    // Real SWIM gossip over UDP on --cluster-bind, joining via
+    // --cluster-seeds; membership and the vvctl control path (status /
+    // members / join / leave) are served over HTTP on --cluster-status-port.
     if let Some(cluster_bind) = args.cluster_bind {
         let node_id = match args.cluster_node_id.as_deref() {
             Some(s) => match uuid::Uuid::parse_str(s) {
@@ -1280,11 +1319,11 @@ pub fn run(args: ServeArgs) -> Result<()> {
                     None
                 }
             },
-            None => None,
+            None => super::cluster_cmd::load_identity(&args.dir).map(|i| NodeId(i.node_id)),
         };
         let cluster_node = ClusterNode::start(cluster_bind, args.cluster_seeds.clone(), node_id);
         eprintln!(
-            "  cluster   : node {} on {} ({} configured seed(s))",
+            "  cluster   : node {} on {} ({} seed(s))",
             cluster_node.status().node_id,
             cluster_bind,
             args.cluster_seeds.len()
@@ -1295,6 +1334,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .spawn(move || {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async move {
+                    if let Err(e) = cluster_node.start_gossip(Default::default()).await {
+                        eprintln!("  cluster   : gossip bind failed on {cluster_bind}: {e}");
+                    }
                     eprintln!("  cluster   : status http://127.0.0.1:{status_port}/cluster/status");
                     ClusterStatusServer::new(cluster_node)
                         .serve(status_port)
@@ -1305,6 +1347,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
     } else {
         eprintln!("  cluster   : disabled (use --cluster-bind to enable)");
     }
+
+    // ── WAL-shipping replication (F5) ────────────────────────────────────────
+    let _replication = start_replication(&args, engine.as_ref(), master_key.as_ref())?;
 
     // ── Prometheus metrics endpoint (VV-OBS-005) ─────────────────────────────
     if args.metrics_port > 0 {
@@ -1389,6 +1434,148 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     server.serve().with_context(|| "server error")?;
     Ok(())
+}
+
+/// Live replication endpoint started by `--replication-role`. Dropping it
+/// stops replication; it owns the runtime its tasks run on.
+pub struct ReplicationHandle {
+    _rt: tokio::runtime::Runtime,
+    pub server: Option<Arc<ReplicationServer>>,
+    pub client: Option<Arc<ReplicationClient>>,
+}
+
+/// Validate the replication flags and start the leader listener or follower
+/// pull loop. Returns `Ok(None)` when replication is not requested.
+pub fn start_replication(
+    args: &ServeArgs,
+    engine: Option<&Arc<TableEngine>>,
+    key: Option<&Arc<KeyStore>>,
+) -> Result<Option<ReplicationHandle>> {
+    let r = &args.replication;
+    let Some(role) = r.replication_role else {
+        if r.replicate_from.is_some() || r.replication_listen.is_some() {
+            bail!("--replicate-from / --replication-listen require --replication-role");
+        }
+        eprintln!("  replication: disabled (use --replication-role to enable)");
+        return Ok(None);
+    };
+    if role == ReplicationRole::Standalone {
+        return Ok(None);
+    }
+    let engine = match (args.multi, engine) {
+        (false, Some(e)) => Arc::clone(e),
+        _ => bail!("--replication-role supports single-table mode only (not --multi)"),
+    };
+    let cfg = ReplicationConfig::default()
+        .with_mode(r.replication_mode)
+        .with_replication_factor(r.replication_factor);
+    cfg.validate()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("replication")
+        .enable_all()
+        .build()
+        .with_context(|| "build replication runtime")?;
+    let cell = RoleCell::new(role);
+    match role {
+        ReplicationRole::Leader => {
+            if r.replicate_from.is_some() {
+                bail!("--replicate-from is for followers; a leader uses --replication-listen");
+            }
+            let listen = r.replication_listen.ok_or_else(|| {
+                anyhow::anyhow!("--replication-role leader needs --replication-listen")
+            })?;
+            let wal_dir = args.dir.join("wal");
+            let server = rt
+                .block_on(ReplicationServer::start(engine, wal_dir, cfg, cell, listen))
+                .with_context(|| format!("start replication listener on {listen}"))?;
+            eprintln!(
+                "  replication: leader on {} ({}, factor {})",
+                server.local_addr(),
+                r.replication_mode,
+                r.replication_factor
+            );
+            Ok(Some(ReplicationHandle {
+                _rt: rt,
+                server: Some(server),
+                client: None,
+            }))
+        }
+        ReplicationRole::Follower => {
+            if r.replication_listen.is_some() {
+                bail!("--replication-listen is for leaders; a follower uses --replicate-from");
+            }
+            let from = r.replicate_from.clone().ok_or_else(|| {
+                anyhow::anyhow!("--replication-role follower needs --replicate-from")
+            })?;
+            // A follower must not take client writes: the only credential it
+            // accepts is a read-only one.
+            if args.secret.is_none()
+                || args.key_scope != Some(KeyScope::ReadOnly)
+                || args.key_file.is_some()
+            {
+                bail!(
+                    "a replication follower is read-only: pass --secret with --key-scope \
+                     read-only (and no --key-file) so clients cannot write to it"
+                );
+            }
+            let client = {
+                let _g = rt.enter();
+                ReplicationClient::start(engine, &args.dir, key.cloned(), cfg, cell, from.clone())
+                    .with_context(|| "start replication follower")?
+            };
+            eprintln!(
+                "  replication: follower of {from} (applied lsn {}, read-only)",
+                client.applied_lsn()
+            );
+            Ok(Some(ReplicationHandle {
+                _rt: rt,
+                server: None,
+                client: Some(client),
+            }))
+        }
+        ReplicationRole::Standalone => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod replication_flag_tests {
+    use super::*;
+
+    fn args() -> ServeArgs {
+        ServeArgs {
+            dir: PathBuf::from("."),
+            ..ServeArgs::default()
+        }
+    }
+
+    #[test]
+    fn replication_is_off_by_default_and_flags_need_a_role() {
+        assert!(start_replication(&args(), None, None).unwrap().is_none());
+        let mut a = args();
+        a.replication.replicate_from = Some("127.0.0.1:1".into());
+        assert!(start_replication(&a, None, None).is_err());
+    }
+
+    #[test]
+    fn follower_must_be_read_only_and_leader_needs_a_listener() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(
+            TableEngine::open_with(vec!["pk".into()], dir.path(), EngineOptions::new(1024))
+                .unwrap(),
+        );
+        let mut a = args();
+        a.dir = dir.path().to_path_buf();
+        a.replication.replication_role = Some(ReplicationRole::Follower);
+        a.replication.replicate_from = Some("127.0.0.1:1".into());
+        let err = start_replication(&a, Some(&engine), None).err().unwrap();
+        assert!(err.to_string().contains("read-only"), "{err}");
+
+        a.replication.replication_role = Some(ReplicationRole::Leader);
+        a.replication.replicate_from = None;
+        let err = start_replication(&a, Some(&engine), None).err().unwrap();
+        assert!(err.to_string().contains("--replication-listen"), "{err}");
+    }
 }
 
 #[cfg(test)]

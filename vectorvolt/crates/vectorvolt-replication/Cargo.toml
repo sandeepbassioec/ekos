@@ -5,6 +5,12 @@ edition = "2021"
 
 [dependencies]
 vectorvolt-engine = { workspace = true }
+vectorvolt-wal = { workspace = true }
+vectorvolt-txn = { workspace = true }
+vectorvolt-crypto = { workspace = true }
+tokio = { workspace = true }
+crc32fast = { workspace = true }
+tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }

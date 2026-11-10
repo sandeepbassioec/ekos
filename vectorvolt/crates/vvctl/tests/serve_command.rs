@@ -46,6 +46,7 @@ fn make_args(addr: &str) -> ServeArgs {
         cluster_node_id: None,
         cluster_status_port: 7900,
         listener: Default::default(),
+        replication: Default::default(),
     }
 }
 

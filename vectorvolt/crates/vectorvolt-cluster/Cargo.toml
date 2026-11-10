@@ -17,6 +17,8 @@ dashmap    = "6.1"
 async-trait = "0.1"
 rand       = "0.8"
 thiserror  = { workspace = true }
+crc32fast  = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true }

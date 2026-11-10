@@ -1,7 +1,14 @@
 //! `vvctl cluster` — manage a VectorVolt cluster (VV-CLU-CLI-001..006).
 //!
-//! Commands read/write a `cluster.json` state file in the data directory.
-//! No running daemon required — operations are in-process.
+//! Two modes:
+//! - Offline (default): commands read/write `cluster.json` in the data dir.
+//! - Live (`--node host:port`, the node's `--cluster-status-port` endpoint):
+//!   `status`, `members`, `join` and `leave` talk to the running `vvctl
+//!   serve --cluster-bind` node, which reports its real SWIM membership,
+//!   joins through a seed, or gracefully leaves (broadcasting Left).
+//!
+//! `init` also writes `cluster_identity.json` (fresh cluster id + node id)
+//! which `vvctl serve` uses as its node id.
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -19,8 +26,110 @@ pub struct ClusterArgs {
     #[arg(short, long, default_value = DEFAULT_DIR)]
     pub dir: PathBuf,
 
+    /// Control endpoint of a running node (its `--cluster-status-port`).
+    /// When set, status/members/join/leave act on the live cluster.
+    #[arg(long)]
+    pub node: Option<SocketAddr>,
+
     #[command(subcommand)]
     pub command: ClusterCommand,
+}
+
+/// Cluster/node identity created by `cluster init`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClusterIdentity {
+    pub cluster_id: uuid::Uuid,
+    pub node_id: uuid::Uuid,
+    pub cluster_name: String,
+    pub created_unix_secs: u64,
+}
+
+const IDENTITY_FILE: &str = "cluster_identity.json";
+
+/// Load `<dir>/cluster_identity.json` if present and valid.
+pub fn load_identity(dir: &Path) -> Option<ClusterIdentity> {
+    let raw = std::fs::read_to_string(dir.join(IDENTITY_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Minimal HTTP/1.1 client for the node control endpoint.
+fn http(node: SocketAddr, method: &str, path: &str) -> Result<String> {
+    use std::io::{Read, Write};
+    let timeout = std::time::Duration::from_secs(10);
+    let mut s = std::net::TcpStream::connect_timeout(&node, timeout).with_context(|| {
+        format!("cannot reach cluster node at {node} (is `serve --cluster-bind` running?)")
+    })?;
+    s.set_read_timeout(Some(timeout))?;
+    let crlf = "\r\n";
+    let req =
+        format!("{method} {path} HTTP/1.1{crlf}Host: {node}{crlf}Connection: close{crlf}{crlf}");
+    s.write_all(req.as_bytes())?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw)?;
+    let (head, body) = raw
+        .split_once(&format!("{crlf}{crlf}"))
+        .unwrap_or((&raw, ""));
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    if code != 200 {
+        anyhow::bail!("node returned {code}: {}", body.trim());
+    }
+    Ok(body.to_string())
+}
+
+/// Run `cmd` against the live node; `Ok(false)` if the command is offline-only.
+fn live(node: SocketAddr, cmd: &ClusterCommand) -> Result<bool> {
+    use vectorvolt_cluster::node_runtime::{ClusterStatus, PeerInfo};
+    match cmd {
+        ClusterCommand::Status => {
+            let st: ClusterStatus = serde_json::from_str(&http(node, "GET", "/cluster/status")?)?;
+            println!("Node:     {} ({})", st.node_id, st.bind_addr);
+            println!(
+                "Members:  {} total ({} alive, {} suspect, {} dead, {} left)",
+                st.membership_size, st.alive, st.suspect, st.dead, st.left
+            );
+            let gossip = if st.gossip_active {
+                "active"
+            } else {
+                "not started"
+            };
+            println!("Gossip:   {gossip}");
+            println!("Seeds:    {}", st.configured_seeds.join(", "));
+            Ok(true)
+        }
+        ClusterCommand::Nodes | ClusterCommand::Members => {
+            let ms: Vec<PeerInfo> = serde_json::from_str(&http(node, "GET", "/cluster/members")?)?;
+            println!(
+                "{:<38} {:<22} {:<10} INCARNATION",
+                "NODE-ID", "ADDRESS", "STATE"
+            );
+            println!("{}", "-".repeat(80));
+            for m in ms {
+                println!(
+                    "{:<38} {:<22} {:<10} {}",
+                    m.node_id,
+                    m.addr,
+                    m.state.to_lowercase(),
+                    m.incarnation
+                );
+            }
+            Ok(true)
+        }
+        ClusterCommand::Join { addr } => {
+            http(node, "POST", &format!("/cluster/join?seed={addr}"))?;
+            println!("Node {node} joined the cluster via seed {addr}.");
+            Ok(true)
+        }
+        ClusterCommand::Leave { .. } => {
+            http(node, "POST", "/cluster/leave")?;
+            println!("Node {node} left the cluster (Left broadcast).");
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[derive(Subcommand)]
@@ -41,6 +150,9 @@ pub enum ClusterCommand {
     /// List all nodes in the cluster.
     Nodes,
 
+    /// List cluster members (live with `--node`; same as `nodes` offline).
+    Members,
+
     /// Show overall cluster health (alive / suspect / dead counts).
     Status,
 
@@ -51,11 +163,12 @@ pub enum ClusterCommand {
         addr: SocketAddr,
     },
 
-    /// Mark a node as Left by its address.
+    /// Mark a node as Left by its address (offline), or gracefully make the
+    /// node given by `--node` leave the live cluster.
     Leave {
-        /// Node address to remove.
+        /// Node address to remove (required offline).
         #[arg(long)]
-        addr: SocketAddr,
+        addr: Option<SocketAddr>,
     },
 
     /// Show vnode ring ownership summary.
@@ -89,6 +202,11 @@ fn save(dir: &Path, cfg: &ClusterConfig) -> Result<()> {
 }
 
 pub fn run(args: ClusterArgs) -> Result<()> {
+    if let Some(node) = args.node
+        && live(node, &args.command)?
+    {
+        return Ok(());
+    }
     match args.command {
         ClusterCommand::Init {
             name,
@@ -99,10 +217,29 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             cfg.replication_factor = replication_factor;
             cfg.vnode_count = vnode_count;
             save(&args.dir, &cfg)?;
-            println!("Initialized cluster '{}' in {}", name, args.dir.display());
+            let ident = ClusterIdentity {
+                cluster_id: uuid::Uuid::new_v4(),
+                node_id: uuid::Uuid::new_v4(),
+                cluster_name: name.clone(),
+                created_unix_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            };
+            std::fs::write(
+                args.dir.join(IDENTITY_FILE),
+                serde_json::to_string_pretty(&ident)?,
+            )?;
+            println!(
+                "Initialized cluster '{}' (id {}, node {}) in {}",
+                name,
+                ident.cluster_id,
+                ident.node_id,
+                args.dir.display()
+            );
         }
 
-        ClusterCommand::Nodes => {
+        ClusterCommand::Nodes | ClusterCommand::Members => {
             let cfg = load(&args.dir)?;
             if cfg.nodes.is_empty() {
                 println!("No nodes. Use `vvctl cluster join --addr <host:port>` to add one.");
@@ -189,6 +326,9 @@ pub fn run(args: ClusterArgs) -> Result<()> {
         }
 
         ClusterCommand::Leave { addr } => {
+            let addr = addr.context(
+                "--addr is required offline (use --node <host:port> to leave a live cluster)",
+            )?;
             let mut cfg = load(&args.dir)?;
             let mut found = false;
             for n in cfg.nodes.iter_mut() {
