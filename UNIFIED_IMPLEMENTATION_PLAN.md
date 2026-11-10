@@ -815,6 +815,15 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 | H14 | Materialized views sync vs eventual; survive restart | 5.7, D-08 | M | ⏸ |
 | H15 | TSC telemetry ring + shadow exporter | 6.10 | M | ⬜ |
 | H16 | DPDK, RIO, RDMA, flow steering, PTP, cloud adapters | 4.2–4.9 | L | ⬜ |
+| H17 | Built but unwired (found 2026-11-10 writing `VectorVolt_Guide.md`): `vvctl serve --transport xdp` builds `TransportKind::Xdp`, but `vectorvolt-net` `Server` stores `config.transport` and never reads it, so every connection is TCP. Make the accept/IO loop use `vectorvolt-xdp` when set; fail startup if XDP can't bind. Verify on Linux, which E15 did for the XDP crate. | 4.6, E15 | M | ⬜ |
+| H18 | io_uring WAL writer (`vectorvolt-wal/src/uring_writer.rs`) is used only by `vvctl linux uring-bench` and tests; the engine WAL uses the plain `WalWriter`. Wire it behind a config flag on Linux 5.6+ with a fallback to `WalWriter`. Prove crash durability matches before making it default. | 2.x | M | ⬜ |
+| H19 | O_DIRECT / tiered writer is used only by `vvctl linux direct-write`. Wire it, or drop it, for segments and SSTs. Fix the alignment: the code uses 512 B, many NVMe drives need 4096 B. | 3.x | M | ⬜ |
+| H20 | `hal.*` config (pinning, NUMA, huge pages, wait strategy) is parsed but not applied. Apply it at startup to the shard writers, WAL thread and net loop: affinity, NUMA-local allocation, huge-page arenas, and `WaitStrategy` in the ring buffer. This is the wiring half of H1–H3/H5. | 1.4/1.5 | M | ⬜ |
+| H21 | Process hardening `harden()` (`vectorvolt-crypto/src/hardening.rs`: drop capabilities, `PR_SET_NO_NEW_PRIVS`, securebits) is never called. Call it after the listeners bind (after XDP setup, which needs CAP_BPF/CAP_NET_ADMIN), with a `--no-harden` escape hatch. | 4.11 | S | ⬜ |
+| H22 | Hardware CRC-32C (`hal/src/simd`, SSE4.2) is unused; WAL, wire and `.vvsst` frames use IEEE CRC-32 (`crc32fast`). Decide: switch new formats to CRC-32C with a version byte and keep reading old frames, or remove it. | E14 | M | ⬜ |
+| H23 | Graph "simd" paths are scalar, and there is no AVX-512/NEON (see H4). Either vectorize them with runtime dispatch or rename them. | 1.6 | S | ⬜ |
+| H24 | TPM key sealing defaults to a stub (`vectorvolt-tpm` without the `tpm` feature returns `NotSupported`), and nothing has been run on a real TPM 2.0. Build with the feature on Linux CI and test against `swtpm`. Remove the env-var handoff of the unsealed key. | 4.x | M | ⬜ |
+| H25 | HAL cycle timer (RDTSC), bump arena and wait strategies are used only by `vvctl bench/hal/tune`. Adopt them where they help: timer in telemetry (H15), arena on the hot path (H2), wait strategy (H20). Otherwise mark them tooling-only. | 1.3, 6.10 | S | ⬜ |
 
 ### I — Config, S22, S23
 
@@ -931,3 +940,4 @@ Order: O1 → O2 → O3/O4 → O5 + O6 → O7 → O10 → O9 → O8. Deferred, p
 - 2026-11-09: **Batch E follow-ups** (branch `feat/gaps-batch-e3`): E16–E18 ✅; E15 (XDP on real Linux) deferred until a Linux machine is available.
 - 2026-11-09: **Batch E final** (branch `feat/gaps-batch-e4`): E15 ✅ verified on real Linux; E17 leftovers closed. **Batch E has no open items.**
 - 2026-11-10: Added batch **O — VXL extension language**, scheduled after batch N. Hard rule: VXL never runs in the write hot path.
+- 2026-11-10: Added H17–H25: hardware features that exist in code but are not used by the running engine (XDP transport, io_uring WAL, O_DIRECT, `hal.*` config, `harden()`, CRC-32C, graph SIMD, TPM, HAL timer/arena/wait).
