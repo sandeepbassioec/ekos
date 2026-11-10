@@ -1,6 +1,7 @@
 //! Async driver binding a [`RaftNode`] to a [`RaftTransport`].
 
 use super::node::{Outbound, RaftError, RaftNode, StateMachine, Status};
+use crate::node::NodeId;
 use crate::transport::RaftTransport;
 use std::io;
 use std::sync::Arc;
@@ -12,6 +13,14 @@ enum Cmd {
     Propose(Vec<u8>, oneshot::Sender<Result<u64, RaftError>>),
     Status(oneshot::Sender<Status>),
     Snapshot(oneshot::Sender<Result<bool, RaftError>>),
+    Member(MemberOp, NodeId, oneshot::Sender<Result<u64, RaftError>>),
+}
+
+#[derive(Clone, Copy)]
+enum MemberOp {
+    AddLearner,
+    Promote,
+    Remove,
 }
 
 /// Handle to a running Raft node task.
@@ -36,6 +45,32 @@ impl RaftHandle {
         let (tx, rx) = oneshot::channel();
         self.tx.send(Cmd::Status(tx)).await.ok()?;
         rx.await.ok()
+    }
+
+    async fn member(&self, op: MemberOp, id: NodeId) -> Result<u64, RaftError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Member(op, id, tx))
+            .await
+            .map_err(|_| closed())?;
+        rx.await.map_err(|_| closed())?
+    }
+
+    /// Leader-only: add `id` as a non-voting learner; the leader promotes it to
+    /// voter automatically once it has caught up. Returns the config entry index.
+    pub async fn add_server(&self, id: NodeId) -> Result<u64, RaftError> {
+        self.member(MemberOp::AddLearner, id).await
+    }
+
+    /// Leader-only: explicitly promote a caught-up learner to voter.
+    pub async fn promote_server(&self, id: NodeId) -> Result<u64, RaftError> {
+        self.member(MemberOp::Promote, id).await
+    }
+
+    /// Leader-only: remove a server (possibly the leader itself, which then
+    /// steps down once the change commits).
+    pub async fn remove_server(&self, id: NodeId) -> Result<u64, RaftError> {
+        self.member(MemberOp::Remove, id).await
     }
 
     pub async fn snapshot(&self) -> Result<bool, RaftError> {
@@ -90,6 +125,18 @@ where
                         Err(e @ RaftError::Io(_)) => { let _ = reply.send(Err(closed())); Err(e) }
                         Err(e) => { let _ = reply.send(Err(e)); Ok(Vec::new()) }
                     },
+                    Some(Cmd::Member(op, id, reply)) => {
+                        let r = match op {
+                            MemberOp::AddLearner => node.add_learner(id),
+                            MemberOp::Promote => node.promote(id),
+                            MemberOp::Remove => node.remove_server(id),
+                        };
+                        match r {
+                            Ok((idx, out)) => { let _ = reply.send(Ok(idx)); Ok(out) }
+                            Err(e @ RaftError::Io(_)) => { let _ = reply.send(Err(closed())); Err(e) }
+                            Err(e) => { let _ = reply.send(Err(e)); Ok(Vec::new()) }
+                        }
+                    }
                     Some(Cmd::Status(reply)) => { let _ = reply.send(node.status()); Ok(Vec::new()) }
                     Some(Cmd::Snapshot(reply)) => match node.take_snapshot() {
                         Ok(b) => { let _ = reply.send(Ok(b)); Ok(Vec::new()) }

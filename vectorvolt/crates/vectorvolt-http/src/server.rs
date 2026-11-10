@@ -32,7 +32,14 @@ pub struct AppState {
     /// When `Some`, every non-observability request must carry
     /// `Authorization: Bearer <token>`.
     pub api_token: Option<String>,
+    /// Write fence (F6): `Err(msg)` rejects a mutating request with 503.
+    pub write_gate: Option<WriteGate>,
+    /// Called after a successful mutating request (replication wait, F6).
+    pub after_write: Option<WriteGate>,
 }
+
+/// A write-fencing check: `Ok(())` when this node may accept writes now.
+pub type WriteGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 /// Configuration for the HTTP gateway.
 pub struct HttpServerConfig {
@@ -43,6 +50,10 @@ pub struct HttpServerConfig {
     /// Serve HTTPS with this rustls config (`None` = plaintext HTTP). A config
     /// with a client-certificate verifier makes it mutual TLS.
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Write fence (F6); see [`AppState::write_gate`].
+    pub write_gate: Option<WriteGate>,
+    /// See [`AppState::after_write`].
+    pub after_write: Option<WriteGate>,
 }
 
 impl HttpServerConfig {
@@ -51,7 +62,22 @@ impl HttpServerConfig {
             addr,
             api_token: None,
             tls: None,
+            write_gate: None,
+            after_write: None,
         }
+    }
+
+    /// Run `hook` after every successful mutating request; an `Err` turns the
+    /// response into a 504 (committed locally, replication unconfirmed).
+    pub fn with_after_write(mut self, hook: WriteGate) -> Self {
+        self.after_write = Some(hook);
+        self
+    }
+
+    /// Reject mutating requests while the gate says this node is not the primary.
+    pub fn with_write_gate(mut self, gate: WriteGate) -> Self {
+        self.write_gate = Some(gate);
+        self
     }
 
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
@@ -174,6 +200,8 @@ impl HttpServer {
             sql,
             metrics,
             config.api_token,
+            config.write_gate,
+            config.after_write,
         );
         let tcp = TcpListener::bind(config.addr).await?;
         let listener = match config.tls {
@@ -256,6 +284,83 @@ async fn auth_middleware(
     next.run(req).await
 }
 
+/// True for requests that only read (GET/HEAD/OPTIONS, read-style POSTs).
+fn is_read_only_route(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return true;
+    }
+    *method == Method::POST && (path.ends_with("/query") || path.ends_with("/batch/get"))
+}
+
+/// True for a SQL statement that cannot mutate.
+fn sql_is_read_only(sql: &str) -> bool {
+    let head: String = sql
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    matches!(
+        head.as_str(),
+        "SELECT" | "EXPLAIN" | "SHOW" | "DESCRIBE" | "WITH"
+    )
+}
+
+/// F6 write fence: a node that is not the primary for the current epoch
+/// refuses mutating requests (503, naming the current primary).
+async fn write_gate_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.write_gate.is_none() && state.after_write.is_none() {
+        return next.run(req).await;
+    }
+    let reject = |status: StatusCode, msg: String, code: &str| {
+        (
+            status,
+            axum::Json(serde_json::json!({ "error": msg, "code": code })),
+        )
+            .into_response()
+    };
+    let path = req.uri().path().to_string();
+    let mut req = req;
+    let is_write = if is_read_only_route(req.method(), &path) {
+        false
+    } else if req.method() == axum::http::Method::POST && path == "/sql" {
+        let (parts, body) = req.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, 16 * 1024 * 1024).await else {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        };
+        let is_read = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("sql").and_then(|s| s.as_str()).map(sql_is_read_only))
+            .unwrap_or(false);
+        req = Request::from_parts(parts, Body::from(bytes));
+        !is_read
+    } else {
+        true
+    };
+    if !is_write {
+        return next.run(req).await;
+    }
+    if let Some(gate) = &state.write_gate
+        && let Err(msg) = gate()
+    {
+        return reject(StatusCode::SERVICE_UNAVAILABLE, msg, "not_primary");
+    }
+    let resp = next.run(req).await;
+    if resp.status().is_success()
+        && let Some(hook) = &state.after_write
+        && let Err(msg) = hook()
+    {
+        return reject(StatusCode::GATEWAY_TIMEOUT, msg, "replication_unconfirmed");
+    }
+    resp
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_router(
     registry: Arc<TableRegistry>,
     views: Arc<ViewRegistry>,
@@ -264,6 +369,8 @@ fn build_router(
     sql: Arc<SqlExecutor>,
     metrics: Arc<Metrics>,
     api_token: Option<String>,
+    write_gate: Option<WriteGate>,
+    after_write: Option<WriteGate>,
 ) -> Router {
     let state = Arc::new(AppState {
         registry,
@@ -273,6 +380,8 @@ fn build_router(
         sql,
         metrics,
         api_token,
+        write_gate,
+        after_write,
     });
     Router::new()
         // Observability
@@ -432,6 +541,10 @@ fn build_router(
             "/multi_txn/{id}/rollback",
             post(handlers::multi_txn_rollback_handler),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            write_gate_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

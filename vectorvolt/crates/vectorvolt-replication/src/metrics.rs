@@ -23,6 +23,22 @@ pub struct ReplicationMetrics {
     /// Follower: 1 + ms since `epoch` when it fell behind; 0 = caught up.
     behind_since_ms: AtomicU64,
     pub(crate) connected: AtomicU64,
+    /// Follower: rows received in full snapshots.
+    pub(crate) snapshot_rows: AtomicU64,
+    /// Follower: row operations applied from streamed frames.
+    pub(crate) rows_applied: AtomicU64,
+    /// Follower: rows rewritten/removed to truncate a divergent tail.
+    pub(crate) fix_rows: AtomicU64,
+    /// Follower: sessions that resumed from a mapped point (no snapshot).
+    pub(crate) incremental_resumes: AtomicU64,
+    /// Follower: frames/heartbeats dropped for carrying a stale epoch.
+    pub(crate) stale_epoch_frames: AtomicU64,
+    /// Leader: acks dropped for carrying another epoch.
+    pub(crate) stale_acks: AtomicU64,
+    /// Leader: writes admitted with fewer acks than configured.
+    pub(crate) degraded_writes: AtomicU64,
+    /// Leader gauge: 1 while running below the configured replica count.
+    pub(crate) degraded: AtomicU64,
 }
 
 impl Default for ReplicationMetrics {
@@ -42,6 +58,14 @@ impl Default for ReplicationMetrics {
             leader_tip_lsn: AtomicU64::new(0),
             behind_since_ms: AtomicU64::new(0),
             connected: AtomicU64::new(0),
+            snapshot_rows: AtomicU64::new(0),
+            rows_applied: AtomicU64::new(0),
+            fix_rows: AtomicU64::new(0),
+            incremental_resumes: AtomicU64::new(0),
+            stale_epoch_frames: AtomicU64::new(0),
+            stale_acks: AtomicU64::new(0),
+            degraded_writes: AtomicU64::new(0),
+            degraded: AtomicU64::new(0),
         }
     }
 }
@@ -65,6 +89,15 @@ pub struct MetricsSnapshot {
     /// Milliseconds the follower has been continuously behind (0 = caught up).
     pub lag_ms: u64,
     pub connected: bool,
+    pub snapshot_rows: u64,
+    pub rows_applied: u64,
+    pub fix_rows: u64,
+    pub incremental_resumes: u64,
+    pub stale_epoch_frames: u64,
+    pub stale_acks: u64,
+    pub degraded_writes: u64,
+    /// True while the leader runs below the configured replica count.
+    pub degraded: bool,
 }
 
 impl ReplicationMetrics {
@@ -116,6 +149,14 @@ impl ReplicationMetrics {
                 self.now_ms().saturating_sub(behind - 1)
             },
             connected: self.connected.load(Ordering::Relaxed) != 0,
+            snapshot_rows: self.snapshot_rows.load(Ordering::Relaxed),
+            rows_applied: self.rows_applied.load(Ordering::Relaxed),
+            fix_rows: self.fix_rows.load(Ordering::Relaxed),
+            incremental_resumes: self.incremental_resumes.load(Ordering::Relaxed),
+            stale_epoch_frames: self.stale_epoch_frames.load(Ordering::Relaxed),
+            stale_acks: self.stale_acks.load(Ordering::Relaxed),
+            degraded_writes: self.degraded_writes.load(Ordering::Relaxed),
+            degraded: self.degraded.load(Ordering::Relaxed) != 0,
         }
     }
 }

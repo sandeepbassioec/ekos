@@ -47,6 +47,7 @@ pub mod config;
 mod distinct;
 mod engine;
 mod error;
+mod hooks;
 mod field_update;
 mod groupby;
 mod index_catalog;
@@ -78,6 +79,7 @@ pub mod system_profile;
 mod window;
 
 pub use aggregate::HistogramBucket;
+pub use hooks::{CommitStamper, WriteGuard};
 pub use aggregate_root::{AggregateRoot, AggregateRouter};
 pub use catalog_alias::{create_alias, list_aliases, remove_alias, resolve_alias};
 pub use catalog_clone::clone_table;

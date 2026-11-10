@@ -8,7 +8,8 @@ use store::OutputFormat;
 use vvctl::commands::{
     bench, bench_net, catalog, cdc_cmd, chaos, cluster_cmd, completion, config, config_audit,
     connect, control, disconnect, events_cmd, graph, hal, http, install, keygen, ledger_cmd, linux,
-    ping, profile, projection_cmd, query_cmd, reader, serve, server_cmd, sql, status_cmd, store,
+    ping, profile, projection_cmd, query_cmd, reader, serve, server_cmd, shard_cmd, sql, status_cmd,
+    store,
     support_bundle, table, topology, tune, vector, wal, xdp_cmd,
 };
 use vvctl::ui;
@@ -171,6 +172,9 @@ enum Commands {
 
     /// Cluster membership management (nodes, join, leave, status, ring).
     Cluster(cluster_cmd::ClusterArgs),
+
+    /// Shard split, live migration, drain and rebalance (list, split, move, drain, rebalance).
+    Shard(shard_cmd::ShardArgs),
 
     /// Change Data Capture — inspect, query, and compact a table's CDC event log (S25-A).
     Cdc(cdc_cmd::CdcArgs),
@@ -380,6 +384,8 @@ fn main() -> Result<()> {
         Commands::Install(args) => install::run(args)?,
 
         Commands::Cluster(args) => cluster_cmd::run(args)?,
+
+        Commands::Shard(args) => shard_cmd::run(args)?,
 
         Commands::Cdc(args) => cdc_cmd::run(args)?,
 

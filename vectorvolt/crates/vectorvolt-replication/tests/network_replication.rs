@@ -43,6 +43,15 @@ fn cfg(mode: ReplicationMode, rf: usize) -> ReplicationConfig {
         read_timeout: Duration::from_secs(5),
         batch_frames: 64,
         snapshot_batch_rows: 50,
+        degraded_ok: false,
+    }
+}
+
+async fn wait_in_sync(server: &ReplicationServer, n: usize) {
+    let deadline = Instant::now() + T;
+    while server.in_sync_followers() < n {
+        assert!(Instant::now() < deadline, "followers never caught up");
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -272,19 +281,26 @@ async fn sync_mode_waits_for_ack_and_times_out_without_a_follower() {
     assert!(
         matches!(
             err,
-            ReplicationError::AckTimeout {
+            ReplicationError::InsufficientReplicas {
                 needed: 1,
-                got: 0,
+                in_sync: 0,
                 ..
             }
         ),
         "{err:?}"
     );
     assert!(
-        started.elapsed() >= Duration::from_millis(500),
-        "returned before the timeout"
+        err.to_string().contains("insufficient replicas"),
+        "clear error text: {err}"
     );
-    assert_eq!(server.metrics().snapshot().ack_timeouts, 1);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "refused up front, not after the ack timeout"
+    );
+    assert!(
+        le.get(1).unwrap().is_none(),
+        "a refused write must not be applied"
+    );
 
     // Follower up: the write returns only once it is durably applied there.
     let fe = engine(fd.path());
@@ -295,10 +311,14 @@ async fn sync_mode_waits_for_ack_and_times_out_without_a_follower() {
         server.local_addr(),
         cfg(ReplicationMode::Sync, 2),
     );
+    wait_in_sync(&server, 1).await;
     let lsn = server.insert_replicated(2, vec![2, 22]).await.unwrap();
     assert!(client.applied_lsn() >= lsn);
     assert_eq!(fe.get(2).unwrap().unwrap().values[1], 22);
-    assert_eq!(fe.get(1).unwrap().unwrap().values[1], 1); // earlier write caught up too
+    assert!(
+        fe.get(1).unwrap().is_none(),
+        "the refused write never reached the follower"
+    );
 
     // Replication factor 3 needs two followers; one is not enough.
     let (ld3, fd3) = (TempDir::new().unwrap(), TempDir::new().unwrap());
@@ -311,13 +331,14 @@ async fn sync_mode_waits_for_ack_and_times_out_without_a_follower() {
         server3.local_addr(),
         cfg(ReplicationMode::Sync, 3),
     );
+    wait_in_sync(&server3, 1).await;
     let err = server3.insert_replicated(1, vec![1, 1]).await.unwrap_err();
     assert!(
         matches!(
             err,
-            ReplicationError::AckTimeout {
+            ReplicationError::InsufficientReplicas {
                 needed: 2,
-                got: 1,
+                in_sync: 1,
                 ..
             }
         ),
@@ -340,6 +361,7 @@ async fn sync_mode_waits_for_ack_and_times_out_without_a_follower() {
         servers.local_addr(),
         cfg(ReplicationMode::SemiSync, 3),
     );
+    wait_in_sync(&servers, 1).await;
     servers.insert_replicated(1, vec![1, 1]).await.unwrap();
 }
 
@@ -368,6 +390,7 @@ async fn corrupted_frame_is_rejected_and_not_applied() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let good = Message::Frames {
+        epoch: 0,
         tip: 1,
         frames: vec![WireFrame {
             seq: 1,
@@ -390,6 +413,10 @@ async fn corrupted_frame_is_rejected_and_not_applied() {
             tip: 1,
             snapshot: false,
             start_lsn: 0,
+            epoch: 0,
+            truncate: false,
+            common_epoch: 0,
+            common_lsn: 0,
         };
         // Connection 1: valid welcome, then a bit-flipped frame message.
         let (mut s, _) = listener.accept().await.unwrap();

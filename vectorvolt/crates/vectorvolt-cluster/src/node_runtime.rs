@@ -31,6 +31,19 @@ pub struct ClusterNode {
     gossip: GossipEngine,
     swim: OnceLock<Arc<SwimNode>>,
     started_at: Instant,
+    hook: OnceLock<Arc<dyn MembershipHook>>,
+}
+
+/// Glue from gossip / the `vvctl cluster join|leave` control path to another
+/// membership system (the failover Raft group's `add_server` / `remove_server`).
+#[async_trait::async_trait]
+pub trait MembershipHook: Send + Sync {
+    /// This node joined the gossip cluster through the control path.
+    async fn joined(&self);
+    /// This node is about to leave gracefully (called before `Left` is broadcast).
+    async fn leaving(&self);
+    /// Periodic snapshot of every gossip member (about twice a second).
+    async fn members(&self, members: Vec<PeerInfo>);
 }
 
 impl ClusterNode {
@@ -59,7 +72,13 @@ impl ClusterNode {
             gossip,
             swim: OnceLock::new(),
             started_at: Instant::now(),
+            hook: OnceLock::new(),
         })
+    }
+
+    /// Install the membership hook (once). Returns `false` if already set.
+    pub fn set_membership_hook(&self, h: Arc<dyn MembershipHook>) -> bool {
+        self.hook.set(h).is_ok()
     }
 
     /// Bind the UDP gossip socket on the bind address, start SWIM, and join
@@ -72,6 +91,18 @@ impl ClusterNode {
             return Ok(());
         }
         swim.start();
+        {
+            let me = Arc::clone(self);
+            let swim = swim.clone();
+            tokio::spawn(async move {
+                while !swim.has_left() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if let Some(h) = me.hook.get() {
+                        h.members(me.members()).await;
+                    }
+                }
+            });
+        }
         let seeds = self.configured_seeds.clone();
         if !seeds.is_empty() {
             tokio::spawn(async move {
@@ -95,6 +126,9 @@ impl ClusterNode {
             .get()
             .ok_or("gossip is not running on this node")?;
         if swim.join(&[seed]).await {
+            if let Some(h) = self.hook.get() {
+                h.joined().await;
+            }
             Ok(())
         } else {
             Err(format!("seed {seed} did not answer"))
@@ -107,6 +141,9 @@ impl ClusterNode {
             .swim
             .get()
             .ok_or("gossip is not running on this node")?;
+        if let Some(h) = self.hook.get() {
+            h.leaving().await;
+        }
         swim.leave().await;
         Ok(())
     }
@@ -196,6 +233,86 @@ pub struct ClusterStatus {
     pub note: String,
 }
 
+/// One parsed control-plane request handed to the installed [`ExtHandler`].
+#[derive(Debug, Clone)]
+pub struct ExtRequest {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub body: String,
+    /// Peer address is loopback.
+    pub loopback: bool,
+    /// Value of the `x-vv-secret` request header, if any.
+    pub secret: Option<String>,
+}
+
+/// Extra routes mounted on the node control server (`/shards*`, `/shardnode/*`,
+/// `/sagas*`, `/versionstamp`). Installed once per process by `vvctl serve`.
+#[async_trait::async_trait]
+pub trait ExtHandler: Send + Sync {
+    /// `None` = not one of this handler's routes (falls through to 404).
+    async fn handle(&self, req: ExtRequest) -> Option<(u16, String)>;
+}
+
+static EXT: OnceLock<Arc<dyn ExtHandler>> = OnceLock::new();
+
+/// Install the process-wide extension handler. Returns `false` if one is
+/// already installed.
+pub fn install_ext(h: Arc<dyn ExtHandler>) -> bool {
+    EXT.set(h).is_ok()
+}
+
+const MAX_REQUEST: usize = 32 << 20;
+
+/// Read one HTTP request (head + `Content-Length` body) from `stream`.
+async fn read_request<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Option<(String, String, Option<String>, String)> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 8192];
+    let head_end = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p + 4;
+        }
+        if buf.len() > 64 * 1024 {
+            return None;
+        }
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            // Bare request line without a blank line (legacy clients).
+            break buf.len();
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let mut content_len = 0usize;
+    let mut secret = None;
+    for l in head.lines().skip(1) {
+        if let Some((k, v)) = l.split_once(':') {
+            let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
+            if k == "content-length" {
+                content_len = v.parse().unwrap_or(0);
+            } else if k == "x-vv-secret" {
+                secret = Some(v.to_string());
+            }
+        }
+    }
+    if content_len > MAX_REQUEST {
+        return None;
+    }
+    while buf.len() < head_end + content_len {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body = String::from_utf8_lossy(&buf[head_end.min(buf.len())..]).to_string();
+    let line = head.lines().next().unwrap_or("").to_string();
+    Some((line, head, secret, body))
+}
+
 fn json<T: Serialize>(v: &T) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".to_string())
 }
@@ -212,7 +329,7 @@ impl ClusterStatusServer {
 
     /// Bind and serve forever on `port`.
     pub async fn serve(self, port: u16) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
         let addr = format!("0.0.0.0:{port}");
@@ -235,10 +352,10 @@ impl ClusterStatusServer {
             let node = self.node.clone();
             let loopback = peer.ip().is_loopback();
             tokio::spawn(async move {
-                let mut buf = [0u8; 2048];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let head = String::from_utf8_lossy(&buf[..n]);
-                let line = head.lines().next().unwrap_or("");
+                let Some((line, _head, secret, body)) = read_request(&mut stream).await else {
+                    return;
+                };
+                let line = line.as_str();
                 let mut parts = line.split_whitespace();
                 let method = parts.next().unwrap_or("");
                 let target = parts.next().unwrap_or("");
@@ -273,7 +390,26 @@ impl ClusterStatusServer {
                         Ok(()) => (ok, "application/json", json(&node.status())),
                         Err(e) => ("409 Conflict", "text/plain", format!("{e}\n")),
                     },
-                    _ => ("404 Not Found", "text/plain", "404 Not Found\n".to_string()),
+                    _ => {
+                        let routed = match EXT.get() {
+                            Some(ext) => {
+                                ext.handle(ExtRequest {
+                                    method: method.to_string(),
+                                    path: path.to_string(),
+                                    query: query.to_string(),
+                                    body,
+                                    loopback,
+                                    secret,
+                                })
+                                .await
+                            }
+                            None => None,
+                        };
+                        match routed {
+                            Some((code, body)) => (http_status(code), "application/json", body),
+                            None => ("404 Not Found", "text/plain", "404 Not Found\n".to_string()),
+                        }
+                    }
                 };
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -282,5 +418,20 @@ impl ClusterStatusServer {
                 let _ = stream.write_all(response.as_bytes()).await;
             });
         }
+    }
+}
+
+fn http_status(code: u16) -> &'static str {
+    match code {
+        200 => "200 OK",
+        202 => "202 Accepted",
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        403 => "403 Forbidden",
+        404 => "404 Not Found",
+        409 => "409 Conflict",
+        502 => "502 Bad Gateway",
+        503 => "503 Service Unavailable",
+        _ => "500 Internal Server Error",
     }
 }

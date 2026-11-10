@@ -107,6 +107,26 @@ impl RoleCell {
     }
 }
 
+/// Shared, monotonically advancing "highest primary epoch seen" cell. A
+/// follower's replication client drops anything from a lower epoch.
+#[derive(Debug, Clone, Default)]
+pub struct EpochCell(Arc<std::sync::atomic::AtomicU64>);
+
+impl EpochCell {
+    pub fn new(epoch: u64) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU64::new(epoch)))
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Raise the known epoch to at least `epoch`; returns the resulting value.
+    pub fn advance(&self, epoch: u64) -> u64 {
+        self.0.fetch_max(epoch, Ordering::AcqRel).max(epoch)
+    }
+}
+
 /// Tunables shared by leader and follower.
 #[derive(Debug, Clone)]
 pub struct ReplicationConfig {
@@ -128,6 +148,12 @@ pub struct ReplicationConfig {
     pub batch_frames: usize,
     /// Max rows per snapshot message.
     pub snapshot_batch_rows: usize,
+    /// Leader: when fewer in-sync followers are alive than the mode needs,
+    /// accept writes anyway with fewer acks (explicitly: a `degraded` gauge, a
+    /// `degraded_writes` counter and a log line) instead of rejecting them with
+    /// "insufficient replicas". The configured factor itself never changes;
+    /// full acknowledgement resumes as soon as enough followers are caught up.
+    pub degraded_ok: bool,
 }
 
 impl Default for ReplicationConfig {
@@ -143,6 +169,7 @@ impl Default for ReplicationConfig {
             read_timeout: Duration::from_secs(10),
             batch_frames: 256,
             snapshot_batch_rows: 1024,
+            degraded_ok: false,
         }
     }
 }
@@ -155,6 +182,11 @@ impl ReplicationConfig {
 
     pub fn with_replication_factor(mut self, n: usize) -> Self {
         self.replication_factor = n;
+        self
+    }
+
+    pub fn with_degraded_ok(mut self, yes: bool) -> Self {
+        self.degraded_ok = yes;
         self
     }
 

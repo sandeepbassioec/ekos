@@ -16,6 +16,7 @@ fn args(dir: &TempDir, command: ClusterCommand) -> ClusterArgs {
     ClusterArgs {
         dir: dir.path().to_path_buf(),
         node: None,
+        offline: true,
         command,
     }
 }

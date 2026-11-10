@@ -1,9 +1,12 @@
 //! Cluster network transport for Raft RPC (gap F1).
 //!
-//! * Framing: `[version u8][len u32 LE][crc32 u32 LE][json payload]`; frames
-//!   with a wrong version, oversize length or bad CRC are rejected and the
-//!   connection is dropped. The codec is generic over `AsyncRead`/`AsyncWrite`,
-//!   so a TLS stream (tokio-rustls) can be layered in without changing it.
+//! * Framing: `[version u8][len u32 LE][crc32 u32 LE][binary payload]` (compact
+//!   varint encoding, see `crate::raft::codec`); frames with a wrong version,
+//!   oversize length or bad CRC are rejected and the connection is dropped. The
+//!   codec is generic over `AsyncRead`/`AsyncWrite`.
+//! * TLS: `TlsConfig` layers tokio-rustls over the same codec with mutual
+//!   authentication (CA + node cert/key); `TcpTransport::bind` stays plaintext
+//!   for tests, `TcpTransport::bind_tls` is the production entry point.
 //! * [`TcpTransport`]: tokio TCP, one lazily-created writer task per peer with
 //!   connect timeout, write timeout and exponential reconnect backoff.
 //! * [`MemNetwork`]: in-memory network with partitions for tests.
@@ -12,6 +15,7 @@
 //! requires; lost messages are recovered by heartbeats/retries.
 
 use crate::node::NodeId;
+use crate::raft::codec::{CodecError, Reader, Wire};
 use crate::raft::rpc::Rpc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -25,7 +29,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-pub const FRAME_VERSION: u8 = 1;
+/// Wire version 2 = binary payloads (version 1 was JSON and is rejected).
+pub const FRAME_VERSION: u8 = 2;
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +52,21 @@ pub struct Envelope {
     pub msg: Rpc,
 }
 
+impl Wire for Envelope {
+    fn to_wire(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(48);
+        out.extend_from_slice(self.from.0.as_bytes());
+        out.extend(self.msg.to_wire());
+        out
+    }
+
+    fn from_wire(buf: &[u8]) -> Result<Self, CodecError> {
+        let from = Reader::new(buf).node()?;
+        let msg = Rpc::from_wire(&buf[16..])?;
+        Ok(Envelope { from, msg })
+    }
+}
+
 #[async_trait]
 pub trait RaftTransport: Send + Sync + 'static {
     fn local_id(&self) -> &NodeId;
@@ -58,8 +78,8 @@ pub trait RaftTransport: Send + Sync + 'static {
 
 // ---- framing ---------------------------------------------------------------
 
-pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, TransportError> {
-    let payload = serde_json::to_vec(value).map_err(|e| TransportError::Frame(e.to_string()))?;
+pub fn encode_frame<T: Wire>(value: &T) -> Result<Vec<u8>, TransportError> {
+    let payload = value.to_wire();
     if payload.len() > MAX_FRAME_LEN {
         return Err(TransportError::Frame("frame too large".into()));
     }
@@ -71,7 +91,7 @@ pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, TransportError> 
     Ok(out)
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
+pub async fn write_frame<W: AsyncWrite + Unpin, T: Wire>(
     w: &mut W,
     value: &T,
 ) -> Result<(), TransportError> {
@@ -82,7 +102,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
 }
 
 /// Read one frame. `Ok(None)` on clean EOF at a frame boundary.
-pub async fn read_frame<R: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(
+pub async fn read_frame<R: AsyncRead + Unpin, T: Wire>(
     r: &mut R,
 ) -> Result<Option<T>, TransportError> {
     let mut hdr = [0u8; 9];
@@ -109,7 +129,7 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(
     if crc32fast::hash(&payload) != want {
         return Err(TransportError::Frame("crc mismatch".into()));
     }
-    serde_json::from_slice(&payload)
+    T::from_wire(&payload)
         .map(Some)
         .map_err(|e| TransportError::Frame(e.to_string()))
 }
@@ -138,27 +158,180 @@ impl Default for TcpConfig {
     }
 }
 
+/// Mutual-TLS settings for the Raft transport.
+///
+/// Every node presents a certificate issued by the cluster CA and requires the
+/// same of its peers (mTLS). Server certificates are verified against the
+/// peer's IP address unless `server_name` is set, in which case that DNS name
+/// must be in every node certificate's SANs.
+///
+/// Note: mTLS proves a peer holds *a* cluster certificate; it does not bind a
+/// certificate to a particular `NodeId`.
+#[derive(Clone)]
+pub struct TlsConfig {
+    server: Arc<rustls::ServerConfig>,
+    client: Arc<rustls::ClientConfig>,
+    server_name: Option<String>,
+}
+
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No contents: the config holds the private key.
+        f.write_str("TlsConfig(<configured>)")
+    }
+}
+
+fn tls_err(what: &str, e: impl std::fmt::Display) -> TransportError {
+    TransportError::Io(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("tls: {what}: {e}"),
+    ))
+}
+
+impl TlsConfig {
+    /// Build from PEM bytes: the cluster `ca_pem`, this node's `cert_pem`
+    /// chain (leaf first) and its private `key_pem`.
+    pub fn from_pem(
+        ca_pem: &[u8],
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        server_name: Option<&str>,
+    ) -> Result<Self, TransportError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut &cert_pem[..])
+                .collect::<Result<_, _>>()
+                .map_err(|e| tls_err("reading node certificate", e))?;
+        if certs.is_empty() {
+            return Err(tls_err("node certificate", "no certificates in PEM"));
+        }
+        let key = || {
+            rustls_pemfile::private_key(&mut &key_pem[..])
+                .map_err(|e| tls_err("reading private key", e))?
+                .ok_or_else(|| tls_err("private key", "no key in PEM"))
+        };
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut &ca_pem[..]) {
+            let c = c.map_err(|e| tls_err("reading CA", e))?;
+            roots.add(c).map_err(|e| tls_err("adding CA", e))?;
+        }
+        if roots.is_empty() {
+            return Err(tls_err("CA", "no certificates in PEM"));
+        }
+        let roots = Arc::new(roots);
+
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            roots.clone(),
+            provider.clone(),
+        )
+        .build()
+        .map_err(|e| tls_err("client verifier", e))?;
+        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| tls_err("protocol versions", e))?
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs.clone(), key()?)
+            .map_err(|e| tls_err("server certificate/key", e))?;
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| tls_err("protocol versions", e))?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certs, key()?)
+            .map_err(|e| tls_err("client certificate/key", e))?;
+        Ok(TlsConfig {
+            server: Arc::new(server),
+            client: Arc::new(client),
+            server_name: server_name.map(str::to_owned),
+        })
+    }
+
+    /// Load the CA, node certificate and key from PEM files.
+    pub fn from_files(
+        ca: impl AsRef<std::path::Path>,
+        cert: impl AsRef<std::path::Path>,
+        key: impl AsRef<std::path::Path>,
+        server_name: Option<&str>,
+    ) -> Result<Self, TransportError> {
+        Self::from_pem(
+            &std::fs::read(ca)?,
+            &std::fs::read(cert)?,
+            &std::fs::read(key)?,
+            server_name,
+        )
+    }
+
+    fn name_for(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<rustls::pki_types::ServerName<'static>, TransportError> {
+        match &self.server_name {
+            Some(n) => rustls::pki_types::ServerName::try_from(n.clone())
+                .map_err(|e| tls_err("server name", e)),
+            None => Ok(rustls::pki_types::ServerName::IpAddress(addr.ip().into())),
+        }
+    }
+}
+
 pub struct TcpTransport {
     id: NodeId,
     local_addr: SocketAddr,
     cfg: TcpConfig,
+    tls: Option<TlsConfig>,
     peers: StdMutex<HashMap<NodeId, SocketAddr>>,
     writers: StdMutex<HashMap<NodeId, mpsc::Sender<Envelope>>>,
     inbox: Mutex<mpsc::Receiver<Envelope>>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
+/// Read frames until EOF or the first bad frame, forwarding envelopes.
+async fn pump<S: AsyncRead + Unpin>(mut stream: S, tx: mpsc::Sender<Envelope>) {
+    // Any frame/CRC/version error drops the connection.
+    while let Ok(Some(env)) = read_frame::<_, Envelope>(&mut stream).await {
+        if tx.send(env).await.is_err() {
+            return;
+        }
+    }
+}
+
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl TcpTransport {
-    /// Bind a listener on `addr` (use port 0 for an ephemeral port).
+    /// Bind a plaintext listener on `addr` (use port 0 for an ephemeral port).
+    /// Intended for tests and trusted loopback use; see [`Self::bind_tls`].
     pub async fn bind(
         id: NodeId,
         addr: SocketAddr,
         peers: HashMap<NodeId, SocketAddr>,
         cfg: TcpConfig,
     ) -> io::Result<Self> {
+        Self::bind_inner(id, addr, peers, cfg, None).await
+    }
+
+    /// Bind a listener that requires mutual TLS from every peer and uses TLS
+    /// for all outbound connections.
+    pub async fn bind_tls(
+        id: NodeId,
+        addr: SocketAddr,
+        peers: HashMap<NodeId, SocketAddr>,
+        cfg: TcpConfig,
+        tls: TlsConfig,
+    ) -> io::Result<Self> {
+        Self::bind_inner(id, addr, peers, cfg, Some(tls)).await
+    }
+
+    async fn bind_inner(
+        id: NodeId,
+        addr: SocketAddr,
+        peers: HashMap<NodeId, SocketAddr>,
+        cfg: TcpConfig,
+        tls: Option<TlsConfig>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let (tx, rx) = mpsc::channel(4096);
+        let acceptor = tls
+            .as_ref()
+            .map(|t| tokio_rustls::TlsAcceptor::from(t.server.clone()));
         let accept = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -166,12 +339,18 @@ impl TcpTransport {
                 };
                 let _ = stream.set_nodelay(true);
                 let tx = tx.clone();
+                let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    let mut stream = stream;
-                    // Any frame/CRC/version error drops the connection.
-                    while let Ok(Some(env)) = read_frame::<_, Envelope>(&mut stream).await {
-                        if tx.send(env).await.is_err() {
-                            return;
+                    match acceptor {
+                        None => pump(stream, tx).await,
+                        Some(a) => {
+                            // Handshake failures (no/untrusted client cert, plaintext
+                            // peer, ...) just drop the connection.
+                            if let Ok(Ok(s)) =
+                                tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, a.accept(stream)).await
+                            {
+                                pump(s, tx).await;
+                            }
                         }
                     }
                 });
@@ -181,6 +360,7 @@ impl TcpTransport {
             id,
             local_addr,
             cfg,
+            tls,
             peers: StdMutex::new(peers),
             writers: StdMutex::new(HashMap::new()),
             inbox: Mutex::new(rx),
@@ -198,6 +378,12 @@ impl TcpTransport {
         self.writers.lock().expect("writers").remove(&id);
     }
 
+    /// Forget a peer (e.g. after it was removed from the cluster).
+    pub fn remove_peer(&self, id: &NodeId) {
+        self.peers.lock().expect("peers").remove(id);
+        self.writers.lock().expect("writers").remove(id);
+    }
+
     fn writer_for(&self, to: &NodeId) -> Result<mpsc::Sender<Envelope>, TransportError> {
         let mut writers = self.writers.lock().expect("writers");
         if let Some(w) = writers.get(to).filter(|w| !w.is_closed()) {
@@ -210,25 +396,56 @@ impl TcpTransport {
             .get(to)
             .ok_or_else(|| TransportError::UnknownPeer(to.clone()))?;
         let (tx, rx) = mpsc::channel(self.cfg.queue_cap);
-        let task = tokio::spawn(peer_writer(addr, rx, self.cfg.clone()));
+        let task = tokio::spawn(peer_writer(addr, rx, self.cfg.clone(), self.tls.clone()));
         self.tasks.lock().expect("tasks").push(task);
         writers.insert(to.clone(), tx.clone());
         Ok(tx)
     }
 }
 
-async fn peer_writer(addr: SocketAddr, mut rx: mpsc::Receiver<Envelope>, cfg: TcpConfig) {
-    let mut conn: Option<TcpStream> = None;
+trait Conn: AsyncWrite + Unpin + Send {}
+impl<T: AsyncWrite + Unpin + Send> Conn for T {}
+
+async fn connect(
+    addr: SocketAddr,
+    cfg: &TcpConfig,
+    tls: &Option<TlsConfig>,
+) -> Option<Box<dyn Conn>> {
+    let fut = async {
+        let s = TcpStream::connect(addr).await.ok()?;
+        let _ = s.set_nodelay(true);
+        match tls {
+            None => Some(Box::new(s) as Box<dyn Conn>),
+            Some(t) => {
+                let name = t.name_for(addr).ok()?;
+                let c = tokio_rustls::TlsConnector::from(t.client.clone());
+                let s = c.connect(name, s).await.ok()?;
+                Some(Box::new(s) as Box<dyn Conn>)
+            }
+        }
+    };
+    tokio::time::timeout(cfg.connect_timeout.max(TLS_HANDSHAKE_TIMEOUT), fut)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn peer_writer(
+    addr: SocketAddr,
+    mut rx: mpsc::Receiver<Envelope>,
+    cfg: TcpConfig,
+    tls: Option<TlsConfig>,
+) {
+    let mut conn: Option<Box<dyn Conn>> = None;
     let mut backoff = cfg.backoff_initial;
     while let Some(env) = rx.recv().await {
         if conn.is_none() {
-            match tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(addr)).await {
-                Ok(Ok(s)) => {
-                    let _ = s.set_nodelay(true);
+            match connect(addr, &cfg, &tls).await {
+                Some(s) => {
                     conn = Some(s);
                     backoff = cfg.backoff_initial;
                 }
-                _ => {
+                None => {
                     // Unreachable: drop this and any queued (stale) messages, back off.
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(cfg.backoff_max);

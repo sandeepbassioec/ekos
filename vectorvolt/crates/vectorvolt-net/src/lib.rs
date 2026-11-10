@@ -43,7 +43,7 @@ pub use frame::{Opcode, WIRE_HEADER_SIZE, WIRE_MAGIC, WIRE_VERSION, WireFrameHea
 pub use metrics::{prometheus_text, summary_line};
 pub use pool::{ConnectionPool, PooledConn};
 pub use protocol::{Header, OpCode, Request, Response};
-pub use server::{Server, ServerConfig, ServerStats};
+pub use server::{Server, ServerConfig, ServerStats, WriteGate};
 pub use tls::{ClientTlsConfig, ServerTlsConfig};
 pub use transport::TransportKind;
 pub use vectorvolt_engine::TableRegistry;
@@ -196,4 +196,10 @@ pub mod error_code {
     pub const TXN_ID_MISMATCH: u16 = 14;
     /// A request argument is out of range or otherwise invalid.
     pub const INVALID_ARGUMENT: u16 = 15;
+    /// This node is not the write primary for the current epoch (F6); the
+    /// message names the current primary.
+    pub const NOT_PRIMARY: u16 = 16;
+    /// The write is committed on this node but replication was not confirmed
+    /// in time (sync / semi-sync): treat the outcome as unconfirmed.
+    pub const REPLICATION: u16 = 17;
 }

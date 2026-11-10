@@ -14,6 +14,10 @@ tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rcgen = { workspace = true }

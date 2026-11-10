@@ -33,6 +33,17 @@ pub enum ReplicationError {
         timeout: Duration,
     },
 
+    /// Fewer in-sync followers are alive than the replication mode requires
+    /// and degraded writes are not enabled; the write was *not* applied.
+    #[error(
+        "insufficient replicas: {mode} replication needs {needed} in-sync follower(s),          only {in_sync} available (start with --replication-degraded-ok to accept          writes with fewer replicas)"
+    )]
+    InsufficientReplicas {
+        mode: String,
+        needed: usize,
+        in_sync: usize,
+    },
+
     /// A write was attempted on a node that is a replication follower.
     #[error("node is a read-only replication follower")]
     ReadOnlyFollower,

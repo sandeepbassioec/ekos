@@ -13,7 +13,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{ReplResult, ReplicationError};
 
 pub const MAGIC: u32 = 0x3150_5256; // "VRP1" little-endian
-pub const PROTO_VERSION: u8 = 1;
+/// Version 2 carries the primary epoch in every `Frames` / `Heartbeat` / `Ack`
+/// and an `(epoch, lsn)` history in `Hello`, so a follower and a new primary
+/// can agree on a common point after a failover instead of re-syncing.
+pub const PROTO_VERSION: u8 = 2;
 /// Upper bound on one message body; larger lengths are treated as corruption.
 pub const MAX_BODY: u32 = 64 * 1024 * 1024;
 
@@ -21,10 +24,29 @@ const T_HELLO: u8 = 1;
 const T_WELCOME: u8 = 2;
 const T_SNAP_ROWS: u8 = 3;
 const T_SNAP_END: u8 = 4;
-const T_FRAMES: u8 = 5;
-const T_HEARTBEAT: u8 = 6;
-const T_ACK: u8 = 7;
+const T_FRAMES_V1: u8 = 5;
+const T_HEARTBEAT_V1: u8 = 6;
+const T_ACK_V1: u8 = 7;
 const T_ERROR: u8 = 8;
+const T_HELLO_TABLE: u8 = 9;
+const T_CATALOG_HELLO: u8 = 10;
+const T_CATALOG: u8 = 11;
+const T_FRAMES: u8 = 12;
+const T_HEARTBEAT: u8 = 13;
+const T_ACK: u8 = 14;
+const T_TAIL_KEYS: u8 = 15;
+const T_STAMPS: u8 = 16;
+
+/// One table of a multi-table leader as announced to a follower.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub name: String,
+    /// The table schema in its on-disk text form (`TableSchema::to_text`).
+    pub schema: String,
+    /// Identity of this incarnation of the table: changes when the table is
+    /// dropped and created again under the same name.
+    pub id: u64,
+}
 
 /// One WAL frame as shipped to a follower.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +66,10 @@ pub enum Message {
     Hello {
         version: u8,
         applied_lsn: u64,
+        /// Epoch of the primary whose LSN space `applied_lsn` is in (v2).
+        epoch: u64,
+        /// `(epoch, highest lsn applied in that epoch)`, newest epoch first (v2).
+        history: Vec<(u64, u64)>,
     },
     /// Leader -> follower: stream plan. If `snapshot`, rows follow, then frames
     /// resume after `start_lsn`; otherwise frames resume after `applied_lsn`.
@@ -52,24 +78,57 @@ pub enum Message {
         tip: u64,
         snapshot: bool,
         start_lsn: u64,
+        /// The primary's epoch; every later message of the stream carries it.
+        epoch: u64,
+        /// The follower holds a divergent un-acked tail: it must answer with
+        /// [`Message::TailKeys`], receives the primary's current rows for those
+        /// keys, and then streams from `start_lsn`.
+        truncate: bool,
+        /// Last `(epoch, lsn)` both sides agree on (meaningful if `truncate`).
+        common_epoch: u64,
+        common_lsn: u64,
     },
     SnapshotRows(Vec<(u64, Vec<u64>)>),
     SnapshotEnd {
         snapshot_lsn: u64,
     },
     Frames {
+        epoch: u64,
         tip: u64,
         frames: Vec<WireFrame>,
     },
     Heartbeat {
+        epoch: u64,
         tip: u64,
     },
     /// Follower -> leader.
     Ack {
+        epoch: u64,
         applied_lsn: u64,
         durable_lsn: u64,
     },
+    /// Follower -> leader after a truncating `Welcome`: the keys its divergent
+    /// tail touched (`ok == false`: the tail is not available, send a snapshot).
+    TailKeys {
+        ok: bool,
+        pks: Vec<u64>,
+    },
     Error(String),
+    /// Leader -> follower, sent just before the `Frames` it describes (and only
+    /// when the leader has any): `(wal seq, 12-byte commit versionstamp)`.
+    Stamps(Vec<(u64, [u8; 12])>),
+    /// Follower -> leader (multi-table leader): replicate table `table`.
+    HelloTable {
+        version: u8,
+        table: String,
+        applied_lsn: u64,
+    },
+    /// Follower -> leader (multi-table leader): stream the table catalog.
+    CatalogHello {
+        version: u8,
+    },
+    /// Leader -> follower: the full current table list (sent on every change).
+    Catalog(Vec<CatalogEntry>),
 }
 
 // ── encoding ──────────────────────────────────────────────────────────────────
@@ -139,22 +198,40 @@ impl Message {
             Message::Hello {
                 version,
                 applied_lsn,
+                epoch,
+                history,
             } => {
                 w.u8(T_HELLO);
                 w.u8(*version);
                 w.u64(*applied_lsn);
+                if *version >= 2 {
+                    w.u64(*epoch);
+                    w.u32(history.len() as u32);
+                    for (e, l) in history {
+                        w.u64(*e);
+                        w.u64(*l);
+                    }
+                }
             }
             Message::Welcome {
                 first_lsn,
                 tip,
                 snapshot,
                 start_lsn,
+                epoch,
+                truncate,
+                common_epoch,
+                common_lsn,
             } => {
                 w.u8(T_WELCOME);
                 w.u64(*first_lsn);
                 w.u64(*tip);
                 w.u8(*snapshot as u8);
                 w.u64(*start_lsn);
+                w.u64(*epoch);
+                w.u8(*truncate as u8);
+                w.u64(*common_epoch);
+                w.u64(*common_lsn);
             }
             Message::SnapshotRows(rows) => {
                 w.u8(T_SNAP_ROWS);
@@ -171,8 +248,9 @@ impl Message {
                 w.u8(T_SNAP_END);
                 w.u64(*snapshot_lsn);
             }
-            Message::Frames { tip, frames } => {
+            Message::Frames { epoch, tip, frames } => {
                 w.u8(T_FRAMES);
+                w.u64(*epoch);
                 w.u64(*tip);
                 w.u32(frames.len() as u32);
                 for f in frames {
@@ -188,21 +266,63 @@ impl Message {
                     w.bytes(&f.payload);
                 }
             }
-            Message::Heartbeat { tip } => {
+            Message::Heartbeat { epoch, tip } => {
                 w.u8(T_HEARTBEAT);
+                w.u64(*epoch);
                 w.u64(*tip);
             }
             Message::Ack {
+                epoch,
                 applied_lsn,
                 durable_lsn,
             } => {
                 w.u8(T_ACK);
+                w.u64(*epoch);
                 w.u64(*applied_lsn);
                 w.u64(*durable_lsn);
+            }
+            Message::TailKeys { ok, pks } => {
+                w.u8(T_TAIL_KEYS);
+                w.u8(*ok as u8);
+                w.u32(pks.len() as u32);
+                for pk in pks {
+                    w.u64(*pk);
+                }
+            }
+            Message::Stamps(st) => {
+                w.u8(T_STAMPS);
+                w.u32(st.len() as u32);
+                for (seq, s) in st {
+                    w.u64(*seq);
+                    w.0.extend_from_slice(s);
+                }
             }
             Message::Error(s) => {
                 w.u8(T_ERROR);
                 w.bytes(s.as_bytes());
+            }
+            Message::HelloTable {
+                version,
+                table,
+                applied_lsn,
+            } => {
+                w.u8(T_HELLO_TABLE);
+                w.u8(*version);
+                w.bytes(table.as_bytes());
+                w.u64(*applied_lsn);
+            }
+            Message::CatalogHello { version } => {
+                w.u8(T_CATALOG_HELLO);
+                w.u8(*version);
+            }
+            Message::Catalog(entries) => {
+                w.u8(T_CATALOG);
+                w.u32(entries.len() as u32);
+                for e in entries {
+                    w.bytes(e.name.as_bytes());
+                    w.bytes(e.schema.as_bytes());
+                    w.u64(e.id);
+                }
             }
         }
         w.0
@@ -211,16 +331,44 @@ impl Message {
     fn decode_body(body: &[u8]) -> ReplResult<Self> {
         let mut r = Rd { buf: body, pos: 0 };
         let msg = match r.u8()? {
-            T_HELLO => Message::Hello {
-                version: r.u8()?,
-                applied_lsn: r.u64()?,
-            },
+            T_HELLO => {
+                let version = r.u8()?;
+                let applied_lsn = r.u64()?;
+                // A v1 hello ends here; it is parsed only so the leader can
+                // answer it with a clear "unsupported version" error.
+                let (epoch, history) = if version >= 2 {
+                    let epoch = r.u64()?;
+                    let n = r.u32()? as usize;
+                    let mut h = Vec::with_capacity(n.min(256));
+                    for _ in 0..n {
+                        h.push((r.u64()?, r.u64()?));
+                    }
+                    (epoch, h)
+                } else {
+                    (0, Vec::new())
+                };
+                Message::Hello {
+                    version,
+                    applied_lsn,
+                    epoch,
+                    history,
+                }
+            }
             T_WELCOME => Message::Welcome {
                 first_lsn: r.u64()?,
                 tip: r.u64()?,
                 snapshot: r.u8()? != 0,
                 start_lsn: r.u64()?,
+                epoch: r.u64()?,
+                truncate: r.u8()? != 0,
+                common_epoch: r.u64()?,
+                common_lsn: r.u64()?,
             },
+            T_FRAMES_V1 | T_HEARTBEAT_V1 | T_ACK_V1 => {
+                return Err(ReplicationError::Corrupt(
+                    "protocol v1 stream message (epoch-less) outside the handshake".into(),
+                ))
+            }
             T_SNAP_ROWS => {
                 let n = r.u32()? as usize;
                 let mut rows = Vec::with_capacity(n.min(65_536));
@@ -239,6 +387,7 @@ impl Message {
                 snapshot_lsn: r.u64()?,
             },
             T_FRAMES => {
+                let epoch = r.u64()?;
                 let tip = r.u64()?;
                 let n = r.u32()? as usize;
                 let mut frames = Vec::with_capacity(n.min(4096));
@@ -258,14 +407,55 @@ impl Message {
                         payload,
                     });
                 }
-                Message::Frames { tip, frames }
+                Message::Frames { epoch, tip, frames }
             }
-            T_HEARTBEAT => Message::Heartbeat { tip: r.u64()? },
+            T_HEARTBEAT => Message::Heartbeat {
+                epoch: r.u64()?,
+                tip: r.u64()?,
+            },
             T_ACK => Message::Ack {
+                epoch: r.u64()?,
                 applied_lsn: r.u64()?,
                 durable_lsn: r.u64()?,
             },
+            T_STAMPS => {
+                let n = r.u32()? as usize;
+                let mut st = Vec::with_capacity(n.min(65_536));
+                for _ in 0..n {
+                    let seq = r.u64()?;
+                    let s: [u8; 12] = r.take(12)?.try_into().unwrap();
+                    st.push((seq, s));
+                }
+                Message::Stamps(st)
+            }
+            T_TAIL_KEYS => {
+                let ok = r.u8()? != 0;
+                let n = r.u32()? as usize;
+                let mut pks = Vec::with_capacity(n.min(65_536));
+                for _ in 0..n {
+                    pks.push(r.u64()?);
+                }
+                Message::TailKeys { ok, pks }
+            }
             T_ERROR => Message::Error(String::from_utf8_lossy(r.bytes()?).into_owned()),
+            T_HELLO_TABLE => Message::HelloTable {
+                version: r.u8()?,
+                table: String::from_utf8_lossy(r.bytes()?).into_owned(),
+                applied_lsn: r.u64()?,
+            },
+            T_CATALOG_HELLO => Message::CatalogHello { version: r.u8()? },
+            T_CATALOG => {
+                let n = r.u32()? as usize;
+                let mut v = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    v.push(CatalogEntry {
+                        name: String::from_utf8_lossy(r.bytes()?).into_owned(),
+                        schema: String::from_utf8_lossy(r.bytes()?).into_owned(),
+                        id: r.u64()?,
+                    });
+                }
+                Message::Catalog(v)
+            }
             t => {
                 return Err(ReplicationError::Corrupt(format!(
                     "unknown message type {t}"
@@ -342,8 +532,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_messages_round_trip() {
+        for msg in [
+            Message::HelloTable {
+                version: PROTO_VERSION,
+                table: "orders".into(),
+                applied_lsn: 7,
+            },
+            Message::CatalogHello {
+                version: PROTO_VERSION,
+            },
+            Message::Catalog(vec![CatalogEntry {
+                name: "t".into(),
+                schema: "pk:u64
+v:u64
+"
+                .into(),
+                id: 99,
+            }]),
+        ] {
+            assert_eq!(Message::decode(&msg.encode()).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn v2_handshake_and_stream_messages_round_trip() {
+        for msg in [
+            Message::Hello {
+                version: PROTO_VERSION,
+                applied_lsn: 40,
+                epoch: 3,
+                history: vec![(3, 40), (2, 17)],
+            },
+            Message::Welcome {
+                first_lsn: 1,
+                tip: 50,
+                snapshot: false,
+                start_lsn: 33,
+                epoch: 4,
+                truncate: true,
+                common_epoch: 2,
+                common_lsn: 17,
+            },
+            Message::Heartbeat { epoch: 4, tip: 9 },
+            Message::Ack {
+                epoch: 4,
+                applied_lsn: 8,
+                durable_lsn: 7,
+            },
+            Message::TailKeys {
+                ok: true,
+                pks: vec![1, 5, 9],
+            },
+        ] {
+            assert_eq!(Message::decode(&msg.encode()).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn v1_hello_still_parses_but_v1_stream_messages_do_not() {
+        // v1 Hello body: type, version=1, applied_lsn.
+        let mut body = vec![T_HELLO, 1];
+        body.extend_from_slice(&7u64.to_le_bytes());
+        let m = Message::decode_body(&body).unwrap();
+        assert_eq!(
+            m,
+            Message::Hello {
+                version: 1,
+                applied_lsn: 7,
+                epoch: 0,
+                history: vec![]
+            }
+        );
+        let mut hb = vec![T_HEARTBEAT_V1];
+        hb.extend_from_slice(&1u64.to_le_bytes());
+        assert!(Message::decode_body(&hb).is_err());
+    }
+
+    #[test]
     fn round_trips_and_detects_bit_flips() {
         let msg = Message::Frames {
+            epoch: 3,
             tip: 9,
             frames: vec![WireFrame {
                 seq: 9,

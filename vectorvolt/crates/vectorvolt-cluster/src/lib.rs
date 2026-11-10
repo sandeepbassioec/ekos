@@ -1,5 +1,6 @@
 pub mod config;
 pub mod epoch;
+pub mod failover;
 pub mod gossip;
 pub mod gossip_net;
 pub mod membership;
@@ -8,6 +9,11 @@ pub mod node_runtime;
 pub mod quorum;
 pub mod raft;
 pub mod ring;
+pub mod saga;
 pub mod shard;
+pub mod shard_rpc;
 pub mod swim;
 pub mod transport;
+pub mod versionstamp;
+pub mod migration;
+pub mod rebalance;

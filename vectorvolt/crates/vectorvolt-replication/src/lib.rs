@@ -57,17 +57,26 @@ mod error;
 mod follower;
 mod frame;
 mod leader;
+mod lineage;
 mod metrics;
+mod multi_client;
 mod proto;
 mod server;
+mod tls;
 mod wal_tail;
 
-pub use client::{load_position, save_position, ReplicationClient, POSITION_FILE};
-pub use config::{ReplicationConfig, ReplicationMode, ReplicationRole, RoleCell};
+pub use client::{
+    load_position, load_position_full, save_position, save_position_full, set_stamp_observer,
+    Position, ReplicationClient, POSITION_FILE,
+};
+pub use config::{EpochCell, ReplicationConfig, ReplicationMode, ReplicationRole, RoleCell};
 pub use error::{ReplResult, ReplicationError};
+pub use lineage::{Lineage, LineageStore, Mapped, LINEAGE_FILE};
 pub use metrics::{MetricsSnapshot, ReplicationMetrics};
-pub use proto::{Message, WireFrame};
-pub use server::{FollowerInfo, ReplicationServer};
+pub use multi_client::MultiReplicationClient;
+pub use proto::{Message, WireFrame, PROTO_VERSION};
+pub use server::{FollowerInfo, MultiReplicationServer, ReplicationServer};
+pub use tls::{ReplicationTlsClient, ReplicationTlsServer};
 
 pub use follower::Follower;
 pub use frame::{ReplicaMutation, ReplicationFrame};

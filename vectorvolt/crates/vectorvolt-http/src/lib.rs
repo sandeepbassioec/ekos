@@ -25,4 +25,4 @@ pub mod types;
 pub mod webhook;
 
 pub use metrics::Metrics;
-pub use server::{AppState, HttpServer, HttpServerConfig};
+pub use server::{AppState, HttpServer, HttpServerConfig, WriteGate};

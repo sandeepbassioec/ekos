@@ -5,7 +5,9 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 use vectorvolt_cluster::node_runtime::{ClusterNode, ClusterStatusServer, PeerInfo};
 use vectorvolt_cluster::swim::SwimConfig;
-use vvctl::commands::cluster_cmd::{ClusterArgs, ClusterCommand, load_identity, run};
+use vvctl::commands::cluster_cmd::{
+    ClusterArgs, ClusterCommand, load_identity, record_control_addr, run,
+};
 
 fn free_udp() -> SocketAddr {
     let s = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -67,6 +69,7 @@ fn args(dir: &std::path::Path, node: Option<SocketAddr>, command: ClusterCommand
     ClusterArgs {
         dir: dir.to_path_buf(),
         node,
+        offline: false,
         command,
     }
 }
@@ -127,4 +130,63 @@ fn live_command_fails_cleanly_when_node_unreachable() {
     let d = tempfile::tempdir().unwrap();
     let dead: SocketAddr = format!("127.0.0.1:{}", free_tcp()).parse().unwrap();
     assert!(run(args(d.path(), Some(dead), ClusterCommand::Status)).is_err());
+}
+
+fn init_dir(d: &std::path::Path) {
+    run(args(
+        d,
+        None,
+        ClusterCommand::Init {
+            name: "c".into(),
+            replication_factor: 3,
+            vnode_count: 16,
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn commands_default_to_the_local_node_from_cluster_identity() {
+    let d = tempfile::tempdir().unwrap();
+    init_dir(d.path());
+    let (seed_udp, seed_ctl) = start_node(vec![]);
+    let (_b_udp, b_ctl) = start_node(vec![]);
+
+    // The identity records this node's control endpoint; no --node needed.
+    record_control_addr(d.path(), b_ctl).unwrap();
+    assert_eq!(load_identity(d.path()).unwrap().control_addr, Some(b_ctl));
+    run(args(d.path(), None, ClusterCommand::Status)).unwrap();
+    run(args(d.path(), None, ClusterCommand::Members)).unwrap();
+    run(args(
+        d.path(),
+        None,
+        ClusterCommand::Join { addr: seed_udp },
+    ))
+    .unwrap();
+    assert!(wait(Duration::from_secs(5), || {
+        members(seed_ctl)
+            .iter()
+            .filter(|m| m.state == "Alive")
+            .count()
+            == 2
+    }));
+    run(args(d.path(), None, ClusterCommand::Leave { addr: None })).unwrap();
+    assert!(wait(Duration::from_secs(5), || {
+        members(seed_ctl).iter().any(|m| m.state == "Left")
+    }));
+}
+
+#[test]
+fn default_does_not_silently_fall_back_to_offline_cluster_json() {
+    let d = tempfile::tempdir().unwrap();
+    init_dir(d.path());
+    // cluster.json exists, but the recorded node is unreachable: error, not offline data.
+    let dead: SocketAddr = format!("127.0.0.1:{}", free_tcp()).parse().unwrap();
+    record_control_addr(d.path(), dead).unwrap();
+    assert!(run(args(d.path(), None, ClusterCommand::Status)).is_err());
+    assert!(run(args(d.path(), None, ClusterCommand::Members)).is_err());
+    // Offline mode only with the explicit flag.
+    let mut a = args(d.path(), None, ClusterCommand::Status);
+    a.offline = true;
+    run(a).unwrap();
 }

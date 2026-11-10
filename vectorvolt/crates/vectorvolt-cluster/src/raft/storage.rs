@@ -8,6 +8,7 @@
 //!   a torn / corrupt tail is detected on load and truncated away
 //! - `snapshot`    : `[crc32 u32 LE][json]`, replaced atomically
 
+use super::config::ClusterConfig;
 use super::log::LogEntry;
 use crate::node::NodeId;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,9 @@ pub struct Snapshot {
     pub last_index: u64,
     pub last_term: u64,
     pub data: Vec<u8>,
+    /// Membership as of `last_index` (absent in snapshots from older versions).
+    #[serde(default)]
+    pub config: Option<ClusterConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -314,6 +318,7 @@ mod tests {
                 last_index: 2,
                 last_term: 1,
                 data: vec![9],
+                config: None,
             },
             &[e(1, 3)],
         )

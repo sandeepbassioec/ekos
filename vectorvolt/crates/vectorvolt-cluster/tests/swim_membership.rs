@@ -179,3 +179,31 @@ async fn real_udp_cluster_converges_and_detects_failure() {
     .await;
     assert!(ok, "UDP: killed node not declared Dead");
 }
+
+#[tokio::test]
+async fn restart_with_new_id_at_same_address_retires_old_entry_promptly() {
+    let (net, nodes) = mem_cluster(4);
+    join_all(&nodes).await;
+    converge(&nodes).await;
+
+    // Node 3 crashes and comes back at the same address under a new id.
+    let old = nodes[3].clone();
+    old.shutdown();
+    let fresh = spawn_node(net.endpoint(old.local_addr()));
+    assert!(fresh.join(&[nodes[0].local_addr()]).await);
+
+    let observers = &nodes[..3];
+    let ok = until(Duration::from_secs(2), || {
+        observers
+            .iter()
+            .all(|o| state_of(o, &old) == Some(NodeState::Left))
+            && observers
+                .iter()
+                .all(|o| state_of(o, &fresh) == Some(NodeState::Alive))
+    })
+    .await;
+    assert!(
+        ok,
+        "old id must be Left (not waiting for suspect timeout) and new id Alive"
+    );
+}
