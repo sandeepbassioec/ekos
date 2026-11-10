@@ -13,7 +13,18 @@
 //!   handled in this layer.
 //! - Reads from a follower reflect only what has been applied so far.
 //!
-//! ## Example
+//! ## Networked WAL shipping
+//!
+//! [`ReplicationServer`] (leader) streams committed WAL frames over TCP to
+//! [`ReplicationClient`]s (followers), CRC-framed, starting from each
+//! follower's last applied LSN; a follower that is new, ahead, or older than
+//! the leader's retained WAL receives a snapshot first. Followers ack applied
+//! and durable LSNs; [`ReplicationMode`] decides whether a writer waits
+//! (`wait_for_replication`), and a missing ack is an [`ReplicationError::AckTimeout`].
+//! [`RoleCell`] holds the switchable [`ReplicationRole`] a later election step
+//! can flip to promote a follower.
+//!
+//! ## Example (in-process)
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -40,9 +51,32 @@
 //! assert_eq!(row.values[1], 42);
 //! ```
 
+mod client;
+mod config;
+mod error;
 mod follower;
 mod frame;
 mod leader;
+mod lineage;
+mod metrics;
+mod multi_client;
+mod proto;
+mod server;
+mod tls;
+mod wal_tail;
+
+pub use client::{
+    load_position, load_position_full, save_position, save_position_full, set_stamp_observer,
+    Position, ReplicationClient, POSITION_FILE,
+};
+pub use config::{EpochCell, ReplicationConfig, ReplicationMode, ReplicationRole, RoleCell};
+pub use error::{ReplResult, ReplicationError};
+pub use lineage::{Lineage, LineageStore, Mapped, LINEAGE_FILE};
+pub use metrics::{MetricsSnapshot, ReplicationMetrics};
+pub use multi_client::MultiReplicationClient;
+pub use proto::{Message, WireFrame, PROTO_VERSION};
+pub use server::{FollowerInfo, MultiReplicationServer, ReplicationServer};
+pub use tls::{ReplicationTlsClient, ReplicationTlsServer};
 
 pub use follower::Follower;
 pub use frame::{ReplicaMutation, ReplicationFrame};

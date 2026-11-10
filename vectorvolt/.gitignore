@@ -3,3 +3,6 @@ Cargo.lock
 *.vwal
 *.vwal.tmp
 dist/
+
+# Written to the working directory by some vvctl tests
+_txn_intent.log

@@ -27,7 +27,7 @@ use vectorvolt_engine::TableEngine;
 use vectorvolt_net::frame::{Opcode, WIRE_HEADER_SIZE};
 
 pub use config::ServerConfig;
-pub use grpc::{GrpcServer, GrpcWriteService};
+pub use grpc::{GrpcServer, GrpcWriteService, WriteGate};
 
 pub mod config;
 pub mod grpc;

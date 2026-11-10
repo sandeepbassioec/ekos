@@ -4,17 +4,28 @@ use vectorvolt_cluster::{
     config::ClusterConfig,
     epoch::EpochFence,
     gossip::GossipEngine,
+    gossip_net::MemNetwork,
     membership::MembershipList,
     node::{NodeId, NodeMeta, NodeState},
     quorum::QuorumCoordinator,
     raft::{election::RaftCluster, state::RaftRole},
     ring::HashRing,
     shard::ShardMap,
-    swim::{AlwaysTimeoutProber, SwimProber},
+    swim::{SwimConfig, SwimNode},
 };
 
 fn addr() -> SocketAddr {
     "127.0.0.1:9001".parse().unwrap()
+}
+
+fn meta_at(id: NodeId, addr: SocketAddr) -> NodeMeta {
+    NodeMeta {
+        id,
+        addr,
+        state: NodeState::Alive,
+        incarnation: 0,
+        last_seen_ns: 0,
+    }
 }
 
 fn meta(id: NodeId) -> NodeMeta {
@@ -55,31 +66,41 @@ fn three_node_membership_converges_via_gossip() {
     assert!(ml_c.get(&a).is_some());
 }
 
-// 2. SWIM failure detection marks dead node
+// 2. SWIM failure detection marks dead node (real protocol over an in-memory network)
 #[tokio::test]
 async fn swim_failure_detection_marks_dead_node() {
-    let self_id = NodeId::new();
-    let target = NodeId::new();
-    let ml = Arc::new(MembershipList::new(meta(self_id.clone())));
-    ml.upsert(meta(target.clone()));
-
-    let prober = SwimProber::new(
-        ml.clone(),
-        std::time::Duration::from_millis(0),
-        std::time::Duration::from_millis(0),
-    )
-    .with_prober(Box::new(AlwaysTimeoutProber));
-    prober.probe_direct(&target).await;
-    {
-        let mut t = prober.suspect_times_for_test();
-        t.insert(
-            target.clone(),
-            std::time::Instant::now() - std::time::Duration::from_secs(10),
+    let net = MemNetwork::new();
+    let cfg = SwimConfig {
+        probe_interval: std::time::Duration::from_millis(20),
+        probe_timeout: std::time::Duration::from_millis(15),
+        suspect_timeout: std::time::Duration::from_millis(100),
+        indirect_probes: 2,
+        max_piggyback: 8,
+    };
+    let mk = |i: u8| {
+        let a: SocketAddr = format!("10.1.0.{i}:7000").parse().unwrap();
+        let n = SwimNode::new(
+            Arc::new(MembershipList::new(meta_at(NodeId::new(), a))),
+            net.endpoint(a),
+            cfg.clone(),
         );
+        n.start();
+        n
+    };
+    let (a, b, c) = (mk(1), mk(2), mk(3));
+    assert!(b.join(&[a.local_addr()]).await);
+    assert!(c.join(&[a.local_addr()]).await);
+    let target = c.membership().local_id().clone();
+    net.set_down(c.local_addr(), true);
+    c.shutdown();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < end {
+        if a.membership().get(&target).map(|m| m.state) == Some(NodeState::Dead) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let dead = prober.expire_suspects();
-    assert!(dead.contains(&target));
-    assert_eq!(ml.get(&target).unwrap().state, NodeState::Dead);
+    panic!("node not declared Dead");
 }
 
 // 3. HashRing with 3 nodes distributes keys evenly

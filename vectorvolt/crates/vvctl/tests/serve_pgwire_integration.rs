@@ -79,6 +79,7 @@ fn start_multi_with_pgwire(
         cluster_node_id: None,
         cluster_status_port: 7900,
         listener: Default::default(),
+        replication: Default::default(),
     };
 
     let bound = bind(&args).expect("bind");

@@ -30,6 +30,7 @@ use vectorvolt_wal::{WalConfig, WalReader, WalWriter};
 
 use crate::cdc::ChangeEvent;
 use crate::cdc_log::CdcLog;
+use crate::hooks::{CommitStamper, WriteGuard};
 use crate::index_catalog;
 use crate::mvcc::MvccStore;
 use crate::schema::TableSchema;
@@ -123,6 +124,8 @@ pub struct TableEngine {
     /// `snapshot.vvss`, `secondary_index.catalog`); `None` when unencrypted
     /// (PP-54 / PP-56). Vector/HNSW indexes are in memory only.
     pub(crate) side_key: Option<SideKey>,
+    /// Commit-stamper and write-guard hooks (cluster layer).
+    pub(crate) hooks: crate::hooks::EngineHooks,
 }
 
 /// How durable a write must be before `insert` returns.
@@ -809,6 +812,7 @@ impl TableEngine {
             fk_rebuild: parking_lot::Mutex::new(()),
             projections: parking_lot::Mutex::new(vectorvolt_projection::ProjectionStore::new()),
             vector_indexes: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            hooks: Default::default(),
             side_key,
         };
 
@@ -969,7 +973,47 @@ impl TableEngine {
         &self.schema
     }
 
+    /// Sequence of the last WAL frame appended (F6: lets a server wait for
+    /// replication of every write that has already returned).
+    pub fn wal_tip_sequence(&self) -> u64 {
+        self.txn.wal_tip_sequence()
+    }
+
+    /// Install (or clear) the commit stamper: called once per commit with the
+    /// CDC LSN, its versionstamp is stored on the emitted [`ChangeEvent`]s.
+    pub fn set_commit_stamper(&self, stamper: Option<CommitStamper>) {
+        self.hooks.set_stamper(stamper);
+    }
+
+    /// Install (or clear) the per-key write gate consulted by `insert`,
+    /// `update`, `delete` and `apply_batch` (hence every transaction surface).
+    /// A rejected write fails with an `Io` error of kind `PermissionDenied`
+    /// carrying the guard's reason.
+    pub fn set_write_guard(&self, guard: Option<WriteGuard>) {
+        self.hooks.set_guard(guard);
+    }
+
+    /// After flipping the write guard to reject, wait (up to `timeout`) until
+    /// every write that already passed it has finished. Returns `false` on
+    /// timeout.
+    /// Versionstamps of recent commits whose WAL sequence is in `lo..=hi`.
+    pub fn commit_stamps_in(&self, lo: u64, hi: u64) -> Vec<(u64, [u8; 12])> {
+        self.hooks.stamps_in(lo, hi)
+    }
+
+    /// Stamped commits that have not yet recorded their stamp (replication
+    /// waits briefly for this to reach 0 before shipping frames).
+    pub fn commit_stamps_pending(&self) -> u64 {
+        self.hooks.pending_count()
+    }
+
+    pub fn quiesce_writes(&self, timeout: std::time::Duration) -> bool {
+        self.hooks.quiesce(timeout)
+    }
+
     pub fn insert(&self, pk: u64, values: Vec<u64>) -> EngineResult<WalTip> {
+        let _ticket = self.hooks.enter([pk])?;
+        let _pending = self.hooks.pending();
         self.schema.validate_row(&values)?;
 
         // Clone for CDC â€” always needed for log persistence; also used for
@@ -1001,7 +1045,9 @@ impl TableEngine {
                 .lsn_counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
-            let ev = ChangeEvent::insert(lsn, pk, vals.clone());
+            let stamp = self.hooks.stamp(lsn);
+            self.hooks.record(tip.sequence, stamp);
+            let ev = ChangeEvent::insert(lsn, pk, vals.clone()).with_stamp(stamp);
             self.persist_cdc(&ev);
             let _ = self.changes_tx.send(ev);
             self.projections
@@ -1015,6 +1061,8 @@ impl TableEngine {
     ///
     /// All live secondary indexes are updated after the delete succeeds.
     pub fn delete(&self, pk: u64) -> EngineResult<WalTip> {
+        let _ticket = self.hooks.enter([pk])?;
+        let _pending = self.hooks.pending();
         let old_row = if !self.secondary_indexes.read().is_empty() {
             self.get(pk)?
         } else {
@@ -1032,7 +1080,9 @@ impl TableEngine {
             .lsn_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        let ev = ChangeEvent::delete(lsn, pk);
+        let stamp = self.hooks.stamp(lsn);
+        self.hooks.record(tip.sequence, stamp);
+        let ev = ChangeEvent::delete(lsn, pk).with_stamp(stamp);
         self.persist_cdc(&ev);
         let _ = self.changes_tx.send(ev);
         self.projections
@@ -1052,6 +1102,8 @@ impl TableEngine {
     ///
     /// Returns `Err(TxnError::PkNotFound)` if `pk` does not exist.
     pub fn update(&self, pk: u64, new_values: Vec<u64>) -> EngineResult<WalTip> {
+        let _ticket = self.hooks.enter([pk])?;
+        let _pending = self.hooks.pending();
         self.schema.validate_row(&new_values)?;
 
         // Snapshot old row for secondary-index maintenance.
@@ -1079,7 +1131,9 @@ impl TableEngine {
             .lsn_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        let ev = ChangeEvent::insert(lsn, pk, new_values);
+        let stamp = self.hooks.stamp(lsn);
+        self.hooks.record(tip.sequence, stamp);
+        let ev = ChangeEvent::insert(lsn, pk, new_values).with_stamp(stamp);
         self.persist_cdc(&ev);
         let _ = self.changes_tx.send(ev);
         Ok(tip)
@@ -1983,6 +2037,19 @@ impl TableEngine {
     /// This is the commit path for every transaction surface (engine MVCC,
     /// the wire protocol, gRPC, HTTP multi-table, SQL).
     pub fn apply_batch(&self, ops: Vec<(u64, Option<Vec<u64>>)>) -> EngineResult<WalTip> {
+        self.apply_batch_stamped(ops, None)
+    }
+
+    /// Like [`apply_batch`](Self::apply_batch), but the emitted CDC events (and
+    /// the commit-stamp ring) carry `stamp` -- the versionstamp the primary
+    /// assigned -- instead of a fresh local one. `None` stamps locally.
+    pub fn apply_batch_stamped(
+        &self,
+        ops: Vec<(u64, Option<Vec<u64>>)>,
+        stamp: Option<[u8; 12]>,
+    ) -> EngineResult<WalTip> {
+        let _ticket = self.hooks.enter(ops.iter().map(|(pk, _)| *pk))?;
+        let _pending = self.hooks.pending();
         for (_, op) in &ops {
             if let Some(values) = op {
                 self.schema.validate_row(values)?;
@@ -2004,6 +2071,12 @@ impl TableEngine {
             self.maybe_compact()?;
         }
 
+        // One versionstamp per commit, shared by every event of the batch.
+        let batch_stamp = stamp.or_else(|| {
+            self.hooks
+                .stamp(self.lsn_counter.load(std::sync::atomic::Ordering::Relaxed) + 1)
+        });
+        self.hooks.record(tip.sequence, batch_stamp);
         for (i, (pk, op)) in ops.into_iter().enumerate() {
             let old = old_rows.get(i).and_then(|r| r.as_ref());
             match op {
@@ -2015,7 +2088,7 @@ impl TableEngine {
                         .lsn_counter
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         + 1;
-                    let ev = ChangeEvent::insert(lsn, pk, values.clone());
+                    let ev = ChangeEvent::insert(lsn, pk, values.clone()).with_stamp(batch_stamp);
                     self.persist_cdc(&ev);
                     let _ = self.changes_tx.send(ev);
                     self.projections
@@ -2034,7 +2107,7 @@ impl TableEngine {
                         .lsn_counter
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         + 1;
-                    let ev = ChangeEvent::delete(lsn, pk);
+                    let ev = ChangeEvent::delete(lsn, pk).with_stamp(batch_stamp);
                     self.persist_cdc(&ev);
                     let _ = self.changes_tx.send(ev);
                     self.projections
@@ -2073,6 +2146,30 @@ impl TableEngine {
         self.txn
             .get_at(pk, read_ts)
             .map(|values| EngineRow { pk, values })
+    }
+
+    /// A consistent replication point: the WAL tip sequence together with
+    /// every live row as of exactly that sequence.
+    ///
+    /// The tip is read at an instant when no mutation is half-applied (see
+    /// `TxnManager::quiesced_tip`), and rows are read from the MVCC version
+    /// chains at that sequence (a row's commit timestamp is its WAL frame
+    /// sequence). Writers are blocked only for the instant of the tip read,
+    /// never for the scan, and the result contains the effect of every frame
+    /// `<= tip` and of none after it — so a follower that installs the rows and
+    /// then streams frames `> tip` sees each mutation exactly once.
+    pub fn consistent_snapshot(&self) -> (u64, Vec<EngineRow>) {
+        let tip = self.txn.quiesced_tip();
+        (tip, self.scan_at(tip))
+    }
+
+    /// The consistent snapshot point of [`consistent_snapshot`](Self::consistent_snapshot)
+    /// without the row data: the tip and the (unordered) live keys as of it.
+    /// Rows can then be fetched in bounded chunks with
+    /// [`get_at`](Self::get_at) at that tip.
+    pub fn consistent_snapshot_keys(&self) -> (u64, Vec<u64>) {
+        let tip = self.txn.quiesced_tip();
+        (tip, self.txn.pks_at(tip))
     }
 
     /// Snapshot-consistent full scan as of `read_ts`.
@@ -2126,5 +2223,145 @@ mod cdc_failure_tests {
             .map(|e| e.lsn)
             .collect();
         assert_eq!(lsns, vec![1, 3]);
+    }
+}
+
+#[cfg(test)]
+mod consistent_snapshot_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// The returned rows are exactly the state after the frame at the
+    /// returned tip, even while writers keep going.
+    #[test]
+    fn consistent_snapshot_matches_state_at_tip_under_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let eng = Arc::new(
+            TableEngine::open_with(
+                vec!["pk".into(), "v".into()],
+                dir.path(),
+                EngineOptions::new(1 << 20).with_durability(Durability::WriteOnly),
+            )
+            .unwrap(),
+        );
+        let (tip0, rows0) = eng.consistent_snapshot();
+        assert_eq!(tip0, 0);
+        assert!(rows0.is_empty());
+
+        // A single writer logs the model state after every sequence.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (eng, stop) = (Arc::clone(&eng), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut model: BTreeMap<u64, u64> = BTreeMap::new();
+                let mut history: BTreeMap<u64, BTreeMap<u64, u64>> = BTreeMap::new();
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) && i < 3000 {
+                    let pk = i % 37;
+                    let seq = if i % 5 == 4 && model.contains_key(&pk) {
+                        model.remove(&pk);
+                        eng.delete(pk).unwrap().sequence
+                    } else {
+                        model.insert(pk, i);
+                        eng.insert(pk, vec![pk, i]).unwrap().sequence
+                    };
+                    history.insert(seq, model.clone());
+                    i += 1;
+                }
+                history
+            })
+        };
+        let mut snaps = Vec::new();
+        for _ in 0..20 {
+            snaps.push(eng.consistent_snapshot());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let history = writer.join().unwrap();
+        for (tip, rows) in snaps {
+            let got: BTreeMap<u64, u64> = rows.iter().map(|r| (r.pk, r.values[1])).collect();
+            let want = if tip == 0 {
+                BTreeMap::new()
+            } else {
+                history.get(&tip).cloned().unwrap()
+            };
+            assert_eq!(got, want, "snapshot at tip {tip} is not the state at tip");
+        }
+    }
+}
+
+#[cfg(test)]
+mod hooks_tests {
+    use super::*;
+
+    fn open() -> (tempfile::TempDir, Arc<TableEngine>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let eng = Arc::new(
+            TableEngine::open_with(
+                vec!["pk".into(), "v".into()],
+                dir.path(),
+                EngineOptions::new(1 << 20).with_durability(Durability::WriteOnly),
+            )
+            .unwrap(),
+        );
+        (dir, eng)
+    }
+
+    #[test]
+    fn commit_stamper_stamps_cdc_events_and_batches_share_one_stamp() {
+        let (_d, eng) = open();
+        let mut rx = eng.subscribe_changes();
+        assert!(rx.try_recv().is_err());
+        eng.insert(1, vec![1, 10]).unwrap();
+        assert!(rx.try_recv().unwrap().versionstamp.is_none());
+
+        let n = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let n2 = Arc::clone(&n);
+        eng.set_commit_stamper(Some(Arc::new(move |_lsn| {
+            Some([n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1; 12])
+        })));
+        eng.insert(2, vec![2, 20]).unwrap();
+        eng.apply_batch(vec![(3, Some(vec![3, 30])), (4, Some(vec![4, 40]))])
+            .unwrap();
+        let a = rx.try_recv().unwrap();
+        let b = rx.try_recv().unwrap();
+        let c = rx.try_recv().unwrap();
+        assert_eq!(a.versionstamp, Some([1; 12]));
+        assert_eq!(b.versionstamp, Some([2; 12]));
+        assert_eq!(c.versionstamp, Some([2; 12]), "one stamp per commit");
+        // Stamps survive the persisted CDC log.
+        let logged = eng.read_log_from(0).unwrap();
+        assert_eq!(logged.last().unwrap().versionstamp, Some([2; 12]));
+    }
+
+    #[test]
+    fn write_guard_rejects_and_quiesce_waits() {
+        let (_d, eng) = open();
+        let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = Arc::clone(&frozen);
+        eng.set_write_guard(Some(Arc::new(move |pk| {
+            if pk >= 100 && f2.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("shard:frozen".into())
+            } else {
+                Ok(())
+            }
+        })));
+        eng.insert(100, vec![100, 1]).unwrap();
+        frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(eng.quiesce_writes(std::time::Duration::from_secs(1)));
+        let e = eng.insert(100, vec![100, 2]).unwrap_err();
+        assert!(e.to_string().contains("shard:frozen"), "{e}");
+        assert!(eng.delete(100).is_err());
+        assert!(eng.update(100, vec![100, 3]).is_err());
+        assert!(
+            eng.apply_batch(vec![(5, Some(vec![5, 5])), (100, None)])
+                .is_err()
+        );
+        assert!(
+            eng.get(5).unwrap().is_none(),
+            "rejected batch writes nothing"
+        );
+        eng.insert(5, vec![5, 5]).unwrap();
+        assert_eq!(eng.get(100).unwrap().unwrap().values, vec![100, 1]);
     }
 }

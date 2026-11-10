@@ -80,12 +80,55 @@ impl MembershipList {
         }
     }
 
+    pub fn set_incarnation(&self, id: &NodeId, inc: u64) {
+        if let Some(mut entry) = self.members.get_mut(id) {
+            entry.incarnation = inc;
+            entry.state = NodeState::Alive;
+        }
+    }
+
     pub fn bump_incarnation(&self, id: &NodeId) -> Option<u64> {
         if let Some(mut entry) = self.members.get_mut(id) {
             entry.incarnation += 1;
             return Some(entry.incarnation);
         }
         None
+    }
+
+    /// SWIM update-precedence merge. Returns `true` if the update changed
+    /// the list. Rules: a higher incarnation always wins; at an equal
+    /// incarnation the "worse" state wins (Alive < Suspect < Dead < Left).
+    /// Unknown nodes are inserted.
+    pub fn apply_update(&self, meta: NodeMeta) -> bool {
+        fn rank(s: &NodeState) -> u8 {
+            match s {
+                NodeState::Alive => 0,
+                NodeState::Suspect => 1,
+                NodeState::Dead => 2,
+                NodeState::Left => 3,
+            }
+        }
+        match self.members.entry(meta.id.clone()) {
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(meta);
+                true
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut o) => {
+                let cur = o.get();
+                let wins = meta.incarnation > cur.incarnation
+                    || (meta.incarnation == cur.incarnation
+                        && rank(&meta.state) > rank(&cur.state));
+                if wins {
+                    o.insert(meta);
+                }
+                wins
+            }
+        }
+    }
+
+    /// All members in any state.
+    pub fn all_members(&self) -> Vec<NodeMeta> {
+        self.members.iter().map(|e| e.value().clone()).collect()
     }
 
     /// Shared Arc constructor helper.

@@ -15,6 +15,8 @@ fn state_file(dir: &TempDir) -> std::path::PathBuf {
 fn args(dir: &TempDir, command: ClusterCommand) -> ClusterArgs {
     ClusterArgs {
         dir: dir.path().to_path_buf(),
+        node: None,
+        offline: true,
         command,
     }
 }
@@ -102,7 +104,7 @@ fn leave_marks_node_left() {
     .unwrap();
     let addr: SocketAddr = "127.0.0.1:7003".parse().unwrap();
     run(args(&dir, ClusterCommand::Join { addr })).unwrap();
-    run(args(&dir, ClusterCommand::Leave { addr })).unwrap();
+    run(args(&dir, ClusterCommand::Leave { addr: Some(addr) })).unwrap();
     let raw = std::fs::read_to_string(state_file(&dir)).unwrap();
     assert!(raw.contains("Left"));
 }
@@ -120,7 +122,7 @@ fn leave_unknown_node_errors() {
     ))
     .unwrap();
     let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-    assert!(run(args(&dir, ClusterCommand::Leave { addr })).is_err());
+    assert!(run(args(&dir, ClusterCommand::Leave { addr: Some(addr) })).is_err());
 }
 
 #[test]

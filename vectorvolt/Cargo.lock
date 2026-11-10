@@ -4189,12 +4189,18 @@ name = "vectorvolt-cluster"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "crc32fast",
  "dashmap",
  "rand 0.8.8",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "uuid",
 ]
 
@@ -4481,11 +4487,21 @@ dependencies = [
 name = "vectorvolt-replication"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "crossbeam-channel",
  "parking_lot",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "vectorvolt-crypto",
  "vectorvolt-engine",
+ "vectorvolt-txn",
+ "vectorvolt-wal",
 ]
 
 [[package]]
@@ -4755,6 +4771,7 @@ dependencies = [
  "vectorvolt-otel",
  "vectorvolt-query",
  "vectorvolt-reader",
+ "vectorvolt-replication",
  "vectorvolt-semantic",
  "vectorvolt-server",
  "vectorvolt-sink",

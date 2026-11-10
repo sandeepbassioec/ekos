@@ -309,6 +309,12 @@ impl TxnManager {
         self.wal.wal().tip().sequence
     }
 
+    /// Sequence of the last frame appended to the WAL, without quiescing
+    /// writers (an upper bound for every write that has already returned).
+    pub fn wal_tip_sequence(&self) -> u64 {
+        self.wal.wal().tip().sequence
+    }
+
     /// Opt into WAL/row-data encryption at rest: every mutation payload is
     /// encrypted before it reaches the WAL. The caller (`TableEngine`) is
     /// responsible for decrypting `frame.payload` with the same key during
@@ -669,6 +675,11 @@ impl TxnManager {
     /// is a later step — this just exposes the primitive.)
     pub fn begin_snapshot(&self) -> u64 {
         self.clock.current()
+    }
+
+    /// Keys live as of `read_ts` (no row data), in unspecified order.
+    pub fn pks_at(&self, read_ts: u64) -> Vec<u64> {
+        self.version_index.visible_pks_at(read_ts)
     }
 
     /// Snapshot-consistent full scan as of `read_ts`.

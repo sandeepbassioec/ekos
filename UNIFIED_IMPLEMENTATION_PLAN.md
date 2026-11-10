@@ -763,14 +763,37 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 
 | # | Gap | Ref | Size | Status |
 |---|---|---|---|---|
-| F1 | Cluster network transport (gossip + Raft RPC) | 6.11 | L | ⬜ |
-| F2 | Real Raft: persisted term/vote/log, network replication, snapshot install | LD-SWIM | L | ⬜ |
-| F3 | SWIM probe always Suspect | 6.11 | M | ⬜ |
-| F4 | `--cluster-seeds` recorded only; `cluster join/leave/init` local only | — | M | ⬜ |
-| F5 | Replication: network, catch-up, acks/sync, replication factor | §6.3 | L | ⬜ |
-| F6 | Epoch fencing + < 2 s failover | 6.5 | L | ⬜ |
-| F7 | Shard split, auto-scale, live migration, drain | 6.8/6.9 | L | ⬜ |
-| F8 | Cross-shard sagas; cluster versionstamps | §5.9, 6.15 | L | ⬜ |
+| F1 | Cluster network transport (gossip + Raft RPC) | 6.11 | L | ✅ `transport.rs`: framed TCP RPC (version, length, CRC), timeouts, reconnect with backoff, binary codec (frame v2), TLS/mTLS (`bind_tls`), and an in-memory network for tests. SWIM over UDP (`gossip_net.rs`). |
+| F2 | Real Raft: persisted term/vote/log, network replication, snapshot install | LD-SWIM | L | ✅ Raft (`raft/`): fsynced hard state and log (CRC, torn-tail trim); elections with pre-vote and leader stickiness; replication with conflict backoff; commits only current-term entries on a majority. Chunked, resumable InstallSnapshot. Single-server membership changes with learners. Tests `raft_cluster.rs`, `raft_advanced.rs`. |
+| F3 | SWIM probe always Suspect | 6.11 | M | ✅ `SwimNode`: ping, ping-req via k helpers, suspicion with incarnations then Dead, refutation, piggy-backed dissemination, graceful leave, and reconciliation when a node restarts under a new id. Mock probers removed. Tests `swim_membership.rs`. |
+| F4 | `--cluster-seeds` recorded only; `cluster join/leave/init` local only | — | M | ✅ `serve --cluster-seeds` joins through gossip. `vvctl cluster init/join/leave/status/members` target the running node (local `control_addr` by default; `--offline` for the old file mode). Join/leave also add/remove the node in the failover Raft group. |
+| F5 | Replication: network, catch-up, acks/sync, replication factor | §6.3 | L | ✅ TCP WAL-shipping replication (`vectorvolt-replication`):
+  - all tables, each with a persisted position;
+  - catch-up, with snapshot fallback via `consistent_snapshot`;
+  - async, semi-sync and sync acks, with RF enforced ("insufficient replicas"; `--replication-degraded-ok` opt-in);
+  - TLS/mTLS and lag metrics;
+  - an allocation-free `wait_for_replication`. |
+| F6 | Epoch fencing + < 2 s failover | 6.5 | L | ✅ Raft control plane (`failover.rs`):
+  - epoch-CAS promotion, a lease-fenced write gate, and the epoch on every replication frame and ack;
+  - incremental catch-up via the (epoch, LSN) lineage;
+  - followers reject writes on HTTP, gRPC, pgwire and native;
+  - dynamic peers.
+
+  Measured failover 0.34 s (3 real processes). |
+| F7 | Shard split, auto-scale, live migration, drain | 6.8/6.9 | L | ✅ Shards:
+  - split, live migration (bounded cutover) and drain, with the map committed through Raft;
+  - a rate-limited rebalancer, off by default;
+  - an engine-backed shard node with streamed snapshot chunks;
+  - a migration journal with crash repair;
+  - `/shards*` endpoints and `vvctl shard`.
+
+  Tests `shard_ops.rs`, `shard_live.rs`, `shard_migration_engine.rs`. |
+| F8 | Cross-shard sagas; cluster versionstamps | §5.9, 6.15 | L | ✅ 12-byte HLC versionstamps:
+  - epoch-aware, persisted high-water, byte order equals logical order;
+  - assigned at commit via `set_commit_stamper` and carried in CDC and replication (`Stamps` message);
+  - `GET /versionstamp`.
+
+  Durable saga coordinator with compensation, timeouts and resume at startup; `POST /sagas`, `GET /sagas/{id}`. Residual: stamps for WAL frames older than the in-memory ring (after a restart) are assigned locally on the follower. |
 
 ### G — Engine core (Phase 2–3)
 
@@ -878,7 +901,7 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 | L6 | CDC reverse ingestion; backfill; migration demo | 7.5.4/7.5.5 | L | ⬜ |
 | L7 | Reference Java app testbed | 7.6 | L | ⬜ |
 | L8 | Full suite green on Linux CI | — | M | 🟡 |
-| L9 | Privileged Linux CI job for root/network tests | — | S | ⬜ |
+| L9 | Privileged Linux CI job for root/network tests | — | S | 🟡 The XDP root job exists (veth pair, `sudo`; PRs #657/#658). Other root/network tests are not in it yet. |
 | L10 | Benchmarks with methodology + comparisons | 7.8 | M | ⬜ |
 
 ### M — Build, CI, release
@@ -927,6 +950,28 @@ Source: *VectorVolt VXL Language Specification v1.0* and *VXL Requirements & Arc
 
 Order: O1 → O2 → O3/O4 → O5 + O6 → O7 → O10 → O9 → O8. Deferred, per the spec: LLVM backend, JIT, hot-swap, SIMD specialization, full IDE tooling.
 
+### P — Open findings from batches A–F and the user guide (logged 2026-11-10)
+
+These came up while finishing batches D–F and writing `C:\VectorVolt\VectorVolt_Guide.md`, and no other row tracked them. Hardware items found the same way are H17–H25. Pick any time; S items first.
+
+| # | Finding | Found in | Size | Status |
+|---|---|---|---|---|
+| P1 | pgwire leftovers from D2: no SCRAM-SHA-256-PLUS (channel binding); text parameters containing `'` are refused instead of bound safely; `Describe` finds columns by running the query; every result column is reported as `text`, so strict drivers (JDBC, npgsql) see wrong types. | D2 | M | ⬜ |
+| P2 | The native binary protocol (`vectorvolt-net/src/protocol.rs`) has no SQL opcode, so the Python/Go/TS/Rust SDKs can't run SQL (`query`/`execute` raise not-supported). Rows are lists of `u64` only. Add a SQL request/response opcode with typed values, and update the SDKs and their golden tests. | E12, E18 | L | ⬜ |
+| P3 | Python SDK default port is 5050, but the server listens on 5995. Fix the default and check the Go/TS defaults. | Guide 8.3 | S | ⬜ |
+| P4 | `vvctl server stop`, `vvctl disconnect` and `vvctl projection` still fail with "not implemented": there is no opcode or endpoint for them. Implement them, or remove the commands. | E4 | M | ⬜ |
+| P5 | Control API cluster endpoints (`/nodes`, `/shards`, `/snapshot` cluster parts) still return 501 from E3, although batch F now has real membership, shards and Raft. Back them with the F4/F7 node APIs. | E3, F4, F7 | M | ⬜ |
+| P6 | XDP was verified on a veth pair only (generic/copy mode). Verify on a physical NIC in native driver mode with zero-copy (e.g. ixgbe/i40e/mlx5; on EC2, ENA's XDP support), and record throughput and latency vs TCP. Depends on H17 (server must use XDP first). | E15 | M | ⬜ |
+| P7 | Versionstamps for WAL frames older than the in-memory stamp ring (after a primary restart) are replicated without the primary's stamp, and the follower stamps them locally. Persist the stamp with the WAL record (or a stamp sidecar index) so it survives restart. | F8 | M | ⬜ |
+| P8 | Failover, replication and shard moves are tested in-process and as processes on one host only. Add a multi-machine test (e.g. 3 VMs, real network delay and loss), including a network partition. | F6, F7 | M | ⬜ |
+| P9 | Some code writes `_txn_intent.log` into the current working directory (seen under `crates/vvctl` after tests; now gitignored). Find the default path in the txn intent log and make it relative to the data dir. | F (tests) | S | ⬜ |
+| P10 | Isolation levels: READ COMMITTED vs REPEATABLE READ (vs SERIALIZABLE, if accepted) aren't confirmed to behave differently in SQL. Specify them, and add anomaly tests (dirty read, non-repeatable read, phantom, write skew). | Guide 8.4 | M | ⬜ |
+| P11 | Master config keys `network.bind_addr` and `network.max_connections` are documented in `serve.rs` as applied but aren't used by `bind()`. Apply them or fix the doc. Also fix the stale `--encrypt-at-rest` help comment. | Guide 8.3 | S | ⬜ |
+| P12 | Encryption-at-rest residuals:<br>• key rotation re-encrypts only when a table is compacted or opened;<br>• plaintext legacy prefixes are still accepted unauthenticated, for migration;<br>• forging the table-marker frame, or rolling back to exactly the marker, needs a keyed frame chain (A12 residual).<br><br>Add background re-encryption, a cutoff that rejects plaintext after migration, and the keyed chain. | A12, C | M | ⬜ |
+| P13 | Sinks:<br>• the Redis stream sink and cache use the synchronous `redis` client (`tokio-comp` off), so they block an async worker;<br>• single-table mode names events' table `default`;<br>• the Postgres sink can't map non-`u64` columns.<br><br>Switch to async Redis, use the real table name, and add typed columns (with P2). | E8, E9, E17 | M | ⬜ |
+| P14 | Confirm and enable CPU crypto instructions: check that AES-GCM, SHA3 and CRC dependencies use AES-NI/PCLMUL/SHA extensions (target features and the crates' feature flags) on x86-64 and ARMv8, and benchmark them. | Guide 8.4 | S | ⬜ |
+| P15 | CI health: `Test & Lint` fails because the linker runs out of memory on the 2-vCPU runner (fix in PR #659, not yet confirmed green). `cargo fmt --all` (write mode) fails on Windows with os error 206 (command line too long); add a script that formats per crate with the right edition. | CI, tooling | S | 🟡 |
+
 ### Gap register log
 
 - 2026-10-31: register created. PR #647 (PP-01…13, 20–22, 25, 31, 32 + CI green-up) precedes batch A.
@@ -941,3 +986,5 @@ Order: O1 → O2 → O3/O4 → O5 + O6 → O7 → O10 → O9 → O8. Deferred, p
 - 2026-11-09: **Batch E final** (branch `feat/gaps-batch-e4`): E15 ✅ verified on real Linux; E17 leftovers closed. **Batch E has no open items.**
 - 2026-11-10: Added batch **O — VXL extension language**, scheduled after batch N. Hard rule: VXL never runs in the write hot path.
 - 2026-11-10: Added H17–H25: hardware features that exist in code but are not used by the running engine (XDP transport, io_uring WAL, O_DIRECT, `hal.*` config, `harden()`, CRC-32C, graph SIMD, TPM, HAL timer/arena/wait).
+- 2026-11-10: Added batch **P** (P1–P15): open findings from batches A–F and the user guide that no row tracked. L9 is now 🟡.
+- 2026-11-10: **Batch F complete** (branch `feat/gaps-batch-f`): F1–F8 ✅. Raft, SWIM, replication, failover (0.34 s), shards, versionstamps and sagas are wired into `vvctl serve`.

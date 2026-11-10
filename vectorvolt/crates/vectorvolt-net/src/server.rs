@@ -60,9 +60,51 @@ pub struct ServerConfig {
     /// Set to [`TransportKind::Xdp`] (Linux only) to bypass the kernel TCP
     /// stack and receive frames directly via AF_XDP.  Requires `CAP_NET_RAW`.
     pub transport: TransportKind,
+
+    /// Write fence (F6). Consulted before every request that needs
+    /// `ReadWrite`/`Admin` scope; an `Err(msg)` answers with
+    /// [`error_code::NOT_PRIMARY`] and `msg` (which names the current
+    /// primary). `None` accepts writes unconditionally.
+    pub write_gate: Option<WriteGate>,
+
+    /// Called after a successful write request (replication wait, F6). An
+    /// `Err(msg)` is returned to the client as [`error_code::REPLICATION`]:
+    /// the write is committed locally but its replication is unconfirmed.
+    pub after_write: Option<WriteGate>,
+}
+
+/// A write-fencing check: `Ok(())` when this node may accept writes now.
+#[derive(Clone)]
+pub struct WriteGate(pub Arc<dyn Fn() -> Result<(), String> + Send + Sync>);
+
+impl WriteGate {
+    pub fn new(f: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Self {
+        WriteGate(Arc::new(f))
+    }
+    pub fn check(&self) -> Result<(), String> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for WriteGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriteGate")
+    }
 }
 
 impl ServerConfig {
+    /// Install a post-write hook (see [`ServerConfig::after_write`]).
+    pub fn with_after_write(mut self, hook: WriteGate) -> Self {
+        self.after_write = Some(hook);
+        self
+    }
+
+    /// Install a write fence (see [`ServerConfig::write_gate`]).
+    pub fn with_write_gate(mut self, gate: WriteGate) -> Self {
+        self.write_gate = Some(gate);
+        self
+    }
+
     /// Require authentication with the given credentials.
     pub fn with_auth(mut self, auth: AuthConfig) -> Self {
         self.auth = auth;
@@ -93,6 +135,8 @@ impl ServerConfig {
             auth: AuthConfig::disabled(),
             tls: None,
             transport: TransportKind::Tcp,
+            write_gate: None,
+            after_write: None,
         }
     }
 
@@ -221,6 +265,8 @@ impl Server {
             let shutdown = Arc::clone(&self.shutdown);
             let auth = self.config.auth.clone();
             let tls = self.config.tls.clone();
+            let gate = self.config.write_gate.clone();
+            let hook = self.config.after_write.clone();
             std::thread::spawn(move || {
                 let span = info_span!("vv.connection", peer = ?peer);
                 let _enter = span.enter();
@@ -230,7 +276,15 @@ impl Server {
                 // denial of service that costs the attacker a single socket.
                 match ServerConn::accept(stream, tls.as_ref()) {
                     Ok(conn) => {
-                        let _ = handle_connection(conn, &registry, &stats, &shutdown, &auth);
+                        let _ = handle_connection(
+                            conn,
+                            &registry,
+                            &stats,
+                            &shutdown,
+                            &auth,
+                            gate.as_ref(),
+                            hook.as_ref(),
+                        );
                     }
                     Err(_) => {
                         stats.tls_handshake_failures.fetch_add(1, Ordering::Relaxed);
@@ -299,6 +353,8 @@ fn handle_connection(
     stats: &ServerStats,
     shutdown: &AtomicBool,
     auth_config: &AuthConfig,
+    gate: Option<&WriteGate>,
+    hook: Option<&WriteGate>,
 ) -> NetResult<()> {
     let mut header_buf = [0u8; HEADER_SIZE];
     // Auth state is per CONNECTION, not per process.
@@ -347,6 +403,8 @@ fn handle_connection(
                     &mut auth,
                     auth_config,
                     stats,
+                    gate,
+                    hook,
                 ) {
                     Ok(r) => r,
                     Err(r) => {
@@ -385,6 +443,8 @@ fn serve_authenticated(
     auth: &mut AuthState,
     config: &AuthConfig,
     stats: &ServerStats,
+    gate: Option<&WriteGate>,
+    hook: Option<&WriteGate>,
 ) -> Result<Response, Response> {
     match req {
         Request::Hello => {
@@ -423,14 +483,33 @@ fn serve_authenticated(
             })
         }
         other => {
-            if let Err(e) = auth.require(required_scope(&other)) {
+            let scope = required_scope(&other);
+            if let Err(e) = auth.require(scope) {
                 stats.forbidden_rejections.fetch_add(1, Ordering::Relaxed);
                 return Ok(Response::Error {
                     code: error_code::FORBIDDEN,
                     message: e.to_string(),
                 });
             }
-            Ok(serve_request(registry, selected, txn, next_txn_id, other))
+            if scope != Scope::ReadOnly
+                && let Some(Err(msg)) = gate.map(WriteGate::check)
+            {
+                return Ok(Response::Error {
+                    code: error_code::NOT_PRIMARY,
+                    message: msg,
+                });
+            }
+            let resp = serve_request(registry, selected, txn, next_txn_id, other);
+            if scope != Scope::ReadOnly
+                && !matches!(resp, Response::Error { .. })
+                && let Some(Err(msg)) = hook.map(WriteGate::check)
+            {
+                return Ok(Response::Error {
+                    code: error_code::REPLICATION,
+                    message: msg,
+                });
+            }
+            Ok(resp)
         }
     }
 }
