@@ -897,6 +897,27 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 | N6 | README limitations, CHANGELOG, historical doc banners | §9 | S | ⬜ |
 | N7 | Traceability catalog re-key | §9 | S | ⬜ |
 
+### O — VXL extension language (start after batch N is complete)
+
+Source: *VectorVolt VXL Language Specification v1.0* and *VXL Requirements & Architecture Rationale* (proposed, 2026-11). VXL is a statically typed, Rust-inspired DSL compiled to native code (Cranelift, AOT) for transaction validation, WAL observers, projections and execution policies.
+
+**Hard rule: VXL never runs inside the write hot path.** VXL code must never run in the WAL writer and group commit (`vectorvolt-wal` `writer.rs`, `group_commit.rs`, `uring_writer.rs`, `sync_commit.rs`), in transaction ordering and MVCC (`vectorvolt-txn` `manager.rs`, `shard_writer.rs`, `ring_buffer.rs`, `mvcc.rs`), or in the network/XDP I/O loops. Extensions never get `wal.append`, `checkpoint` or `current_lsn`; the engine owns LSNs and durability. The only pre-commit hook is O8, which is opt-in, bounded, and behind the latency gate O9. The engine depends only on `vxl-abi`, never on the compiler crates.
+
+| # | Item | Ref | Size | Status |
+|---|---|---|---|---|
+| O1 | Move in-engine projection fan-out off the write path: `Engine` calls `projections.lock().fan_out(...)` synchronously inside insert/delete (`vectorvolt-engine/src/engine.rs`, 4 call sites). Run `Reducer`s on a CDC-subscriber thread instead. Prerequisite for any VXL reducer. | VXL §11 | M | ⬜ |
+| O2 | Freeze the integration contract against the real engine: EBNF and reserved words; a typed row format or schema-mapping layer (the spec uses `u128` ids and `Decimal`, but `Mutation` and change events carry `u64` keys and `Vec<u64>` values); a target list matching the actual sinks (Kafka, Postgres, Redis; MongoDB would be a new sink). | VXL rationale §13 | M | ⬜ |
+| O3 | Compiler proof of concept: `vxl/` crates outside the engine dependency tree (lexer, parser, AST, types, HIR, MIR, Cranelift codegen, CLI). Diagnostics with source locations. A Rust-callable native function. | VXL spec §14, §21 | L | ⬜ |
+| O4 | `vxl-abi`: the hook traits, extension metadata (name, version, `abi_version`, target, capabilities), artifact validation, and the lifecycle (validate → register → load → init → activate → deactivate → unload). Load only at startup or table open, never per write. | VXL spec §15, §18 | M | ⬜ |
+| O5 | VXL projections in the sink pipeline: transform/filter/route/fan-out between outbox dequeue and sink delivery (`WalSinkBridge`, `OutboxDispatcher`). Reuse the existing at-least-once delivery, ack-after-flush, backoff, DLQ and persisted cursor. | VXL spec §11 | L | ⬜ |
+| O6 | Isolation for post-commit extensions: run O5/O7 extensions in a WebAssembly sandbox (wasmtime) or a separate worker process fed by the outbox, so a crash, panic or leak stalls only that sink. Enforce capabilities explicitly. | VXL rationale §3.2, §7 | L | ⬜ |
+| O7 | WAL observer and replay hooks: `on_append` becomes a read-only observer on the committed CDC stream (`vectorvolt-events/src/cdc_bridge.rs`), never inside the WAL writer. `on_replay` runs in LSN order on the recovery path and is deterministic (no clock, random or network). | VXL spec §10, §17 | M | ⬜ |
+| O8 | Bounded pre-commit transaction validation (the only latency-adding hook): AOT only, before `GroupCommit::submit`, off by default, enabled per table. No unbounded loops, allocation, clock, random, network or filesystem. An instruction budget ("fuel") aborts on overrun. Fails closed with a clear SQLSTATE. Kill switch per table without restart. Trusted native extensions only. | VXL spec §9 | L | ⬜ |
+| O9 | Latency gate: an end-to-end write benchmark (transaction, WAL durability, projection) in CI that fails the build if p99 write latency regresses past an agreed threshold with VXL enabled vs disabled. Required before O8 can be turned on. | VXL rationale §6, §12 | M | ⬜ |
+| O10 | Execution policies as load-time config: `partition_by`, `affinity` and `concurrency` compile to configuration read by `vectorvolt-txn/src/routing.rs` and `vectorvolt-hal/src/affinity.rs`. No VXL code runs per transaction. | VXL spec §12 | S | ⬜ |
+
+Order: O1 → O2 → O3/O4 → O5 + O6 → O7 → O10 → O9 → O8. Deferred, per the spec: LLVM backend, JIT, hot-swap, SIMD specialization, full IDE tooling.
+
 ### Gap register log
 
 - 2026-10-31: register created. PR #647 (PP-01…13, 20–22, 25, 31, 32 + CI green-up) precedes batch A.
@@ -909,3 +930,4 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 - 2026-11-04: **Batch E part 2** (branch `feat/gaps-batch-e2`): E1, E2, E8, E9, E11, E12 ✅. **Batch E complete.**
 - 2026-11-09: **Batch E follow-ups** (branch `feat/gaps-batch-e3`): E16–E18 ✅; E15 (XDP on real Linux) deferred until a Linux machine is available.
 - 2026-11-09: **Batch E final** (branch `feat/gaps-batch-e4`): E15 ✅ verified on real Linux; E17 leftovers closed. **Batch E has no open items.**
+- 2026-11-10: Added batch **O — VXL extension language**, scheduled after batch N. Hard rule: VXL never runs in the write hot path.
