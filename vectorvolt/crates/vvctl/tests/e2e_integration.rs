@@ -69,6 +69,7 @@ impl E2EHarness {
             cluster_node_id: None,
             cluster_status_port: 7900,
             listener: Default::default(),
+            replication: Default::default(),
             catalog: false,
             restore_catalog: false,
         };

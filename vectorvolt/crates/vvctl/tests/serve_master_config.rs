@@ -54,6 +54,7 @@ fn base_args(dir: &TempDir) -> ServeArgs {
         cluster_node_id: None,
         cluster_status_port: 7900,
         listener: Default::default(),
+        replication: Default::default(),
     }
 }
 

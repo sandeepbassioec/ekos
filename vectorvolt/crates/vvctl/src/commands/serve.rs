@@ -40,6 +40,10 @@ use vectorvolt_net::tls::ServerTlsConfig;
 use vectorvolt_net::{AuthConfig, Scope, Secret, Server, ServerConfig};
 use vectorvolt_reader::auth::AuthMethod;
 use vectorvolt_reader::server::{PgConfig, PgServer};
+use vectorvolt_replication::{
+    ReplicationClient, ReplicationConfig, ReplicationMode, ReplicationRole, ReplicationServer,
+    RoleCell,
+};
 
 const SCHEMA_FILE: &str = "schema.txt";
 
@@ -262,37 +266,119 @@ pub struct ServeArgs {
     #[arg(long)]
     pub pgwire_port: Option<u16>,
 
-    /// Start a `vectorvolt-cluster` node bound to this address (gossip/Raft
-    /// membership listener) and expose its live status over
-    /// `--cluster-status-port` (Gap #3).
-    ///
-    /// NOTE: `vectorvolt-cluster` does not yet implement wire-level gossip
-    /// transport (see `vectorvolt_cluster::node_runtime` docs), so this
-    /// starts a real, observable node with real membership/gossip state, but
-    /// `--cluster-seeds` peers are recorded as configured-only and are not
-    /// yet reachable over the network. Disabled if omitted.
-    #[arg(long)]
+    /// Start a `vectorvolt-cluster` node bound to this address (UDP SWIM
+    /// gossip) and expose its live membership and control endpoint on
+    /// `--cluster-status-port`. Peers are discovered by joining through
+    /// `--cluster-seeds`. Positional argument after the table directory in
+    /// `serve <dir> <cluster_bind>`; disabled if omitted.
     pub cluster_bind: Option<SocketAddr>,
 
-    /// Comma-separated seed peer addresses to record for this cluster node
-    /// (see `--cluster-bind`). Purely informational until gossip transport
-    /// exists.
+    /// Comma-separated seed peer addresses (`host:port` of other nodes'
+    /// the cluster-bind address). The node joins the cluster through the first seed
+    /// that answers, retrying with backoff in the background.
     #[arg(long, value_delimiter = ',')]
     pub cluster_seeds: Vec<SocketAddr>,
 
-    /// Explicit node id (UUID) for this cluster node. Auto-generated if
-    /// omitted.
+    /// Explicit node id (UUID) for this cluster node. Defaults to the node id
+    /// in `<dir>/cluster_identity.json` (written by `vvctl cluster init`),
+    /// else auto-generated.
     #[arg(long)]
     pub cluster_node_id: Option<String>,
 
     /// Port to serve `GET /cluster/status` JSON on. Only used when
-    /// `--cluster-bind` is set. Defaults to 7900.
+    /// a cluster-bind address is given. Defaults to 7900.
     #[arg(long, default_value_t = 7900)]
     pub cluster_status_port: u16,
 
     /// Listener TLS / pgwire options (D1, D3, D4).
     #[command(flatten)]
     pub listener: ListenerArgs,
+
+    /// WAL-shipping replication options (F5).
+    #[command(flatten)]
+    pub replication: ReplicationArgs,
+}
+
+/// WAL-shipping replication flags (`vectorvolt-replication`).
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationArgs {
+    /// Replication role: `leader` streams committed WAL frames to followers
+    /// (needs `--replication-listen`); `follower` pulls them from
+    /// `--replicate-from` and is read-only. Single-table mode only.
+    #[arg(long)]
+    pub replication_role: Option<ReplicationRole>,
+
+    /// Leader address to replicate from (`host:port`). Follower only.
+    #[arg(long)]
+    pub replicate_from: Option<String>,
+
+    /// Address the leader accepts follower connections on. Leader only.
+    #[arg(long)]
+    pub replication_listen: Option<SocketAddr>,
+
+    /// When a write counts as replicated: `async` (never wait), `semi-sync`
+    /// (one follower applied) or `sync` (replication-factor - 1 followers
+    /// durably applied, else the write errors after the ack timeout).
+    #[arg(long, default_value = "async")]
+    pub replication_mode: ReplicationMode,
+
+    /// Total copies of the data including the leader.
+    #[arg(long, default_value_t = 2)]
+    pub replication_factor: usize,
+
+    /// Run the epoch-fenced failover control plane (F6): a Raft group across
+    /// the nodes elects the write primary, bumps the fencing epoch on every
+    /// promotion and re-points followers. Needs `--raft-listen`,
+    /// `--replication-listen` and one `--failover-peer` per other node;
+    /// replaces `--replication-role`. Single-table mode only.
+    #[arg(long)]
+    pub failover: bool,
+
+    /// Raft RPC listener (TCP) for `--failover`.
+    #[arg(long)]
+    pub raft_listen: Option<SocketAddr>,
+
+    /// Another control-plane member: `<uuid>=<raft_addr>,<repl_addr>,<client_addr>`.
+    /// Repeatable.
+    #[arg(long = "failover-peer")]
+    pub failover_peers: Vec<String>,
+
+    /// Client address this node advertises as the primary in "not primary"
+    /// errors (defaults to the wire-protocol listen address).
+    #[arg(long)]
+    pub failover_client_addr: Option<String>,
+
+    /// Join an already running failover group instead of bootstrapping one:
+    /// this node asks the `--failover-peer` members (via their replication
+    /// addresses) to add it through Raft membership. `--failover-peer` is the
+    /// bootstrap list only; membership changes at runtime thereafter.
+    #[arg(long)]
+    pub failover_join: bool,
+
+    /// Accept sync / semi-sync writes with fewer in-sync replicas than the
+    /// configured factor instead of rejecting them with "insufficient
+    /// replicas". The degraded state is reported (metric + log) and full
+    /// acknowledgement resumes by itself when followers catch up.
+    #[arg(long)]
+    pub replication_degraded_ok: bool,
+}
+
+impl Default for ReplicationArgs {
+    fn default() -> Self {
+        Self {
+            replication_role: None,
+            replicate_from: None,
+            replication_listen: None,
+            replication_mode: ReplicationMode::Async,
+            replication_factor: 2,
+            failover: false,
+            raft_listen: None,
+            failover_peers: Vec::new(),
+            failover_client_addr: None,
+            failover_join: false,
+            replication_degraded_ok: false,
+        }
+    }
 }
 
 /// Shared listener options: mutual TLS for every listener, and pgwire bind /
@@ -478,6 +564,7 @@ impl Default for ServeArgs {
             cluster_node_id: None,
             cluster_status_port: 7900,
             listener: ListenerArgs::default(),
+            replication: ReplicationArgs::default(),
         }
     }
 }
@@ -505,6 +592,10 @@ pub struct BoundServer {
     pub encrypt_at_rest: bool,
     /// The master key when `--encrypt-at-rest` is active (`None` otherwise).
     pub master_key: Option<Arc<KeyStore>>,
+    /// F6: write fence every listener consults (allows all until failover starts).
+    pub write_gate: super::serve_failover::LateGate,
+    /// F6: post-write replication wait every listener runs.
+    pub after_write: super::serve_failover::LateGate,
 }
 
 /// Resolve the AES-256-GCM master key for `--encrypt-at-rest` from
@@ -833,6 +924,15 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
     if let Some(t) = &serve_tls {
         config = config.with_tls(t.net.clone());
     }
+    let write_gate = super::serve_failover::LateGate::default();
+    let after_write = super::serve_failover::LateGate::default();
+    {
+        let g = write_gate.as_gate();
+        let a = after_write.as_gate();
+        config = config
+            .with_write_gate(vectorvolt_net::WriteGate::new(move || g()))
+            .with_after_write(vectorvolt_net::WriteGate::new(move || a()));
+    }
 
     let server = server_builder(config)?;
 
@@ -868,6 +968,8 @@ pub fn bind(args: &ServeArgs) -> Result<BoundServer> {
         master_config,
         encrypt_at_rest: args.encrypt_at_rest,
         master_key,
+        write_gate,
+        after_write,
     })
 }
 
@@ -942,6 +1044,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
         master_config,
         encrypt_at_rest,
         master_key,
+        write_gate,
+        after_write,
     } = bind(&args)?;
 
     // ── Sinks (CDC fan-out) ───────────────────────────────────────────────────
@@ -998,6 +1102,22 @@ pub fn run(args: ServeArgs) -> Result<()> {
         unreachable!("either registry or engine must be present")
     };
     run_startup_recovery(&recovery_registry);
+
+    // ── Epoch-fenced failover control plane (F6) ─────────────────────────────
+    // Started before any listener so their write fences are live from the first
+    // request: a node is read-only until Raft elects it primary.
+    let _failover = start_failover(
+        &args,
+        engine.as_ref(),
+        master_key.as_ref(),
+        local,
+        &write_gate,
+        &after_write,
+    )?;
+    let (gate_w, gate_a) = (write_gate.as_gate(), after_write.as_gate());
+
+    // ── Versionstamps, shard plane and sagas on the real engine (F7/F8) ─────
+    super::serve_cluster_ext::start(&args, engine.as_ref())?;
 
     // ── Startup banner ────────────────────────────────────────────────────────
     eprintln!("VectorVolt server ready");
@@ -1097,6 +1217,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
             };
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         http_shutdown = Some(tx);
+        let (http_gate_w, http_gate_a) = (gate_w.clone(), gate_a.clone());
         let http_tls = tls.as_ref().map(|t| t.net.rustls_config());
         warn_plaintext("HTTP", http_addr, http_tls.is_some());
         std::thread::Builder::new()
@@ -1106,6 +1227,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async move {
                     let mut cfg = HttpServerConfig::new(http_addr);
+                    cfg = cfg
+                        .with_write_gate(http_gate_w)
+                        .with_after_write(http_gate_a);
                     if let Some(tok) = http_token {
                         cfg = cfg.with_token(tok);
                     }
@@ -1164,6 +1288,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
         let grpc_engine = Arc::clone(eng);
         use vectorvolt_server::GrpcServer;
         let mut grpc_srv = GrpcServer::standalone(grpc_addr, grpc_engine);
+        grpc_srv = grpc_srv
+            .with_write_gate(gate_w.clone())
+            .with_after_write(gate_a.clone());
         if let Some(token) = grpc_token {
             grpc_srv = grpc_srv.with_token(token);
         }
@@ -1222,6 +1349,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         let pg_auth = args.listener.pgwire_auth;
         warn_plaintext("pgwire", pgwire_addr, pg_tls.is_some());
         let pg_dir = args.dir.clone();
+        let (pg_gate_w, pg_gate_a) = (gate_w.clone(), gate_a.clone());
         // A3: `--secret` also gates pgwire (clients send it as their password).
         let pg_password = args.secret.as_ref().map(|s| s.trim().to_owned());
         // A2: SQL column encryption uses a key derived from the master key.
@@ -1239,6 +1367,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
                     let server =
                         build_pg_server(config, pg_reg, pg_password, pg_auth, pg_column_key)
                             .with_tls(pg_tls)
+                            .with_write_gate(pg_gate_w)
+                            .with_after_write(pg_gate_a)
                             .with_require_tls(pg_require_tls)
                             .with_max_connections(pg_max_connections);
                     eprintln!(
@@ -1262,15 +1392,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eprintln!("  pgwire    : disabled (use --pgwire-port to enable)");
     }
 
-    // ── Cluster node (optional, Gap #3) ──────────────────────────────────────
-    // Starts a real vectorvolt-cluster node (NodeId + MembershipList +
-    // GossipEngine) alongside this single-node server so its state is
-    // observable via GET /cluster/status. See
-    // vectorvolt_cluster::node_runtime for what is and is not real here:
-    // membership/gossip data structures are the genuine ones exercised by
-    // vectorvolt-cluster's own tests, but there is no wire-level gossip
-    // transport yet, so --cluster-seeds peers are recorded as
-    // configured-only, not claimed as discovered/reachable.
+    // ── Cluster node (optional) ──────────────────────────────────────────────
+    // Real SWIM gossip over UDP on --cluster-bind, joining via
+    // --cluster-seeds; membership and the vvctl control path (status /
+    // members / join / leave) are served over HTTP on --cluster-status-port.
     if let Some(cluster_bind) = args.cluster_bind {
         let node_id = match args.cluster_node_id.as_deref() {
             Some(s) => match uuid::Uuid::parse_str(s) {
@@ -1280,21 +1405,42 @@ pub fn run(args: ServeArgs) -> Result<()> {
                     None
                 }
             },
-            None => None,
+            None => super::cluster_cmd::load_identity(&args.dir).map(|i| NodeId(i.node_id)),
         };
         let cluster_node = ClusterNode::start(cluster_bind, args.cluster_seeds.clone(), node_id);
+        // `vvctl cluster join/leave` and gossip join/leave events drive the
+        // failover Raft group's membership.
+        if let Some(fh) = &_failover {
+            cluster_node.set_membership_hook(Arc::new(
+                super::serve_failover::RaftMembershipBridge::new(
+                    Arc::clone(&fh.node.controller),
+                    fh.seeds.clone(),
+                ),
+            ));
+        }
         eprintln!(
-            "  cluster   : node {} on {} ({} configured seed(s))",
+            "  cluster   : node {} on {} ({} seed(s))",
             cluster_node.status().node_id,
             cluster_bind,
             args.cluster_seeds.len()
         );
         let status_port = args.cluster_status_port;
+        // `vvctl cluster status/members/join/leave` find this node's control
+        // endpoint through the identity file instead of needing `--node`.
+        if let Err(e) = super::cluster_cmd::record_control_addr(
+            &args.dir,
+            SocketAddr::from(([127, 0, 0, 1], status_port)),
+        ) {
+            eprintln!("  cluster   : could not record the control address: {e}");
+        }
         std::thread::Builder::new()
             .name("cluster-status".into())
             .spawn(move || {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async move {
+                    if let Err(e) = cluster_node.start_gossip(Default::default()).await {
+                        eprintln!("  cluster   : gossip bind failed on {cluster_bind}: {e}");
+                    }
                     eprintln!("  cluster   : status http://127.0.0.1:{status_port}/cluster/status");
                     ClusterStatusServer::new(cluster_node)
                         .serve(status_port)
@@ -1303,8 +1449,13 @@ pub fn run(args: ServeArgs) -> Result<()> {
             })
             .expect("spawn cluster-status thread");
     } else {
-        eprintln!("  cluster   : disabled (use --cluster-bind to enable)");
+        eprintln!(
+            "  cluster   : disabled (pass a cluster-bind address after the table dir to enable)"
+        );
     }
+
+    // ── WAL-shipping replication (F5) ────────────────────────────────────────
+    let _replication = start_replication(&args, engine.as_ref(), master_key.as_ref())?;
 
     // ── Prometheus metrics endpoint (VV-OBS-005) ─────────────────────────────
     if args.metrics_port > 0 {
@@ -1391,6 +1542,152 @@ pub fn run(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Live replication endpoint started by `--replication-role`. Dropping it
+/// stops replication; it owns the runtime its tasks run on.
+pub struct ReplicationHandle {
+    _rt: tokio::runtime::Runtime,
+    pub server: Option<Arc<ReplicationServer>>,
+    pub client: Option<Arc<ReplicationClient>>,
+}
+
+/// Validate the replication flags and start the leader listener or follower
+/// pull loop. Returns `Ok(None)` when replication is not requested.
+pub fn start_replication(
+    args: &ServeArgs,
+    engine: Option<&Arc<TableEngine>>,
+    key: Option<&Arc<KeyStore>>,
+) -> Result<Option<ReplicationHandle>> {
+    let r = &args.replication;
+    let Some(role) = r.replication_role else {
+        // `--failover` owns `--replication-listen` (the fenced front).
+        if r.failover {
+            return Ok(None);
+        }
+        if r.replicate_from.is_some() || r.replication_listen.is_some() {
+            bail!("--replicate-from / --replication-listen require --replication-role");
+        }
+        eprintln!("  replication: disabled (use --replication-role to enable)");
+        return Ok(None);
+    };
+    if role == ReplicationRole::Standalone {
+        return Ok(None);
+    }
+    let engine = match (args.multi, engine) {
+        (false, Some(e)) => Arc::clone(e),
+        _ => bail!("--replication-role supports single-table mode only (not --multi)"),
+    };
+    let cfg = ReplicationConfig::default()
+        .with_mode(r.replication_mode)
+        .with_replication_factor(r.replication_factor);
+    cfg.validate()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("replication")
+        .enable_all()
+        .build()
+        .with_context(|| "build replication runtime")?;
+    let cell = RoleCell::new(role);
+    match role {
+        ReplicationRole::Leader => {
+            if r.replicate_from.is_some() {
+                bail!("--replicate-from is for followers; a leader uses --replication-listen");
+            }
+            let listen = r.replication_listen.ok_or_else(|| {
+                anyhow::anyhow!("--replication-role leader needs --replication-listen")
+            })?;
+            let wal_dir = args.dir.join("wal");
+            let server = rt
+                .block_on(ReplicationServer::start(engine, wal_dir, cfg, cell, listen))
+                .with_context(|| format!("start replication listener on {listen}"))?;
+            eprintln!(
+                "  replication: leader on {} ({}, factor {})",
+                server.local_addr(),
+                r.replication_mode,
+                r.replication_factor
+            );
+            Ok(Some(ReplicationHandle {
+                _rt: rt,
+                server: Some(server),
+                client: None,
+            }))
+        }
+        ReplicationRole::Follower => {
+            if r.replication_listen.is_some() {
+                bail!("--replication-listen is for leaders; a follower uses --replicate-from");
+            }
+            let from = r.replicate_from.clone().ok_or_else(|| {
+                anyhow::anyhow!("--replication-role follower needs --replicate-from")
+            })?;
+            // A follower must not take client writes: the only credential it
+            // accepts is a read-only one.
+            if args.secret.is_none()
+                || args.key_scope != Some(KeyScope::ReadOnly)
+                || args.key_file.is_some()
+            {
+                bail!(
+                    "a replication follower is read-only: pass --secret with --key-scope \
+                     read-only (and no --key-file) so clients cannot write to it"
+                );
+            }
+            let client = {
+                let _g = rt.enter();
+                ReplicationClient::start(engine, &args.dir, key.cloned(), cfg, cell, from.clone())
+                    .with_context(|| "start replication follower")?
+            };
+            eprintln!(
+                "  replication: follower of {from} (applied lsn {}, read-only)",
+                client.applied_lsn()
+            );
+            Ok(Some(ReplicationHandle {
+                _rt: rt,
+                server: None,
+                client: Some(client),
+            }))
+        }
+        ReplicationRole::Standalone => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod replication_flag_tests {
+    use super::*;
+
+    fn args() -> ServeArgs {
+        ServeArgs {
+            dir: PathBuf::from("."),
+            ..ServeArgs::default()
+        }
+    }
+
+    #[test]
+    fn replication_is_off_by_default_and_flags_need_a_role() {
+        assert!(start_replication(&args(), None, None).unwrap().is_none());
+        let mut a = args();
+        a.replication.replicate_from = Some("127.0.0.1:1".into());
+        assert!(start_replication(&a, None, None).is_err());
+    }
+
+    #[test]
+    fn follower_must_be_read_only_and_leader_needs_a_listener() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(
+            TableEngine::open_with(vec!["pk".into()], dir.path(), EngineOptions::new(1024))
+                .unwrap(),
+        );
+        let mut a = args();
+        a.dir = dir.path().to_path_buf();
+        a.replication.replication_role = Some(ReplicationRole::Follower);
+        a.replication.replicate_from = Some("127.0.0.1:1".into());
+        let err = start_replication(&a, Some(&engine), None).err().unwrap();
+        assert!(err.to_string().contains("read-only"), "{err}");
+
+        a.replication.replication_role = Some(ReplicationRole::Leader);
+        a.replication.replicate_from = None;
+        let err = start_replication(&a, Some(&engine), None).err().unwrap();
+        assert!(err.to_string().contains("--replication-listen"), "{err}");
+    }
+}
+
 #[cfg(test)]
 mod key_scope_tests {
     use super::*;
@@ -1467,4 +1764,126 @@ ops admin {HEX}
         .unwrap();
         assert!(build_auth(&args).is_err());
     }
+}
+
+/// Live failover node started by `--failover`. Dropping it stops the control
+/// plane; it owns the runtime its tasks run on.
+pub struct FailoverHandle {
+    _rt: tokio::runtime::Runtime,
+    pub node: Arc<super::serve_failover::FailoverNode>,
+    /// Replication addresses of the configured `--failover-peer` members.
+    pub seeds: Vec<SocketAddr>,
+}
+
+/// Start the epoch-fenced failover control plane when `--failover` is set and
+/// install the resulting fences into the listeners' late-bound gates.
+pub fn start_failover(
+    args: &ServeArgs,
+    engine: Option<&Arc<TableEngine>>,
+    key: Option<&Arc<KeyStore>>,
+    client_addr: SocketAddr,
+    write_gate: &super::serve_failover::LateGate,
+    after_write: &super::serve_failover::LateGate,
+) -> Result<Option<FailoverHandle>> {
+    use super::serve_failover::{FailoverNode, FailoverNodeOpts, parse_node_id, parse_peer};
+    use vectorvolt_cluster::failover::FailoverConfig;
+
+    let r = &args.replication;
+    if !r.failover {
+        if r.raft_listen.is_some() || !r.failover_peers.is_empty() {
+            bail!("--raft-listen / --failover-peer require --failover");
+        }
+        return Ok(None);
+    }
+    if r.replication_role.is_some() || r.replicate_from.is_some() {
+        bail!("--failover elects the primary itself; drop --replication-role / --replicate-from");
+    }
+    let engine = match (args.multi, engine) {
+        (false, Some(e)) => Arc::clone(e),
+        _ => bail!("--failover supports single-table mode only (not --multi)"),
+    };
+    let raft_listen = r
+        .raft_listen
+        .ok_or_else(|| anyhow::anyhow!("--failover needs --raft-listen"))?;
+    let repl_listen = r
+        .replication_listen
+        .ok_or_else(|| anyhow::anyhow!("--failover needs --replication-listen"))?;
+    let node_id = match args.cluster_node_id.as_deref() {
+        Some(s) => {
+            parse_node_id(s).map_err(|e| anyhow::anyhow!("invalid --cluster-node-id: {e}"))?
+        }
+        None => super::cluster_cmd::load_identity(&args.dir)
+            .map(|i| NodeId(i.node_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--failover needs a stable node id: pass --cluster-node-id or run \
+                     `vvctl cluster init`"
+                )
+            })?,
+    };
+    let mut peers = Vec::new();
+    for p in &r.failover_peers {
+        peers.push(parse_peer(p).map_err(|e| anyhow::anyhow!(e))?);
+    }
+    let mut control = FailoverConfig::new(
+        node_id,
+        args.dir.join("failover"),
+        peers.iter().map(|p| p.0.clone()).collect(),
+    );
+    control.raft_listen = raft_listen;
+    control.repl_listen = repl_listen;
+    control.join = r.failover_join;
+    control.admin_token = args.secret.clone();
+    control.client_addr = r
+        .failover_client_addr
+        .clone()
+        .unwrap_or_else(|| client_addr.to_string());
+    let repl = ReplicationConfig::default()
+        .with_mode(r.replication_mode)
+        .with_replication_factor(r.replication_factor)
+        .with_degraded_ok(r.replication_degraded_ok);
+    repl.validate()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("failover")
+        .enable_all()
+        .build()
+        .with_context(|| "build failover runtime")?;
+    let node = rt
+        .block_on(FailoverNode::start(FailoverNodeOpts {
+            engine,
+            dir: args.dir.clone(),
+            key: key.cloned(),
+            repl,
+            control,
+        }))
+        .with_context(|| "start failover node")?;
+    let seeds: Vec<SocketAddr> = peers.iter().map(|p| p.2).collect();
+    for (id, raft, repl_addr, client) in peers {
+        node.controller.add_peer(&id, raft, repl_addr, client);
+    }
+    if r.failover_join {
+        let _guard = rt.enter();
+        node.controller.auto_join(seeds.clone());
+    }
+    write_gate.set(node.write_gate());
+    after_write.set(node.after_write());
+    {
+        let fence = node.fence();
+        // Commit versionstamps carry the failover epoch.
+        super::serve_cluster_ext::set_epoch_source(Arc::new(move || fence.epoch()));
+    }
+    eprintln!(
+        "  failover  : node {} raft {} replication {} ({}, factor {}); read-only until elected",
+        node.controller.node_id(),
+        node.controller.raft_addr(),
+        node.controller.repl_addr(),
+        r.replication_mode,
+        r.replication_factor
+    );
+    Ok(Some(FailoverHandle {
+        _rt: rt,
+        node,
+        seeds,
+    }))
 }

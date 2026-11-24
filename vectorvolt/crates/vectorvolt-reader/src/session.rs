@@ -118,6 +118,51 @@ impl AsyncWrite for PgStream {
     }
 }
 
+/// A write-fencing check (F6): `Ok(())` when this node may accept writes now.
+pub type WriteGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// True for statements that cannot mutate (everything else is fenced on a
+/// node that is not the write primary).
+pub fn sql_is_read_only(sql: &str) -> bool {
+    sql.split(';').all(statement_is_read_only)
+}
+
+fn statement_is_read_only(sql: &str) -> bool {
+    let head: String = sql
+        .trim_start()
+        .trim_start_matches('(')
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    head.is_empty()
+        || matches!(
+            head.as_str(),
+            "SELECT"
+                | "WITH"
+                | "EXPLAIN"
+                | "SHOW"
+                | "SET"
+                | "RESET"
+                | "BEGIN"
+                | "START"
+                | "COMMIT"
+                | "END"
+                | "ROLLBACK"
+                | "ABORT"
+                | "DEALLOCATE"
+                | "DISCARD"
+                | "DECLARE"
+                | "FETCH"
+                | "CLOSE"
+                | "PREPARE"
+                | "USE"
+                | "DESCRIBE"
+                | "VALUES"
+                | "LISTEN"
+        )
+}
+
 /// A single client session over a `TcpStream` (optionally upgraded to TLS).
 pub struct PgSession {
     stream: PgStream,
@@ -137,6 +182,10 @@ pub struct PgSession {
     skip_until_sync: bool,
     /// Pending backend messages, written on Sync / Flush / simple Query.
     out: BytesMut,
+    /// F6 write fence.
+    write_gate: Option<WriteGate>,
+    /// Called after a successful mutating statement (replication wait).
+    after_write: Option<WriteGate>,
 }
 
 /// Most statements / portals one session may hold (memory bound).
@@ -158,6 +207,36 @@ impl PgSession {
             portals: HashMap::new(),
             skip_until_sync: false,
             out: BytesMut::new(),
+            write_gate: None,
+            after_write: None,
+        }
+    }
+
+    /// Run `hook` after every successful mutating statement; an `Err` is
+    /// reported to the client in place of the success (F6 replication wait).
+    pub fn with_after_write(mut self, hook: Option<WriteGate>) -> Self {
+        self.after_write = hook;
+        self
+    }
+
+    fn after_write(&self, sql: &str) -> Result<(), String> {
+        match &self.after_write {
+            Some(h) if !sql_is_read_only(sql) => h(),
+            _ => Ok(()),
+        }
+    }
+
+    /// Fence mutating statements behind `gate` (F6).
+    pub fn with_write_gate(mut self, gate: Option<WriteGate>) -> Self {
+        self.write_gate = gate;
+        self
+    }
+
+    /// `Err(message)` when `sql` mutates and this node is not the primary.
+    fn check_write(&self, sql: &str) -> Result<(), String> {
+        match &self.write_gate {
+            Some(g) if !sql_is_read_only(sql) => g(),
+            _ => Ok(()),
         }
     }
 
@@ -634,10 +713,14 @@ impl PgSession {
 
     /// Run `sql` on the executor, mapping errors and reporting notices.
     fn run_sql(&mut self, sql: &str) -> Result<QueryResult, ProtoError> {
+        self.check_write(sql)
+            .map_err(|m| ProtoError::new("25006", m))?;
         let result = self
             .executor
             .execute(sql)
             .map_err(|e| ProtoError::new("XX000", e.to_string()))?;
+        self.after_write(sql)
+            .map_err(|m| ProtoError::new("XX000", m))?;
         let mut notices = Vec::new();
         let result = unwrap_notices(result, &mut notices);
         for n in notices {
@@ -789,8 +872,16 @@ impl PgSession {
     }
 
     async fn handle_query(&mut self, sql: &str) -> std::io::Result<()> {
+        if let Err(m) = self.check_write(sql) {
+            return self.stream.write_all(&encode_error_response(&m)).await;
+        }
         match self.executor.execute(sql) {
-            Ok(result) => self.send_result(result).await,
+            Ok(result) => {
+                if let Err(m) = self.after_write(sql) {
+                    return self.stream.write_all(&encode_error_response(&m)).await;
+                }
+                self.send_result(result).await
+            }
             Err(e) => {
                 self.stream
                     .write_all(&encode_error_response(&e.to_string()))

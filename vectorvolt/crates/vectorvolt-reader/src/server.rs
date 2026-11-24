@@ -12,7 +12,7 @@ use vectorvolt_engine::TableRegistry;
 use vectorvolt_query::sql::executor::SqlExecutor;
 
 use crate::auth::{AuthMethod, Credentials};
-use crate::session::{PgSession, open_registry};
+use crate::session::{PgSession, WriteGate, open_registry};
 use crate::wire::encode_fatal_error;
 
 /// Configuration for `PgServer`.
@@ -54,6 +54,9 @@ struct ConnPolicy {
     max_connections: Option<usize>,
     /// Sessions currently running on this listener.
     live: Arc<AtomicUsize>,
+    /// F6 write fence handed to every session.
+    write_gate: Option<WriteGate>,
+    after_write: Option<WriteGate>,
 }
 
 /// Decrements the live-session count when a session ends, however it ends.
@@ -120,6 +123,8 @@ impl ConnPolicy {
             self.credentials.clone(),
         )
         .with_tls(self.tls.clone(), self.require_tls)
+        .with_write_gate(self.write_gate.clone())
+        .with_after_write(self.after_write.clone())
     }
 
     /// Admit and run one connection to completion.
@@ -204,6 +209,8 @@ pub struct PgServer {
     require_tls: bool,
     max_connections: Option<usize>,
     live: Arc<AtomicUsize>,
+    write_gate: Option<WriteGate>,
+    after_write: Option<WriteGate>,
 }
 
 impl PgServer {
@@ -226,6 +233,8 @@ impl PgServer {
             require_tls: false,
             max_connections: None,
             live: Arc::new(AtomicUsize::new(0)),
+            write_gate: None,
+            after_write: None,
         }
     }
 
@@ -264,6 +273,18 @@ impl PgServer {
         self
     }
 
+    /// Run `hook` after every successful mutating statement (replication wait).
+    pub fn with_after_write(mut self, hook: WriteGate) -> Self {
+        self.after_write = Some(hook);
+        self
+    }
+
+    /// Refuse mutating statements (F6); `Err(msg)` becomes SQLSTATE 25006.
+    pub fn with_write_gate(mut self, gate: WriteGate) -> Self {
+        self.write_gate = Some(gate);
+        self
+    }
+
     /// Cap concurrent sessions on this listener. The executor's own S116
     /// `max_connections` (default 100) also applies; the tighter one wins.
     pub fn with_max_connections(mut self, max: Option<usize>) -> Self {
@@ -289,6 +310,8 @@ impl PgServer {
             require_tls: self.require_tls,
             max_connections: self.max_connections,
             live: Arc::clone(&self.live),
+            write_gate: self.write_gate.clone(),
+            after_write: self.after_write.clone(),
         }
     }
 
@@ -354,6 +377,8 @@ impl PgServer {
             require_tls: false,
             max_connections: None,
             live: Arc::new(AtomicUsize::new(0)),
+            write_gate: None,
+            after_write: None,
         }
         .accept_until(listener, addr, shutdown)
         .await

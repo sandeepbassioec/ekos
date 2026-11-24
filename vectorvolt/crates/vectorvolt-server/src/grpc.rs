@@ -28,11 +28,18 @@ use proto::{
 
 // ── Service state ─────────────────────────────────────────────────────────────
 
+/// A write-fencing / post-write check (F6): `Ok(())` to proceed.
+pub type WriteGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct GrpcWriteService {
     engine: Arc<TableEngine>,
     txns: Arc<DashMap<u64, AsyncMutex<TxnState>>>,
     txn_seq: Arc<AtomicU64>,
+    /// Rejects mutations while this node is not the write primary.
+    write_gate: Option<WriteGate>,
+    /// Runs after each successful mutation (replication wait).
+    after_write: Option<WriteGate>,
 }
 
 impl GrpcWriteService {
@@ -45,6 +52,26 @@ impl GrpcWriteService {
             engine,
             txns,
             txn_seq,
+            write_gate: None,
+            after_write: None,
+        }
+    }
+}
+
+impl GrpcWriteService {
+    #[allow(clippy::result_large_err)] // tonic's `Status` is the handler error type
+    fn fence(&self) -> Result<(), Status> {
+        match &self.write_gate {
+            Some(g) => g().map_err(Status::failed_precondition),
+            None => Ok(()),
+        }
+    }
+
+    #[allow(clippy::result_large_err)] // tonic's `Status` is the handler error type
+    fn replicated(&self) -> Result<(), Status> {
+        match &self.after_write {
+            Some(h) => h().map_err(Status::deadline_exceeded),
+            None => Ok(()),
         }
     }
 }
@@ -60,10 +87,12 @@ impl WriteService for GrpcWriteService {
     }
 
     async fn insert(&self, req: Request<InsertRequest>) -> Result<Response<WriteReply>, Status> {
+        self.fence()?;
         let r = req.into_inner();
         self.engine
             .insert(r.pk, r.values)
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.replicated()?;
         Ok(Response::new(WriteReply {
             status: "ok".into(),
             error: String::new(),
@@ -71,10 +100,12 @@ impl WriteService for GrpcWriteService {
     }
 
     async fn delete(&self, req: Request<DeleteRequest>) -> Result<Response<WriteReply>, Status> {
+        self.fence()?;
         let r = req.into_inner();
         self.engine
             .delete(r.pk)
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.replicated()?;
         Ok(Response::new(WriteReply {
             status: "ok".into(),
             error: String::new(),
@@ -105,6 +136,7 @@ impl WriteService for GrpcWriteService {
         &self,
         _req: Request<BeginTxnRequest>,
     ) -> Result<Response<BeginTxnReply>, Status> {
+        self.fence()?;
         let txn_id = self.txn_seq.fetch_add(1, Ordering::Relaxed);
         self.txns
             .insert(txn_id, AsyncMutex::new(TxnState { ops: Vec::new() }));
@@ -112,6 +144,7 @@ impl WriteService for GrpcWriteService {
     }
 
     async fn execute(&self, req: Request<ExecuteRequest>) -> Result<Response<WriteReply>, Status> {
+        self.fence()?;
         let r = req.into_inner();
         let entry = self
             .txns
@@ -140,6 +173,7 @@ impl WriteService for GrpcWriteService {
         &self,
         req: Request<CommitTxnRequest>,
     ) -> Result<Response<CommitReply>, Status> {
+        self.fence()?;
         let txn_id = req.into_inner().txn_id;
         let ops = {
             let entry = self
@@ -163,6 +197,7 @@ impl WriteService for GrpcWriteService {
         self.engine
             .apply_batch(batch)
             .map_err(|e| Status::internal(format!("commit failed, nothing applied: {e}")))?;
+        self.replicated()?;
         Ok(Response::new(CommitReply {
             status: "committed".into(),
             ops: applied,
@@ -256,6 +291,20 @@ impl GrpcServer {
     /// True if the server speaks TLS.
     pub fn is_tls(&self) -> bool {
         self.tls.is_some()
+    }
+
+    /// Fence mutating RPCs behind `gate` (F6): `Err(msg)` becomes
+    /// `FAILED_PRECONDITION` with the current primary named in `msg`.
+    pub fn with_write_gate(mut self, gate: WriteGate) -> Self {
+        self.svc.write_gate = Some(gate);
+        self
+    }
+
+    /// Run `hook` after each successful mutation (replication wait); an `Err`
+    /// is `DEADLINE_EXCEEDED` (committed locally, replication unconfirmed).
+    pub fn with_after_write(mut self, hook: WriteGate) -> Self {
+        self.svc.after_write = Some(hook);
+        self
     }
 
     /// Require `authorization: Bearer <token>` on every RPC.

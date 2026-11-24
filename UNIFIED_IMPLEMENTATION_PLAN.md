@@ -763,14 +763,37 @@ Out of scope by owner decision: PP-33 (PAM credentials), PP-41 (ConsoleApp1).
 
 | # | Gap | Ref | Size | Status |
 |---|---|---|---|---|
-| F1 | Cluster network transport (gossip + Raft RPC) | 6.11 | L | ⬜ |
-| F2 | Real Raft: persisted term/vote/log, network replication, snapshot install | LD-SWIM | L | ⬜ |
-| F3 | SWIM probe always Suspect | 6.11 | M | ⬜ |
-| F4 | `--cluster-seeds` recorded only; `cluster join/leave/init` local only | — | M | ⬜ |
-| F5 | Replication: network, catch-up, acks/sync, replication factor | §6.3 | L | ⬜ |
-| F6 | Epoch fencing + < 2 s failover | 6.5 | L | ⬜ |
-| F7 | Shard split, auto-scale, live migration, drain | 6.8/6.9 | L | ⬜ |
-| F8 | Cross-shard sagas; cluster versionstamps | §5.9, 6.15 | L | ⬜ |
+| F1 | Cluster network transport (gossip + Raft RPC) | 6.11 | L | ✅ `transport.rs`: framed TCP RPC (version, length, CRC), timeouts, reconnect with backoff, binary codec (frame v2), TLS/mTLS (`bind_tls`), and an in-memory network for tests. SWIM over UDP (`gossip_net.rs`). |
+| F2 | Real Raft: persisted term/vote/log, network replication, snapshot install | LD-SWIM | L | ✅ Raft (`raft/`): fsynced hard state and log (CRC, torn-tail trim); elections with pre-vote and leader stickiness; replication with conflict backoff; commits only current-term entries on a majority. Chunked, resumable InstallSnapshot. Single-server membership changes with learners. Tests `raft_cluster.rs`, `raft_advanced.rs`. |
+| F3 | SWIM probe always Suspect | 6.11 | M | ✅ `SwimNode`: ping, ping-req via k helpers, suspicion with incarnations then Dead, refutation, piggy-backed dissemination, graceful leave, and reconciliation when a node restarts under a new id. Mock probers removed. Tests `swim_membership.rs`. |
+| F4 | `--cluster-seeds` recorded only; `cluster join/leave/init` local only | — | M | ✅ `serve --cluster-seeds` joins through gossip. `vvctl cluster init/join/leave/status/members` target the running node (local `control_addr` by default; `--offline` for the old file mode). Join/leave also add/remove the node in the failover Raft group. |
+| F5 | Replication: network, catch-up, acks/sync, replication factor | §6.3 | L | ✅ TCP WAL-shipping replication (`vectorvolt-replication`):
+  - all tables, each with a persisted position;
+  - catch-up, with snapshot fallback via `consistent_snapshot`;
+  - async, semi-sync and sync acks, with RF enforced ("insufficient replicas"; `--replication-degraded-ok` opt-in);
+  - TLS/mTLS and lag metrics;
+  - an allocation-free `wait_for_replication`. |
+| F6 | Epoch fencing + < 2 s failover | 6.5 | L | ✅ Raft control plane (`failover.rs`):
+  - epoch-CAS promotion, a lease-fenced write gate, and the epoch on every replication frame and ack;
+  - incremental catch-up via the (epoch, LSN) lineage;
+  - followers reject writes on HTTP, gRPC, pgwire and native;
+  - dynamic peers.
+
+  Measured failover 0.34 s (3 real processes). |
+| F7 | Shard split, auto-scale, live migration, drain | 6.8/6.9 | L | ✅ Shards:
+  - split, live migration (bounded cutover) and drain, with the map committed through Raft;
+  - a rate-limited rebalancer, off by default;
+  - an engine-backed shard node with streamed snapshot chunks;
+  - a migration journal with crash repair;
+  - `/shards*` endpoints and `vvctl shard`.
+
+  Tests `shard_ops.rs`, `shard_live.rs`, `shard_migration_engine.rs`. |
+| F8 | Cross-shard sagas; cluster versionstamps | §5.9, 6.15 | L | ✅ 12-byte HLC versionstamps:
+  - epoch-aware, persisted high-water, byte order equals logical order;
+  - assigned at commit via `set_commit_stamper` and carried in CDC and replication (`Stamps` message);
+  - `GET /versionstamp`.
+
+  Durable saga coordinator with compensation, timeouts and resume at startup; `POST /sagas`, `GET /sagas/{id}`. Residual: stamps for WAL frames older than the in-memory ring (after a restart) are assigned locally on the follower. |
 
 ### G — Engine core (Phase 2–3)
 
@@ -964,3 +987,4 @@ These came up while finishing batches D–F and writing `C:\VectorVolt\VectorVol
 - 2026-11-10: Added batch **O — VXL extension language**, scheduled after batch N. Hard rule: VXL never runs in the write hot path.
 - 2026-11-10: Added H17–H25: hardware features that exist in code but are not used by the running engine (XDP transport, io_uring WAL, O_DIRECT, `hal.*` config, `harden()`, CRC-32C, graph SIMD, TPM, HAL timer/arena/wait).
 - 2026-11-10: Added batch **P** (P1–P15): open findings from batches A–F and the user guide that no row tracked. L9 is now 🟡.
+- 2026-11-10: **Batch F complete** (branch `feat/gaps-batch-f`): F1–F8 ✅. Raft, SWIM, replication, failover (0.34 s), shards, versionstamps and sagas are wired into `vvctl serve`.

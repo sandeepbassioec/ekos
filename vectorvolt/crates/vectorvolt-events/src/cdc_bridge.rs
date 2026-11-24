@@ -54,6 +54,12 @@ impl CdcEventBridge {
                         Some(vals) => json!({ "pk": ev.pk, "values": vals, "lsn": ev.lsn }),
                         None => json!({ "pk": ev.pk, "lsn": ev.lsn }),
                     };
+                    // F8: sinks see the commit versionstamp (hex) when one was assigned.
+                    let mut payload = payload;
+                    if let Some(stamp) = ev.versionstamp {
+                        payload["versionstamp"] =
+                            json!(stamp.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    }
                     let envelope = DomainEventEnvelope::new(
                         &event_type,
                         "1.0.0",
